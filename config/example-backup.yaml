@@ -1,0 +1,52 @@
+# Example Kafka Backup Configuration
+# Copy this file and modify for your environment
+
+mode: backup
+backup_id: "backup-2025-01-15-001"
+
+# Source Kafka cluster configuration
+source:
+  bootstrap_servers:
+    - localhost:9092
+    # - broker-2:9092
+    # - broker-3:9092
+
+  # Security settings (optional)
+  security:
+    security_protocol: PLAINTEXT  # PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
+    # sasl_mechanism: PLAIN        # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    # sasl_username: "your-username"
+    # sasl_password: "your-password"
+    # ssl_ca_location: "/path/to/ca.crt"
+
+  # Topic selection
+  topics:
+    include:
+      - orders
+      - payments
+      - "events-*"           # Glob patterns supported
+    exclude:
+      - "__consumer_offsets" # Internal topics excluded by default
+      - "__transaction_state"
+      - "*-changelog"        # Exclude Kafka Streams changelog topics
+
+# Storage configuration
+storage:
+  backend: filesystem  # filesystem | s3 (s3 coming in Milestone 2)
+  path: "/var/lib/kafka-backup/data"
+  # prefix: "cluster-prod"  # Optional prefix for all keys
+
+# Backup-specific options
+backup:
+  # Segment size limits
+  segment_max_bytes: 134217728     # 128MB - split segments when reaching this size
+  segment_max_interval_ms: 60000   # 60 seconds - split segments after this time
+
+  # Compression algorithm
+  compression: zstd  # zstd (default), lz4, none
+
+  # Starting offset for backup
+  start_offset: earliest  # earliest | latest | specific
+
+  # Continuous mode (keep running and backing up new data)
+  continuous: false  # true for continuous, false for one-shot

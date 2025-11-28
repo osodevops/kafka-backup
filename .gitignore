@@ -1,0 +1,25 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Backup data
+/backups/
+*.db
+
+# Config files with credentials (keep examples, ignore real configs)
+config/confluent-*.yaml
+config/prod-*.yaml
+!config/example-*.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

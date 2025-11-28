@@ -1,0 +1,34 @@
+[package]
+name = "kafka-backup-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI tool for Kafka backup and restore operations"
+
+[[bin]]
+name = "kafka-backup"
+path = "src/main.rs"
+
+[dependencies]
+kafka-backup-core.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Serialization (for config loading)
+serde_yaml.workspace = true
+serde_json.workspace = true
+
+# Time
+chrono.workspace = true

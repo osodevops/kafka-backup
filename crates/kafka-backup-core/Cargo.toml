@@ -1,0 +1,70 @@
+[package]
+name = "kafka-backup-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core engine for Kafka backup and restore operations"
+
+[dependencies]
+# Kafka protocol
+kafka-protocol.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+bytes.workspace = true
+
+# Compression
+zstd.workspace = true
+lz4_flex.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Collections
+indexmap.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Encoding
+base64.workspace = true
+
+# TLS
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Object storage
+object_store.workspace = true
+url.workspace = true
+
+# Metrics
+prometheus.workspace = true
+
+# Utilities
+parking_lot.workspace = true
+crc32fast.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tempfile.workspace = true
+tokio-test.workspace = true
+tracing-subscriber.workspace = true

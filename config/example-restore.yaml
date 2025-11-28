@@ -1,0 +1,132 @@
+# Example Kafka Restore Configuration
+# Copy this file and modify for your environment
+
+mode: restore
+backup_id: "backup-2025-01-15-001"
+
+# Target Kafka cluster configuration (where to restore to)
+target:
+  bootstrap_servers:
+    - localhost:9092
+    # - broker-2:9092
+
+  # Security settings (optional)
+  security:
+    security_protocol: PLAINTEXT
+    # sasl_mechanism: PLAIN
+    # sasl_username: "your-username"
+    # sasl_password: "your-password"
+
+  # Topic selection (which topics to restore)
+  topics:
+    include:
+      - orders
+      - payments
+      - "events-*"  # Glob patterns supported
+    exclude:
+      - "*-internal"  # Exclude topics ending with -internal
+
+# Storage configuration (where to read backup from)
+storage:
+  backend: filesystem
+  path: "/var/lib/kafka-backup/data"
+
+# Restore-specific options
+restore:
+  # ==========================================
+  # Point-in-Time Restore (PITR)
+  # ==========================================
+  # Restore only records within this time range (epoch milliseconds)
+  # time_window_start: 1705276800000  # 2024-01-15 00:00:00 UTC
+  # time_window_end: 1705363200000    # 2024-01-16 00:00:00 UTC
+
+  # ==========================================
+  # Partition Filtering
+  # ==========================================
+  # Only restore specific partitions (optional)
+  # source_partitions:
+  #   - 0
+  #   - 1
+  #   - 2
+
+  # ==========================================
+  # Partition Remapping
+  # ==========================================
+  # Map source partitions to different target partitions
+  # partition_mapping:
+  #   0: 0   # source partition 0 -> target partition 0
+  #   1: 2   # source partition 1 -> target partition 2
+  #   2: 4   # source partition 2 -> target partition 4
+
+  # ==========================================
+  # Topic Remapping
+  # ==========================================
+  # Restore data to different topic names
+  topic_mapping:
+    # orders: orders_restored
+    # payments: payments_clone
+
+  # ==========================================
+  # Consumer Offset Strategy
+  # ==========================================
+  # How to handle consumer group offsets during restore
+  # Options:
+  #   - skip: Don't touch consumer offsets (default)
+  #   - header-based: Store original offset in message headers
+  #   - timestamp-based: Calculate offsets based on timestamps
+  #   - cluster-scan: Scan target cluster to map offsets
+  #   - manual: Only generate offset mapping report
+  consumer_group_strategy: skip
+
+  # ==========================================
+  # Dry-Run Mode
+  # ==========================================
+  # Validate restore without writing to target cluster
+  dry_run: false
+
+  # ==========================================
+  # Original Offset Headers
+  # ==========================================
+  # Include original offset as a header in restored records
+  # Headers added: x-original-offset, x-original-timestamp
+  include_original_offset_header: true
+
+  # ==========================================
+  # Rate Limiting
+  # ==========================================
+  # rate_limit_records_per_sec: 10000
+  # rate_limit_bytes_per_sec: 10485760  # 10 MB/s
+
+  # ==========================================
+  # Performance Tuning
+  # ==========================================
+  # Maximum concurrent partitions to restore in parallel
+  max_concurrent_partitions: 4
+
+  # Batch size for producing to target cluster
+  produce_batch_size: 1000
+
+  # ==========================================
+  # Resumable Restores
+  # ==========================================
+  # Checkpoint state file for resuming interrupted restores
+  # checkpoint_state: "/var/lib/kafka-backup/restore-checkpoint.json"
+
+  # Checkpoint interval in seconds
+  checkpoint_interval_secs: 60
+
+  # ==========================================
+  # Offset Mapping Report
+  # ==========================================
+  # Output file for offset mapping (useful for consumer group reset)
+  # offset_report: "/var/lib/kafka-backup/offset-mapping.json"
+
+  # ==========================================
+  # Consumer Group Offset Reset (DANGEROUS)
+  # ==========================================
+  # WARNING: Only enable if you understand the implications!
+  # This will modify __consumer_offsets on the target cluster
+  reset_consumer_offsets: false
+  # consumer_groups:
+  #   - my-consumer-group
+  #   - another-group

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__context7__resolve-library-id",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo test:*)",
+      "Bash(cat:*)",
+      "Bash(tree:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kafka-backup-core",
+    "crates/kafka-backup-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["OSO"]
+
+[workspace.dependencies]
+# Kafka protocol
+kafka-protocol = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+bytes = "1"
+
+# Compression
+zstd = "0.13"
+lz4_flex = "0.11"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Collections
+indexmap = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Encoding
+base64 = "0.22"
+
+# TLS
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Object storage
+object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
+url = "2"
+
+# Metrics
+prometheus = "0.13"
+
+# Utilities
+parking_lot = "0.12"
+crc32fast = "1.4"
+regex = "1"
+
+# Testing
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["kafka"] }
+tempfile = "3"
+tokio-test = "0.4"
+
+# Internal crates
+kafka-backup-core = { path = "crates/kafka-backup-core" }
