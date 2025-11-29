@@ -31,9 +31,21 @@ pub use metrics::{MetricsReport, MetricsServer, MetricsServerConfig, Performance
 pub use offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 pub use restore::{
     engine::{RestoreEngine, RestoreProgress},
+    offset_automation::{
+        BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
+        GroupResetOutcome, OffsetMapping as BulkOffsetMapping, OffsetResetBatch,
+        OffsetResetMetrics, PartitionError, PerformanceStats,
+    },
     offset_reset::{
         GroupResetPlan, GroupResetResult, OffsetResetExecutor, OffsetResetPlan,
         OffsetResetPlanBuilder, OffsetResetReport, OffsetResetStrategy, PartitionResetPlan,
+    },
+    offset_rollback::{
+        rollback_offset_reset, reset_offsets_with_rollback, snapshot_current_offsets,
+        verify_rollback, GroupOffsetState, OffsetMismatch, OffsetSnapshot,
+        OffsetSnapshotMetadata, OffsetSnapshotStorage, PartitionOffsetState,
+        RestoreWithRollbackResult, RestoreWithRollbackStatus, RollbackResult, RollbackStatus,
+        StorageBackendSnapshotStore, VerificationResult,
     },
     three_phase::{Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore},
 };

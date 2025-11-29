@@ -127,6 +127,164 @@ enum Commands {
         #[arg(short, long)]
         config: String,
     },
+
+    /// Execute bulk parallel offset reset (Phase 3 optimization)
+    OffsetResetBulk {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Backup ID with offset mapping
+        #[arg(short, long)]
+        backup_id: String,
+
+        /// Consumer groups to reset (comma-separated)
+        #[arg(short, long, value_delimiter = ',')]
+        groups: Vec<String>,
+
+        /// Kafka bootstrap servers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        bootstrap_servers: Vec<String>,
+
+        /// Maximum concurrent requests (default: 50)
+        #[arg(long, default_value = "50")]
+        max_concurrent: usize,
+
+        /// Maximum retry attempts for failed partitions (default: 3)
+        #[arg(long, default_value = "3")]
+        max_retries: u32,
+
+        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
+        #[arg(long)]
+        security_protocol: Option<String>,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Offset snapshot and rollback operations
+    OffsetRollback {
+        #[command(subcommand)]
+        action: OffsetRollbackAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OffsetRollbackAction {
+    /// Create a snapshot of current consumer group offsets
+    Snapshot {
+        /// Path to the storage location for snapshots
+        #[arg(short, long)]
+        path: String,
+
+        /// Consumer groups to snapshot (comma-separated)
+        #[arg(short, long, value_delimiter = ',')]
+        groups: Vec<String>,
+
+        /// Kafka bootstrap servers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        bootstrap_servers: Vec<String>,
+
+        /// Description for the snapshot
+        #[arg(short, long)]
+        description: Option<String>,
+
+        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
+        #[arg(long)]
+        security_protocol: Option<String>,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// List available offset snapshots
+    List {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Show details of a specific snapshot
+    Show {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Snapshot ID to show
+        #[arg(short, long)]
+        snapshot_id: String,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Rollback offsets to a previous snapshot
+    Rollback {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Snapshot ID to rollback to
+        #[arg(short, long)]
+        snapshot_id: String,
+
+        /// Kafka bootstrap servers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        bootstrap_servers: Vec<String>,
+
+        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
+        #[arg(long)]
+        security_protocol: Option<String>,
+
+        /// Verify offsets after rollback
+        #[arg(long, default_value = "true")]
+        verify: bool,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Verify current offsets match a snapshot
+    Verify {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Snapshot ID to verify against
+        #[arg(short, long)]
+        snapshot_id: String,
+
+        /// Kafka bootstrap servers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        bootstrap_servers: Vec<String>,
+
+        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
+        #[arg(long)]
+        security_protocol: Option<String>,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Delete a snapshot
+    Delete {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Snapshot ID to delete
+        #[arg(short, long)]
+        snapshot_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -322,6 +480,104 @@ async fn main() -> Result<()> {
         Commands::ThreePhaseRestore { config } => {
             commands::three_phase::run(&config).await?;
         }
+        Commands::OffsetResetBulk {
+            path,
+            backup_id,
+            groups,
+            bootstrap_servers,
+            max_concurrent,
+            max_retries,
+            security_protocol,
+            format,
+        } => {
+            commands::offset_reset_bulk::execute_bulk(
+                &path,
+                &backup_id,
+                &groups,
+                &bootstrap_servers,
+                max_concurrent,
+                max_retries,
+                security_protocol.as_deref(),
+                commands::offset_reset_bulk::OutputFormat::from(format.as_str()),
+            )
+            .await?;
+        }
+        Commands::OffsetRollback { action } => match action {
+            OffsetRollbackAction::Snapshot {
+                path,
+                groups,
+                bootstrap_servers,
+                description,
+                security_protocol,
+                format,
+            } => {
+                commands::offset_rollback::create_snapshot(
+                    &path,
+                    &groups,
+                    &bootstrap_servers,
+                    description.as_deref(),
+                    security_protocol.as_deref(),
+                    commands::offset_rollback::OutputFormat::from(format.as_str()),
+                )
+                .await?;
+            }
+            OffsetRollbackAction::List { path, format } => {
+                commands::offset_rollback::list_snapshots(
+                    &path,
+                    commands::offset_rollback::OutputFormat::from(format.as_str()),
+                )
+                .await?;
+            }
+            OffsetRollbackAction::Show {
+                path,
+                snapshot_id,
+                format,
+            } => {
+                commands::offset_rollback::show_snapshot(
+                    &path,
+                    &snapshot_id,
+                    commands::offset_rollback::OutputFormat::from(format.as_str()),
+                )
+                .await?;
+            }
+            OffsetRollbackAction::Rollback {
+                path,
+                snapshot_id,
+                bootstrap_servers,
+                security_protocol,
+                verify,
+                format,
+            } => {
+                commands::offset_rollback::execute_rollback(
+                    &path,
+                    &snapshot_id,
+                    &bootstrap_servers,
+                    security_protocol.as_deref(),
+                    verify,
+                    commands::offset_rollback::OutputFormat::from(format.as_str()),
+                )
+                .await?;
+            }
+            OffsetRollbackAction::Verify {
+                path,
+                snapshot_id,
+                bootstrap_servers,
+                security_protocol,
+                format,
+            } => {
+                commands::offset_rollback::verify_snapshot(
+                    &path,
+                    &snapshot_id,
+                    &bootstrap_servers,
+                    security_protocol.as_deref(),
+                    commands::offset_rollback::OutputFormat::from(format.as_str()),
+                )
+                .await?;
+            }
+            OffsetRollbackAction::Delete { path, snapshot_id } => {
+                commands::offset_rollback::delete_snapshot(&path, &snapshot_id).await?;
+            }
+        },
     }
 
     Ok(())

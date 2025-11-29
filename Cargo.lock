@@ -1241,6 +1241,7 @@ dependencies = [
  "chrono",
  "clap",
  "kafka-backup-core",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tokio",

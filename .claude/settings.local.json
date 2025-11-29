@@ -8,7 +8,13 @@
       "Bash(cargo search:*)",
       "Bash(cargo test:*)",
       "Bash(cat:*)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(sudo chown:*)",
+      "Bash(sudo chmod:*)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": [],
     "ask": []

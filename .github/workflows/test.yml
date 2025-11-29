@@ -1,0 +1,249 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast checks - runs first to fail fast on simple issues
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check compilation
+        run: cargo check --all-targets
+
+  # Unit tests - fast, no external dependencies
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-unit-
+
+      - name: Run unit tests (lib)
+        run: cargo test --lib --all-features
+        env:
+          RUST_LOG: debug
+
+      - name: Run unit test suite
+        run: cargo test --test unit --all-features
+        env:
+          RUST_LOG: debug
+
+  # Integration tests - require Docker
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    services:
+      # Docker-in-Docker for testcontainers
+      dind:
+        image: docker:dind
+        options: --privileged
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-integration-
+
+      - name: Run integration tests
+        run: cargo test --test integration --all-features -- --nocapture
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+          RUST_LOG: debug
+          TESTCONTAINERS: "true"
+
+      - name: Run integration test suite
+        run: cargo test --test integration_tests --all-features -- --nocapture --include-ignored
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+          RUST_LOG: debug
+          TESTCONTAINERS: "true"
+        timeout-minutes: 15
+
+  # Chaos tests - slower, may require special setup
+  chaos-tests:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    # Only run on main branch or when explicitly requested
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'run-chaos-tests')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-chaos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-chaos-
+
+      - name: Run chaos tests (non-ignored only)
+        run: cargo test --test chaos_tests --all-features -- --nocapture
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+          RUST_LOG: debug
+        timeout-minutes: 20
+
+  # Coverage reporting
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Only run on main branch pushes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Generate coverage report
+        run: |
+          cargo tarpaulin \
+            --out Xml \
+            --out Html \
+            --timeout 300 \
+            --ignore-panics \
+            --ignore-tests \
+            --workspace \
+            --exclude-files "*/tests/*"
+        continue-on-error: true
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./cobertura.xml
+          fail_ci_if_error: false
+          verbose: true
+
+      - name: Upload coverage HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: tarpaulin-report.html
+          retention-days: 7
+
+  # Security audit
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+        continue-on-error: true
+
+  # Summary job for branch protection
+  tests-complete:
+    name: Tests Complete
+    runs-on: ubuntu-latest
+    needs: [check, unit-tests, integration-tests]
+    if: always()
+    steps:
+      - name: Check all tests passed
+        run: |
+          if [ "${{ needs.check.result }}" != "success" ] || \
+             [ "${{ needs.unit-tests.result }}" != "success" ] || \
+             [ "${{ needs.integration-tests.result }}" != "success" ]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          echo "All required tests passed!"
