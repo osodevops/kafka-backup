@@ -81,7 +81,7 @@ jobs:
           RUST_LOG: debug
 
       - name: Run unit test suite
-        run: cargo test --test unit --all-features
+        run: cargo test --test unit_tests --all-features
         env:
           RUST_LOG: debug
 
@@ -121,7 +121,7 @@ jobs:
           TESTCONTAINERS: "true"
 
       - name: Run integration test suite
-        run: cargo test --test integration_tests --all-features -- --nocapture --include-ignored
+        run: cargo test --test integration_suite_tests --all-features -- --nocapture --include-ignored
         env:
           DOCKER_HOST: unix:///var/run/docker.sock
           RUST_LOG: debug

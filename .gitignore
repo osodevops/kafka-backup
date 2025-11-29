@@ -21,5 +21,8 @@ config/prod-*.yaml
 # macOS
 .DS_Store
 
+# Claude Code
+.claude/
+
 # Logs
 *.log
