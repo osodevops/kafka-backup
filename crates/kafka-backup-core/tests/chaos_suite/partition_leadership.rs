@@ -12,6 +12,8 @@
 //!        Old code: Crashes, loses work
 //! Result: Incomplete backup, no recovery
 
+#![allow(dead_code, unused_imports)]
+
 use std::time::Duration;
 
 // ============================================================================
@@ -179,9 +181,9 @@ async fn chaos_partition_reassignment_during_backup() {
 
 /// Get the current partition leader for a topic-partition.
 async fn get_partition_leader(
-    bootstrap_servers: &str,
-    topic: &str,
-    partition: i32,
+    _bootstrap_servers: &str,
+    _topic: &str,
+    _partition: i32,
 ) -> anyhow::Result<i32> {
     // This would use the Kafka admin client to get metadata
     // and extract the leader broker ID
@@ -189,18 +191,18 @@ async fn get_partition_leader(
 }
 
 /// Kill a specific broker in the cluster.
-async fn kill_broker(cluster: &(), broker_id: i32) -> anyhow::Result<()> {
+async fn kill_broker(_cluster: &(), _broker_id: i32) -> anyhow::Result<()> {
     // This would stop the broker container
     todo!("Implement broker kill")
 }
 
 /// Wait for a new leader to be elected.
 async fn wait_for_new_leader(
-    bootstrap_servers: &str,
-    topic: &str,
-    partition: i32,
-    old_leader: i32,
-    timeout: Duration,
+    _bootstrap_servers: &str,
+    _topic: &str,
+    _partition: i32,
+    _old_leader: i32,
+    _timeout: Duration,
 ) -> anyhow::Result<i32> {
     // Poll metadata until leader changes
     todo!("Implement leader election wait")

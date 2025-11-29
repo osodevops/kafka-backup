@@ -7,9 +7,9 @@
 //!
 //! These tests require Docker and may take several minutes to complete.
 
+#![allow(dead_code, unused_imports)]
+
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::time::sleep;
 
 use kafka_backup_core::backup::BackupEngine;
 use kafka_backup_core::restore::RestoreEngine;

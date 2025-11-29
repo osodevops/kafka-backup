@@ -3,11 +3,13 @@
 //! Provides Kafka container management, test client creation,
 //! and helper functions used across integration tests.
 
+#![allow(dead_code, unused_imports)]
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::kafka::Kafka;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
 use kafka_backup_core::config::{
@@ -62,10 +64,8 @@ impl KafkaTestCluster {
         let start = Instant::now();
 
         loop {
-            if client.connect().await.is_ok() {
-                if client.fetch_metadata(None).await.is_ok() {
-                    return Ok(());
-                }
+            if client.connect().await.is_ok() && client.fetch_metadata(None).await.is_ok() {
+                return Ok(());
             }
 
             if start.elapsed() > timeout {
@@ -84,7 +84,9 @@ impl KafkaTestCluster {
         let records = generate_test_records(num_messages, topic);
         for (i, record) in records.iter().enumerate() {
             let partition = (i % 3) as i32; // Distribute across partitions
-            client.produce(topic, partition, vec![record.clone()]).await?;
+            client
+                .produce(topic, partition, vec![record.clone()])
+                .await?;
         }
 
         Ok(())
@@ -207,7 +209,7 @@ pub fn generate_test_records(count: usize, topic: &str) -> Vec<BackupRecord> {
 }
 
 /// Generate test records with specific timestamps.
-pub fn generate_records_with_timestamps(topic: &str, timestamps: &[i64]) -> Vec<BackupRecord> {
+pub fn generate_records_with_timestamps(_topic: &str, timestamps: &[i64]) -> Vec<BackupRecord> {
     timestamps
         .iter()
         .enumerate()

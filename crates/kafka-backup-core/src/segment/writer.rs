@@ -160,7 +160,8 @@ impl SegmentWriter {
         )?;
 
         // Build final segment
-        let mut segment = BytesMut::with_capacity(HEADER_SIZE + compressed_data.len() + FOOTER_SIZE);
+        let mut segment =
+            BytesMut::with_capacity(HEADER_SIZE + compressed_data.len() + FOOTER_SIZE);
         segment.extend_from_slice(&header.to_bytes());
         segment.extend_from_slice(&compressed_data);
 
@@ -175,7 +176,8 @@ impl SegmentWriter {
         self.storage.put(key, Bytes::from(segment)).await?;
 
         // Update metrics
-        self.metrics.record_bytes(compressed_size as u64, uncompressed_size as u64);
+        self.metrics
+            .record_bytes(compressed_size as u64, uncompressed_size as u64);
         self.metrics.record_records(self.record_count);
         self.metrics.record_segment();
         self.metrics.record_segment_write_latency(start.elapsed());

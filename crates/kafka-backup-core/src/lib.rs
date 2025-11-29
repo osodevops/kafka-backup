@@ -18,14 +18,19 @@ pub mod segment;
 pub mod storage;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
-pub use config::{Config, OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreOptions};
+pub use config::{
+    Config, OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreOptions,
+};
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
+pub use kafka::{
+    CommittedOffset, ConsumerGroup, ConsumerGroupDescription, ConsumerGroupMember, TimestampOffset,
+};
 pub use manifest::{
     BackupManifest, BackupRecord, ConsumerGroupOffset, ConsumerGroupOffsets, DryRunPartitionReport,
-    DryRunReport, DryRunTopicReport, OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup,
-    PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport, SegmentMetadata,
-    TopicBackup, TopicRestoreReport,
+    DryRunReport, DryRunTopicReport, OffsetMapping, OffsetMappingEntry, OffsetPair,
+    PartitionBackup, PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport,
+    SegmentMetadata, TopicBackup, TopicRestoreReport,
 };
 pub use metrics::{MetricsReport, MetricsServer, MetricsServerConfig, PerformanceMetrics};
 pub use offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -41,14 +46,11 @@ pub use restore::{
         OffsetResetPlanBuilder, OffsetResetReport, OffsetResetStrategy, PartitionResetPlan,
     },
     offset_rollback::{
-        rollback_offset_reset, reset_offsets_with_rollback, snapshot_current_offsets,
-        verify_rollback, GroupOffsetState, OffsetMismatch, OffsetSnapshot,
-        OffsetSnapshotMetadata, OffsetSnapshotStorage, PartitionOffsetState,
-        RestoreWithRollbackResult, RestoreWithRollbackStatus, RollbackResult, RollbackStatus,
-        StorageBackendSnapshotStore, VerificationResult,
+        reset_offsets_with_rollback, rollback_offset_reset, snapshot_current_offsets,
+        verify_rollback, GroupOffsetState, OffsetMismatch, OffsetSnapshot, OffsetSnapshotMetadata,
+        OffsetSnapshotStorage, PartitionOffsetState, RestoreWithRollbackResult,
+        RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
+        VerificationResult,
     },
     three_phase::{Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore},
-};
-pub use kafka::{
-    CommittedOffset, ConsumerGroup, ConsumerGroupDescription, ConsumerGroupMember, TimestampOffset,
 };

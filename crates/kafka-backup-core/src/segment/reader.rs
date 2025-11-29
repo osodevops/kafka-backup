@@ -30,7 +30,7 @@ impl SegmentReader {
 
         // Verify footer magic
         let footer_start = data.len() - FOOTER_SIZE;
-        if &data[footer_start + 4..] != &MAGIC_END {
+        if data[footer_start + 4..] != MAGIC_END {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid segment footer magic",
@@ -38,7 +38,8 @@ impl SegmentReader {
         }
 
         // Verify CRC
-        let stored_crc = u32::from_le_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
+        let stored_crc =
+            u32::from_le_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
         let computed_crc = super::format::crc32(&data[..footer_start]);
         if stored_crc != computed_crc {
             return Err(Error::Io(std::io::Error::new(
@@ -131,7 +132,8 @@ impl SegmentReader {
 
     /// Read all remaining records
     pub fn read_all(&mut self) -> Result<Vec<BinaryRecord>> {
-        let mut records = Vec::with_capacity((self.header.record_count - self.records_read) as usize);
+        let mut records =
+            Vec::with_capacity((self.header.record_count - self.records_read) as usize);
         while let Some(record) = self.next_record()? {
             records.push(record);
         }
@@ -160,10 +162,10 @@ impl Iterator for SegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::SegmentWriter;
-    use crate::segment::writer::SegmentWriterConfig;
-    use crate::storage::{FilesystemBackend, StorageBackend};
     use crate::metrics::PerformanceMetrics;
+    use crate::segment::writer::SegmentWriterConfig;
+    use crate::segment::SegmentWriter;
+    use crate::storage::{FilesystemBackend, StorageBackend};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -183,9 +185,7 @@ mod tests {
                 offset: i,
                 key: Some(Bytes::from(format!("key-{}", i))),
                 value: Some(Bytes::from(format!("value-{}", i))),
-                headers: vec![
-                    ("h1".to_string(), Some(Bytes::from("v1"))),
-                ],
+                headers: vec![("h1".to_string(), Some(Bytes::from("v1")))],
             })
             .collect();
 

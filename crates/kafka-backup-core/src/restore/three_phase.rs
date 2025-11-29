@@ -138,13 +138,15 @@ impl ThreePhaseRestore {
             let report = if strategy != OffsetResetStrategy::DryRun {
                 Some(self.apply_offset_reset(&plan).await?)
             } else {
-                warnings.push("Phase 3 ran in dry-run mode, offsets not actually reset".to_string());
+                warnings
+                    .push("Phase 3 ran in dry-run mode, offsets not actually reset".to_string());
                 None
             };
 
             (Some(plan), report)
         } else {
-            if !restore_options.consumer_groups.is_empty() && !restore_options.reset_consumer_offsets
+            if !restore_options.consumer_groups.is_empty()
+                && !restore_options.reset_consumer_offsets
             {
                 warnings.push(
                     "Consumer groups specified but reset_consumer_offsets=false, skipping Phase 3"
@@ -205,7 +207,10 @@ impl ThreePhaseRestore {
             match client.connect().await {
                 Ok(_) => OffsetResetExecutor::new(client, target.bootstrap_servers.clone()),
                 Err(e) => {
-                    warn!("Could not connect to target cluster for offset fetch: {}", e);
+                    warn!(
+                        "Could not connect to target cluster for offset fetch: {}",
+                        e
+                    );
                     OffsetResetExecutor::new_offline(target.bootstrap_servers.clone())
                 }
             }
@@ -221,7 +226,9 @@ impl ThreePhaseRestore {
     /// Apply Phase 3: Execute offset reset plan
     pub async fn apply_offset_reset(&self, plan: &OffsetResetPlan) -> Result<OffsetResetReport> {
         let target = self.config.target.as_ref().ok_or_else(|| {
-            crate::Error::Config("Target cluster configuration required for offset reset".to_string())
+            crate::Error::Config(
+                "Target cluster configuration required for offset reset".to_string(),
+            )
         })?;
 
         let client = KafkaClient::new(target.clone());

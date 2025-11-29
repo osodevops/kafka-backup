@@ -30,7 +30,7 @@ impl FilesystemBackend {
     }
 
     /// Convert a filesystem path to a storage key
-    fn path_to_key(&self, path: &PathBuf) -> Option<String> {
+    fn path_to_key(&self, path: &std::path::Path) -> Option<String> {
         path.strip_prefix(&self.base_path)
             .ok()
             .map(|p| p.to_string_lossy().to_string())
@@ -260,7 +260,10 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put("backup1/topics/orders/partition=0/segment-001.zst", Bytes::from("data"))
+            .put(
+                "backup1/topics/orders/partition=0/segment-001.zst",
+                Bytes::from("data"),
+            )
             .await
             .unwrap();
         backend

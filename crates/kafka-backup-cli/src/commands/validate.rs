@@ -3,7 +3,7 @@ use kafka_backup_core::segment::SegmentReader;
 use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::BackupManifest;
 use std::path::PathBuf;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Default)]
 struct ValidationReport {
@@ -56,7 +56,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
         Ok(data) => data,
         Err(e) => {
             error!("Failed to load manifest: {}", e);
-            report.issues.push(format!("Manifest not found: {}", manifest_key));
+            report
+                .issues
+                .push(format!("Manifest not found: {}", manifest_key));
             report.print();
             return Ok(());
         }
@@ -95,7 +97,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                     Err(e) => {
                         warn!("Error checking segment {}: {}", segment.key, e);
                         report.segments_missing += 1;
-                        report.issues.push(format!("Error checking segment: {}", segment.key));
+                        report
+                            .issues
+                            .push(format!("Error checking segment: {}", segment.key));
                         continue;
                     }
                 };
@@ -103,7 +107,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                 if !exists {
                     warn!("Missing segment: {}", segment.key);
                     report.segments_missing += 1;
-                    report.issues.push(format!("Missing segment: {}", segment.key));
+                    report
+                        .issues
+                        .push(format!("Missing segment: {}", segment.key));
                     continue;
                 }
 
@@ -137,11 +143,15 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                                     if reader.record_count() != segment.record_count as u64 {
                                         warn!(
                                             "Record count mismatch for {}: expected {}, got {}",
-                                            segment.key, segment.record_count, reader.record_count()
+                                            segment.key,
+                                            segment.record_count,
+                                            reader.record_count()
                                         );
                                         report.issues.push(format!(
                                             "Record count mismatch: {} (expected {}, got {})",
-                                            segment.key, segment.record_count, reader.record_count()
+                                            segment.key,
+                                            segment.record_count,
+                                            reader.record_count()
                                         ));
                                     }
 
@@ -149,7 +159,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                                     if reader.start_offset() != segment.start_offset {
                                         warn!(
                                             "Start offset mismatch for {}: expected {}, got {}",
-                                            segment.key, segment.start_offset, reader.start_offset()
+                                            segment.key,
+                                            segment.start_offset,
+                                            reader.start_offset()
                                         );
                                         report.issues.push(format!(
                                             "Start offset mismatch: {}",
@@ -160,12 +172,13 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                                     if reader.end_offset() != segment.end_offset {
                                         warn!(
                                             "End offset mismatch for {}: expected {}, got {}",
-                                            segment.key, segment.end_offset, reader.end_offset()
+                                            segment.key,
+                                            segment.end_offset,
+                                            reader.end_offset()
                                         );
-                                        report.issues.push(format!(
-                                            "End offset mismatch: {}",
-                                            segment.key
-                                        ));
+                                        report
+                                            .issues
+                                            .push(format!("End offset mismatch: {}", segment.key));
                                     }
 
                                     report.records_validated += reader.record_count();
@@ -184,10 +197,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                         Err(e) => {
                             error!("Failed to read segment {}: {}", segment.key, e);
                             report.segments_corrupted += 1;
-                            report.issues.push(format!(
-                                "Failed to read segment: {} ({})",
-                                segment.key, e
-                            ));
+                            report
+                                .issues
+                                .push(format!("Failed to read segment: {} ({})", segment.key, e));
                         }
                     }
                 } else {

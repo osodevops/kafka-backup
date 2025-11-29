@@ -5,6 +5,13 @@
 //! - Offset reset batching
 //! - Snapshot structures
 
+#![allow(
+    dead_code,
+    unused_imports,
+    clippy::useless_vec,
+    clippy::unnecessary_cast
+)]
+
 use kafka_backup_core::restore::offset_automation::{OffsetResetBatch, OffsetResetMetrics};
 use kafka_backup_core::restore::offset_rollback::{
     GroupOffsetState, OffsetSnapshot, PartitionOffsetState,
@@ -60,7 +67,12 @@ fn offset_reset_metrics_creation() {
     let metrics = OffsetResetMetrics::new();
 
     // Verify it can be created without errors
-    assert_eq!(metrics.total_offsets_reset.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        metrics
+            .total_offsets_reset
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 #[test]
@@ -75,7 +87,7 @@ fn offset_reset_metrics_latency_tracking() {
 
     // Verify p50 is around 30ms (median of 10, 20, 30, 40, 50)
     let p50 = metrics.p50_latency_ms();
-    assert!(p50 >= 25.0 && p50 <= 35.0, "p50 was {}", p50);
+    assert!((25.0..=35.0).contains(&p50), "p50 was {}", p50);
 }
 
 #[test]
@@ -89,7 +101,7 @@ fn offset_reset_metrics_percentiles() {
 
     // p50 should be around 50
     let p50 = metrics.p50_latency_ms();
-    assert!(p50 >= 45.0 && p50 <= 55.0, "p50 was {}", p50);
+    assert!((45.0..=55.0).contains(&p50), "p50 was {}", p50);
 
     // p99 should be around 99
     let p99 = metrics.p99_latency_ms();
@@ -187,16 +199,22 @@ fn offset_snapshot_total_offsets() {
     // Group 1 with 2 partitions
     let mut topic_offsets_1 = HashMap::new();
     let mut partition_offsets_1 = HashMap::new();
-    partition_offsets_1.insert(0, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
-    partition_offsets_1.insert(1, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
+    partition_offsets_1.insert(
+        0,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
+    partition_offsets_1.insert(
+        1,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
     topic_offsets_1.insert("orders".to_string(), partition_offsets_1);
 
     group_offsets.insert(
@@ -211,11 +229,14 @@ fn offset_snapshot_total_offsets() {
     // Group 2 with 1 partition
     let mut topic_offsets_2 = HashMap::new();
     let mut partition_offsets_2 = HashMap::new();
-    partition_offsets_2.insert(0, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
+    partition_offsets_2.insert(
+        0,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
     topic_offsets_2.insert("payments".to_string(), partition_offsets_2);
 
     group_offsets.insert(

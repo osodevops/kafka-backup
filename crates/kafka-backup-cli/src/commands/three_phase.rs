@@ -30,7 +30,11 @@ pub async fn run(config_path: &str) -> Result<()> {
     println!("║ Backup ID: {:67} ║", report.backup_id);
     println!(
         "║ Status: {:70} ║",
-        if report.success { "✓ SUCCESS" } else { "✗ FAILED" }
+        if report.success {
+            "✓ SUCCESS"
+        } else {
+            "✗ FAILED"
+        }
     );
     println!(
         "║ Duration: {:68} ║",
@@ -51,11 +55,16 @@ pub async fn run(config_path: &str) -> Result<()> {
     );
     println!(
         "║   Offset mappings: {:59} ║",
-        report.restore_report.offset_mapping.detailed_mapping_count()
+        report
+            .restore_report
+            .offset_mapping
+            .detailed_mapping_count()
     );
 
     if !report.restore_report.errors.is_empty() {
-        println!("║   Errors:                                                                    ║");
+        println!(
+            "║   Errors:                                                                    ║"
+        );
         for error in &report.restore_report.errors {
             println!("║     - {:72} ║", truncate_string(error, 72));
         }
@@ -63,17 +72,20 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     // Phase 3 summary
     if let Some(ref reset_plan) = report.offset_reset_plan {
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
-        println!("║ PHASE 3: OFFSET RESET                                                        ║");
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
+        println!(
+            "║ PHASE 3: OFFSET RESET                                                        ║"
+        );
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
         println!(
             "║   Strategy: {:66} ║",
             format!("{:?}", reset_plan.strategy)
         );
-        println!(
-            "║   Consumer groups: {:59} ║",
-            reset_plan.groups.len()
-        );
+        println!("║   Consumer groups: {:59} ║", reset_plan.groups.len());
 
         let total_partitions: usize = reset_plan.groups.iter().map(|g| g.partitions.len()).sum();
         println!("║   Partitions planned: {:56} ║", total_partitions);
@@ -99,18 +111,30 @@ pub async fn run(config_path: &str) -> Result<()> {
                 }
             }
         } else if reset_plan.dry_run {
-            println!("║   Note: Dry run mode - offsets not actually reset                            ║");
+            println!(
+                "║   Note: Dry run mode - offsets not actually reset                            ║"
+            );
         }
     } else {
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
-        println!("║ PHASE 3: OFFSET RESET (skipped)                                              ║");
-        println!("║   No consumer groups configured or reset_consumer_offsets=false              ║");
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
+        println!(
+            "║ PHASE 3: OFFSET RESET (skipped)                                              ║"
+        );
+        println!(
+            "║   No consumer groups configured or reset_consumer_offsets=false              ║"
+        );
     }
 
     // Warnings
     if !report.warnings.is_empty() {
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
-        println!("║ WARNINGS                                                                     ║");
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
+        println!(
+            "║ WARNINGS                                                                     ║"
+        );
         for warning in &report.warnings {
             println!("║   ⚠️  {:72} ║", truncate_string(warning, 72));
         }

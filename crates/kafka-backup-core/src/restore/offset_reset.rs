@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 use crate::kafka::{commit_offsets, fetch_offsets, KafkaClient};
-use crate::manifest::{ConsumerGroupOffsets, OffsetMapping};
 #[cfg(test)]
 use crate::manifest::ConsumerGroupOffset;
+use crate::manifest::{ConsumerGroupOffsets, OffsetMapping};
 use crate::Result;
 
 /// Offset reset plan for consumer groups
@@ -166,9 +166,7 @@ impl OffsetResetExecutor {
         let mut groups = Vec::new();
 
         for group_id in group_ids {
-            let group_plan = self
-                .generate_group_plan(offset_mapping, group_id)
-                .await?;
+            let group_plan = self.generate_group_plan(offset_mapping, group_id).await?;
             groups.push(group_plan);
         }
 
@@ -446,10 +444,7 @@ impl OffsetResetExecutor {
                         bootstrap
                     ));
                     script.push_str(&format!("  --group {} \\\n", group.group_id));
-                    script.push_str(&format!(
-                        "  --topic {}:{} \\\n",
-                        p.topic, p.partition
-                    ));
+                    script.push_str(&format!("  --topic {}:{} \\\n", p.topic, p.partition));
                     script.push_str(&format!(
                         "  --reset-offsets --to-offset {} --execute\n\n",
                         p.target_offset
@@ -482,7 +477,12 @@ impl OffsetResetExecutor {
             for p in &group.partitions {
                 csv.push_str(&format!(
                     "{},{},{},{},{},{}\n",
-                    group.group_id, p.topic, p.partition, p.source_offset, p.target_offset, p.timestamp
+                    group.group_id,
+                    p.topic,
+                    p.partition,
+                    p.source_offset,
+                    p.target_offset,
+                    p.timestamp
                 ));
             }
         }
@@ -667,8 +667,10 @@ mod tests {
             target_bootstrap_servers: vec!["kafka-1:9092".to_string(), "kafka-2:9092".to_string()],
         };
 
-        let executor =
-            OffsetResetExecutor::new_offline(vec!["kafka-1:9092".to_string(), "kafka-2:9092".to_string()]);
+        let executor = OffsetResetExecutor::new_offline(vec![
+            "kafka-1:9092".to_string(),
+            "kafka-2:9092".to_string(),
+        ]);
         let script = executor.generate_shell_script(&plan);
 
         // Verify script structure
@@ -736,8 +738,7 @@ mod tests {
             },
         );
 
-        let builder = OffsetResetPlanBuilder::new(mapping)
-            .add_consumer_group(group_offsets);
+        let builder = OffsetResetPlanBuilder::new(mapping).add_consumer_group(group_offsets);
 
         let plan = builder.build(OffsetResetStrategy::Manual);
 

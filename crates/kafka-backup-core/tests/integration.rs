@@ -1,9 +1,9 @@
 //! Integration tests for kafka-backup.
 
 use std::path::PathBuf;
+use tempfile::TempDir;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::kafka::Kafka;
-use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
 use kafka_backup_core::backup::BackupEngine;
@@ -14,8 +14,7 @@ use kafka_backup_core::config::{
 use kafka_backup_core::kafka::KafkaClient;
 use kafka_backup_core::manifest::BackupRecord;
 use kafka_backup_core::restore::offset_automation::{
-    BulkOffsetReset, BulkOffsetResetConfig, BulkResetStatus,
-    OffsetMapping as BulkOffsetMapping,
+    BulkOffsetReset, BulkOffsetResetConfig, BulkResetStatus, OffsetMapping as BulkOffsetMapping,
 };
 use kafka_backup_core::restore::RestoreEngine;
 use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
@@ -27,10 +26,12 @@ use kafka_backup_core::BackupManifest;
 
 /// Start a Kafka container for testing
 async fn start_kafka() -> ContainerAsync<Kafka> {
-    let kafka = Kafka::default()
-        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true");
+    let kafka = Kafka::default().with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true");
 
-    kafka.start().await.expect("Failed to start Kafka container")
+    kafka
+        .start()
+        .await
+        .expect("Failed to start Kafka container")
 }
 
 /// Get the bootstrap server address for a Kafka container
@@ -197,7 +198,9 @@ async fn test_backup_and_restore() {
         vec![test_topic.to_string()],
     );
 
-    let backup_engine = BackupEngine::new(backup_config).await.expect("Failed to create backup engine");
+    let backup_engine = BackupEngine::new(backup_config)
+        .await
+        .expect("Failed to create backup engine");
     backup_engine.run().await.expect("Backup failed");
 
     // Verify backup was created
@@ -275,7 +278,9 @@ async fn test_backup_compression() {
         backup_opts.compression = CompressionType::Zstd;
     }
 
-    let engine = BackupEngine::new(config).await.expect("Failed to create backup engine");
+    let engine = BackupEngine::new(config)
+        .await
+        .expect("Failed to create backup engine");
     engine.run().await.expect("Backup failed");
 
     // Verify compressed segments exist
@@ -342,7 +347,11 @@ async fn test_bulk_offset_reset_parallel() {
     wait_for_kafka(&client).await;
 
     // Create test topics by producing messages
-    let topics = vec!["bulk-test-topic-1", "bulk-test-topic-2", "bulk-test-topic-3"];
+    let topics = vec![
+        "bulk-test-topic-1",
+        "bulk-test-topic-2",
+        "bulk-test-topic-3",
+    ];
     client.connect().await.expect("Failed to connect");
 
     for topic in &topics {
@@ -457,7 +466,10 @@ async fn test_bulk_offset_reset_performance() {
 
     println!("Bulk reset performance:");
     println!("  Duration: {} ms", report.duration_ms);
-    println!("  Throughput: {:.2} ops/s", report.performance.offsets_per_second);
+    println!(
+        "  Throughput: {:.2} ops/s",
+        report.performance.offsets_per_second
+    );
     println!("  Avg latency: {:.2} ms", report.performance.avg_latency_ms);
     println!("  P50 latency: {:.2} ms", report.performance.p50_latency_ms);
     println!("  P99 latency: {:.2} ms", report.performance.p99_latency_ms);
@@ -546,8 +558,8 @@ async fn test_bulk_offset_reset_metrics() {
 // ============================================================================
 
 use kafka_backup_core::restore::offset_rollback::{
-    snapshot_current_offsets, rollback_offset_reset, verify_rollback,
-    OffsetSnapshotStorage, StorageBackendSnapshotStore, RollbackStatus,
+    rollback_offset_reset, snapshot_current_offsets, verify_rollback, OffsetSnapshotStorage,
+    RollbackStatus, StorageBackendSnapshotStore,
 };
 use std::sync::Arc;
 
@@ -582,13 +594,9 @@ async fn test_offset_snapshot_creation() {
     let consumer_groups = vec![group_id.to_string()];
     let bootstrap_servers = vec![bootstrap_server.clone()];
 
-    let snapshot = snapshot_current_offsets(
-        &client,
-        &consumer_groups,
-        bootstrap_servers,
-    )
-    .await
-    .expect("Failed to create snapshot");
+    let snapshot = snapshot_current_offsets(&client, &consumer_groups, bootstrap_servers)
+        .await
+        .expect("Failed to create snapshot");
 
     // Verify snapshot properties
     assert!(!snapshot.snapshot_id.is_empty());
@@ -600,7 +608,8 @@ async fn test_offset_snapshot_creation() {
 #[tokio::test]
 async fn test_snapshot_storage_operations() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
     let snapshot_store = StorageBackendSnapshotStore::new(backend);
 
     // Initially no snapshots
@@ -611,24 +620,32 @@ async fn test_snapshot_storage_operations() {
     assert!(snapshots.is_empty());
 
     // Create a mock snapshot
-    use kafka_backup_core::restore::offset_rollback::{OffsetSnapshot, GroupOffsetState, PartitionOffsetState};
+    use kafka_backup_core::restore::offset_rollback::{
+        GroupOffsetState, OffsetSnapshot, PartitionOffsetState,
+    };
     use std::collections::HashMap;
 
     let mut group_offsets = HashMap::new();
     let mut offsets = HashMap::new();
     let mut partitions = HashMap::new();
-    partitions.insert(0i32, PartitionOffsetState {
-        offset: 100,
-        metadata: Some("test".to_string()),
-        timestamp: Some(chrono::Utc::now().timestamp_millis()),
-    });
+    partitions.insert(
+        0i32,
+        PartitionOffsetState {
+            offset: 100,
+            metadata: Some("test".to_string()),
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        },
+    );
     offsets.insert("test-topic".to_string(), partitions);
 
-    group_offsets.insert("test-group".to_string(), GroupOffsetState {
-        group_id: "test-group".to_string(),
-        offsets,
-        partition_count: 1,
-    });
+    group_offsets.insert(
+        "test-group".to_string(),
+        GroupOffsetState {
+            group_id: "test-group".to_string(),
+            offsets,
+            partition_count: 1,
+        },
+    );
 
     let snapshot = OffsetSnapshot {
         snapshot_id: "test-snapshot-001".to_string(),
@@ -648,7 +665,10 @@ async fn test_snapshot_storage_operations() {
     assert_eq!(snapshot_id, "test-snapshot-001");
 
     // Verify it exists
-    assert!(snapshot_store.exists(&snapshot_id).await.expect("Failed to check exists"));
+    assert!(snapshot_store
+        .exists(&snapshot_id)
+        .await
+        .expect("Failed to check exists"));
 
     // List snapshots
     let snapshots = snapshot_store
@@ -674,7 +694,10 @@ async fn test_snapshot_storage_operations() {
         .await
         .expect("Failed to delete snapshot");
 
-    assert!(!snapshot_store.exists(&snapshot_id).await.expect("Failed to check exists"));
+    assert!(!snapshot_store
+        .exists(&snapshot_id)
+        .await
+        .expect("Failed to check exists"));
 }
 
 /// Test rollback to a snapshot
@@ -705,16 +728,15 @@ async fn test_offset_rollback() {
     let consumer_groups = vec![group_id.to_string()];
     let bootstrap_servers = vec![bootstrap_server.clone()];
 
-    let snapshot = snapshot_current_offsets(
-        &client,
-        &consumer_groups,
-        bootstrap_servers.clone(),
-    )
-    .await
-    .expect("Failed to create snapshot");
+    let snapshot = snapshot_current_offsets(&client, &consumer_groups, bootstrap_servers.clone())
+        .await
+        .expect("Failed to create snapshot");
 
     println!("Created snapshot: {}", snapshot.snapshot_id);
-    println!("Groups in snapshot: {:?}", snapshot.group_offsets.keys().collect::<Vec<_>>());
+    println!(
+        "Groups in snapshot: {:?}",
+        snapshot.group_offsets.keys().collect::<Vec<_>>()
+    );
 
     // Execute rollback
     let result = rollback_offset_reset(&client, &snapshot)
@@ -749,13 +771,9 @@ async fn test_offset_verification() {
     let consumer_groups: Vec<String> = vec![];
     let bootstrap_servers = vec![bootstrap_server.clone()];
 
-    let snapshot = snapshot_current_offsets(
-        &client,
-        &consumer_groups,
-        bootstrap_servers,
-    )
-    .await
-    .expect("Failed to create snapshot");
+    let snapshot = snapshot_current_offsets(&client, &consumer_groups, bootstrap_servers)
+        .await
+        .expect("Failed to create snapshot");
 
     // Verify against current state (should match since we just created it)
     let verification = verify_rollback(&client, &snapshot)

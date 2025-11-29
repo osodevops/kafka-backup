@@ -32,8 +32,7 @@ pub async fn run(path: &str, backup_id: Option<&str>) -> Result<()> {
                     .flat_map(|p| &p.segments)
                     .map(|s| s.record_count)
                     .sum();
-                let total_segments: usize =
-                    topic.partitions.iter().map(|p| p.segments.len()).sum();
+                let total_segments: usize = topic.partitions.iter().map(|p| p.segments.len()).sum();
                 println!(
                     "  - {} ({} partitions, {} segments, {} records)",
                     topic.name,

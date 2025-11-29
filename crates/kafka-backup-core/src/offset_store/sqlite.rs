@@ -12,12 +12,15 @@ use super::{OffsetInfo, OffsetStore, OffsetStoreConfig};
 use crate::storage::StorageBackend;
 use crate::Result;
 
+/// Type alias for pending offset updates map (backup_id, topic, partition) -> offset
+type PendingOffsets = std::collections::HashMap<(String, String, i32), i64>;
+
 /// SQLite-based offset store
 pub struct SqliteOffsetStore {
     pool: SqlitePool,
     config: OffsetStoreConfig,
     /// Pending offset updates (topic, partition) -> offset
-    pending: Arc<RwLock<std::collections::HashMap<(String, String, i32), i64>>>,
+    pending: Arc<RwLock<PendingOffsets>>,
 }
 
 impl SqliteOffsetStore {
@@ -117,7 +120,8 @@ impl OffsetStore for SqliteOffsetStore {
         // Check pending updates first
         {
             let pending = self.pending.read().await;
-            if let Some(&offset) = pending.get(&(backup_id.to_string(), topic.to_string(), partition))
+            if let Some(&offset) =
+                pending.get(&(backup_id.to_string(), topic.to_string(), partition))
             {
                 return Ok(Some(offset));
             }
@@ -162,12 +166,14 @@ impl OffsetStore for SqliteOffsetStore {
 
         Ok(rows
             .into_iter()
-            .map(|(topic, partition, last_offset, checkpoint_ts)| OffsetInfo {
-                topic,
-                partition,
-                last_offset,
-                checkpoint_ts,
-            })
+            .map(
+                |(topic, partition, last_offset, checkpoint_ts)| OffsetInfo {
+                    topic,
+                    partition,
+                    last_offset,
+                    checkpoint_ts,
+                },
+            )
             .collect())
     }
 
@@ -303,7 +309,10 @@ mod tests {
         assert!(offset.is_none());
 
         // Set offset
-        store.set_offset("backup-1", "topic-1", 0, 100).await.unwrap();
+        store
+            .set_offset("backup-1", "topic-1", 0, 100)
+            .await
+            .unwrap();
 
         // Should be in pending
         let offset = store.get_offset("backup-1", "topic-1", 0).await.unwrap();

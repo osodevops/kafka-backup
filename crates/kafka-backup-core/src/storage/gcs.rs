@@ -44,9 +44,12 @@ impl GcsBackend {
             builder = builder.with_service_account_path(path);
         }
 
-        let store = builder
-            .build()
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to create GCS client: {}", e))))?;
+        let store = builder.build().map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to create GCS client: {}",
+                e
+            )))
+        })?;
 
         info!(
             "Created GCS backend for bucket: {}, prefix: {:?}",
@@ -97,21 +100,19 @@ impl StorageBackend for GcsBackend {
         let path = self.full_path(key);
         debug!("GCS GET: {}", path);
 
-        let result = self
-            .store
-            .get(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("GCS GET failed: {}", e))),
-            })?;
+        let result = self.store.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("GCS GET failed: {}", e))),
+        })?;
 
-        result
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to read GCS response: {}", e))))
+        result.bytes().await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to read GCS response: {}",
+                e
+            )))
+        })
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -158,10 +159,9 @@ impl StorageBackend for GcsBackend {
         let path = self.full_path(key);
         debug!("GCS DELETE: {}", path);
 
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("GCS DELETE failed: {}", e))))?;
+        self.store.delete(&path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("GCS DELETE failed: {}", e)))
+        })?;
 
         Ok(())
     }
@@ -170,16 +170,12 @@ impl StorageBackend for GcsBackend {
         let path = self.full_path(key);
         debug!("GCS HEAD (size): {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("GCS HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("GCS HEAD failed: {}", e))),
+        })?;
 
         Ok(meta.size as u64)
     }
@@ -188,16 +184,12 @@ impl StorageBackend for GcsBackend {
         let path = self.full_path(key);
         debug!("GCS HEAD: {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("GCS HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("GCS HEAD failed: {}", e))),
+        })?;
 
         Ok(ObjectMetadata {
             size: meta.size as u64,
@@ -211,10 +203,9 @@ impl StorageBackend for GcsBackend {
         let dest_path = self.full_path(dest);
         debug!("GCS COPY: {} -> {}", src_path, dest_path);
 
-        self.store
-            .copy(&src_path, &dest_path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("GCS COPY failed: {}", e))))?;
+        self.store.copy(&src_path, &dest_path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("GCS COPY failed: {}", e)))
+        })?;
 
         Ok(())
     }

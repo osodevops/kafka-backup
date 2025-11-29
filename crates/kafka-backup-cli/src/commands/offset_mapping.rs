@@ -35,7 +35,13 @@ pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
             }
 
             if min_offset != i64::MAX {
-                mapping.add(&topic.name, partition.partition_id, min_offset, None, min_ts);
+                mapping.add(
+                    &topic.name,
+                    partition.partition_id,
+                    min_offset,
+                    None,
+                    min_ts,
+                );
                 mapping.update_range(
                     &topic.name,
                     partition.partition_id,
@@ -78,17 +84,28 @@ pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
 }
 
 fn print_offset_mapping_text(mapping: &OffsetMapping, backup_id: &str) {
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                              OFFSET MAPPING REPORT                                   ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "╔══════════════════════════════════════════════════════════════════════════════════════╗"
+    );
+    println!(
+        "║                              OFFSET MAPPING REPORT                                   ║"
+    );
+    println!(
+        "╠══════════════════════════════════════════════════════════════════════════════════════╣"
+    );
     println!("║ Backup ID: {:77} ║", backup_id);
-    println!("╠══════════════════════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "╠══════════════════════════════════════════════════════════════════════════════════════╣"
+    );
     println!("║ Topic/Partition    │ Source Offset Range     │ First Timestamp        │ Last Timestamp          ║");
     println!("╠════════════════════╪═════════════════════════╪════════════════════════╪═════════════════════════╣");
 
     for entry in mapping.sorted_entries() {
         let tp = format!("{}/{}", entry.topic, entry.partition);
-        let offset_range = format!("{} - {}", entry.source_first_offset, entry.source_last_offset);
+        let offset_range = format!(
+            "{} - {}",
+            entry.source_first_offset, entry.source_last_offset
+        );
 
         let first_ts = chrono::DateTime::from_timestamp_millis(entry.first_timestamp)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -104,7 +121,9 @@ fn print_offset_mapping_text(mapping: &OffsetMapping, backup_id: &str) {
         );
     }
 
-    println!("╚══════════════════════════════════════════════════════════════════════════════════════╝");
+    println!(
+        "╚══════════════════════════════════════════════════════════════════════════════════════╝"
+    );
 
     // Print consumer group reset commands
     println!();
@@ -116,14 +135,9 @@ fn print_offset_mapping_text(mapping: &OffsetMapping, backup_id: &str) {
             "# Reset to start of backup for {}/{}",
             entry.topic, entry.partition
         );
-        println!(
-            "kafka-consumer-groups --bootstrap-server <BROKER> \\",
-        );
+        println!("kafka-consumer-groups --bootstrap-server <BROKER> \\",);
         println!("  --group <GROUP_NAME> \\");
-        println!(
-            "  --topic {}:{} \\",
-            entry.topic, entry.partition
-        );
+        println!("  --topic {}:{} \\", entry.topic, entry.partition);
         println!(
             "  --reset-offsets --to-offset {} --execute",
             entry.source_first_offset
@@ -137,18 +151,10 @@ fn print_offset_mapping_text(mapping: &OffsetMapping, backup_id: &str) {
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000").to_string())
             .unwrap_or_else(|| entry.first_timestamp.to_string());
 
-        println!(
-            "kafka-consumer-groups --bootstrap-server <BROKER> \\",
-        );
+        println!("kafka-consumer-groups --bootstrap-server <BROKER> \\",);
         println!("  --group <GROUP_NAME> \\");
-        println!(
-            "  --topic {}:{} \\",
-            entry.topic, entry.partition
-        );
-        println!(
-            "  --reset-offsets --to-datetime {} --execute",
-            ts
-        );
+        println!("  --topic {}:{} \\", entry.topic, entry.partition);
+        println!("  --reset-offsets --to-datetime {} --execute", ts);
         println!();
     }
 }

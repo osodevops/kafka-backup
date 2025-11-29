@@ -216,7 +216,8 @@ impl BackupEngine {
                     }
                 };
 
-                let partitions: Vec<i32> = metadata.partitions.iter().map(|p| p.partition_id).collect();
+                let partitions: Vec<i32> =
+                    metadata.partitions.iter().map(|p| p.partition_id).collect();
 
                 // Spawn a task for EACH partition (true parallelism)
                 for partition in partitions {
@@ -236,7 +237,11 @@ impl BackupEngine {
                     };
 
                     all_handles.push(tokio::spawn(async move {
-                        (ctx.topic.clone(), ctx.partition, ctx.backup_partition().await)
+                        (
+                            ctx.topic.clone(),
+                            ctx.partition,
+                            ctx.backup_partition().await,
+                        )
                     }));
                 }
             }
@@ -265,10 +270,10 @@ impl BackupEngine {
             }
 
             if error_count > 0 && !self.health.is_operational() {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("{} partitions failed to backup", error_count),
-                )));
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "{} partitions failed to backup",
+                    error_count
+                ))));
             }
 
             // Checkpoint offsets
@@ -356,11 +361,17 @@ impl BackupEngine {
             let included = if selection.include.is_empty() {
                 true // Include all if no patterns specified
             } else {
-                selection.include.iter().any(|pattern| glob_match(pattern, name))
+                selection
+                    .include
+                    .iter()
+                    .any(|pattern| glob_match(pattern, name))
             };
 
             // Check exclude patterns
-            let excluded = selection.exclude.iter().any(|pattern| glob_match(pattern, name));
+            let excluded = selection
+                .exclude
+                .iter()
+                .any(|pattern| glob_match(pattern, name));
 
             if included && !excluded {
                 selected.push(name.clone());
@@ -454,7 +465,8 @@ impl BackupPartitionContext {
             let (records, next_offset) = match fetch_result {
                 Ok(data) => data,
                 Err(e) => {
-                    self.health.mark_degraded("kafka", &format!("Fetch error: {}", e));
+                    self.health
+                        .mark_degraded("kafka", &format!("Fetch error: {}", e));
                     self.kafka_cb.record_failure();
                     return Err(e);
                 }

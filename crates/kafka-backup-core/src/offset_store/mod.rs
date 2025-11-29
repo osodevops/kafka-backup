@@ -26,12 +26,8 @@ pub struct OffsetInfo {
 #[async_trait]
 pub trait OffsetStore: Send + Sync {
     /// Get the last committed offset for a topic-partition
-    async fn get_offset(
-        &self,
-        backup_id: &str,
-        topic: &str,
-        partition: i32,
-    ) -> Result<Option<i64>>;
+    async fn get_offset(&self, backup_id: &str, topic: &str, partition: i32)
+        -> Result<Option<i64>>;
 
     /// Set the offset for a topic-partition
     async fn set_offset(

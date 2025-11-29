@@ -6,6 +6,13 @@
 //! - Timestamp mapping
 //! - Partition handling
 
+#![allow(
+    dead_code,
+    unused_imports,
+    clippy::useless_vec,
+    clippy::unnecessary_cast
+)]
+
 use kafka_backup_core::config::TopicSelection;
 use kafka_backup_core::manifest::{BackupRecord, RecordHeader};
 
@@ -177,7 +184,10 @@ fn topic_filter_exclude_overrides_include() {
 fn topic_filter_exclude_internal_topics() {
     let selection = TopicSelection {
         include: vec!["*".to_string()],
-        exclude: vec!["__consumer_offsets".to_string(), "__transaction_state".to_string()],
+        exclude: vec![
+            "__consumer_offsets".to_string(),
+            "__transaction_state".to_string(),
+        ],
     };
 
     assert!(selection.matches("orders"));
@@ -238,9 +248,7 @@ fn timestamp_handles_far_future() {
 
 #[test]
 fn records_maintain_offset_order_within_partition() {
-    let records: Vec<BackupRecord> = (100..103)
-        .map(|offset| create_test_record_with_offset(offset))
-        .collect();
+    let records: Vec<BackupRecord> = (100..103).map(create_test_record_with_offset).collect();
 
     assert_eq!(records[0].offset, 100);
     assert_eq!(records[1].offset, 101);
@@ -253,7 +261,7 @@ fn offset_gaps_are_preserved() {
     let offsets = vec![100i64, 105, 110]; // Gaps: 101-104, 106-109
     let records: Vec<BackupRecord> = offsets
         .into_iter()
-        .map(|o| create_test_record_with_offset(o))
+        .map(create_test_record_with_offset)
         .collect();
 
     assert_eq!(records[1].offset - records[0].offset, 5);

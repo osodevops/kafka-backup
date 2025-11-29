@@ -41,27 +41,27 @@ impl StorageBackend for MemoryBackend {
         self.store
             .put(&path, PutPayload::from_bytes(data))
             .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Memory PUT failed: {}", e))))?;
+            .map_err(|e| {
+                Error::Storage(StorageError::Backend(format!("Memory PUT failed: {}", e)))
+            })?;
         Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = Path::from(key);
-        let result = self
-            .store
-            .get(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Memory GET failed: {}", e))),
-            })?;
+        let result = self.store.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Memory GET failed: {}", e))),
+        })?;
 
-        result
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to read bytes: {}", e))))
+        result.bytes().await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to read bytes: {}",
+                e
+            )))
+        })
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -101,41 +101,35 @@ impl StorageBackend for MemoryBackend {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = Path::from(key);
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Memory DELETE failed: {}", e))))?;
+        self.store.delete(&path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Memory DELETE failed: {}",
+                e
+            )))
+        })?;
         Ok(())
     }
 
     async fn size(&self, key: &str) -> Result<u64> {
         let path = Path::from(key);
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Memory HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Memory HEAD failed: {}", e))),
+        })?;
 
         Ok(meta.size as u64)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMetadata> {
         let path = Path::from(key);
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Memory HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Memory HEAD failed: {}", e))),
+        })?;
 
         Ok(ObjectMetadata {
             size: meta.size as u64,
@@ -148,10 +142,9 @@ impl StorageBackend for MemoryBackend {
         let src_path = Path::from(src);
         let dest_path = Path::from(dest);
 
-        self.store
-            .copy(&src_path, &dest_path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Memory COPY failed: {}", e))))?;
+        self.store.copy(&src_path, &dest_path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("Memory COPY failed: {}", e)))
+        })?;
 
         Ok(())
     }

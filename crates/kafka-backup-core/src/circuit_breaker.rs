@@ -106,7 +106,10 @@ impl CircuitBreaker {
                 );
 
                 if state.success_count >= self.config.success_threshold {
-                    info!("[{}] Circuit closing after successful test", self.config.name);
+                    info!(
+                        "[{}] Circuit closing after successful test",
+                        self.config.name
+                    );
                     state.state = CircuitState::Closed;
                     state.failure_count = 0;
                     state.success_count = 0;
@@ -143,7 +146,10 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                warn!("[{}] Test request failed, circuit reopening", self.config.name);
+                warn!(
+                    "[{}] Test request failed, circuit reopening",
+                    self.config.name
+                );
                 state.state = CircuitState::Open;
                 state.success_count = 0;
             }

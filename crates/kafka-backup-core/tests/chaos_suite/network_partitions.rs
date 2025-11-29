@@ -8,6 +8,8 @@
 //! These tests would ideally use network manipulation tools like
 //! toxiproxy or iptables rules to simulate network failures.
 
+#![allow(dead_code, unused_imports)]
+
 use std::time::Duration;
 
 // ============================================================================

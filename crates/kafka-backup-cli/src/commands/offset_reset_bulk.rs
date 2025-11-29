@@ -35,6 +35,7 @@ impl From<&str> for OutputFormat {
 }
 
 /// Execute bulk parallel offset reset
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_bulk(
     path: &str,
     backup_id: &str,
@@ -63,7 +64,9 @@ pub async fn execute_bulk(
 
     if bulk_mappings.is_empty() {
         warn!("No offset mappings found for specified consumer groups");
-        println!("No offsets to reset. Check that the consumer groups exist in the offset mapping.");
+        println!(
+            "No offsets to reset. Check that the consumer groups exist in the offset mapping."
+        );
         return Ok(());
     }
 
@@ -81,7 +84,10 @@ pub async fn execute_bulk(
     };
 
     let client = KafkaClient::new(kafka_config);
-    client.connect().await.context("Failed to connect to Kafka")?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to Kafka")?;
 
     // Configure bulk reset
     let config = BulkOffsetResetConfig {
@@ -129,11 +135,9 @@ fn build_bulk_offset_mappings(
             for (topic, topic_offsets) in &group_offsets.offsets {
                 for (partition, offset_info) in topic_offsets {
                     // Use target_offset if available, otherwise try to look up from detailed mapping
-                    let target_offset = offset_info
-                        .target_offset
-                        .or_else(|| {
-                            mapping.lookup_target_offset(topic, *partition, offset_info.source_offset)
-                        });
+                    let target_offset = offset_info.target_offset.or_else(|| {
+                        mapping.lookup_target_offset(topic, *partition, offset_info.source_offset)
+                    });
 
                     if let Some(offset) = target_offset {
                         bulk_mappings.push(BulkOffsetMapping {
@@ -217,40 +221,19 @@ fn print_report_text(report: &BulkOffsetResetReport) {
     println!("╔══════════════════════════════════════════════════════════════════════════════╗");
     println!("║                         BULK OFFSET RESET REPORT                             ║");
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Status: {} {:67} ║",
-        status_icon, status_text
-    );
+    println!("║ Status: {} {:67} ║", status_icon, status_text);
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
     println!("║ Summary                                                                      ║");
     println!("╟──────────────────────────────────────────────────────────────────────────────╢");
-    println!(
-        "║   Total Groups:     {:57} ║",
-        report.total_groups
-    );
-    println!(
-        "║   Successful:       {:57} ║",
-        report.successful_groups
-    );
-    println!(
-        "║   Failed:           {:57} ║",
-        report.failed_groups
-    );
-    println!(
-        "║   Offsets Reset:    {:57} ║",
-        report.total_offsets_reset
-    );
-    println!(
-        "║   Offsets Failed:   {:57} ║",
-        report.total_offsets_failed
-    );
+    println!("║   Total Groups:     {:57} ║", report.total_groups);
+    println!("║   Successful:       {:57} ║", report.successful_groups);
+    println!("║   Failed:           {:57} ║", report.failed_groups);
+    println!("║   Offsets Reset:    {:57} ║", report.total_offsets_reset);
+    println!("║   Offsets Failed:   {:57} ║", report.total_offsets_failed);
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
     println!("║ Performance                                                                  ║");
     println!("╟──────────────────────────────────────────────────────────────────────────────╢");
-    println!(
-        "║   Duration:         {:54} ms ║",
-        report.duration_ms
-    );
+    println!("║   Duration:         {:54} ms ║", report.duration_ms);
     println!(
         "║   Avg Latency:      {:54.2} ms ║",
         report.performance.avg_latency_ms
@@ -310,24 +293,27 @@ fn parse_security_config(protocol: Option<&str>) -> SecurityConfig {
         _ => SecurityProtocol::Plaintext,
     };
 
-    let (sasl_mechanism, sasl_username, sasl_password) =
-        if matches!(security_protocol, SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext)
-        {
-            (
-                Some(SaslMechanism::Plain),
-                std::env::var("KAFKA_USERNAME").ok(),
-                std::env::var("KAFKA_PASSWORD").ok(),
-            )
-        } else {
-            (None, None, None)
-        };
+    let (sasl_mechanism, sasl_username, sasl_password) = if matches!(
+        security_protocol,
+        SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext
+    ) {
+        (
+            Some(SaslMechanism::Plain),
+            std::env::var("KAFKA_USERNAME").ok(),
+            std::env::var("KAFKA_PASSWORD").ok(),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    let ssl_ca_location =
-        if matches!(security_protocol, SecurityProtocol::Ssl | SecurityProtocol::SaslSsl) {
-            std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
-        } else {
-            None
-        };
+    let ssl_ca_location = if matches!(
+        security_protocol,
+        SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
+    ) {
+        std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
+    } else {
+        None
+    };
 
     SecurityConfig {
         security_protocol,

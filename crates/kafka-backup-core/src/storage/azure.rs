@@ -49,9 +49,12 @@ impl AzureBackend {
             builder = builder.with_access_key(key);
         }
 
-        let store = builder
-            .build()
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to create Azure client: {}", e))))?;
+        let store = builder.build().map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to create Azure client: {}",
+                e
+            )))
+        })?;
 
         info!(
             "Created Azure backend for account: {}, container: {}, prefix: {:?}",
@@ -93,7 +96,9 @@ impl StorageBackend for AzureBackend {
         self.store
             .put(&path, PutPayload::from_bytes(data))
             .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Azure PUT failed: {}", e))))?;
+            .map_err(|e| {
+                Error::Storage(StorageError::Backend(format!("Azure PUT failed: {}", e)))
+            })?;
 
         Ok(())
     }
@@ -102,21 +107,19 @@ impl StorageBackend for AzureBackend {
         let path = self.full_path(key);
         debug!("Azure GET: {}", path);
 
-        let result = self
-            .store
-            .get(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Azure GET failed: {}", e))),
-            })?;
+        let result = self.store.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Azure GET failed: {}", e))),
+        })?;
 
-        result
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to read Azure response: {}", e))))
+        result.bytes().await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to read Azure response: {}",
+                e
+            )))
+        })
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -163,10 +166,9 @@ impl StorageBackend for AzureBackend {
         let path = self.full_path(key);
         debug!("Azure DELETE: {}", path);
 
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Azure DELETE failed: {}", e))))?;
+        self.store.delete(&path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("Azure DELETE failed: {}", e)))
+        })?;
 
         Ok(())
     }
@@ -175,16 +177,12 @@ impl StorageBackend for AzureBackend {
         let path = self.full_path(key);
         debug!("Azure HEAD (size): {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Azure HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Azure HEAD failed: {}", e))),
+        })?;
 
         Ok(meta.size as u64)
     }
@@ -193,16 +191,12 @@ impl StorageBackend for AzureBackend {
         let path = self.full_path(key);
         debug!("Azure HEAD: {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => {
-                    Error::Storage(StorageError::NotFound(key.to_string()))
-                }
-                _ => Error::Storage(StorageError::Backend(format!("Azure HEAD failed: {}", e))),
-            })?;
+        let meta = self.store.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                Error::Storage(StorageError::NotFound(key.to_string()))
+            }
+            _ => Error::Storage(StorageError::Backend(format!("Azure HEAD failed: {}", e))),
+        })?;
 
         Ok(ObjectMetadata {
             size: meta.size as u64,
@@ -216,10 +210,9 @@ impl StorageBackend for AzureBackend {
         let dest_path = self.full_path(dest);
         debug!("Azure COPY: {} -> {}", src_path, dest_path);
 
-        self.store
-            .copy(&src_path, &dest_path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Azure COPY failed: {}", e))))?;
+        self.store.copy(&src_path, &dest_path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("Azure COPY failed: {}", e)))
+        })?;
 
         Ok(())
     }

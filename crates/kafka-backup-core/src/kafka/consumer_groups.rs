@@ -255,7 +255,7 @@ pub async fn commit_offsets(
                     kafka_protocol::messages::offset_commit_request::OffsetCommitRequestPartition::default()
                         .with_partition_index(partition)
                         .with_committed_offset(offset)
-                        .with_committed_metadata(metadata.map(|m| StrBytes::from_string(m)))
+                        .with_committed_metadata(metadata.map(StrBytes::from_string))
                 })
                 .collect();
 
@@ -277,7 +277,9 @@ pub async fn commit_offsets(
             if partition.error_code != 0 {
                 warn!(
                     "Failed to commit offset for {}:{} - error code {}",
-                    topic.name.as_str(), partition.partition_index, partition.error_code
+                    topic.name.as_str(),
+                    partition.partition_index,
+                    partition.error_code
                 );
             }
             results.push((

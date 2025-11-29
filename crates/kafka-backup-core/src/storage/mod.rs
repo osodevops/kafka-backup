@@ -107,9 +107,7 @@ pub fn create_backend_from_config(
 ///
 /// This function is maintained for backward compatibility with existing
 /// configuration files. For new code, prefer `create_backend_from_config`.
-pub fn create_backend(
-    config: &crate::config::StorageConfig,
-) -> Result<Arc<dyn StorageBackend>> {
+pub fn create_backend(config: &crate::config::StorageConfig) -> Result<Arc<dyn StorageBackend>> {
     match config.backend {
         crate::config::StorageBackendType::Filesystem => {
             let path = config
@@ -134,7 +132,7 @@ pub fn create_backend(
                 allow_http: config
                     .endpoint
                     .as_ref()
-                    .map_or(false, |e| e.starts_with("http://")),
+                    .is_some_and(|e| e.starts_with("http://")),
             };
 
             Ok(Arc::new(S3Backend::new(s3_config)?))

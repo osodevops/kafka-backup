@@ -108,7 +108,7 @@ impl SegmentHeader {
             )));
         }
 
-        if &data[0..4] != &MAGIC_BYTES {
+        if data[0..4] != MAGIC_BYTES {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid segment magic bytes",

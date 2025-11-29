@@ -296,14 +296,17 @@ impl MetricsReport {
             self.records_processed
         ));
 
-        output.push_str("# HELP kafka_backup_bytes_written_total Total bytes written (compressed)\n");
+        output
+            .push_str("# HELP kafka_backup_bytes_written_total Total bytes written (compressed)\n");
         output.push_str("# TYPE kafka_backup_bytes_written_total counter\n");
         output.push_str(&format!(
             "kafka_backup_bytes_written_total {}\n\n",
             self.bytes_written
         ));
 
-        output.push_str("# HELP kafka_backup_bytes_uncompressed_total Total bytes before compression\n");
+        output.push_str(
+            "# HELP kafka_backup_bytes_uncompressed_total Total bytes before compression\n",
+        );
         output.push_str("# TYPE kafka_backup_bytes_uncompressed_total counter\n");
         output.push_str(&format!(
             "kafka_backup_bytes_uncompressed_total {}\n\n",
@@ -351,7 +354,9 @@ impl MetricsReport {
         ));
 
         // Checkpoint latency histogram summary
-        output.push_str("# HELP kafka_backup_checkpoint_latency_ms Checkpoint latency in milliseconds\n");
+        output.push_str(
+            "# HELP kafka_backup_checkpoint_latency_ms Checkpoint latency in milliseconds\n",
+        );
         output.push_str("# TYPE kafka_backup_checkpoint_latency_ms summary\n");
         output.push_str(&format!(
             "kafka_backup_checkpoint_latency_ms{{quantile=\"0.5\"}} {:.2}\n",
@@ -375,7 +380,9 @@ impl MetricsReport {
         ));
 
         // Segment write latency histogram summary
-        output.push_str("# HELP kafka_backup_segment_write_latency_ms Segment write latency in milliseconds\n");
+        output.push_str(
+            "# HELP kafka_backup_segment_write_latency_ms Segment write latency in milliseconds\n",
+        );
         output.push_str("# TYPE kafka_backup_segment_write_latency_ms summary\n");
         output.push_str(&format!(
             "kafka_backup_segment_write_latency_ms{{quantile=\"0.5\"}} {:.2}\n",

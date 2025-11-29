@@ -164,15 +164,13 @@ impl OffsetSnapshot {
 
     /// Add a group's offset state to the snapshot.
     pub fn add_group(&mut self, group_state: GroupOffsetState) {
-        self.group_offsets.insert(group_state.group_id.clone(), group_state);
+        self.group_offsets
+            .insert(group_state.group_id.clone(), group_state);
     }
 
     /// Get the total number of offsets in the snapshot.
     pub fn total_offsets(&self) -> usize {
-        self.group_offsets
-            .values()
-            .map(|g| g.partition_count)
-            .sum()
+        self.group_offsets.values().map(|g| g.partition_count).sum()
     }
 
     /// Convert to metadata (lightweight summary).
@@ -295,7 +293,8 @@ impl OffsetSnapshotStorage for StorageBackendSnapshotStore {
             if key.ends_with("/metadata.json") {
                 match self.backend.get(&key).await {
                     Ok(data) => {
-                        if let Ok(metadata) = serde_json::from_slice::<OffsetSnapshotMetadata>(&data)
+                        if let Ok(metadata) =
+                            serde_json::from_slice::<OffsetSnapshotMetadata>(&data)
                         {
                             snapshots.push(metadata);
                         }
@@ -359,17 +358,14 @@ pub async fn snapshot_current_offsets(
 
                 for committed in committed_offsets {
                     if committed.error_code == 0 {
-                        offsets
-                            .entry(committed.topic.clone())
-                            .or_default()
-                            .insert(
-                                committed.partition,
-                                PartitionOffsetState {
-                                    offset: committed.offset,
-                                    metadata: committed.metadata,
-                                    timestamp: None,
-                                },
-                            );
+                        offsets.entry(committed.topic.clone()).or_default().insert(
+                            committed.partition,
+                            PartitionOffsetState {
+                                offset: committed.offset,
+                                metadata: committed.metadata,
+                                timestamp: None,
+                            },
+                        );
                         partition_count += 1;
                     }
                 }
@@ -748,23 +744,24 @@ pub async fn reset_offsets_with_rollback(
 
     // Phase 1: Create snapshot
     info!("Phase 1: Creating offset snapshot...");
-    let snapshot = match snapshot_current_offsets(snapshot_client, &group_ids, bootstrap_servers).await {
-        Ok(snap) => snap,
-        Err(e) => {
-            let error_msg = format!("Failed to create snapshot: {}", e);
-            errors.push(error_msg);
-            return Ok(RestoreWithRollbackResult {
-                status: RestoreWithRollbackStatus::Failed,
-                snapshot_id: String::new(),
-                offsets_reset: false,
-                rollback_available: false,
-                reset_report: None,
-                rollback_result: None,
-                errors,
-                duration_ms: start_time.elapsed().as_millis() as u64,
-            });
-        }
-    };
+    let snapshot =
+        match snapshot_current_offsets(snapshot_client, &group_ids, bootstrap_servers).await {
+            Ok(snap) => snap,
+            Err(e) => {
+                let error_msg = format!("Failed to create snapshot: {}", e);
+                errors.push(error_msg);
+                return Ok(RestoreWithRollbackResult {
+                    status: RestoreWithRollbackStatus::Failed,
+                    snapshot_id: String::new(),
+                    offsets_reset: false,
+                    rollback_available: false,
+                    reset_report: None,
+                    rollback_result: None,
+                    errors,
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                });
+            }
+        };
 
     // Save snapshot to storage
     let snapshot_id = match snapshot_storage.save_snapshot(&snapshot).await {
@@ -832,7 +829,8 @@ pub async fn reset_offsets_with_rollback(
     };
 
     // Check if we need to rollback due to partial failure
-    let should_rollback = auto_rollback_on_failure && reset_report.status == BulkResetStatus::Failed;
+    let should_rollback =
+        auto_rollback_on_failure && reset_report.status == BulkResetStatus::Failed;
 
     if should_rollback {
         info!("Phase 3: Auto-rollback triggered due to reset failure...");
@@ -840,7 +838,9 @@ pub async fn reset_offsets_with_rollback(
 
         return Ok(RestoreWithRollbackResult {
             status: match &rollback_result {
-                Ok(r) if r.status == RollbackStatus::Success => RestoreWithRollbackStatus::RolledBack,
+                Ok(r) if r.status == RollbackStatus::Success => {
+                    RestoreWithRollbackStatus::RolledBack
+                }
                 _ => RestoreWithRollbackStatus::Failed,
             },
             snapshot_id,
@@ -932,9 +932,8 @@ mod tests {
 
     #[test]
     fn test_offset_snapshot_serialization() {
-        let mut snapshot =
-            OffsetSnapshot::new(vec!["localhost:9092".to_string()])
-                .with_description("Test snapshot".to_string());
+        let mut snapshot = OffsetSnapshot::new(vec!["localhost:9092".to_string()])
+            .with_description("Test snapshot".to_string());
 
         let mut offsets = HashMap::new();
         offsets.insert(
@@ -959,7 +958,10 @@ mod tests {
         let deserialized: OffsetSnapshot = serde_json::from_str(&json).unwrap();
 
         assert_eq!(snapshot.snapshot_id, deserialized.snapshot_id);
-        assert_eq!(snapshot.group_offsets.len(), deserialized.group_offsets.len());
+        assert_eq!(
+            snapshot.group_offsets.len(),
+            deserialized.group_offsets.len()
+        );
         assert_eq!(snapshot.description, deserialized.description);
     }
 
@@ -986,7 +988,10 @@ mod tests {
         assert_eq!(metadata.group_count, 2);
         assert_eq!(metadata.offset_count, 8);
         assert_eq!(metadata.restore_id, Some("restore-123".to_string()));
-        assert_eq!(metadata.description, Some("Pre-restore snapshot".to_string()));
+        assert_eq!(
+            metadata.description,
+            Some("Pre-restore snapshot".to_string())
+        );
     }
 
     #[tokio::test]

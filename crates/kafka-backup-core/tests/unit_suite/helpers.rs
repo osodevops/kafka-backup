@@ -93,7 +93,7 @@ pub fn create_segment_metadata(
         end_offset,
         start_timestamp,
         end_timestamp,
-        record_count: (end_offset - start_offset + 1) as i64,
+        record_count: end_offset - start_offset + 1,
         compressed_size: 1024,
         uncompressed_size: 4096,
     }

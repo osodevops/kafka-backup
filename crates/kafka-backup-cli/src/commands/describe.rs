@@ -92,10 +92,7 @@ fn print_manifest_text(manifest: &BackupManifest) {
         .map(|s| s.uncompressed_size)
         .sum();
 
-    println!(
-        "║ Compressed Size: {:54} ║",
-        format_bytes(total_compressed)
-    );
+    println!("║ Compressed Size: {:54} ║", format_bytes(total_compressed));
     println!(
         "║ Uncompressed Size: {:52} ║",
         format_bytes(total_uncompressed)

@@ -10,21 +10,16 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Health status levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
     /// All systems operational
+    #[default]
     Healthy,
     /// Some issues but still operational
     Degraded,
     /// Critical issues, system may not be functioning
     Unhealthy,
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        HealthStatus::Healthy
-    }
 }
 
 /// Individual component health
@@ -265,7 +260,11 @@ impl std::fmt::Display for HealthReport {
         writeln!(f, "Uptime: {:.0}s", self.uptime_secs)?;
         writeln!(f, "Active Jobs: {}", self.active_jobs)?;
         writeln!(f, "Records Processed: {}", self.records_processed)?;
-        writeln!(f, "Current Throughput: {:.0} rec/s", self.current_throughput)?;
+        writeln!(
+            f,
+            "Current Throughput: {:.0} rec/s",
+            self.current_throughput
+        )?;
         writeln!(f)?;
         writeln!(f, "Components:")?;
         for comp in &self.components {

@@ -213,8 +213,20 @@ async fn load_offset_mapping(
             }
 
             if min_offset != i64::MAX {
-                mapping.add(&topic.name, partition.partition_id, min_offset, None, min_ts);
-                mapping.update_range(&topic.name, partition.partition_id, max_offset, None, max_ts);
+                mapping.add(
+                    &topic.name,
+                    partition.partition_id,
+                    min_offset,
+                    None,
+                    min_ts,
+                );
+                mapping.update_range(
+                    &topic.name,
+                    partition.partition_id,
+                    max_offset,
+                    None,
+                    max_ts,
+                );
             }
         }
     }
@@ -237,13 +249,13 @@ fn output_plan(
             for group in &plan.groups {
                 for partition in &group.partitions {
                     println!(
-                        "{},{},{},{},{},{}",
+                        "{},{},{},{},{},{:?}",
                         group.group_id,
                         partition.topic,
                         partition.partition,
                         partition.source_offset,
                         partition.target_offset,
-                        format!("{:?}", plan.strategy)
+                        plan.strategy
                     );
                 }
             }
@@ -265,23 +277,19 @@ fn print_plan_text(plan: &OffsetResetPlan) {
     println!("╔══════════════════════════════════════════════════════════════════════════════╗");
     println!("║                            OFFSET RESET PLAN                                 ║");
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Strategy: {:68} ║",
-        format!("{:?}", plan.strategy)
-    );
+    println!("║ Strategy: {:68} ║", format!("{:?}", plan.strategy));
     println!(
         "║ Dry Run: {:69} ║",
         if plan.dry_run { "Yes" } else { "No" }
     );
-    println!(
-        "║ Groups: {:70} ║",
-        plan.groups.len()
-    );
+    println!("║ Groups: {:70} ║", plan.groups.len());
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
 
     for group in &plan.groups {
         println!("║ Group: {:71} ║", group.group_id);
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
         println!("║   Topic/Partition          │ Source Offset    │ Target Offset              ║");
         println!("╟────────────────────────────┼──────────────────┼────────────────────────────╢");
 
@@ -292,7 +300,9 @@ fn print_plan_text(plan: &OffsetResetPlan) {
                 tp, partition.source_offset, partition.target_offset
             );
         }
-        println!("╟──────────────────────────────────────────────────────────────────────────────╢");
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
     }
 
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
@@ -313,24 +323,27 @@ fn parse_security_config(protocol: Option<&str>) -> SecurityConfig {
         _ => SecurityProtocol::Plaintext,
     };
 
-    let (sasl_mechanism, sasl_username, sasl_password) =
-        if matches!(security_protocol, SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext)
-        {
-            (
-                Some(SaslMechanism::Plain),
-                std::env::var("KAFKA_USERNAME").ok(),
-                std::env::var("KAFKA_PASSWORD").ok(),
-            )
-        } else {
-            (None, None, None)
-        };
+    let (sasl_mechanism, sasl_username, sasl_password) = if matches!(
+        security_protocol,
+        SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext
+    ) {
+        (
+            Some(SaslMechanism::Plain),
+            std::env::var("KAFKA_USERNAME").ok(),
+            std::env::var("KAFKA_PASSWORD").ok(),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    let ssl_ca_location =
-        if matches!(security_protocol, SecurityProtocol::Ssl | SecurityProtocol::SaslSsl) {
-            std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
-        } else {
-            None
-        };
+    let ssl_ca_location = if matches!(
+        security_protocol,
+        SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
+    ) {
+        std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
+    } else {
+        None
+    };
 
     SecurityConfig {
         security_protocol,

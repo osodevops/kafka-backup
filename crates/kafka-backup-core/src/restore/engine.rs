@@ -264,7 +264,10 @@ impl RestoreEngine {
 
     /// Run a dry-run validation
     pub async fn dry_run(&self) -> Result<DryRunReport> {
-        info!("Running dry-run validation for backup: {}", self.config.backup_id);
+        info!(
+            "Running dry-run validation for backup: {}",
+            self.config.backup_id
+        );
 
         // Load manifest
         let manifest = self.load_manifest().await?;
@@ -289,7 +292,9 @@ impl RestoreEngine {
         };
 
         if topics_to_restore.is_empty() {
-            report.warnings.push("No topics matched for restore".to_string());
+            report
+                .warnings
+                .push("No topics matched for restore".to_string());
             return Ok(report);
         }
 
@@ -357,12 +362,14 @@ impl RestoreEngine {
                     partition_max_ts = partition_max_ts.max(segment.end_timestamp);
 
                     // Update global time range
-                    min_timestamp = Some(min_timestamp.map_or(segment.start_timestamp, |m| {
-                        m.min(segment.start_timestamp)
-                    }));
-                    max_timestamp = Some(max_timestamp.map_or(segment.end_timestamp, |m| {
-                        m.max(segment.end_timestamp)
-                    }));
+                    min_timestamp = Some(
+                        min_timestamp
+                            .map_or(segment.start_timestamp, |m| m.min(segment.start_timestamp)),
+                    );
+                    max_timestamp = Some(
+                        max_timestamp
+                            .map_or(segment.end_timestamp, |m| m.max(segment.end_timestamp)),
+                    );
                 }
 
                 report.records_to_restore += partition_records as u64;
@@ -387,9 +394,9 @@ impl RestoreEngine {
         // Add consumer offset actions based on strategy
         match restore_options.consumer_group_strategy {
             OffsetStrategy::Skip => {
-                report.consumer_offset_actions.push(
-                    "Consumer offsets will not be modified (skip strategy)".to_string(),
-                );
+                report
+                    .consumer_offset_actions
+                    .push("Consumer offsets will not be modified (skip strategy)".to_string());
             }
             OffsetStrategy::HeaderBased => {
                 report.consumer_offset_actions.push(
@@ -397,9 +404,9 @@ impl RestoreEngine {
                 );
             }
             OffsetStrategy::TimestampBased => {
-                report.consumer_offset_actions.push(
-                    "Consumer offsets will be calculated based on timestamps".to_string(),
-                );
+                report
+                    .consumer_offset_actions
+                    .push("Consumer offsets will be calculated based on timestamps".to_string());
             }
             OffsetStrategy::ClusterScan => {
                 report.consumer_offset_actions.push(
@@ -407,18 +414,17 @@ impl RestoreEngine {
                 );
             }
             OffsetStrategy::Manual => {
-                report.consumer_offset_actions.push(
-                    "Offset mapping will be reported; manual reset required".to_string(),
-                );
+                report
+                    .consumer_offset_actions
+                    .push("Offset mapping will be reported; manual reset required".to_string());
             }
         }
 
         if restore_options.reset_consumer_offsets {
             for group in &restore_options.consumer_groups {
-                report.consumer_offset_actions.push(format!(
-                    "Consumer group '{}' offsets will be reset",
-                    group
-                ));
+                report
+                    .consumer_offset_actions
+                    .push(format!("Consumer group '{}' offsets will be reset", group));
             }
         }
 
@@ -469,9 +475,10 @@ impl RestoreEngine {
 
         // Create partition leader router for multi-broker support
         info!("Connecting to target Kafka cluster via partition leader router...");
-        let target_config = self.target_config.clone().ok_or_else(|| {
-            Error::Config("Target configuration required".to_string())
-        })?;
+        let target_config = self
+            .target_config
+            .clone()
+            .ok_or_else(|| Error::Config("Target configuration required".to_string()))?;
 
         match PartitionLeaderRouter::new(target_config).await {
             Ok(router) => {
@@ -699,9 +706,12 @@ impl RestoreEngine {
                 .unwrap_or(partition_backup.partition_id);
 
             // Get the router from the RwLock
-            let router = self.router.read().await.clone().ok_or_else(|| {
-                Error::Config("Router not initialized".to_string())
-            })?;
+            let router = self
+                .router
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
 
             let ctx = RestorePartitionContext {
                 source_topic: topic_backup.name.clone(),
@@ -734,10 +744,7 @@ impl RestoreEngine {
 
         for handle in handles {
             let report = handle.await.map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Task join error: {}", e),
-                ))
+                Error::Io(std::io::Error::other(format!("Task join error: {}", e)))
             })??;
 
             total_records += report.records;

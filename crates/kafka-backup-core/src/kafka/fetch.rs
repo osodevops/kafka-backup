@@ -2,7 +2,8 @@
 
 use bytes::Bytes;
 use kafka_protocol::messages::{
-    ApiKey, BrokerId, FetchRequest, FetchResponse as KafkaFetchResponse, ListOffsetsRequest, TopicName,
+    ApiKey, BrokerId, FetchRequest, FetchResponse as KafkaFetchResponse, ListOffsetsRequest,
+    TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
@@ -34,12 +35,11 @@ pub async fn fetch(
     offset: i64,
     max_bytes: i32,
 ) -> Result<FetchResponse> {
-    let fetch_partition =
-        kafka_protocol::messages::fetch_request::FetchPartition::default()
-            .with_partition(partition)
-            .with_fetch_offset(offset)
-            .with_partition_max_bytes(max_bytes)
-            .with_log_start_offset(-1);
+    let fetch_partition = kafka_protocol::messages::fetch_request::FetchPartition::default()
+        .with_partition(partition)
+        .with_fetch_offset(offset)
+        .with_partition_max_bytes(max_bytes)
+        .with_log_start_offset(-1);
 
     let fetch_topic = kafka_protocol::messages::fetch_request::FetchTopic::default()
         .with_topic(TopicName(StrBytes::from_string(topic.to_string())))
@@ -119,8 +119,11 @@ pub async fn fetch(
 fn decode_records(data: &Bytes) -> Result<Vec<BackupRecord>> {
     let mut buf = data.clone();
 
-    let decoded_records = RecordBatchDecoder::decode::<_, fn(&mut Bytes, kafka_protocol::records::Compression) -> anyhow::Result<Bytes>>(&mut buf)
-        .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {:?}", e)))?;
+    let decoded_records = RecordBatchDecoder::decode::<
+        _,
+        fn(&mut Bytes, kafka_protocol::records::Compression) -> anyhow::Result<Bytes>,
+    >(&mut buf)
+    .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {:?}", e)))?;
 
     let records: Vec<BackupRecord> = decoded_records
         .into_iter()
@@ -151,11 +154,7 @@ fn convert_record(record: &Record) -> BackupRecord {
 }
 
 /// Get the earliest and latest offsets for a partition
-pub async fn get_offsets(
-    client: &KafkaClient,
-    topic: &str,
-    partition: i32,
-) -> Result<(i64, i64)> {
+pub async fn get_offsets(client: &KafkaClient, topic: &str, partition: i32) -> Result<(i64, i64)> {
     // Fetch earliest offset (timestamp = -2)
     let earliest = list_offset(client, topic, partition, -2).await?;
     // Fetch latest offset (timestamp = -1)

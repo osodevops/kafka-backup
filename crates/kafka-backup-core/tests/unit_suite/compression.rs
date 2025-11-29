@@ -19,7 +19,8 @@ use super::helpers::{generate_random_bytes, generate_repetitive_bytes};
 fn compression_zstd_roundtrip_small_message() {
     let data = b"small message".to_vec();
     let compressed = compress(&data, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     assert_eq!(decompressed, data);
 }
@@ -28,7 +29,8 @@ fn compression_zstd_roundtrip_small_message() {
 fn compression_zstd_roundtrip_large_message() {
     let data = vec![0u8; 1024 * 1024]; // 1MB of zeros
     let compressed = compress(&data, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     assert_eq!(decompressed.len(), data.len());
     assert_eq!(decompressed, data);
@@ -51,7 +53,8 @@ fn compression_zstd_compresses_repetitive_data() {
 fn compression_zstd_handles_random_data() {
     let random = generate_random_bytes(1024);
     let compressed = compress(&random, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     // Random data shouldn't compress much, but roundtrip must work
     assert_eq!(decompressed, random);
@@ -63,7 +66,8 @@ fn compression_zstd_handles_random_data() {
 fn compression_zstd_empty_input() {
     let empty: Vec<u8> = vec![];
     let compressed = compress(&empty, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     assert_eq!(decompressed, empty);
 }
@@ -120,9 +124,13 @@ fn compression_lz4_empty_input() {
 fn compression_none_passes_through() {
     let data = b"uncompressed data".to_vec();
     let compressed = compress(&data, CompressionType::None).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::None).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::None).expect("Decompression failed");
 
-    assert_eq!(compressed, data, "No compression should pass through unchanged");
+    assert_eq!(
+        compressed, data,
+        "No compression should pass through unchanged"
+    );
     assert_eq!(decompressed, data);
 }
 
@@ -217,7 +225,8 @@ fn compression_kafka_like_json_records() {
 
     let data = records.join("\n").into_bytes();
     let compressed = compress(&data, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     assert_eq!(decompressed, data);
 
@@ -235,7 +244,8 @@ fn compression_preserves_binary_data() {
     binary_data.extend((0..=255).collect::<Vec<u8>>());
 
     let compressed = compress(&binary_data, CompressionType::Zstd).expect("Compression failed");
-    let decompressed = decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
+    let decompressed =
+        decompress(&compressed, CompressionType::Zstd).expect("Decompression failed");
 
     assert_eq!(decompressed, binary_data);
 }

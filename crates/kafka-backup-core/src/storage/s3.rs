@@ -78,9 +78,12 @@ impl S3Backend {
             builder = builder.with_allow_http(true);
         }
 
-        let store = builder
-            .build()
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to create S3 client: {}", e))))?;
+        let store = builder.build().map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to create S3 client: {}",
+                e
+            )))
+        })?;
 
         info!(
             "Created S3 backend for bucket: {}, prefix: {:?}",
@@ -120,16 +123,17 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 GET: {}", path);
 
-        let result = self
-            .store
-            .get(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("S3 GET failed: {}", e))))?;
+        let result =
+            self.store.get(&path).await.map_err(|e| {
+                Error::Storage(StorageError::Backend(format!("S3 GET failed: {}", e)))
+            })?;
 
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("Failed to read S3 response: {}", e))))?;
+        let bytes = result.bytes().await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!(
+                "Failed to read S3 response: {}",
+                e
+            )))
+        })?;
 
         Ok(bytes)
     }
@@ -157,7 +161,10 @@ impl StorageBackend for S3Backend {
                     keys.push(stripped);
                 }
                 Err(e) => {
-                    return Err(Error::Storage(StorageError::Backend(format!("S3 LIST failed: {}", e))));
+                    return Err(Error::Storage(StorageError::Backend(format!(
+                        "S3 LIST failed: {}",
+                        e
+                    ))));
                 }
             }
         }
@@ -172,7 +179,10 @@ impl StorageBackend for S3Backend {
         match self.store.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e)))),
+            Err(e) => Err(Error::Storage(StorageError::Backend(format!(
+                "S3 HEAD failed: {}",
+                e
+            )))),
         }
     }
 
@@ -180,10 +190,9 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 DELETE: {}", path);
 
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("S3 DELETE failed: {}", e))))?;
+        self.store.delete(&path).await.map_err(|e| {
+            Error::Storage(StorageError::Backend(format!("S3 DELETE failed: {}", e)))
+        })?;
 
         Ok(())
     }
@@ -192,11 +201,10 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 HEAD (size): {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e))))?;
+        let meta =
+            self.store.head(&path).await.map_err(|e| {
+                Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e)))
+            })?;
 
         Ok(meta.size as u64)
     }
@@ -205,11 +213,10 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 HEAD: {}", path);
 
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e))))?;
+        let meta =
+            self.store.head(&path).await.map_err(|e| {
+                Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e)))
+            })?;
 
         Ok(ObjectMetadata {
             size: meta.size as u64,

@@ -116,16 +116,22 @@ async fn test_snapshot_multiple_groups() {
     // Group 1
     let mut topic_offsets_1 = HashMap::new();
     let mut partition_offsets_1 = HashMap::new();
-    partition_offsets_1.insert(0, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
-    partition_offsets_1.insert(1, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
+    partition_offsets_1.insert(
+        0,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
+    partition_offsets_1.insert(
+        1,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
     topic_offsets_1.insert("orders".to_string(), partition_offsets_1);
 
     group_offsets.insert(
@@ -140,11 +146,14 @@ async fn test_snapshot_multiple_groups() {
     // Group 2
     let mut topic_offsets_2 = HashMap::new();
     let mut partition_offsets_2 = HashMap::new();
-    partition_offsets_2.insert(0, PartitionOffsetState {
-        offset: 0,
-        metadata: None,
-        timestamp: None,
-    });
+    partition_offsets_2.insert(
+        0,
+        PartitionOffsetState {
+            offset: 0,
+            metadata: None,
+            timestamp: None,
+        },
+    );
     topic_offsets_2.insert("payments".to_string(), partition_offsets_2);
 
     group_offsets.insert(

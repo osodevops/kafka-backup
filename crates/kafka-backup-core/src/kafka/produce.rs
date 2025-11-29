@@ -2,7 +2,9 @@
 
 use bytes::{Bytes, BytesMut};
 use indexmap::IndexMap;
-use kafka_protocol::messages::{ApiKey, ProduceRequest, ProduceResponse as KafkaProduceResponse, TopicName};
+use kafka_protocol::messages::{
+    ApiKey, ProduceRequest, ProduceResponse as KafkaProduceResponse, TopicName,
+};
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
@@ -61,7 +63,7 @@ pub async fn produce(
                 producer_id: NO_PRODUCER_ID,
                 producer_epoch: NO_PRODUCER_EPOCH,
                 timestamp_type: TimestampType::Creation,
-                offset: i as i64,  // Will be assigned by broker, relative offset for encoding
+                offset: i as i64, // Will be assigned by broker, relative offset for encoding
                 sequence: NO_SEQUENCE,
                 timestamp: r.timestamp,
                 key: r.key.map(Bytes::from),
@@ -78,20 +80,19 @@ pub async fn produce(
     };
 
     let mut records_buf = BytesMut::new();
-    RecordBatchEncoder::encode::<_, _, fn(&mut BytesMut, &mut BytesMut, Compression) -> anyhow::Result<()>>(
-        &mut records_buf,
-        kafka_records.iter(),
-        &options,
-    )
+    RecordBatchEncoder::encode::<
+        _,
+        _,
+        fn(&mut BytesMut, &mut BytesMut, Compression) -> anyhow::Result<()>,
+    >(&mut records_buf, kafka_records.iter(), &options)
     .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
 
     let records_bytes = records_buf.freeze();
 
     // Build produce request
-    let partition_data =
-        kafka_protocol::messages::produce_request::PartitionProduceData::default()
-            .with_index(partition)
-            .with_records(Some(records_bytes));
+    let partition_data = kafka_protocol::messages::produce_request::PartitionProduceData::default()
+        .with_index(partition)
+        .with_records(Some(records_bytes));
 
     let topic_data = kafka_protocol::messages::produce_request::TopicProduceData::default()
         .with_name(TopicName(StrBytes::from_string(topic.to_string())))

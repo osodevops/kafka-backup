@@ -84,7 +84,11 @@ pub struct TopicBackup {
 impl TopicBackup {
     /// Get or create a partition backup entry
     pub fn get_or_create_partition(&mut self, partition_id: i32) -> &mut PartitionBackup {
-        if !self.partitions.iter().any(|p| p.partition_id == partition_id) {
+        if !self
+            .partitions
+            .iter()
+            .any(|p| p.partition_id == partition_id)
+        {
             self.partitions.push(PartitionBackup {
                 partition_id,
                 segments: Vec::new(),
@@ -461,7 +465,8 @@ pub struct ConsumerGroupOffsets {
     pub group_id: String,
 
     /// Per-partition committed offsets: topic -> partition -> offset info
-    pub offsets: std::collections::HashMap<String, std::collections::HashMap<i32, ConsumerGroupOffset>>,
+    pub offsets:
+        std::collections::HashMap<String, std::collections::HashMap<i32, ConsumerGroupOffset>>,
 }
 
 /// Individual consumer group partition offset
@@ -550,12 +555,18 @@ impl OffsetMapping {
         let key = format!("{}/{}", topic, partition);
 
         // Update range mapping
-        self.update_range(topic, partition, source_offset, Some(target_offset), timestamp);
+        self.update_range(
+            topic,
+            partition,
+            source_offset,
+            Some(target_offset),
+            timestamp,
+        );
 
         // Add detailed mapping
         self.detailed_mappings
             .entry(key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(OffsetPair {
                 source_offset,
                 target_offset,
@@ -591,7 +602,12 @@ impl OffsetMapping {
 
     /// Lookup target offset for a given source offset
     /// Uses detailed mappings for exact lookup, falls back to linear interpolation
-    pub fn lookup_target_offset(&self, topic: &str, partition: i32, source_offset: i64) -> Option<i64> {
+    pub fn lookup_target_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        source_offset: i64,
+    ) -> Option<i64> {
         let key = format!("{}/{}", topic, partition);
 
         // First try detailed mapping for exact match

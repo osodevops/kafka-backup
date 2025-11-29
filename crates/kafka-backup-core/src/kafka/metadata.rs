@@ -83,11 +83,7 @@ pub async fn fetch_metadata(
         .filter_map(|topic| {
             if topic.error_code != 0 {
                 let name = topic.name.as_ref().map(|n| n.as_str()).unwrap_or("unknown");
-                debug!(
-                    "Topic {} has error code {}",
-                    name,
-                    topic.error_code
-                );
+                debug!("Topic {} has error code {}", name, topic.error_code);
                 return None;
             }
 

@@ -13,11 +13,11 @@ pub use offset_automation::{
     PartitionError, PerformanceStats,
 };
 pub use offset_reset::{
-    GroupResetPlan, GroupResetResult, OffsetResetExecutor, OffsetResetPlan,
-    OffsetResetPlanBuilder, OffsetResetReport, OffsetResetStrategy, PartitionResetPlan,
+    GroupResetPlan, GroupResetResult, OffsetResetExecutor, OffsetResetPlan, OffsetResetPlanBuilder,
+    OffsetResetReport, OffsetResetStrategy, PartitionResetPlan,
 };
 pub use offset_rollback::{
-    rollback_offset_reset, reset_offsets_with_rollback, snapshot_current_offsets, verify_rollback,
+    reset_offsets_with_rollback, rollback_offset_reset, snapshot_current_offsets, verify_rollback,
     GroupOffsetState, OffsetMismatch, OffsetSnapshot, OffsetSnapshotMetadata,
     OffsetSnapshotStorage, PartitionOffsetState, RestoreWithRollbackResult,
     RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,

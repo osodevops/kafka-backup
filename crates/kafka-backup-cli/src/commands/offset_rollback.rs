@@ -56,18 +56,21 @@ pub async fn create_snapshot(
     };
 
     let client = KafkaClient::new(kafka_config);
-    client.connect().await.context("Failed to connect to Kafka")?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to Kafka")?;
 
-    println!("Creating offset snapshot for {} consumer groups...", consumer_groups.len());
+    println!(
+        "Creating offset snapshot for {} consumer groups...",
+        consumer_groups.len()
+    );
 
     // Create snapshot
-    let mut snapshot = snapshot_current_offsets(
-        &client,
-        consumer_groups,
-        bootstrap_servers.to_vec(),
-    )
-    .await
-    .context("Failed to create snapshot")?;
+    let mut snapshot =
+        snapshot_current_offsets(&client, consumer_groups, bootstrap_servers.to_vec())
+            .await
+            .context("Failed to create snapshot")?;
 
     // Add description if provided
     if let Some(desc) = description {
@@ -131,8 +134,8 @@ pub async fn list_snapshots(path: &str, format: OutputFormat) -> Result<()> {
             println!("Available offset snapshots:");
             println!();
             println!(
-                "{:<40} {:<24} {:>8} {:>10}  {}",
-                "SNAPSHOT ID", "CREATED AT", "GROUPS", "OFFSETS", "DESCRIPTION"
+                "{:<40} {:<24} {:>8} {:>10}  DESCRIPTION",
+                "SNAPSHOT ID", "CREATED AT", "GROUPS", "OFFSETS"
             );
             println!("{}", "-".repeat(100));
 
@@ -219,7 +222,10 @@ pub async fn execute_rollback(
     };
 
     let client = KafkaClient::new(kafka_config);
-    client.connect().await.context("Failed to connect to Kafka")?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to Kafka")?;
 
     // Execute rollback
     let result = rollback_offset_reset(&client, &snapshot)
@@ -296,7 +302,10 @@ pub async fn verify_snapshot(
     };
 
     let client = KafkaClient::new(kafka_config);
-    client.connect().await.context("Failed to connect to Kafka")?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to Kafka")?;
 
     println!("Verifying offsets against snapshot: {}", snapshot_id);
 
@@ -375,8 +384,9 @@ fn print_snapshot_details(snapshot: &OffsetSnapshot) {
                     topic,
                     partition,
                     offset_state.offset,
-                    " ".repeat(78 - 12 - topic.len() - 10 - format!("{}", offset_state.offset).len())
-                        + "║"
+                    " ".repeat(
+                        78 - 12 - topic.len() - 10 - format!("{}", offset_state.offset).len()
+                    ) + "║"
                 );
             }
         }
@@ -407,18 +417,9 @@ fn print_rollback_result(result: &RollbackResult) {
         "║   Groups Rolled Back: {:<55} ║",
         result.groups_rolled_back
     );
-    println!(
-        "║   Groups Failed:      {:<55} ║",
-        result.groups_failed
-    );
-    println!(
-        "║   Offsets Restored:   {:<55} ║",
-        result.offsets_restored
-    );
-    println!(
-        "║   Duration:           {:<52} ms ║",
-        result.duration_ms
-    );
+    println!("║   Groups Failed:      {:<55} ║", result.groups_failed);
+    println!("║   Offsets Restored:   {:<55} ║", result.offsets_restored);
+    println!("║   Duration:           {:<52} ms ║", result.duration_ms);
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
 
     if !result.errors.is_empty() {
@@ -473,24 +474,27 @@ fn parse_security_config(protocol: Option<&str>) -> SecurityConfig {
         _ => SecurityProtocol::Plaintext,
     };
 
-    let (sasl_mechanism, sasl_username, sasl_password) =
-        if matches!(security_protocol, SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext)
-        {
-            (
-                Some(SaslMechanism::Plain),
-                std::env::var("KAFKA_USERNAME").ok(),
-                std::env::var("KAFKA_PASSWORD").ok(),
-            )
-        } else {
-            (None, None, None)
-        };
+    let (sasl_mechanism, sasl_username, sasl_password) = if matches!(
+        security_protocol,
+        SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext
+    ) {
+        (
+            Some(SaslMechanism::Plain),
+            std::env::var("KAFKA_USERNAME").ok(),
+            std::env::var("KAFKA_PASSWORD").ok(),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    let ssl_ca_location =
-        if matches!(security_protocol, SecurityProtocol::Ssl | SecurityProtocol::SaslSsl) {
-            std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
-        } else {
-            None
-        };
+    let ssl_ca_location = if matches!(
+        security_protocol,
+        SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
+    ) {
+        std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
+    } else {
+        None
+    };
 
     SecurityConfig {
         security_protocol,

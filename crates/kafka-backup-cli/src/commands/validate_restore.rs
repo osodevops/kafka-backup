@@ -68,10 +68,7 @@ fn print_validation_report(report: &kafka_backup_core::manifest::DryRunReport) {
         "║ Segments to process:  {:48} ║",
         report.segments_to_process
     );
-    println!(
-        "║ Records to restore:   {:48} ║",
-        report.records_to_restore
-    );
+    println!("║ Records to restore:   {:48} ║", report.records_to_restore);
     println!(
         "║ Bytes to restore:     {:48} ║",
         format_bytes(report.bytes_to_restore)

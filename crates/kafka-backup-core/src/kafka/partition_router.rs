@@ -132,7 +132,10 @@ impl PartitionLeaderRouter {
     }
 
     /// Get brokers from metadata response by re-fetching metadata
-    async fn get_brokers_from_topics(&self, _topics: &[TopicMetadata]) -> Result<Vec<BrokerMetadata>> {
+    async fn get_brokers_from_topics(
+        &self,
+        _topics: &[TopicMetadata],
+    ) -> Result<Vec<BrokerMetadata>> {
         // Re-fetch metadata to get broker info - the fetch_metadata call
         // updates the internal broker cache
         use kafka_protocol::messages::{ApiKey, MetadataRequest, MetadataResponse};
@@ -141,7 +144,10 @@ impl PartitionLeaderRouter {
             .with_topics(None)
             .with_allow_auto_topic_creation(false);
 
-        let response: MetadataResponse = self.bootstrap_client.send_request(ApiKey::Metadata, request).await?;
+        let response: MetadataResponse = self
+            .bootstrap_client
+            .send_request(ApiKey::Metadata, request)
+            .await?;
 
         let brokers: Vec<BrokerMetadata> = response
             .brokers
@@ -164,7 +170,10 @@ impl PartitionLeaderRouter {
         debug!("Refreshing leader for {}/{}", topic, partition);
 
         // Fetch metadata for just this topic
-        let topics = self.bootstrap_client.fetch_metadata(Some(&[topic.to_string()])).await?;
+        let topics = self
+            .bootstrap_client
+            .fetch_metadata(Some(&[topic.to_string()]))
+            .await?;
 
         // Also refresh broker metadata
         let brokers = self.get_brokers_from_topics(&topics).await?;
@@ -195,7 +204,8 @@ impl PartitionLeaderRouter {
         Err(KafkaError::PartitionNotAvailable {
             topic: topic.to_string(),
             partition,
-        }.into())
+        }
+        .into())
     }
 
     /// Get the leader broker ID for a partition.
@@ -226,13 +236,16 @@ impl PartitionLeaderRouter {
         // Get broker address
         let broker_addr = {
             let brokers = self.broker_metadata.read().await;
-            let broker = brokers.get(&broker_id).ok_or_else(|| {
-                KafkaError::Protocol(format!("Unknown broker ID: {}", broker_id))
-            })?;
+            let broker = brokers
+                .get(&broker_id)
+                .ok_or_else(|| KafkaError::Protocol(format!("Unknown broker ID: {}", broker_id)))?;
             format!("{}:{}", broker.host, broker.port)
         };
 
-        debug!("Creating new connection to broker {} at {}", broker_id, broker_addr);
+        debug!(
+            "Creating new connection to broker {} at {}",
+            broker_id, broker_addr
+        );
 
         // Create new connection with modified config
         let mut broker_config = self.config.clone();
@@ -268,7 +281,10 @@ impl PartitionLeaderRouter {
         max_bytes: i32,
     ) -> Result<FetchResponse> {
         // First attempt
-        match self.fetch_internal(topic, partition, offset, max_bytes).await {
+        match self
+            .fetch_internal(topic, partition, offset, max_bytes)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) if is_not_leader_error(&e) => {
                 // Refresh metadata and retry
@@ -282,7 +298,8 @@ impl PartitionLeaderRouter {
                 self.clear_connection_cache().await;
 
                 // Retry with new leader
-                self.fetch_internal(topic, partition, offset, max_bytes).await
+                self.fetch_internal(topic, partition, offset, max_bytes)
+                    .await
             }
             Err(e) => Err(e),
         }
@@ -333,7 +350,10 @@ impl PartitionLeaderRouter {
         records: Vec<BackupRecord>,
     ) -> Result<ProduceResponse> {
         // First attempt
-        match self.produce_internal(topic, partition, records.clone()).await {
+        match self
+            .produce_internal(topic, partition, records.clone())
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) if is_not_leader_error(&e) => {
                 // Refresh metadata and retry

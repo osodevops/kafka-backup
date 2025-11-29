@@ -80,7 +80,13 @@ impl OffsetResetBatch {
     }
 
     /// Add an offset to the batch.
-    pub fn add_offset(&mut self, topic: String, partition: i32, offset: i64, metadata: Option<String>) {
+    pub fn add_offset(
+        &mut self,
+        topic: String,
+        partition: i32,
+        offset: i64,
+        metadata: Option<String>,
+    ) {
         self.offsets.push((topic, partition, offset, metadata));
     }
 
@@ -194,7 +200,9 @@ impl OffsetResetMetrics {
 
     /// Record a request latency.
     pub fn record_latency(&self, duration: Duration) {
-        self.latencies_ms.lock().push(duration.as_secs_f64() * 1000.0);
+        self.latencies_ms
+            .lock()
+            .push(duration.as_secs_f64() * 1000.0);
     }
 
     /// Calculate p50 latency in milliseconds.
@@ -403,9 +411,11 @@ impl BulkOffsetReset {
         let mut handles = Vec::new();
 
         for batch in batches {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-                crate::Error::Config(format!("Semaphore error: {}", e))
-            })?;
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| crate::Error::Config(format!("Semaphore error: {}", e)))?;
 
             let client = self.client.clone();
             let config = self.config.clone();
@@ -435,7 +445,9 @@ impl BulkOffsetReset {
 
                     if outcome.partitions_failed == 0 {
                         successful_count += 1;
-                        self.metrics.successful_groups.fetch_add(1, Ordering::SeqCst);
+                        self.metrics
+                            .successful_groups
+                            .fetch_add(1, Ordering::SeqCst);
                     } else if outcome.partitions_reset > 0 {
                         // Partial success
                         successful_count += 1;
@@ -456,7 +468,9 @@ impl BulkOffsetReset {
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
-        self.metrics.total_offsets_reset.store(total_offsets_reset, Ordering::SeqCst);
+        self.metrics
+            .total_offsets_reset
+            .store(total_offsets_reset, Ordering::SeqCst);
 
         // Determine overall status
         let status = if failed_count == 0 {
@@ -636,20 +650,25 @@ impl BulkOffsetReset {
     }
 }
 
+/// Type alias for grouped offset data: (topic, partition, new_offset, metadata)
+pub type GroupedOffsetData = Vec<(String, i32, i64, Option<String>)>;
+
 /// Group offset mappings by consumer group ID.
 ///
 /// This is the first step in bulk offset reset - organizing offsets
 /// so we can send one OffsetCommitRequest per group.
 pub fn group_offsets_by_group(
     offset_mappings: Vec<OffsetMapping>,
-) -> HashMap<String, Vec<(String, i32, i64, Option<String>)>> {
+) -> HashMap<String, GroupedOffsetData> {
     let mut grouped: HashMap<String, Vec<_>> = HashMap::new();
 
     for mapping in offset_mappings {
-        grouped
-            .entry(mapping.group_id)
-            .or_default()
-            .push((mapping.topic, mapping.partition, mapping.new_offset, mapping.metadata));
+        grouped.entry(mapping.group_id).or_default().push((
+            mapping.topic,
+            mapping.partition,
+            mapping.new_offset,
+            mapping.metadata,
+        ));
     }
 
     grouped

@@ -6,6 +6,8 @@
 //! - Ordering guarantees
 //! - Edge case handling
 
+#![allow(dead_code, unused_imports, clippy::useless_vec)]
+
 use kafka_backup_core::manifest::{BackupRecord, OffsetMapping, OffsetMappingEntry, RecordHeader};
 
 use super::helpers::{create_segment_metadata, generate_records_with_timestamps};
@@ -346,7 +348,7 @@ fn segment_metadata_offset_range() {
 #[test]
 fn segment_filtering_by_time_window() {
     let segments = vec![
-        create_segment_metadata(0, 99, 1000, 1999),    // Entirely before window
+        create_segment_metadata(0, 99, 1000, 1999), // Entirely before window
         create_segment_metadata(100, 199, 2000, 2999), // Overlaps start
         create_segment_metadata(200, 299, 3000, 3999), // Entirely within
         create_segment_metadata(300, 399, 4000, 4999), // Overlaps end
@@ -382,10 +384,7 @@ fn topic_mapping_simple() {
     mapping.insert("payments".to_string(), "payments-dr".to_string());
 
     assert_eq!(mapping.get("orders"), Some(&"orders-recovered".to_string()));
-    assert_eq!(
-        mapping.get("payments"),
-        Some(&"payments-dr".to_string())
-    );
+    assert_eq!(mapping.get("payments"), Some(&"payments-dr".to_string()));
     assert_eq!(mapping.get("unknown"), None);
 }
 
@@ -397,7 +396,10 @@ fn topic_mapping_with_no_remap() {
 
     // When no mapping exists, use original topic name
     let source_topic = "orders";
-    let target_topic = mapping.get(source_topic).map(|s| s.as_str()).unwrap_or(source_topic);
+    let target_topic = mapping
+        .get(source_topic)
+        .map(|s| s.as_str())
+        .unwrap_or(source_topic);
 
     assert_eq!(target_topic, "orders");
 }

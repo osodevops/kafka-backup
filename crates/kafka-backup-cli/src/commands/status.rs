@@ -1,6 +1,6 @@
 use anyhow::Result;
 use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
-use kafka_backup_core::{BackupManifest, OffsetStore, SqliteOffsetStore, OffsetStoreConfig};
+use kafka_backup_core::{BackupManifest, OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -153,7 +153,10 @@ pub async fn run(path: &str, backup_id: &str, db_path: Option<&str>) -> Result<(
     println!("  Path: {}", path);
 
     let files = storage.list(backup_id).await?;
-    let segment_count = files.iter().filter(|f| f.ends_with(".bin") || f.ends_with(".zst")).count();
+    let segment_count = files
+        .iter()
+        .filter(|f| f.ends_with(".bin") || f.ends_with(".zst"))
+        .count();
     println!("  Segment Files: {}", segment_count);
 
     Ok(())

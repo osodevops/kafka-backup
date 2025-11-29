@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use super::PerformanceMetrics;
 use crate::health::HealthCheck;
@@ -53,12 +53,14 @@ impl MetricsServer {
 
     /// Run the metrics server
     pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) -> crate::Result<()> {
-        let listener = TcpListener::bind(self.config.bind_address).await.map_err(|e| {
-            crate::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!("Failed to bind metrics server: {}", e),
-            ))
-        })?;
+        let listener = TcpListener::bind(self.config.bind_address)
+            .await
+            .map_err(|e| {
+                crate::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("Failed to bind metrics server: {}", e),
+                ))
+            })?;
 
         info!("Metrics server listening on {}", self.config.bind_address);
 
