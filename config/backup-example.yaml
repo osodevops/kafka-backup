@@ -1,0 +1,27 @@
+mode: backup
+backup_id: "docker-test-backup"
+
+source:
+  bootstrap_servers:
+    - kafka-broker-1:9092
+  topics:
+    include:
+      - "*"
+    exclude:
+      - "__*"
+
+storage:
+  backend: s3
+  bucket: kafka-backups
+  region: us-east-1
+  endpoint: http://minio:9000
+  access_key: minioadmin
+  secret_key: minioadmin
+  path_style: true
+  allow_http: true
+
+backup:
+  compression: zstd
+  segment_max_bytes: 134217728
+  checkpoint_interval_secs: 5
+  max_concurrent_partitions: 4

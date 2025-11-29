@@ -1,0 +1,16 @@
+.git
+.gitignore
+.github
+target/
+*.md
+docs/
+.vscode
+.idea
+*.swp
+.env
+.env.local
+docker-compose.override.yml
+test-data/
+fixtures/
+.DS_Store
+Thumbs.db
