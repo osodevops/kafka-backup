@@ -110,15 +110,15 @@ kafka-backup restore --config restore.yaml
 
 How does kafka-backup compare to other Kafka backup and replication solutions?
 
-| Feature | kafka-backup | kafka-backup (itadventurer) | Kannika | Confluent Replicator | MirrorMaker 2 |
-|---------|--------------|----------------------------|---------|---------------------|---------------|
-| Point-in-time recovery | ✅ Millisecond precision | ❌ | ❓ Unknown | ❌ | ❌ |
-| Cloud storage backup | ✅ S3/Azure/GCS | ❌ Filesystem only | ✅ Multi-cloud | ❌ | ❌ |
-| Consumer offset recovery | ✅ Multiple strategies | ✅ | ✅ | ⚠️ Limited | ⚠️ Limited |
-| No Kafka Connect dependency | ✅ | ❌ Requires Connect | ✅ | ❌ | ❌ |
-| Single binary | ✅ | ❌ | ✅ | ❌ | ❌ |
-| Open source | ✅ MIT | ✅ MIT (unmaintained) | ❌ Commercial | ❌ Commercial | ✅ Apache 2.0 |
-| Actively maintained | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Feature | kafka-backup | Kannika | Confluent Replicator | MirrorMaker 2 |
+|---------|--------------|---------|---------------------|---------------|
+| Point-in-time recovery | ✅ Millisecond precision | ❓ Unknown | ❌ | ❌ |
+| Cloud storage backup | ✅ S3/Azure/GCS | ✅ Multi-cloud | ❌ | ❌ |
+| Consumer offset recovery | ✅ Multiple strategies | ✅ | ⚠️ Limited | ⚠️ Limited |
+| No Kafka Connect dependency | ✅ | ✅ | ❌ | ❌ |
+| Single binary | ✅ | ✅ | ❌ | ❌ |
+| Open source | ✅ MIT | ❌ Commercial | ❌ Commercial | ✅ Apache 2.0 |
+| Actively maintained | ✅ | ✅ | ✅ | ✅ |
 
 ## When NOT to use kafka-backup
 
