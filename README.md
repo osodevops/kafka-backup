@@ -267,7 +267,7 @@ For security vulnerabilities, please email security@osodevops.io instead of open
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+kafka-backup is licensed under the [MIT License](LICENSE) © [OSO](https://oso.sh).
 
 ## Acknowledgments
 
@@ -280,5 +280,5 @@ Built with these excellent Rust crates:
 ---
 
 <p align="center">
-  Made with ❤️ by <a href="https://osodevops.io">OSO DevOps</a>
+  Made with ❤️ by <a href="https://oso.sh">OSO</a>
 </p>
