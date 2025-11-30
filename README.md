@@ -55,7 +55,19 @@ sudo mv kafka-backup /usr/local/bin/
 
 ### Windows
 
-Download the Windows binary from [releases](https://github.com/osodevops/kafka-backup/releases) and add it to your PATH.
+We use [Scoop](https://scoop.sh/) to distribute releases for Windows.
+
+Add the OSO scoop bucket:
+
+```powershell
+scoop bucket add oso https://github.com/osodevops/scoop-bucket.git
+```
+
+Then install kafka-backup:
+
+```powershell
+scoop install kafka-backup
+```
 
 ### Docker
 
