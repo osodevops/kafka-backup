@@ -110,14 +110,13 @@ kafka-backup restore --config restore.yaml
 
 How does kafka-backup compare to other Kafka backup and replication solutions?
 
-| Feature | kafka-backup | [itadventurer/kafka-backup](https://github.com/itadventurer/kafka-backup) | [Kannika](https://www.kannika.io) | Confluent Replicator | MirrorMaker 2 |
-|---------|--------------|-------------------|---------|---------------------|---------------|
+| Feature | kafka-backup | kafka-backup (itadventurer) | Kannika | Confluent Replicator | MirrorMaker 2 |
+|---------|--------------|----------------------------|---------|---------------------|---------------|
 | Point-in-time recovery | ✅ Millisecond precision | ❌ | ❓ Unknown | ❌ | ❌ |
 | Cloud storage backup | ✅ S3/Azure/GCS | ❌ Filesystem only | ✅ Multi-cloud | ❌ | ❌ |
 | Consumer offset recovery | ✅ Multiple strategies | ✅ | ✅ | ⚠️ Limited | ⚠️ Limited |
 | No Kafka Connect dependency | ✅ | ❌ Requires Connect | ✅ | ❌ | ❌ |
 | Single binary | ✅ | ❌ | ✅ | ❌ | ❌ |
-| Written in Rust | ✅ | ❌ Java | ✅ | ❌ | ❌ |
 | Open source | ✅ MIT | ✅ MIT (unmaintained) | ❌ Commercial | ❌ Commercial | ✅ Apache 2.0 |
 | Actively maintained | ✅ | ❌ | ✅ | ✅ | ✅ |
 
