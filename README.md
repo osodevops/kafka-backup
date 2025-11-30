@@ -283,7 +283,7 @@ Contributions are welcome! Please read our contributing guidelines before submit
 
 Need help resolving operational issues or planning a failover strategy? Our team of experts can recover data from non-responsive clusters, fix configuration errors, and get your environment operational as fast as possible.
 
-👉 **[Talk with an expert today](https://oso.sh)** or email us at **enquiries@oso.sh**.
+👉 **[Talk with an expert today](https://oso.sh/contact/)** or email us at **enquiries@oso.sh**.
 
 ## License
 
