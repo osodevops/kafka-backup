@@ -335,6 +335,16 @@ Need help resolving operational issues or planning a failover strategy? Our team
 
 👉 **[Talk with an expert today](https://oso.sh/contact/)** or email us at **enquiries@oso.sh**.
 
+## Contributing
+
+We welcome contributions of all kinds!
+
+- **Report Issues:** Found a bug or have a feature request? Open an [issue on GitHub](https://github.com/osodevops/kafka-backup/issues).
+- **Contribute Code:** Check out our [good first issues](https://github.com/osodevops/kafka-backup/labels/good%20first%20issue) for beginner-friendly tasks.
+- **Improve Docs:** Help us improve the documentation by submitting pull requests.
+
+See [CLAUDE.md](CLAUDE.md) for development guidelines and architecture overview.
+
 ## License
 
 kafka-backup is licensed under the [MIT License](LICENSE) © [OSO](https://oso.sh).

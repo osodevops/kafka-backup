@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest a new feature or improvement
+
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your feature suggestion! Please describe your idea in detail. Don't forget to give us a star! ⭐
+  - type: textarea
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear description of what the problem is.
+      placeholder: I'm always frustrated when [...]
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear description of what you want to happen.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Describe alternatives you've considered
+      description: Any alternative solutions or features you've considered.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Use case
+      description: Describe the use case or scenario where this feature would be helpful.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Add any other context or screenshots about the feature request.
+    validations:
+      required: false
