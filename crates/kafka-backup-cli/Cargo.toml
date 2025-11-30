@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "CLI tool for Kafka backup and restore operations"
+repository = "https://github.com/osodevops/kafka-backup"
+homepage = "https://github.com/osodevops/kafka-backup"
 
 [[bin]]
 name = "kafka-backup"

@@ -79,3 +79,8 @@ tokio-test = "0.4"
 
 # Internal crates
 kafka-backup-core = { path = "crates/kafka-backup-core" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
