@@ -35,11 +35,10 @@
 
 Download the latest binary from the [GitHub Releases](https://github.com/osodevops/kafka-backup/releases) page.
 
-### macOS
+### macOS (Homebrew)
 
 ```bash
-brew tap osodevops/homebrew-tap
-brew install kafka-backup
+brew install osodevops/tap/kafka-backup
 ```
 
 ### Linux / macOS (Shell Installer)
