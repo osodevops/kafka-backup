@@ -261,9 +261,29 @@ Contributions are welcome! Please read our contributing guidelines before submit
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## Security
+## Looking for Enterprise Apache Kafka Support?
 
-For security vulnerabilities, please email security@osodevops.io instead of opening a public issue.
+[OSO](https://oso.sh) engineers are solely focused on deploying, operating, and maintaining Apache Kafka platforms. If you need SLA-backed support or advanced features for compliance and security, our **Enterprise Edition** extends the core tool with capabilities designed for large-scale, regulated environments.
+
+### OSO Kafka Backup: Enterprise Edition
+
+| Feature Category | Enterprise Capability |
+|------------------|----------------------|
+| **Security & Compliance** | AES-256 Encryption (client-side encryption at rest) |
+| | GDPR Compliance Tools (right-to-be-forgotten, PII masking) |
+| | Audit Logging (comprehensive trail of all backup/restore ops) |
+| | Role-Based Access Control (granular permissions) |
+| **Advanced Integrations** | Schema Registry Integration (backup & restore schemas with ID remapping) |
+| | Secrets Management (Vault / AWS Secrets Manager integration) |
+| | SSO / OIDC (Okta, Azure AD, Google Auth) |
+| **Scale & Operations** | Multi-Region Replication (active-active disaster recovery) |
+| | Log Shipping (Datadog, Splunk, Grafana Loki) |
+| | Advanced Metrics & Dashboard (throughput, latency, drill-down UI) |
+| **Support** | 24/7 SLA-Backed Support & dedicated Kafka consulting |
+
+Need help resolving operational issues or planning a failover strategy? Our team of experts can recover data from non-responsive clusters, fix configuration errors, and get your environment operational as fast as possible.
+
+👉 **[Talk with an expert today](https://oso.sh)** or email us at **enquiries@oso.sh**.
 
 ## License
 
