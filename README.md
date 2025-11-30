@@ -118,6 +118,8 @@ kafka-backup restore --config restore.yaml
 | **Operational simplicity** | High | Medium | Medium/Low | Medium | Low |
 | **License** | MIT (OSS) | MIT (unmaintained) | Commercial | Commercial | Apache 2.0 |
 
+> 📖 **[See the full comparison guide](docs/comparison.md)** for detailed analysis of each solution.
+
 **OSO Kafka Backup is the only option that combines millisecond‑precision PITR, cloud‑native cold backups, and automated consumer offset recovery in a single, OSS‑friendly binary.**
 
 Competing tools either:
