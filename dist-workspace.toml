@@ -22,5 +22,7 @@ hosting = "github"
 install-updater = false
 # Homebrew tap repository for publishing formulas
 tap = "osodevops/homebrew-tap"
+# Custom formula name (instead of kafka-backup-cli)
+formula = "kafka-backup"
 # Publish jobs to run (updates homebrew tap automatically)
 publish-jobs = ["homebrew"]
