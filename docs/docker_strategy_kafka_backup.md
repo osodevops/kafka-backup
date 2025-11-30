@@ -5,7 +5,7 @@
 **Best Practice:** Single repository, single `Dockerfile` in root, but structured to support workspace builds.
 
 ```
-osotech/kafka-backup/
+osodevops/kafka-backup/
 ├── Cargo.toml (workspace root)
 ├── core/
 │   ├── Cargo.toml (library crate)
@@ -283,17 +283,17 @@ Thumbs.db
 
 ```bash
 # Build with tag
-docker build -t osotech/kafka-backup:latest .
+docker build -t osodevops/kafka-backup:latest .
 
 # Build with version tag
-docker build -t osotech/kafka-backup:0.1.0 .
+docker build -t osodevops/kafka-backup:0.1.0 .
 
 # Verify image size
 docker images | grep kafka-backup
-# Output: osotech/kafka-backup  latest  abc123  2 weeks ago  78MB
+# Output: osodevops/kafka-backup  latest  abc123  2 weeks ago  78MB
 
 # Test the image
-docker run --rm osotech/kafka-backup:latest --help
+docker run --rm osodevops/kafka-backup:latest --help
 ```
 
 ### Push to Docker Hub
@@ -303,11 +303,11 @@ docker run --rm osotech/kafka-backup:latest --help
 docker login
 
 # Tag for push
-docker tag osotech/kafka-backup:latest osotech/kafka-backup:0.1.0
+docker tag osodevops/kafka-backup:latest osodevops/kafka-backup:0.1.0
 
 # Push
-docker push osotech/kafka-backup:0.1.0
-docker push osotech/kafka-backup:latest
+docker push osodevops/kafka-backup:0.1.0
+docker push osodevops/kafka-backup:latest
 ```
 
 ### CI/CD Automation (GitHub Actions)
@@ -329,7 +329,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: osotech/kafka-backup
+  IMAGE_NAME: osodevops/kafka-backup
 
 jobs:
   build-and-push:
@@ -375,7 +375,7 @@ jobs:
 
 **GitHub Secrets to Set:**
 ```
-DOCKER_USERNAME = "osotech" (or your user)
+DOCKER_USERNAME = "osodevops" (or your user)
 DOCKER_PASSWORD = "your PAT token from hub.docker.com"
 ```
 
@@ -582,9 +582,9 @@ Philosophy: "Lightweight CLI, not container-first"
 
 - [ ] Create `Dockerfile` in root (use Stage 1 template above)
 - [ ] Create `.dockerignore`
-- [ ] Test locally: `docker build -t osotech/kafka-backup:test .`
+- [ ] Test locally: `docker build -t osodevops/kafka-backup:test .`
 - [ ] Verify size: `docker images | grep kafka-backup`
-- [ ] Test CLI: `docker run --rm osotech/kafka-backup:test --help`
+- [ ] Test CLI: `docker run --rm osodevops/kafka-backup:test --help`
 
 ### Week 2: GitHub Actions
 
@@ -592,7 +592,7 @@ Philosophy: "Lightweight CLI, not container-first"
 - [ ] Add `DOCKER_USERNAME` and `DOCKER_PASSWORD` secrets to GitHub
 - [ ] Test on PR (should build, not push)
 - [ ] Tag release: `git tag v0.1.0 && git push --tags`
-- [ ] Verify on Docker Hub: `docker pull osotech/kafka-backup:v0.1.0`
+- [ ] Verify on Docker Hub: `docker pull osodevops/kafka-backup:v0.1.0`
 
 ### Week 3: Documentation
 
@@ -627,12 +627,12 @@ docker run --rm \
   kafka-backup:dev backup --config /config.yaml
 
 # Push to Docker Hub
-docker tag kafka-backup:dev osotech/kafka-backup:latest
-docker push osotech/kafka-backup:latest
+docker tag kafka-backup:dev osodevops/kafka-backup:latest
+docker push osodevops/kafka-backup:latest
 
 # Pull and run from Docker Hub
-docker pull osotech/kafka-backup:latest
-docker run --rm osotech/kafka-backup:latest --version
+docker pull osodevops/kafka-backup:latest
+docker run --rm osodevops/kafka-backup:latest --version
 ```
 
 ---
@@ -642,7 +642,7 @@ docker run --rm osotech/kafka-backup:latest --version
 ```
 Your Machine                GitHub                    Docker Hub
 ───────────────            ──────                    ──────────
-Local changes              Push to main              osotech/kafka-backup:latest
+Local changes              Push to main              osodevops/kafka-backup:latest
     ↓                            ↓                            ↑
 git commit                 GitHub Actions                  Push image
     ↓                            ↓

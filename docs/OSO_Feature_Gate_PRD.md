@@ -17,7 +17,7 @@ Use this checklist during code reviews to ensure:
 **Two Products, One Codebase Architecture:**
 
 ```
-osotech/kafka-backup/
+osodevops/kafka-backup/
 ├── core/                          (Shared between OSS + EE)
 │   ├── backup.rs                  (OSS)
 │   ├── restore.rs                 (OSS)

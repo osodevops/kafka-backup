@@ -31,18 +31,52 @@
 - **Topic filtering** — Wildcard patterns for include/exclude
 - **Deployment agnostic** — Bare metal, VM, Docker, or Kubernetes
 
-## Quick Start
+## Installation
 
-### Installation
+Download the latest binary from the [GitHub Releases](https://github.com/osodevops/kafka-backup/releases) page.
 
-**From source:**
+### macOS
+
+```bash
+brew tap osodevops/homebrew-tap
+brew install kafka-backup
+```
+
+### Linux
+
+Download the appropriate binary for your architecture from [releases](https://github.com/osodevops/kafka-backup/releases):
+
+```bash
+# Example for x86_64
+curl -LO https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf kafka-backup-x86_64-unknown-linux-gnu.tar.gz
+sudo mv kafka-backup /usr/local/bin/
+```
+
+### Windows
+
+Download the Windows binary from [releases](https://github.com/osodevops/kafka-backup/releases) and add it to your PATH.
+
+### Docker
+
+```bash
+docker pull osodevops/kafka-backup
+docker run --rm -v /path/to/config:/config osodevops/kafka-backup backup --config /config/backup.yaml
+```
+
+See the image on [Docker Hub](https://hub.docker.com/r/osodevops/kafka-backup).
+
+### From Source
+
 ```bash
 git clone https://github.com/osodevops/kafka-backup.git
 cd kafka-backup
 cargo build --release
 ```
 
-**Binary location:** `target/release/kafka-backup`
+Binary location: `target/release/kafka-backup`
+
+## Quick Start
 
 ### Backup
 
