@@ -42,30 +42,35 @@ brew tap osodevops/homebrew-tap
 brew install kafka-backup
 ```
 
-### Linux
+### Linux / macOS (Shell Installer)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-cli-installer.sh | sh
+```
+
+### Linux (Manual)
 
 Download the appropriate binary for your architecture from [releases](https://github.com/osodevops/kafka-backup/releases):
 
 ```bash
 # Example for x86_64
-curl -LO https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf kafka-backup-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-cli-x86_64-unknown-linux-gnu.tar.xz
+tar -xJf kafka-backup-cli-x86_64-unknown-linux-gnu.tar.xz
 sudo mv kafka-backup /usr/local/bin/
 ```
 
-### Windows
+### Windows (PowerShell Installer)
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-cli-installer.ps1 | iex"
+```
+
+### Windows (Scoop)
 
 We use [Scoop](https://scoop.sh/) to distribute releases for Windows.
 
-Add the OSO scoop bucket:
-
 ```powershell
 scoop bucket add oso https://github.com/osodevops/scoop-bucket.git
-```
-
-Then install kafka-backup:
-
-```powershell
 scoop install kafka-backup
 ```
 
