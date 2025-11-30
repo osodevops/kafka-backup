@@ -106,19 +106,27 @@ Run the restore:
 kafka-backup restore --config restore.yaml
 ```
 
-## Why kafka-backup?
+## Why OSO Kafka Backup?
 
-How does kafka-backup compare to other Kafka backup and replication solutions?
+| Feature / Outcome | OSO Kafka Backup | itadventurer/kafka-backup | Kannika Armory | Confluent Replicator / Cluster Linking | MirrorMaker 2 |
+|-------------------|------------------|---------------------------|----------------|----------------------------------------|---------------|
+| **Point‑in‑time restore (PITR)** | Yes – millisecond-precision time window restore (per topic/partition) | No – restores full topic from backup directory only | Yes – point‑in‑time restore with filters, but via proprietary SaaS/UI | No – continuous replication only, failover at "latest" or "earliest" offsets | No – DR via replication; no explicit PITR to an arbitrary timestamp |
+| **Cloud storage backup** | Yes – S3, Azure, GCS as primary targets | No – filesystem only (local/volume); no direct object storage support | Partial – pluggable storages but typically K8s PV or enterprise storage backends | No – no direct Kafka→object storage backup; focused on cluster‑to‑cluster replication | No – replicates topics between clusters, not to backup storage |
+| **Consumer offset recovery** | Yes – multi‑strategy offset capture and restore (snapshots + bulk reset) | Partial – backs up and restores consumer group offsets, but relies on offset sidecar file | Yes – restores data and supports environment cloning with schema/ID mapping | Limited – can reset or sync offsets for failover, but not full historical snapshots | Limited – offset sync exists but is fragile and can drift or miss updates |
+| **Designed for true cold backup (air‑gapped DR)** | Yes – backups live in object storage, independent of any Kafka cluster | Partial – local filesystem backup; DR depends on how that storage is managed | Yes – supports "cold backup" and air‑gapping, but as a commercial product | No – keeps a hot secondary cluster in sync; both clusters are "live" | No – hot secondary cluster; replication failure modes can still lose messages |
+| **Kafka Connect / heavy platform dependency** | None – single binary, no Connect or external framework required | Yes – built as a Kafka Connect connector; requires running Connect | Yes – runs as its own platform (K8s controllers, UI, APIs) | Yes – requires full Confluent Platform / Cloud control plane | Yes – MM2 framework plus Connect-style configuration |
+| **Operational simplicity for infra teams** | High – config file + CLI, works on any Kafka (self‑hosted, MSK, Confluent, etc.) | Medium – need to build/deploy connector JAR and manage Connect tasks | Medium/Low – powerful but requires learning product, CRDs, GraphQL/REST | Medium – integrated with Confluent but opinionated and platform‑specific | Low – complex configs; well‑known for tricky DR/offset behavior |
+| **Backup use‑case vs replication** | Purpose‑built backup & restore (PITR + offsets + rollback) | Purpose‑built backup & restore but filesystem‑centric | Purpose‑built commercial backup/restore platform | Replication/DR between clusters, not long‑term backup | Replication/DR between clusters, not long‑term backup |
+| **Licensing & availability** | Open source (MIT); focused on OSS‑friendly infra teams | Open source (MIT), but unmaintained/low activity | Closed‑source commercial product / SaaS | Commercial, tied to Confluent license & stack | Apache 2.0, but part of broader Kafka ecosystem, not a standalone backup tool |
 
-| Feature | kafka-backup | Kannika | Confluent Replicator | MirrorMaker 2 |
-|---------|--------------|---------|---------------------|---------------|
-| Point-in-time recovery | ✅ Millisecond precision | ❓ Unknown | ❌ | ❌ |
-| Cloud storage backup | ✅ S3/Azure/GCS | ✅ Multi-cloud | ❌ | ❌ |
-| Consumer offset recovery | ✅ Multiple strategies | ✅ | ⚠️ Limited | ⚠️ Limited |
-| No Kafka Connect dependency | ✅ | ✅ | ❌ | ❌ |
-| Single binary | ✅ | ✅ | ❌ | ❌ |
-| Open source | ✅ MIT | ❌ Commercial | ❌ Commercial | ✅ Apache 2.0 |
-| Actively maintained | ✅ | ✅ | ✅ | ✅ |
+**OSO Kafka Backup is the only option that combines millisecond‑precision PITR, cloud‑native cold backups, and automated consumer offset recovery in a single, OSS‑friendly binary.**
+
+Competing tools either:
+- Only do filesystem backups
+- Are commercial platforms you have to buy and operate
+- Are replication tools that don't give you true, air‑gapped backups
+
+This makes OSO Kafka Backup the highest‑leverage choice for teams that need real Kafka disaster recovery without adopting a whole new proprietary platform.
 
 ## When NOT to use kafka-backup
 
