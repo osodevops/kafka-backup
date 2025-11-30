@@ -339,7 +339,8 @@ Need help resolving operational issues or planning a failover strategy? Our team
 
 We welcome contributions of all kinds!
 
-- **Report Issues:** Found a bug or have a feature request? Open an [issue on GitHub](https://github.com/osodevops/kafka-backup/issues).
+- **Report Bugs:** Found a bug? Open an [issue on GitHub](https://github.com/osodevops/kafka-backup/issues).
+- **Suggest Features:** Have an idea? [Request a feature](https://github.com/osodevops/kafka-backup/issues/new?template=feature.yml).
 - **Contribute Code:** Check out our [good first issues](https://github.com/osodevops/kafka-backup/labels/good%20first%20issue) for beginner-friendly tasks.
 - **Improve Docs:** Help us improve the documentation by submitting pull requests.
 
