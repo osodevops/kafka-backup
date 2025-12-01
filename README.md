@@ -92,6 +92,26 @@ cargo build --release
 
 Binary location: `target/release/kafka-backup`
 
+## Try It Yourself
+
+Want to see kafka-backup in action? Check out our **[Demo Repository](https://github.com/osodevops/kafka-backup-demos)** with ready-to-run examples:
+
+```bash
+git clone https://github.com/osodevops/kafka-backup-demos
+cd kafka-backup-demos
+docker compose up -d
+cd cli/backup-basic && ./demo.sh
+```
+
+**Available demos:**
+- **Backup & Restore** — Full backup/restore cycle with S3/MinIO
+- **Point-in-Time Recovery** — Restore to any millisecond with rollback safety
+- **Large Messages** — Handle 1-10MB payloads with compression comparisons
+- **Offset Management** — Consumer group offset snapshots and resets
+- **Kafka Streams** — PITR with stateful stream processing apps
+- **Spring Boot** — Microservice integration patterns
+- **Benchmarks** — Throughput, latency, and scaling tests
+
 ## Quick Start
 
 ### Backup
