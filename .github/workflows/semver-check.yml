@@ -1,0 +1,27 @@
+name: Semver Check
+
+on:
+  pull_request:
+    paths:
+      - 'crates/kafka-backup-core/src/**'
+      - 'crates/kafka-backup-core/Cargo.toml'
+
+jobs:
+  semver-check:
+    name: Detect Breaking Changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for baseline comparison
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo-semver-checks
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: kafka-backup-core
+          version-tag-prefix: v
+        # Note: For first publish, this will pass as there's no crates.io baseline
+        # After first publish, it will compare against the published crates.io version
