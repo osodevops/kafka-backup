@@ -178,15 +178,15 @@ kafka-backup restore --config restore.yaml
 
 ## Why OSO Kafka Backup?
 
-| Feature | OSO Kafka Backup | itadventurer/kafka-backup | Kannika Armory | Confluent Replicator | MirrorMaker 2 | Lenses K2K |
-|---------|------------------|---------------------------|----------------|---------------------|---------------|------------|
-| **PITR** | Yes (ms precision) | No | Yes (proprietary UI) | No | No | No |
-| **Cloud storage** | S3, Azure, GCS | Filesystem only | K8s PV / enterprise | No | No | No (separate connectors) |
-| **Offset recovery** | Yes (multi-strategy) | Partial | Yes | Limited | Limited | Limited |
-| **Air-gapped DR** | Yes | Partial | Yes (commercial) | No | No | No |
-| **Platform dependency** | None (single binary) | Kafka Connect | K8s platform | Confluent Platform | MM2 framework | Lenses platform |
-| **Operational simplicity** | High | Medium | Medium/Low | Medium | Low | Medium |
-| **License** | MIT (OSS) | MIT (unmaintained) | Commercial | Commercial | Apache 2.0 | Commercial |
+| Feature | OSO Kafka Backup | itadventurer/kafka-backup | Kannika Armory                    | Confluent Replicator | MirrorMaker 2 | Lenses K2K |
+|---------|------------------|---------------------------|-----------------------------------|---------------------|---------------|------------|
+| **PITR** | Yes (ms precision) | No | Yes (ms precision)                | No | No | No |
+| **Cloud storage** | S3, Azure, GCS | Filesystem only | S3, Azure, GCS & K8s PV (any CSI) | No | No | No (separate connectors) |
+| **Offset recovery** | Yes (multi-strategy) | Partial | Yes                               | Limited | Limited | Limited |
+| **Air-gapped DR** | Yes | Partial | Yes (commercial)                  | No | No | No |
+| **Platform dependency** | None (single binary) | Kafka Connect | K8s platform                      | Confluent Platform | MM2 framework | Lenses platform |
+| **Operational simplicity** | High | Medium | Medium/Low                        | Medium | Low | Medium |
+| **License** | MIT (OSS) | MIT (unmaintained) | Commercial                        | Commercial | Apache 2.0 | Commercial |
 
 > 📖 **[See the full comparison guide](docs/comparison.md)** for detailed analysis of each solution.
 
