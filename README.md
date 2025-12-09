@@ -207,6 +207,8 @@ This makes OSO Kafka Backup the highest‑leverage choice for teams that need re
 
 ## Documentation
 
+**Full documentation is available at [osodevops.github.io/kafka-backup-docs](https://osodevops.github.io/kafka-backup-docs/)**
+
 | Document | Description |
 |----------|-------------|
 | [Quick Start](docs/quickstart.md) | Get started in 5 minutes |
