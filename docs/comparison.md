@@ -19,25 +19,25 @@ This document provides a detailed comparison of OSO Kafka Backup against other K
 
 ### Point-in-Time Restore (PITR)
 
-| Solution | Support | Details |
-|----------|---------|---------|
-| **OSO Kafka Backup** | ✅ Yes | Millisecond-precision time window restore per topic/partition. Specify exact start and end timestamps to restore only the data you need. |
-| **itadventurer/kafka-backup** | ❌ No | Restores full topic from backup directory only. No ability to filter by timestamp or restore partial data. |
-| **Kannika Armory** | ✅ Yes | Point-in-time restore with filters, but requires proprietary SaaS/UI to operate. |
-| **Confluent Replicator** | ❌ No | Continuous replication only. Failover limited to "latest" or "earliest" offsets. |
-| **MirrorMaker 2** | ❌ No | DR via replication only. No explicit PITR to an arbitrary timestamp. |
-| **Lenses K2K** | ❌ No | Designed for continuous cluster-to-cluster replication. No explicit PITR to an arbitrary timestamp. |
+| Solution | Support | Details                                                                                                                                                                                                            |
+|----------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **OSO Kafka Backup** | ✅ Yes | Millisecond-precision time window restore per topic/partition. Specify exact start and end timestamps to restore only the data you need.                                                                           |
+| **itadventurer/kafka-backup** | ❌ No | Restores full topic from backup directory only. No ability to filter by timestamp or restore partial data.                                                                                                         |
+| **Kannika Armory** | ✅ Yes | Millisecond-precision time window restore per topic/partition. Specify exact start and end timestamps to restore only the data you need. Configurable with UI, API and K8s CRD's. |
+| **Confluent Replicator** | ❌ No | Continuous replication only. Failover limited to "latest" or "earliest" offsets.                                                                                                                                   |
+| **MirrorMaker 2** | ❌ No | DR via replication only. No explicit PITR to an arbitrary timestamp.                                                                                                                                               |
+| **Lenses K2K** | ❌ No | Designed for continuous cluster-to-cluster replication. No explicit PITR to an arbitrary timestamp.                                                                                                                |
 
 ### Cloud Storage Backup
 
-| Solution | Support | Details |
-|----------|---------|---------|
-| **OSO Kafka Backup** | ✅ Yes | S3, Azure Blob Storage, and GCS as primary backup targets. Native cloud integration. |
+| Solution | Support | Details                                                                                                                       |
+|----------|--------|-------------------------------------------------------------------------------------------------------------------------------|
+| **OSO Kafka Backup** | ✅ Yes | S3, Azure Blob Storage, and GCS as primary backup targets. Native cloud integration.                                          |
 | **itadventurer/kafka-backup** | ❌ No | Filesystem only (local volumes). No direct object storage support. Cloud backup requires external tooling to sync filesystem. |
-| **Kannika Armory** | ⚠️ Partial | Pluggable storage backends but typically uses K8s Persistent Volumes or enterprise storage. Not primarily cloud-native. |
-| **Confluent Replicator** | ❌ No | No direct Kafka-to-object-storage backup. Focused entirely on cluster-to-cluster replication. |
-| **MirrorMaker 2** | ❌ No | Replicates topics between Kafka clusters only. Not designed for backup storage. |
-| **Lenses K2K** | ❌ No | Targets another Kafka cluster. Backup to S3 is via separate Stream Reactor connectors, not K2K itself. |
+| **Kannika Armory** | ✅ Yes | Pluggable storage backends. Native support for S3, Azure Blob Storage, GCS and Kubernetes CSI driver backed disks.            |
+| **Confluent Replicator** | ❌ No | No direct Kafka-to-object-storage backup. Focused entirely on cluster-to-cluster replication.                                 |
+| **MirrorMaker 2** | ❌ No | Replicates topics between Kafka clusters only. Not designed for backup storage.                                               |
+| **Lenses K2K** | ❌ No | Targets another Kafka cluster. Backup to S3 is via separate Stream Reactor connectors, not K2K itself.                        |
 
 ### Consumer Offset Recovery
 
