@@ -175,6 +175,7 @@ pub struct TopicSelection {
     since = "0.2.0",
     note = "Use crate::storage::StorageBackendConfig instead, which supports Azure, GCS, and more backends"
 )]
+#[allow(deprecated)] // Allow using deprecated StorageBackendType within this deprecated struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Storage backend type
