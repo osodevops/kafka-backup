@@ -43,6 +43,11 @@ pub enum StorageBackendConfig {
     },
 
     /// Azure Blob Storage
+    ///
+    /// Supports multiple authentication methods:
+    /// 1. Storage Account Key (explicit `account_key`)
+    /// 2. Workload Identity (for AKS deployments)
+    /// 3. DefaultAzureCredential chain (environment, managed identity, CLI)
     #[serde(rename = "azure")]
     Azure {
         /// Azure storage account name
@@ -55,6 +60,26 @@ pub enum StorageBackendConfig {
         /// Key prefix for all operations
         #[serde(default)]
         prefix: Option<String>,
+        /// Custom endpoint URL for sovereign clouds (Azure Government, Azure China)
+        /// Example: "https://mystorageaccount.blob.core.usgovcloudapi.net"
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Enable Workload Identity authentication (for AKS)
+        /// When true, uses AZURE_FEDERATED_TOKEN_FILE, AZURE_CLIENT_ID, AZURE_TENANT_ID
+        #[serde(default)]
+        use_workload_identity: Option<bool>,
+        /// Azure AD client ID (for Workload Identity or service principal)
+        #[serde(default)]
+        client_id: Option<String>,
+        /// Azure AD tenant ID (for Workload Identity or service principal)
+        #[serde(default)]
+        tenant_id: Option<String>,
+        /// Client secret (for service principal authentication)
+        #[serde(default)]
+        client_secret: Option<String>,
+        /// SAS token for shared access signature authentication
+        #[serde(default)]
+        sas_token: Option<String>,
     },
 
     /// Google Cloud Storage
@@ -128,11 +153,26 @@ impl StorageBackendConfig {
                 let account_name = host.split('.').next().unwrap_or(host).to_string();
                 let container_name = parsed.path().trim_start_matches('/').to_string();
 
+                // Check for Workload Identity environment
+                let has_workload_identity = std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_ok();
+
                 Ok(Self::Azure {
                     account_name,
                     container_name,
-                    account_key: std::env::var("AZURE_STORAGE_KEY").ok(),
+                    account_key: std::env::var("AZURE_STORAGE_KEY")
+                        .ok()
+                        .or_else(|| std::env::var("AZURE_STORAGE_ACCOUNT_KEY").ok()),
                     prefix: None,
+                    endpoint: None,
+                    use_workload_identity: if has_workload_identity {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    client_id: std::env::var("AZURE_CLIENT_ID").ok(),
+                    tenant_id: std::env::var("AZURE_TENANT_ID").ok(),
+                    client_secret: std::env::var("AZURE_CLIENT_SECRET").ok(),
+                    sas_token: std::env::var("AZURE_STORAGE_SAS_TOKEN").ok(),
                 })
             }
             "gcs" | "gs" => {

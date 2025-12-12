@@ -285,7 +285,8 @@ pub struct Phase1ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Mode, StorageBackendType, StorageConfig};
+    use crate::config::Mode;
+    use crate::storage::StorageBackendConfig;
 
     fn test_config() -> Config {
         Config {
@@ -293,15 +294,8 @@ mod tests {
             backup_id: "test-backup".to_string(),
             source: None,
             target: None,
-            storage: StorageConfig {
-                backend: StorageBackendType::Filesystem,
-                path: Some("/tmp/test".into()),
-                endpoint: None,
-                bucket: None,
-                access_key: None,
-                secret_key: None,
-                prefix: None,
-                region: None,
+            storage: StorageBackendConfig::Filesystem {
+                path: "/tmp/test".into(),
             },
             backup: None,
             restore: None,

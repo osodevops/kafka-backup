@@ -1,0 +1,85 @@
+# Example backup configuration for Azure Blob Storage
+# This configuration demonstrates backing up Kafka topics to Azure Blob Storage
+#
+# Authentication options (in order of precedence):
+# 1. account_key: Storage account access key
+# 2. sas_token: Shared Access Signature token
+# 3. client_secret + client_id + tenant_id: Service principal
+# 4. use_workload_identity: Azure Workload Identity (for AKS)
+# 5. DefaultAzureCredential: Environment, Managed Identity, Azure CLI
+
+mode: backup
+backup_id: azure-backup-001
+
+source:
+  bootstrap_servers:
+    - kafka-broker-1:9092
+    - kafka-broker-2:9092
+    - kafka-broker-3:9092
+  topics:
+    include:
+      - "orders-*"
+      - "payments-*"
+      - "inventory-*"
+    exclude:
+      - "*-dlq"
+      - "*-retry"
+  # Uncomment for secure Kafka clusters
+  # security:
+  #   security_protocol: SASL_SSL
+  #   sasl_mechanism: SCRAM-SHA-512
+  #   sasl_username: kafka-backup
+  #   sasl_password: ${KAFKA_PASSWORD}
+
+storage:
+  backend: azure
+  account_name: mystorageaccount
+  container_name: kafka-backups
+  prefix: production/
+
+  # Authentication - choose ONE method:
+
+  # Option 1: Storage account key (simplest, but less secure)
+  # account_key: ${AZURE_STORAGE_KEY}
+
+  # Option 2: SAS token (time-limited access)
+  # sas_token: "sv=2022-11-02&ss=b&srt=co&sp=rwdlacyx&se=2025-12-31..."
+
+  # Option 3: Service principal (for automation)
+  # client_id: "12345678-1234-1234-1234-123456789abc"
+  # tenant_id: "87654321-4321-4321-4321-cba987654321"
+  # client_secret: ${AZURE_CLIENT_SECRET}
+
+  # Option 4: Workload Identity (recommended for AKS)
+  # use_workload_identity: true
+  # client_id: "12345678-1234-1234-1234-123456789abc"  # Optional, can use env var
+  # tenant_id: "87654321-4321-4321-4321-cba987654321"  # Optional, can use env var
+
+  # Option 5: Sovereign clouds (Azure Government, China)
+  # endpoint: "https://mystorageaccount.blob.core.usgovcloudapi.net"
+
+backup:
+  # Compression settings
+  compression: zstd
+  compression_level: 3
+
+  # Segment settings (128MB segments, rotate every 60s)
+  segment_max_bytes: 134217728
+  segment_max_interval_ms: 60000
+
+  # Checkpoint settings
+  checkpoint_interval_secs: 5
+  sync_interval_secs: 30
+
+  # Include original offsets for DR scenarios
+  include_offset_headers: true
+  source_cluster_id: "prod-cluster-east"
+
+  # Run mode
+  continuous: false  # Set to true for continuous backup
+
+# Offset storage for resumable backups
+offset_storage:
+  backend: sqlite
+  db_path: "./azure-backup-offsets.db"
+  sync_interval_secs: 30

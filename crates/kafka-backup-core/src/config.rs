@@ -20,8 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub target: Option<KafkaConfig>,
 
-    /// Storage configuration
-    pub storage: StorageConfig,
+    /// Storage configuration (supports S3, Azure, GCS, Filesystem, Memory)
+    pub storage: crate::storage::StorageBackendConfig,
 
     /// Backup-specific options
     #[serde(default)]
@@ -167,7 +167,14 @@ pub struct TopicSelection {
     pub exclude: Vec<String>,
 }
 
-/// Storage backend configuration
+/// Legacy storage backend configuration
+///
+/// **Deprecated**: Use `StorageBackendConfig` from the `storage` module instead.
+/// This type is maintained for backward compatibility only.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use crate::storage::StorageBackendConfig instead, which supports Azure, GCS, and more backends"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Storage backend type
@@ -202,7 +209,13 @@ pub struct StorageConfig {
     pub region: Option<String>,
 }
 
-/// Storage backend type
+/// Legacy storage backend type enum
+///
+/// **Deprecated**: Use `StorageBackendConfig` from the `storage` module instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use crate::storage::StorageBackendConfig instead, which supports Azure, GCS, and more backends"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackendType {
@@ -456,23 +469,9 @@ impl Config {
             }
         }
 
-        // Validate storage config
-        match self.storage.backend {
-            StorageBackendType::Filesystem => {
-                if self.storage.path.is_none() {
-                    return Err(crate::Error::Config(
-                        "Storage path is required for filesystem backend".to_string(),
-                    ));
-                }
-            }
-            StorageBackendType::S3 => {
-                if self.storage.bucket.is_none() {
-                    return Err(crate::Error::Config(
-                        "Bucket is required for S3 backend".to_string(),
-                    ));
-                }
-            }
-        }
+        // Storage config validation is handled by StorageBackendConfig's typed enum
+        // Required fields are non-Optional in each variant, so invalid configs
+        // fail at deserialization time rather than runtime validation
 
         Ok(())
     }

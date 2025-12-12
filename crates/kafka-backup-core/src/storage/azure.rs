@@ -23,6 +23,18 @@ pub struct AzureConfig {
     pub account_key: Option<String>,
     /// Key prefix for all operations
     pub prefix: Option<String>,
+    /// Custom endpoint URL for sovereign clouds (Azure Government, Azure China)
+    pub endpoint: Option<String>,
+    /// Enable Workload Identity authentication (for AKS)
+    pub use_workload_identity: Option<bool>,
+    /// Azure AD client ID (for Workload Identity or service principal)
+    pub client_id: Option<String>,
+    /// Azure AD tenant ID (for Workload Identity or service principal)
+    pub tenant_id: Option<String>,
+    /// Client secret (for service principal authentication)
+    pub client_secret: Option<String>,
+    /// SAS token for shared access signature authentication
+    pub sas_token: Option<String>,
 }
 
 /// Azure Blob Storage backend
@@ -34,19 +46,70 @@ pub struct AzureBackend {
 impl AzureBackend {
     /// Create a new Azure Blob Storage backend
     ///
-    /// If `account_key` is not provided, the SDK will attempt to use
-    /// the DefaultAzureCredential chain which tries:
-    /// 1. Environment variables (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
-    /// 2. Managed Identity
-    /// 3. Azure CLI credentials
-    /// 4. Azure Developer CLI credentials
+    /// Authentication methods (in order of precedence):
+    /// 1. SAS token (`sas_token`)
+    /// 2. Storage account key (`account_key`)
+    /// 3. Service principal (`client_id` + `client_secret` + `tenant_id`)
+    /// 4. Workload Identity (`use_workload_identity` or AZURE_FEDERATED_TOKEN_FILE env var)
+    /// 5. DefaultAzureCredential chain (environment, managed identity, CLI)
     pub fn new(config: AzureConfig) -> Result<Self> {
         let mut builder = MicrosoftAzureBuilder::new()
             .with_account(&config.account_name)
             .with_container_name(&config.container_name);
 
-        if let Some(key) = &config.account_key {
+        // Custom endpoint for sovereign clouds (Azure Government, China, etc.)
+        if let Some(endpoint) = &config.endpoint {
+            builder = builder.with_endpoint(endpoint.clone());
+        }
+
+        // Authentication configuration (order matters for precedence)
+        if let Some(sas_token) = &config.sas_token {
+            // SAS token authentication - parse query string into key-value pairs
+            let pairs: Vec<(String, String)> = sas_token
+                .trim_start_matches('?')
+                .split('&')
+                .filter_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    match (parts.next(), parts.next()) {
+                        (Some(k), Some(v)) => Some((k.to_string(), v.to_string())),
+                        _ => None,
+                    }
+                })
+                .collect();
+            builder = builder.with_sas_authorization(pairs);
+            debug!("Azure authentication: SAS token");
+        } else if let Some(key) = &config.account_key {
+            // Storage account key authentication
             builder = builder.with_access_key(key);
+            debug!("Azure authentication: Account key");
+        } else if config.client_secret.is_some() {
+            // Service principal authentication
+            if let Some(client_id) = &config.client_id {
+                builder = builder.with_client_id(client_id);
+            }
+            if let Some(tenant_id) = &config.tenant_id {
+                builder = builder.with_tenant_id(tenant_id);
+            }
+            if let Some(client_secret) = &config.client_secret {
+                builder = builder.with_client_secret(client_secret);
+            }
+            debug!("Azure authentication: Service principal");
+        } else if config.use_workload_identity.unwrap_or(false)
+            || std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_ok()
+        {
+            // Workload Identity - object_store auto-detects from environment
+            // AZURE_FEDERATED_TOKEN_FILE, AZURE_CLIENT_ID, AZURE_TENANT_ID
+            if let Some(client_id) = &config.client_id {
+                builder = builder.with_client_id(client_id);
+            }
+            if let Some(tenant_id) = &config.tenant_id {
+                builder = builder.with_tenant_id(tenant_id);
+            }
+            builder = builder.with_use_azure_cli(false);
+            debug!("Azure authentication: Workload Identity");
+        } else {
+            // DefaultAzureCredential chain - environment, managed identity, CLI
+            debug!("Azure authentication: DefaultAzureCredential chain");
         }
 
         let store = builder.build().map_err(|e| {
@@ -57,8 +120,8 @@ impl AzureBackend {
         })?;
 
         info!(
-            "Created Azure backend for account: {}, container: {}, prefix: {:?}",
-            config.account_name, config.container_name, config.prefix
+            "Created Azure backend for account: {}, container: {}, prefix: {:?}, endpoint: {:?}",
+            config.account_name, config.container_name, config.prefix, config.endpoint
         );
 
         Ok(Self {
@@ -233,6 +296,12 @@ mod tests {
             container_name: "test-backups".to_string(),
             account_key: std::env::var("AZURE_STORAGE_KEY").ok(),
             prefix: Some("test".to_string()),
+            endpoint: None,
+            use_workload_identity: None,
+            client_id: None,
+            tenant_id: None,
+            client_secret: None,
+            sas_token: None,
         };
 
         let backend = AzureBackend::new(config).unwrap();

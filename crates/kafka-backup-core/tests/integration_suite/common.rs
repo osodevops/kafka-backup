@@ -14,10 +14,11 @@ use tokio::time::sleep;
 
 use kafka_backup_core::config::{
     BackupOptions, CompressionType, Config, KafkaConfig, Mode, RestoreOptions, SecurityConfig,
-    StorageBackendType, StorageConfig, TopicSelection,
+    TopicSelection,
 };
 use kafka_backup_core::kafka::KafkaClient;
 use kafka_backup_core::manifest::BackupRecord;
+use kafka_backup_core::storage::StorageBackendConfig;
 
 // ============================================================================
 // Kafka Test Cluster
@@ -116,16 +117,7 @@ pub fn create_backup_config(
             },
         }),
         target: None,
-        storage: StorageConfig {
-            backend: StorageBackendType::Filesystem,
-            path: Some(storage_path),
-            endpoint: None,
-            bucket: None,
-            access_key: None,
-            secret_key: None,
-            prefix: None,
-            region: None,
-        },
+        storage: StorageBackendConfig::Filesystem { path: storage_path },
         backup: Some(BackupOptions {
             segment_max_bytes: 1024 * 1024, // 1MB for testing
             segment_max_interval_ms: 10000,
@@ -156,16 +148,7 @@ pub fn create_restore_config(
                 exclude: vec![],
             },
         }),
-        storage: StorageConfig {
-            backend: StorageBackendType::Filesystem,
-            path: Some(storage_path),
-            endpoint: None,
-            bucket: None,
-            access_key: None,
-            secret_key: None,
-            prefix: None,
-            region: None,
-        },
+        storage: StorageBackendConfig::Filesystem { path: storage_path },
         backup: None,
         restore: Some(RestoreOptions::default()),
         offset_storage: None,
