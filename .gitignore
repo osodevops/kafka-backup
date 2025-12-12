@@ -26,3 +26,4 @@ config/prod-*.yaml
 
 # Logs
 *.log
+config/streamplus-nonprod-azure-test.yaml

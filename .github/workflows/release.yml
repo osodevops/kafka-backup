@@ -44,9 +44,54 @@ on:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # Run tests first - must pass before release proceeds
+  test:
+    name: Pre-release Tests
+    runs-on: ubuntu-latest
+    # Only run tests on actual tag pushes, not PRs (PRs have their own test workflow)
+    if: ${{ !github.event.pull_request }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-test-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --lib --all-features
+        env:
+          RUST_LOG: debug
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - test
+    # Run even if test was skipped (for PRs), but fail if test failed
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
