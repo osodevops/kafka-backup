@@ -72,12 +72,24 @@ pub fn create_backend_from_config(
             container_name,
             account_key,
             prefix,
+            endpoint,
+            use_workload_identity,
+            client_id,
+            tenant_id,
+            client_secret,
+            sas_token,
         } => {
             let azure_config = AzureConfig {
                 account_name: account_name.clone(),
                 container_name: container_name.clone(),
                 account_key: account_key.clone(),
                 prefix: prefix.clone(),
+                endpoint: endpoint.clone(),
+                use_workload_identity: *use_workload_identity,
+                client_id: client_id.clone(),
+                tenant_id: tenant_id.clone(),
+                client_secret: client_secret.clone(),
+                sas_token: sas_token.clone(),
             };
             Ok(Arc::new(AzureBackend::new(azure_config)?))
         }
@@ -103,11 +115,26 @@ pub fn create_backend_from_config(
     }
 }
 
-/// Create a storage backend from the legacy configuration.
+/// Create a storage backend from configuration.
 ///
-/// This function is maintained for backward compatibility with existing
-/// configuration files. For new code, prefer `create_backend_from_config`.
-pub fn create_backend(config: &crate::config::StorageConfig) -> Result<Arc<dyn StorageBackend>> {
+/// This is an alias for `create_backend_from_config` for convenience.
+/// Supports all backend types: S3, Azure, GCS, Filesystem, and Memory.
+pub fn create_backend(config: &StorageBackendConfig) -> Result<Arc<dyn StorageBackend>> {
+    create_backend_from_config(config)
+}
+
+/// Create a storage backend from legacy configuration.
+///
+/// **Deprecated**: Use `create_backend` or `create_backend_from_config` with
+/// `StorageBackendConfig` instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use create_backend() with StorageBackendConfig instead"
+)]
+#[allow(deprecated)]
+pub fn create_backend_legacy(
+    config: &crate::config::StorageConfig,
+) -> Result<Arc<dyn StorageBackend>> {
     match config.backend {
         crate::config::StorageBackendType::Filesystem => {
             let path = config

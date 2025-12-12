@@ -1,0 +1,72 @@
+# Example restore configuration for Azure Blob Storage
+# This configuration demonstrates restoring Kafka topics from Azure Blob Storage
+
+mode: restore
+backup_id: azure-backup-001
+
+target:
+  bootstrap_servers:
+    - kafka-dr-1:9092
+    - kafka-dr-2:9092
+    - kafka-dr-3:9092
+  # Uncomment for secure Kafka clusters
+  # security:
+  #   security_protocol: SASL_SSL
+  #   sasl_mechanism: SCRAM-SHA-512
+  #   sasl_username: kafka-restore
+  #   sasl_password: ${KAFKA_PASSWORD}
+
+storage:
+  backend: azure
+  account_name: mystorageaccount
+  container_name: kafka-backups
+  prefix: production/
+
+  # Authentication - same options as backup config
+  # use_workload_identity: true
+
+restore:
+  # Point-in-time recovery (PITR) - optional
+  # Uncomment to restore a specific time window (epoch milliseconds)
+  # time_window_start: 1736899200000
+  # time_window_end: 1736985600000
+
+  # Topic mapping (restore to different topic names)
+  topic_mapping:
+    orders-events: orders-events-restored
+    payments-events: payments-events-restored
+
+  # Partition mapping (optional, for cross-cluster scenarios)
+  # partition_mapping:
+  #   0: 0
+  #   1: 1
+
+  # Consumer group offset handling
+  consumer_group_strategy: skip  # skip | header-based | timestamp-based
+
+  # Performance settings
+  max_concurrent_partitions: 4
+  produce_batch_size: 1000
+
+  # Rate limiting (optional)
+  # rate_limit_records_per_sec: 10000
+  # rate_limit_bytes_per_sec: 104857600  # 100 MB/s
+
+  # Resumable restore checkpoint
+  checkpoint_state: "./azure-restore-checkpoint.json"
+  checkpoint_interval_secs: 60
+
+  # Dry run mode (validate without writing)
+  dry_run: false
+
+  # Consumer offset reset (advanced)
+  # reset_consumer_offsets: true
+  # consumer_groups:
+  #   - my-consumer-group
+  # offset_report: "./offset-mapping-report.json"
+
+# Offset storage for resumable restores
+offset_storage:
+  backend: sqlite
+  db_path: "./azure-restore-offsets.db"
+  sync_interval_secs: 30
