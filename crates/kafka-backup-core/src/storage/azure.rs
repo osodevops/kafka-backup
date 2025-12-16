@@ -97,16 +97,28 @@ impl AzureBackend {
         } else if config.use_workload_identity.unwrap_or(false)
             || std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_ok()
         {
-            // Workload Identity - let object_store auto-detect from environment
-            // AZURE_FEDERATED_TOKEN_FILE, AZURE_CLIENT_ID, AZURE_TENANT_ID
-            // IMPORTANT: Do NOT call with_client_id() here - that method is for MSI only,
-            // not Workload Identity. The crate reads from env vars automatically.
+            // Workload Identity - explicitly configure federated token authentication
+            // Read from environment variables set by Azure Workload Identity webhook
+            let client_id = std::env::var("AZURE_CLIENT_ID").ok();
+            let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
+            let token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok();
+
+            if let Some(ref file) = token_file {
+                builder = builder.with_federated_token_file(file);
+            }
+            if let Some(ref id) = client_id {
+                builder = builder.with_client_id(id);
+            }
+            if let Some(ref id) = tenant_id {
+                builder = builder.with_tenant_id(id);
+            }
             builder = builder.with_use_azure_cli(false);
+
             debug!(
-                "Azure authentication: Workload Identity (AZURE_CLIENT_ID={}, AZURE_TENANT_ID={}, token_file={})",
-                std::env::var("AZURE_CLIENT_ID").unwrap_or_else(|_| "not set".to_string()),
-                std::env::var("AZURE_TENANT_ID").unwrap_or_else(|_| "not set".to_string()),
-                std::env::var("AZURE_FEDERATED_TOKEN_FILE").unwrap_or_else(|_| "not set".to_string())
+                "Azure authentication: Workload Identity (client_id={}, tenant_id={}, token_file={})",
+                client_id.as_deref().unwrap_or("not set"),
+                tenant_id.as_deref().unwrap_or("not set"),
+                token_file.as_deref().unwrap_or("not set")
             );
         } else {
             // DefaultAzureCredential chain - environment, managed identity, CLI
