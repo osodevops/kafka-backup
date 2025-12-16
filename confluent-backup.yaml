@@ -1,0 +1,34 @@
+# Confluent Cloud Continuous Backup Configuration
+# StreamPlus UAT Cluster
+
+mode: backup
+backup_id: "streamplus-backup-001"
+
+source:
+  bootstrap_servers:
+    - lkc-7762x1.westeurope.azure.private.confluent.cloud:9092
+  topics:
+    include:
+      - "*"                    # All topics
+    exclude:
+      - "_*"                   # Exclude internal topics
+      - "__*"                  # Exclude Kafka internal topics
+
+  # Confluent Cloud authentication
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: PLAIN
+    sasl_username: "NIDHH7PD5B37PFX2"
+    sasl_password: "r0HDx3ZAQszRXLF2jXqBM01ju9PXZ8jbkk8IzopsmTI8wwHIDH4K1WVlkvChLWuU"
+
+storage:
+  backend: filesystem
+  path: ./backups/streamplus
+
+backup:
+  compression: zstd
+  continuous: true                    # Keep running and capture new data
+  checkpoint_interval_secs: 30        # Save progress every 30 seconds
+  max_concurrent_partitions: 4
+  segment_max_records: 100000
+  segment_max_bytes: 104857600        # 100MB per segment
