@@ -97,16 +97,17 @@ impl AzureBackend {
         } else if config.use_workload_identity.unwrap_or(false)
             || std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_ok()
         {
-            // Workload Identity - object_store auto-detects from environment
+            // Workload Identity - let object_store auto-detect from environment
             // AZURE_FEDERATED_TOKEN_FILE, AZURE_CLIENT_ID, AZURE_TENANT_ID
-            if let Some(client_id) = &config.client_id {
-                builder = builder.with_client_id(client_id);
-            }
-            if let Some(tenant_id) = &config.tenant_id {
-                builder = builder.with_tenant_id(tenant_id);
-            }
+            // IMPORTANT: Do NOT call with_client_id() here - that method is for MSI only,
+            // not Workload Identity. The crate reads from env vars automatically.
             builder = builder.with_use_azure_cli(false);
-            debug!("Azure authentication: Workload Identity");
+            debug!(
+                "Azure authentication: Workload Identity (AZURE_CLIENT_ID={}, AZURE_TENANT_ID={}, token_file={})",
+                std::env::var("AZURE_CLIENT_ID").unwrap_or_else(|_| "not set".to_string()),
+                std::env::var("AZURE_TENANT_ID").unwrap_or_else(|_| "not set".to_string()),
+                std::env::var("AZURE_FEDERATED_TOKEN_FILE").unwrap_or_else(|_| "not set".to_string())
+            );
         } else {
             // DefaultAzureCredential chain - environment, managed identity, CLI
             debug!("Azure authentication: DefaultAzureCredential chain");
