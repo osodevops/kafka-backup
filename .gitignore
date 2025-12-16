@@ -6,6 +6,11 @@ Cargo.lock
 # Backup data
 /backups/
 *.db
+*.db-shm
+*.db-wal
+
+# Performance test properties with credentials
+perf-test-*.properties
 
 # Config files with credentials (keep examples, ignore real configs)
 config/confluent-*.yaml
