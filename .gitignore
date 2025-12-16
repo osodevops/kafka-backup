@@ -15,7 +15,12 @@ perf-test-*.properties
 # Config files with credentials (keep examples, ignore real configs)
 config/confluent-*.yaml
 config/prod-*.yaml
+config/streamplus-*.yaml
 !config/example-*.yaml
+
+# Root-level config files with credentials
+confluent-*.yaml
+streamplus-*.yaml
 
 # IDE
 .idea/
@@ -31,4 +36,3 @@ config/prod-*.yaml
 
 # Logs
 *.log
-config/streamplus-nonprod-azure-test.yaml
