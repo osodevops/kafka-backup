@@ -1,5 +1,6 @@
 //! Kafka protocol client implementation.
 
+mod admin;
 mod client;
 pub mod consumer_groups;
 mod fetch;
@@ -7,6 +8,7 @@ mod metadata;
 mod partition_router;
 mod produce;
 
+pub use admin::{create_topics, CreateTopicResult, TopicToCreate};
 pub use client::KafkaClient;
 pub use consumer_groups::{
     commit_offsets, describe_groups, fetch_offsets, list_groups, offsets_for_times,

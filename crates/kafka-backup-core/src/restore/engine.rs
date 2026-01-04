@@ -10,7 +10,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::{decompress, detect_from_extension};
 use crate::config::{Config, Mode, OffsetStrategy, RestoreOptions};
 use crate::health::HealthCheck;
-use crate::kafka::PartitionLeaderRouter;
+use crate::kafka::{PartitionLeaderRouter, TopicToCreate};
 use crate::manifest::{
     BackupManifest, BackupRecord, DryRunPartitionReport, DryRunReport, DryRunTopicReport,
     OffsetMapping, PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport,
@@ -517,6 +517,12 @@ impl RestoreEngine {
             });
         }
 
+        // Auto-create topics if configured
+        if restore_options.create_topics {
+            self.ensure_topics_exist(&topics_to_restore, &restore_options)
+                .await?;
+        }
+
         info!("Restoring {} topics", topics_to_restore.len());
 
         let mut shutdown_rx = self.shutdown_receiver();
@@ -796,6 +802,150 @@ impl RestoreEngine {
         let json = serde_json::to_string_pretty(&*mapping)?;
         tokio::fs::write(path, json).await?;
         info!("Offset mapping report written to {:?}", path);
+        Ok(())
+    }
+
+    /// Ensure all target topics exist, creating them if necessary
+    async fn ensure_topics_exist(
+        &self,
+        topics_to_restore: &[TopicBackup],
+        options: &RestoreOptions,
+    ) -> Result<()> {
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+
+        // Collect target topic names with their required partition counts
+        let mut target_topics: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+
+        for topic_backup in topics_to_restore {
+            let target_name = options
+                .topic_mapping
+                .get(&topic_backup.name)
+                .cloned()
+                .unwrap_or_else(|| topic_backup.name.clone());
+
+            // Calculate partition count (max partition_id + 1)
+            let partition_count = topic_backup
+                .partitions
+                .iter()
+                .map(|p| p.partition_id)
+                .max()
+                .map(|max_id| max_id + 1)
+                .unwrap_or(1);
+
+            target_topics
+                .entry(target_name)
+                .and_modify(|count| *count = (*count).max(partition_count))
+                .or_insert(partition_count);
+        }
+
+        // Check which topics already exist
+        let existing_topics = router.fetch_metadata(None).await?;
+        let existing_names: HashSet<String> =
+            existing_topics.iter().map(|t| t.name.clone()).collect();
+
+        // Find missing topics
+        let missing_topics: Vec<TopicToCreate> = target_topics
+            .iter()
+            .filter(|(name, _)| !existing_names.contains(*name))
+            .map(|(name, &partition_count)| {
+                let replication_factor = options.default_replication_factor.unwrap_or(-1);
+                TopicToCreate {
+                    name: name.clone(),
+                    num_partitions: partition_count,
+                    replication_factor,
+                }
+            })
+            .collect();
+
+        if missing_topics.is_empty() {
+            debug!("All target topics already exist");
+            return Ok(());
+        }
+
+        info!(
+            "Creating {} missing topics: {:?}",
+            missing_topics.len(),
+            missing_topics.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+
+        // Create the missing topics
+        let results = router.create_topics(missing_topics.clone(), 60000).await?;
+
+        // Log results
+        for result in &results {
+            if result.is_success() {
+                info!("Created topic '{}' successfully", result.name);
+            } else if result.already_exists() {
+                debug!("Topic '{}' already exists (race condition)", result.name);
+            }
+        }
+
+        // Wait for topic metadata to propagate
+        self.wait_for_topics_ready(&router, &missing_topics).await?;
+
+        // Refresh router metadata to pick up new topics
+        router.refresh_metadata().await?;
+        info!("Refreshed metadata after topic creation");
+
+        Ok(())
+    }
+
+    /// Wait for newly created topics to be ready (partitions available)
+    async fn wait_for_topics_ready(
+        &self,
+        router: &Arc<PartitionLeaderRouter>,
+        topics: &[TopicToCreate],
+    ) -> Result<()> {
+        let max_retries = 30; // 30 seconds max wait
+        let retry_delay = Duration::from_secs(1);
+
+        for topic in topics {
+            let mut ready = false;
+            for attempt in 1..=max_retries {
+                match router.get_topic_metadata(&topic.name).await {
+                    Ok(metadata) => {
+                        if metadata.partitions.len() >= topic.num_partitions as usize {
+                            debug!(
+                                "Topic '{}' is ready with {} partitions",
+                                topic.name,
+                                metadata.partitions.len()
+                            );
+                            ready = true;
+                            break;
+                        }
+                        debug!(
+                            "Topic '{}' has {} partitions, waiting for {} (attempt {}/{})",
+                            topic.name,
+                            metadata.partitions.len(),
+                            topic.num_partitions,
+                            attempt,
+                            max_retries
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Topic '{}' not yet available: {} (attempt {}/{})",
+                            topic.name, e, attempt, max_retries
+                        );
+                    }
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+
+            if !ready {
+                return Err(Error::Kafka(crate::error::KafkaError::Timeout(format!(
+                    "Timeout waiting for topic '{}' to be ready",
+                    topic.name
+                ))));
+            }
+        }
+
         Ok(())
     }
 }

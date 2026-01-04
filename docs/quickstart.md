@@ -152,6 +152,13 @@ restore:
   include_original_offset_header: true
 ```
 
+> **Tip:** If restoring to a new cluster where topics don't exist, add `create_topics: true` to auto-create them:
+> ```yaml
+> restore:
+>   create_topics: true
+>   default_replication_factor: 3  # optional, defaults to broker default
+> ```
+
 ### Step 2: Validate Before Restoring (Recommended)
 
 ```bash

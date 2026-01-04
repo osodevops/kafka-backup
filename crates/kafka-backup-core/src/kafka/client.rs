@@ -332,6 +332,7 @@ impl KafkaClient {
             ApiKey::SaslAuthenticate => 2,
             ApiKey::ApiVersions => 3,
             ApiKey::ListOffsets => 5,
+            ApiKey::CreateTopics => 5, // v5 supported since Kafka 2.4
             _ => 0,
         }
     }
@@ -374,6 +375,15 @@ impl KafkaClient {
         records: Vec<crate::manifest::BackupRecord>,
     ) -> Result<ProduceResponse> {
         super::produce::produce(self, topic, partition, records).await
+    }
+
+    /// Create topics in the Kafka cluster
+    pub async fn create_topics(
+        &self,
+        topics: Vec<super::TopicToCreate>,
+        timeout_ms: i32,
+    ) -> Result<Vec<super::CreateTopicResult>> {
+        super::admin::create_topics(self, topics, timeout_ms).await
     }
 
     /// Get cached broker metadata

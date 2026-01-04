@@ -431,6 +431,17 @@ pub struct RestoreOptions {
     /// Output file for offset mapping report
     #[serde(default)]
     pub offset_report: Option<std::path::PathBuf>,
+
+    /// Automatically create missing topics before restore
+    /// Default: false (safe default - won't create topics unexpectedly)
+    #[serde(default)]
+    pub create_topics: bool,
+
+    /// Replication factor for auto-created topics
+    /// Default: None (use broker default, typically 1)
+    /// Set to -1 to explicitly use broker default
+    #[serde(default)]
+    pub default_replication_factor: Option<i16>,
 }
 
 fn default_max_concurrent_partitions() -> usize {

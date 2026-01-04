@@ -395,6 +395,20 @@ impl PartitionLeaderRouter {
         self.bootstrap_client.fetch_metadata(topics).await
     }
 
+    /// Create topics in the Kafka cluster.
+    ///
+    /// This sends the CreateTopics request to any broker (the broker will
+    /// route to the controller internally).
+    pub async fn create_topics(
+        &self,
+        topics: Vec<super::TopicToCreate>,
+        timeout_ms: i32,
+    ) -> Result<Vec<super::CreateTopicResult>> {
+        self.bootstrap_client
+            .create_topics(topics, timeout_ms)
+            .await
+    }
+
     /// Get metadata for a specific topic.
     pub async fn get_topic_metadata(&self, topic: &str) -> Result<TopicMetadata> {
         self.bootstrap_client.get_topic_metadata(topic).await

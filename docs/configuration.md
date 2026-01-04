@@ -411,6 +411,35 @@ restore:
   checkpoint_interval_secs: 30
 ```
 
+### Topic Auto-Creation
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `create_topics` | bool | No | `false` | Auto-create missing topics before restore |
+| `default_replication_factor` | int | No | `-1` | Replication factor for created topics (-1 = broker default) |
+
+When `create_topics` is enabled:
+- Missing target topics are created automatically before restore begins
+- Partition count is derived from the backup manifest
+- Replication factor can be specified or left to broker default
+- The engine waits for topic metadata to propagate before producing
+
+```yaml
+restore:
+  # Enable auto-creation of missing topics
+  create_topics: true
+
+  # Use replication factor of 3 for created topics
+  default_replication_factor: 3
+
+  # Topic mapping with auto-creation
+  topic_mapping:
+    orders: orders-restored      # Will be created if missing
+    payments: payments-restored  # Will be created if missing
+```
+
+> **Note:** The number of partitions for auto-created topics is determined from the backup manifest. If the source topic had 6 partitions, the target topic will be created with 6 partitions.
+
 ### Complete Restore Example
 
 ```yaml
@@ -445,7 +474,9 @@ restore:
     - 0
     - 1
 
-  # Topic remapping
+  # Topic remapping (with auto-creation)
+  create_topics: true
+  default_replication_factor: 3
   topic_mapping:
     orders: orders-recovered
     payments: payments-recovered

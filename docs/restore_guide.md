@@ -11,13 +11,14 @@ A comprehensive guide to restoring Kafka topics from backups with full control o
 3. [Configuration Reference](#configuration-reference)
 4. [Point-in-Time Restore](#point-in-time-restore)
 5. [Topic and Partition Filtering](#topic-and-partition-filtering)
-6. [Consumer Offset Management](#consumer-offset-management)
-7. [Resumable Restores](#resumable-restores)
-8. [Dry-Run Validation](#dry-run-validation)
-9. [CLI Commands](#cli-commands)
-10. [Use Cases](#use-cases)
-11. [Best Practices](#best-practices)
-12. [Troubleshooting](#troubleshooting)
+6. [Topic Auto-Creation](#topic-auto-creation)
+7. [Consumer Offset Management](#consumer-offset-management)
+8. [Resumable Restores](#resumable-restores)
+9. [Dry-Run Validation](#dry-run-validation)
+10. [CLI Commands](#cli-commands)
+11. [Use Cases](#use-cases)
+12. [Best Practices](#best-practices)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -377,6 +378,96 @@ restore:
     orders: orders-recovered
     payments: payments-backup
     events: events-clone
+```
+
+---
+
+## Topic Auto-Creation
+
+When restoring to a new cluster or with topic remapping, target topics may not exist. The `create_topics` option automatically creates missing topics before restore begins.
+
+### Configuration
+
+```yaml
+restore:
+  # Enable auto-creation of missing topics
+  create_topics: true
+
+  # Replication factor for created topics (optional)
+  # -1 = use broker default
+  default_replication_factor: 3
+
+  # Topics will be created with names from topic_mapping
+  topic_mapping:
+    orders: orders-restored
+    payments: payments-restored
+```
+
+### How It Works
+
+1. **Topic Discovery**: Before restore starts, the engine identifies all target topics
+2. **Existence Check**: Fetches cluster metadata to find existing topics
+3. **Creation**: Missing topics are created via Kafka's CreateTopics API
+4. **Partition Count**: Derived from the backup manifest (matches source topic)
+5. **Metadata Propagation**: Waits for topic metadata to propagate before producing
+6. **Restore Proceeds**: Normal restore flow continues once topics are ready
+
+### Partition Count
+
+The number of partitions for auto-created topics is determined from the backup:
+
+| Source Topic | Partitions in Backup | Created Topic |
+|--------------|---------------------|---------------|
+| `orders` | 6 | `orders-restored` with 6 partitions |
+| `payments` | 3 | `payments-restored` with 3 partitions |
+
+### Replication Factor
+
+The replication factor can be configured:
+
+| Setting | Behavior |
+|---------|----------|
+| Not specified | Uses broker default (`-1`) |
+| `-1` | Explicitly use broker default |
+| `1` | Single replica (development) |
+| `3` | Three replicas (production) |
+
+### Error Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Topic already exists | Skipped silently (no error) |
+| Creation fails | Error with details, restore aborted |
+| Insufficient permissions | Clear error about required ACLs |
+| Metadata timeout | Retry with backoff, fail after 30s |
+
+### Example: Disaster Recovery to New Cluster
+
+```yaml
+mode: restore
+backup_id: "production-backup-2025-01-15"
+
+target:
+  bootstrap_servers:
+    - dr-cluster.example.com:9092
+  topics:
+    include:
+      - "*"
+
+storage:
+  backend: s3
+  bucket: kafka-backups
+  region: us-east-1
+
+restore:
+  # Create all topics in the new cluster
+  create_topics: true
+  default_replication_factor: 3
+
+  # Optional: rename to indicate DR copy
+  topic_mapping:
+    orders: orders-dr
+    payments: payments-dr
 ```
 
 ---
