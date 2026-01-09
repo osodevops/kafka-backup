@@ -55,6 +55,7 @@ pub enum Error {
 
 /// Kafka-specific errors
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum KafkaError {
     /// Connection failed
     #[error("Failed to connect to broker {broker}: {message}")]
