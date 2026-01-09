@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-01-09
+
+### Added
+- TLS/SSL support for custom CA certificates (`ssl_ca_location`)
+- Mutual TLS (mTLS) authentication with client certificates (`ssl_certificate_location`, `ssl_key_location`)
+- TLS test infrastructure with Docker Compose for integration testing
+- Comprehensive TLS documentation in configuration guide
+
+### Fixed
+- **Breaking:** Fixed TLS certificate configuration being ignored ([#3](https://github.com/osodevops/kafka-backup/issues/3))
+  - Previously, `ssl_ca_location`, `ssl_certificate_location`, and `ssl_key_location` were parsed but never used
+  - Connections to Kafka with self-signed or internal CA certificates now work correctly
+  - Added new error variants to `KafkaError`: `TlsConfig`, `CertificateLoad`, `PrivateKeyLoad`
+
+### Changed
+- **Breaking:** Added new variants to `KafkaError` enum. Code that exhaustively matches on this enum without a wildcard will need updating.
 
 ## [0.1.4] - 2025-12-03
 
@@ -70,7 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cargo-dist release workflow with cross-platform binaries
 - Homebrew tap for macOS/Linux installation
 
-[Unreleased]: https://github.com/osodevops/kafka-backup/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/osodevops/kafka-backup/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/osodevops/kafka-backup/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/osodevops/kafka-backup/compare/v0.1.4...v0.3.0
 [0.1.4]: https://github.com/osodevops/kafka-backup/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/osodevops/kafka-backup/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/osodevops/kafka-backup/compare/v0.1.0...v0.1.2
