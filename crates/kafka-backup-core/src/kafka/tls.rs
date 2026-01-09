@@ -45,7 +45,10 @@ pub fn build_tls_config(security: &SecurityConfig) -> Result<ClientConfig> {
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
-                    KafkaError::TlsConfig(format!("Failed to configure client authentication: {}", e))
+                    KafkaError::TlsConfig(format!(
+                        "Failed to configure client authentication: {}",
+                        e
+                    ))
                 })?
         }
         (Some(cert_path), None) => {
@@ -85,10 +88,12 @@ fn build_root_store(ca_path: &Option<std::path::PathBuf>) -> Result<RootCertStor
             let mut root_store = RootCertStore::empty();
 
             for cert in certs {
-                root_store.add(cert).map_err(|e| KafkaError::CertificateLoad {
-                    path: path.display().to_string(),
-                    message: format!("Failed to add certificate to root store: {}", e),
-                })?;
+                root_store
+                    .add(cert)
+                    .map_err(|e| KafkaError::CertificateLoad {
+                        path: path.display().to_string(),
+                        message: format!("Failed to add certificate to root store: {}", e),
+                    })?;
             }
 
             if root_store.is_empty() {

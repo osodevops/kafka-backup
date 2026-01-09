@@ -59,9 +59,7 @@ fn certs_exist() -> bool {
 #[ignore = "requires Docker TLS Kafka - run docker-compose-tls.yml first"]
 async fn test_kafka_connection_with_custom_ca() {
     if !certs_exist() {
-        panic!(
-            "Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh"
-        );
+        panic!("Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh");
     }
 
     let certs_path = get_certs_path();
@@ -107,9 +105,7 @@ async fn test_kafka_connection_with_custom_ca() {
 #[ignore = "requires Docker TLS Kafka with mTLS - run docker-compose-tls.yml first"]
 async fn test_kafka_mtls_authentication() {
     if !certs_exist() {
-        panic!(
-            "Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh"
-        );
+        panic!("Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh");
     }
 
     let certs_path = get_certs_path();
@@ -187,9 +183,7 @@ async fn test_connection_fails_without_custom_ca() {
 #[ignore = "requires Docker TLS Kafka with mTLS - run docker-compose-tls.yml first"]
 async fn test_mtls_broker_rejects_without_client_cert() {
     if !certs_exist() {
-        panic!(
-            "Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh"
-        );
+        panic!("Test certificates not found. Run: ./tests/tls-test-infra/generate-certs.sh");
     }
 
     let certs_path = get_certs_path();
