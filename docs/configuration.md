@@ -110,6 +110,74 @@ source:
   ssl_ca_location: /etc/kafka/certs/ca.pem
 ```
 
+### TLS/SSL Configuration
+
+kafka-backup supports TLS encryption for Kafka connections, including custom CA certificates and mutual TLS (mTLS) authentication.
+
+#### Security Protocols
+
+| Protocol | Description |
+|----------|-------------|
+| `PLAINTEXT` | No encryption (default) |
+| `SSL` | TLS encryption |
+| `SASL_PLAINTEXT` | SASL authentication without TLS |
+| `SASL_SSL` | SASL authentication with TLS encryption |
+
+#### Custom CA Certificates
+
+When connecting to Kafka brokers that use internal or self-signed certificates, specify the CA certificate path:
+
+```yaml
+source:
+  bootstrap_servers: ["kafka:9093"]
+  security:
+    security_protocol: SSL
+    ssl_ca_location: /etc/kafka/certs/ca.pem
+```
+
+This is required when:
+- Your Kafka cluster uses certificates signed by an internal CA
+- You're using self-signed certificates
+- The default system/webpki root certificates don't include your CA
+
+#### Mutual TLS (mTLS)
+
+For clusters requiring client certificate authentication, provide both the client certificate and private key:
+
+```yaml
+source:
+  bootstrap_servers: ["kafka:9093"]
+  security:
+    security_protocol: SSL
+    ssl_ca_location: /etc/kafka/certs/ca.pem
+    ssl_certificate_location: /etc/kafka/certs/client.pem
+    ssl_key_location: /etc/kafka/certs/client-key.pem
+```
+
+**Important:** Both `ssl_certificate_location` and `ssl_key_location` must be provided together for mTLS. Providing only one will result in an error.
+
+#### SASL + SSL
+
+Combine TLS encryption with SASL authentication:
+
+```yaml
+source:
+  bootstrap_servers: ["kafka:9093"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA-512
+    sasl_username: myuser
+    sasl_password: ${KAFKA_PASSWORD}
+    ssl_ca_location: /etc/kafka/certs/ca.pem
+```
+
+#### Certificate Format
+
+All certificate and key files must be in PEM format:
+- CA certificate: Standard X.509 PEM certificate
+- Client certificate: X.509 PEM certificate
+- Private key: PKCS#1 (RSA), PKCS#8, or SEC1 (EC) PEM format
+
 ---
 
 ## Target Configuration
