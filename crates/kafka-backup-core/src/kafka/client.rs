@@ -138,14 +138,8 @@ impl KafkaClient {
         if use_tls {
             debug!("Establishing TLS connection to {}", server);
 
-            // Build TLS config with system root certificates
-            let root_store = tokio_rustls::rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            };
-
-            let tls_config = tokio_rustls::rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
+            // Build TLS config using security settings (custom CA, mTLS support)
+            let tls_config = super::tls::build_tls_config(&self.config.security)?;
 
             let connector = TlsConnector::from(Arc::new(tls_config));
 

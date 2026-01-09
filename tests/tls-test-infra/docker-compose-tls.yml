@@ -1,0 +1,92 @@
+# Docker Compose for TLS-enabled Kafka testing
+#
+# Prerequisites:
+#   1. Run ./generate-certs.sh to create certificates
+#   2. docker-compose -f docker-compose-tls.yml up -d
+#
+# Services:
+#   - kafka-tls (port 9093): SSL with custom CA, no client auth required
+#   - kafka-mtls (port 9094): SSL with mTLS (client cert required)
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper-tls-test
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Kafka broker with SSL (server-only TLS, no client cert required)
+  kafka-tls:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-tls-test
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,SSL:SSL
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,SSL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-tls:9092,SSL://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # SSL configuration for Confluent images
+      KAFKA_SSL_KEYSTORE_FILENAME: kafka.keystore.jks
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: keystore_creds
+      KAFKA_SSL_KEY_CREDENTIALS: key_creds
+      KAFKA_SSL_TRUSTSTORE_FILENAME: kafka.truststore.jks
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: truststore_creds
+      KAFKA_SSL_CLIENT_AUTH: none
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./certs/broker:/etc/kafka/secrets:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9093"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Kafka broker with mTLS (requires client certificate)
+  kafka-mtls:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-mtls-test
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,SSL:SSL
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,SSL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-mtls:9092,SSL://localhost:9094
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # SSL configuration for Confluent images
+      KAFKA_SSL_KEYSTORE_FILENAME: kafka.keystore.jks
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: keystore_creds
+      KAFKA_SSL_KEY_CREDENTIALS: key_creds
+      KAFKA_SSL_TRUSTSTORE_FILENAME: kafka.truststore.jks
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: truststore_creds
+      KAFKA_SSL_CLIENT_AUTH: required
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./certs/broker:/etc/kafka/secrets:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9094"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s

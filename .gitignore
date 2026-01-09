@@ -36,3 +36,7 @@ streamplus-*.yaml
 
 # Logs
 *.log
+
+# TLS test infrastructure (generated certs)
+tests/tls-test-infra/certs/
+tests/tls-test-infra/test-backup-*.yaml

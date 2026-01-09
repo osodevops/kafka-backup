@@ -7,6 +7,7 @@ mod fetch;
 mod metadata;
 mod partition_router;
 mod produce;
+pub mod tls;
 
 pub use admin::{create_topics, CreateTopicResult, TopicToCreate};
 pub use client::KafkaClient;

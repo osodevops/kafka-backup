@@ -55,6 +55,7 @@ pub enum Error {
 
 /// Kafka-specific errors
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum KafkaError {
     /// Connection failed
     #[error("Failed to connect to broker {broker}: {message}")]
@@ -83,6 +84,18 @@ pub enum KafkaError {
     /// Partition not available
     #[error("Partition {partition} not available for topic {topic}")]
     PartitionNotAvailable { topic: String, partition: i32 },
+
+    /// TLS configuration error
+    #[error("TLS configuration error: {0}")]
+    TlsConfig(String),
+
+    /// Certificate loading error
+    #[error("Failed to load certificate from {path}: {message}")]
+    CertificateLoad { path: String, message: String },
+
+    /// Private key loading error
+    #[error("Failed to load private key from {path}: {message}")]
+    PrivateKeyLoad { path: String, message: String },
 }
 
 /// Storage-specific errors
