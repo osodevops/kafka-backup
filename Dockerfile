@@ -1,7 +1,12 @@
 # ============================================================================
 # STAGE 1: Builder (compile Rust application)
 # ============================================================================
-FROM rust:latest AS builder
+# IMPORTANT: Use rust:bookworm to match the runtime stage's Debian version.
+# Using rust:latest can cause glibc version mismatches since it may use a newer
+# Debian version (e.g., Trixie with glibc 2.41) while the runtime uses Bookworm
+# (glibc 2.36). Binaries compiled against newer glibc won't run on older versions.
+# See: https://github.com/osodevops/kafka-backup/issues/5
+FROM rust:bookworm AS builder
 
 WORKDIR /app
 
@@ -24,6 +29,8 @@ RUN cargo build --release --bin kafka-backup && \
 # ============================================================================
 # STAGE 2: Runtime (minimal image for production)
 # ============================================================================
+# NOTE: This must use the same Debian version as the builder stage (bookworm).
+# If you upgrade the runtime image, also update the builder stage to match.
 FROM debian:bookworm-slim AS runtime
 
 # Create non-root user for security

@@ -7,6 +7,7 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'Dockerfile'
       - '.github/workflows/test.yml'
   pull_request:
     branches: [main]
@@ -14,6 +15,7 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'Dockerfile'
       - '.github/workflows/test.yml'
 
 env:
@@ -233,18 +235,51 @@ jobs:
         run: cargo audit
         continue-on-error: true
 
+  # Docker build validation - ensures the image builds and runs correctly
+  docker-build:
+    name: Docker Build & Smoke Test
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: kafka-backup:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test: verify glibc compatibility and binary execution
+      # This catches issues like rust:latest using newer glibc than runtime image
+      - name: Smoke test - verify binary runs
+        run: |
+          echo "Verifying glibc version in runtime image..."
+          docker run --rm --entrypoint ldd kafka-backup:test --version
+          echo ""
+          echo "Testing binary execution..."
+          docker run --rm kafka-backup:test --version
+          docker run --rm kafka-backup:test --help > /dev/null
+          echo "Docker smoke test passed!"
+
   # Summary job for branch protection
   tests-complete:
     name: Tests Complete
     runs-on: ubuntu-latest
-    needs: [check, unit-tests, integration-tests]
+    needs: [check, unit-tests, integration-tests, docker-build]
     if: always()
     steps:
       - name: Check all tests passed
         run: |
           if [ "${{ needs.check.result }}" != "success" ] || \
              [ "${{ needs.unit-tests.result }}" != "success" ] || \
-             [ "${{ needs.integration-tests.result }}" != "success" ]; then
+             [ "${{ needs.integration-tests.result }}" != "success" ] || \
+             [ "${{ needs.docker-build.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi
