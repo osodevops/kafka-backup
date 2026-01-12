@@ -74,7 +74,26 @@ jobs:
             type=semver,pattern=v{{major}}.{{minor}}
             type=raw,value=latest
 
-      - name: Build and push Docker image
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test: verify the binary actually runs in the container
+      # This catches glibc mismatches and other runtime issues before pushing
+      - name: Smoke test - verify binary runs
+        run: |
+          echo "Testing container startup..."
+          docker run --rm ${{ env.IMAGE_NAME }}:test --version
+          echo "Testing help command..."
+          docker run --rm ${{ env.IMAGE_NAME }}:test --help
+          echo "Smoke test passed!"
+
+      - name: Push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
