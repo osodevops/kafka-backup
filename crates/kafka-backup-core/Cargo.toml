@@ -62,7 +62,6 @@ object_store.workspace = true
 url.workspace = true
 
 # Metrics
-prometheus.workspace = true
 prometheus-client.workspace = true
 
 # HTTP server
@@ -74,6 +73,7 @@ http-body-util.workspace = true
 parking_lot.workspace = true
 crc32fast.workspace = true
 regex.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 testcontainers.workspace = true

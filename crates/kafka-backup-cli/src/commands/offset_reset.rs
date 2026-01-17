@@ -95,6 +95,7 @@ pub async fn execute_plan(
         bootstrap_servers: bootstrap_servers.to_vec(),
         security: parse_security_config(security_protocol),
         topics: Default::default(),
+        connection: Default::default(),
     };
 
     let client = KafkaClient::new(kafka_config);

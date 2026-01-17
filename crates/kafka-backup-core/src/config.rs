@@ -171,6 +171,10 @@ pub struct KafkaConfig {
     /// Topic selection
     #[serde(default)]
     pub topics: TopicSelection,
+
+    /// TCP connection settings (optional - uses defaults if not specified)
+    #[serde(default)]
+    pub connection: ConnectionConfig,
 }
 
 /// Security configuration for Kafka connections
@@ -214,6 +218,37 @@ pub enum SecurityProtocol {
     Ssl,
     SaslPlaintext,
     SaslSsl,
+}
+
+/// TCP connection configuration for Kafka broker connections.
+///
+/// These settings help maintain stable connections to cloud-hosted Kafka services
+/// (like Confluent Cloud) that may terminate idle connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionConfig {
+    /// Enable TCP keepalive to prevent idle connection termination (default: true)
+    pub tcp_keepalive: bool,
+
+    /// Time in seconds before first keepalive probe is sent (default: 60)
+    pub keepalive_time_secs: u64,
+
+    /// Interval in seconds between keepalive probes (default: 20)
+    pub keepalive_interval_secs: u64,
+
+    /// Enable TCP_NODELAY to disable Nagle's algorithm (default: true)
+    pub tcp_nodelay: bool,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            tcp_keepalive: true,
+            keepalive_time_secs: 60,
+            keepalive_interval_secs: 20,
+            tcp_nodelay: true,
+        }
+    }
 }
 
 /// SASL mechanism
@@ -633,5 +668,52 @@ impl RestoreOptions {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_config_defaults() {
+        let config = ConnectionConfig::default();
+        assert!(config.tcp_keepalive);
+        assert_eq!(config.keepalive_time_secs, 60);
+        assert_eq!(config.keepalive_interval_secs, 20);
+        assert!(config.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_kafka_config_connection_defaults() {
+        // Test that KafkaConfig uses ConnectionConfig::default() when not specified
+        let yaml = r#"
+bootstrap_servers:
+  - "localhost:9092"
+"#;
+        let config: KafkaConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.connection.tcp_keepalive);
+        assert_eq!(config.connection.keepalive_time_secs, 60);
+        assert_eq!(config.connection.keepalive_interval_secs, 20);
+        assert!(config.connection.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_kafka_config_connection_custom() {
+        // Test that custom connection settings are properly parsed
+        let yaml = r#"
+bootstrap_servers:
+  - "localhost:9092"
+connection:
+  tcp_keepalive: false
+  keepalive_time_secs: 30
+  keepalive_interval_secs: 10
+  tcp_nodelay: false
+"#;
+        let config: KafkaConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.connection.tcp_keepalive);
+        assert_eq!(config.connection.keepalive_time_secs, 30);
+        assert_eq!(config.connection.keepalive_interval_secs, 10);
+        assert!(!config.connection.tcp_nodelay);
     }
 }

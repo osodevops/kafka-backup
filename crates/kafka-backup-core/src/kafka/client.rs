@@ -4,9 +4,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{ApiKey, RequestHeader, ResponseHeader};
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::protocol::{Decodable, Encodable};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -129,6 +131,9 @@ impl KafkaClient {
                     message: e.to_string(),
                 })?;
 
+        // Configure TCP socket options (keepalive, nodelay)
+        self.configure_socket(&tcp_stream, server)?;
+
         // Wrap in TLS if using SSL or SASL_SSL
         let use_tls = matches!(
             self.config.security.security_protocol,
@@ -166,6 +171,45 @@ impl KafkaClient {
         } else {
             Ok(ConnectionStream::Plain(tcp_stream))
         }
+    }
+
+    /// Configure TCP socket options (keepalive, nodelay) based on connection config.
+    fn configure_socket(&self, stream: &TcpStream, server: &str) -> Result<()> {
+        let conn_config = &self.config.connection;
+
+        // Get socket reference for configuration
+        let sock_ref = SockRef::from(stream);
+
+        // Enable TCP_NODELAY if configured
+        if conn_config.tcp_nodelay {
+            sock_ref
+                .set_nodelay(true)
+                .map_err(|e| KafkaError::ConnectionFailed {
+                    broker: server.to_string(),
+                    message: format!("Failed to set TCP_NODELAY: {}", e),
+                })?;
+        }
+
+        // Configure TCP keepalive if enabled
+        if conn_config.tcp_keepalive {
+            let keepalive = TcpKeepalive::new()
+                .with_time(Duration::from_secs(conn_config.keepalive_time_secs))
+                .with_interval(Duration::from_secs(conn_config.keepalive_interval_secs));
+
+            sock_ref
+                .set_tcp_keepalive(&keepalive)
+                .map_err(|e| KafkaError::ConnectionFailed {
+                    broker: server.to_string(),
+                    message: format!("Failed to set TCP keepalive: {}", e),
+                })?;
+
+            debug!(
+                "TCP keepalive enabled for {}: time={}s, interval={}s",
+                server, conn_config.keepalive_time_secs, conn_config.keepalive_interval_secs
+            );
+        }
+
+        Ok(())
     }
 
     async fn authenticate(&self) -> Result<()> {
@@ -393,5 +437,182 @@ impl KafkaClient {
         for broker in brokers {
             cache.insert(broker.node_id, broker);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConnectionConfig;
+    use std::net::TcpListener;
+
+    /// Test that TCP keepalive settings are actually applied to the socket.
+    /// This creates a real TCP connection and verifies the socket options.
+    #[tokio::test]
+    async fn test_tcp_keepalive_is_applied() {
+        // Start a local TCP listener
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let addr = listener.local_addr().expect("Failed to get local addr");
+
+        // Connect to the listener
+        let tcp_stream = TcpStream::connect(addr).await.expect("Failed to connect");
+
+        // Create a KafkaConfig with TCP keepalive enabled
+        let config = KafkaConfig {
+            bootstrap_servers: vec![addr.to_string()],
+            security: Default::default(),
+            topics: Default::default(),
+            connection: ConnectionConfig {
+                tcp_keepalive: true,
+                keepalive_time_secs: 60,
+                keepalive_interval_secs: 20,
+                tcp_nodelay: true,
+            },
+        };
+
+        let client = KafkaClient::new(config);
+
+        // Apply socket configuration
+        client
+            .configure_socket(&tcp_stream, &addr.to_string())
+            .expect("Failed to configure socket");
+
+        // Verify the settings were applied using socket2
+        let sock_ref = SockRef::from(&tcp_stream);
+
+        // Check TCP_NODELAY is set
+        let nodelay = sock_ref.nodelay().expect("Failed to get nodelay");
+        assert!(nodelay, "TCP_NODELAY should be enabled");
+
+        // Check keepalive is enabled
+        // Note: socket2 doesn't have a direct getter for keepalive enabled,
+        // but we can verify the keepalive settings were set without error.
+        // On macOS, we can check the keepalive time.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let keepalive_time = sock_ref
+                .keepalive_time()
+                .expect("Failed to get keepalive time");
+            assert_eq!(
+                keepalive_time,
+                Duration::from_secs(60),
+                "Keepalive time should be 60 seconds"
+            );
+        }
+
+        // On Linux, we can check both time and interval
+        #[cfg(target_os = "linux")]
+        {
+            let keepalive_time = sock_ref
+                .keepalive_time()
+                .expect("Failed to get keepalive time");
+            assert_eq!(
+                keepalive_time,
+                Duration::from_secs(60),
+                "Keepalive time should be 60 seconds"
+            );
+
+            let keepalive_interval = sock_ref
+                .keepalive_interval()
+                .expect("Failed to get keepalive interval");
+            assert_eq!(
+                keepalive_interval,
+                Duration::from_secs(20),
+                "Keepalive interval should be 20 seconds"
+            );
+        }
+
+        println!("TCP keepalive settings verified successfully!");
+    }
+
+    /// Test that TCP keepalive can be disabled via configuration.
+    #[tokio::test]
+    async fn test_tcp_keepalive_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let addr = listener.local_addr().expect("Failed to get local addr");
+
+        let tcp_stream = TcpStream::connect(addr).await.expect("Failed to connect");
+
+        // Create a KafkaConfig with TCP keepalive DISABLED
+        let config = KafkaConfig {
+            bootstrap_servers: vec![addr.to_string()],
+            security: Default::default(),
+            topics: Default::default(),
+            connection: ConnectionConfig {
+                tcp_keepalive: false,
+                keepalive_time_secs: 60,
+                keepalive_interval_secs: 20,
+                tcp_nodelay: false,
+            },
+        };
+
+        let client = KafkaClient::new(config);
+
+        // Apply socket configuration - should succeed even with keepalive disabled
+        client
+            .configure_socket(&tcp_stream, &addr.to_string())
+            .expect("Failed to configure socket");
+
+        // Verify TCP_NODELAY is NOT set
+        let sock_ref = SockRef::from(&tcp_stream);
+        let nodelay = sock_ref.nodelay().expect("Failed to get nodelay");
+        assert!(!nodelay, "TCP_NODELAY should be disabled");
+
+        println!("TCP keepalive disabled configuration verified!");
+    }
+
+    /// Test custom keepalive values
+    #[tokio::test]
+    async fn test_tcp_keepalive_custom_values() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let addr = listener.local_addr().expect("Failed to get local addr");
+
+        let tcp_stream = TcpStream::connect(addr).await.expect("Failed to connect");
+
+        // Create a KafkaConfig with custom keepalive values
+        let config = KafkaConfig {
+            bootstrap_servers: vec![addr.to_string()],
+            security: Default::default(),
+            topics: Default::default(),
+            connection: ConnectionConfig {
+                tcp_keepalive: true,
+                keepalive_time_secs: 30,     // Custom: 30 seconds
+                keepalive_interval_secs: 10, // Custom: 10 seconds
+                tcp_nodelay: true,
+            },
+        };
+
+        let client = KafkaClient::new(config);
+        client
+            .configure_socket(&tcp_stream, &addr.to_string())
+            .expect("Failed to configure socket");
+
+        let sock_ref = SockRef::from(&tcp_stream);
+
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+        {
+            let keepalive_time = sock_ref
+                .keepalive_time()
+                .expect("Failed to get keepalive time");
+            assert_eq!(
+                keepalive_time,
+                Duration::from_secs(30),
+                "Custom keepalive time should be 30 seconds"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let keepalive_interval = sock_ref
+                .keepalive_interval()
+                .expect("Failed to get keepalive interval");
+            assert_eq!(
+                keepalive_interval,
+                Duration::from_secs(10),
+                "Custom keepalive interval should be 10 seconds"
+            );
+        }
+
+        println!("Custom TCP keepalive values verified!");
     }
 }
