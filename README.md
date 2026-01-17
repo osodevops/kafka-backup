@@ -259,6 +259,33 @@ s3://kafka-backups/
                     └── segment-0002.zst
 ```
 
+## Metrics & Monitoring
+
+kafka-backup exposes Prometheus metrics at `/metrics` for monitoring backup operations:
+
+```yaml
+# Enable metrics in your config
+metrics:
+  enabled: true
+  port: 8080
+```
+
+**Key metrics:**
+- `kafka_backup_lag_records` — Consumer lag per partition
+- `kafka_backup_records_total` — Total records backed up
+- `kafka_backup_compression_ratio` — Compression efficiency
+- `kafka_backup_storage_write_latency_seconds` — Storage I/O latency
+
+A complete **Grafana + Prometheus monitoring stack** is available in the [demos repository](https://github.com/osodevops/kafka-backup-demos/tree/main/monitoring-stack):
+
+```bash
+cd kafka-backup-demos/monitoring-stack
+docker-compose -f docker-compose.metrics.yml up -d
+# Grafana at http://localhost:3000 (admin/admin)
+```
+
+> 📖 **[Full metrics reference](https://osodevops.github.io/kafka-backup-docs/docs/reference/metrics)**
+
 ## Performance
 
 | Metric | Target |

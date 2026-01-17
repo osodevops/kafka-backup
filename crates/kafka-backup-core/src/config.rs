@@ -34,6 +34,76 @@ pub struct Config {
     /// Offset storage configuration
     #[serde(default)]
     pub offset_storage: Option<OffsetStorageConfig>,
+
+    /// Metrics server configuration
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+}
+
+/// Metrics server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MetricsConfig {
+    /// Whether metrics server is enabled (default: true)
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+
+    /// Port for the metrics HTTP server (default: 8080)
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+
+    /// Bind address for the metrics server (default: "0.0.0.0")
+    #[serde(default = "default_metrics_bind_address")]
+    pub bind_address: String,
+
+    /// Path for the metrics endpoint (default: "/metrics")
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+
+    /// How often metrics are recalculated in milliseconds (default: 500)
+    #[serde(default = "default_metrics_update_interval_ms")]
+    pub update_interval_ms: u64,
+
+    /// Maximum partition labels to prevent cardinality explosion (default: 100)
+    #[serde(default = "default_max_partition_labels")]
+    pub max_partition_labels: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            port: default_metrics_port(),
+            bind_address: default_metrics_bind_address(),
+            path: default_metrics_path(),
+            update_interval_ms: default_metrics_update_interval_ms(),
+            max_partition_labels: default_max_partition_labels(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_port() -> u16 {
+    8080
+}
+
+fn default_metrics_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+
+fn default_metrics_update_interval_ms() -> u64 {
+    500
+}
+
+fn default_max_partition_labels() -> usize {
+    100
 }
 
 /// Offset storage configuration for tracking backup progress

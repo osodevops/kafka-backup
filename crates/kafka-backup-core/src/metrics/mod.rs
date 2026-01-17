@@ -1,8 +1,38 @@
 //! Performance metrics collection and reporting.
 //!
-//! This module provides metrics collection for monitoring backup/restore performance,
-//! including throughput, compression ratios, and latencies.
+//! This module provides comprehensive metrics collection for monitoring backup/restore
+//! performance, including consumer lag, throughput, compression ratios, latencies,
+//! storage I/O, and error tracking.
+//!
+//! ## Modules
+//!
+//! - [`labels`] - Label types for Prometheus metrics dimensions
+//! - [`registry`] - The main `PrometheusMetrics` registry with all metrics
+//! - [`instrumented_storage`] - Storage backend decorator with metrics instrumentation
+//! - [`server`] - HTTP server for exposing metrics via `/metrics` endpoint
+//!
+//! ## Quick Start
+//!
+//! ```rust,ignore
+//! use kafka_backup_core::metrics::{PrometheusMetrics, MetricsServer, MetricsServerConfig};
+//! use std::sync::Arc;
+//!
+//! // Create metrics registry
+//! let metrics = Arc::new(PrometheusMetrics::new());
+//!
+//! // Record some metrics
+//! metrics.record_lag("orders", 0, "backup-001", 1000, Some(100));
+//! metrics.inc_records("backup-001", 500);
+//!
+//! // Start metrics server
+//! let config = MetricsServerConfig::default();
+//! let server = MetricsServer::new(config, metrics);
+//! // server.run(shutdown_rx).await?;
+//! ```
 
+pub mod instrumented_storage;
+pub mod labels;
+pub mod registry;
 pub mod server;
 
 use parking_lot::RwLock;
@@ -10,7 +40,21 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// Re-export new Prometheus metrics types
+pub use instrumented_storage::{
+    backend_name_from_config, create_instrumented_backend, InstrumentedStorageBackend,
+};
+pub use labels::{
+    BackupLabels, CommitLabels, CompressionLabels, DurationLabels, ErrorLabels, ErrorType,
+    LagLabels, OperationStatus, RestoreLabels, RestoreProgressLabels, RetryLabels,
+    StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation, ThroughputLabels,
+};
+pub use registry::{PrometheusMetrics, TimerGuard};
 pub use server::{MetricsServer, MetricsServerConfig};
+
+// Legacy exports (deprecated but kept for backward compatibility)
+#[deprecated(since = "0.5.0", note = "Use PrometheusMetrics instead")]
+pub use self::PerformanceMetrics as LegacyPerformanceMetrics;
 
 /// Performance metrics collector
 pub struct PerformanceMetrics {

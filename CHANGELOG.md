@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-01-17
+
+### Added
+- **Prometheus/OpenMetrics metrics support** ([#9](https://github.com/osodevops/kafka-backup/issues/9))
+  - Consumer lag tracking per topic/partition (`kafka_backup_lag_records`)
+  - Records and bytes throughput counters (`kafka_backup_records_total`, `kafka_backup_bytes_total`)
+  - Compression ratio gauge (`kafka_backup_compression_ratio`)
+  - Storage write latency histogram (`kafka_backup_storage_write_latency_seconds`)
+  - Storage I/O bytes counter (`kafka_backup_storage_write_bytes_total`)
+  - Error counting by type (`kafka_backup_errors_total`)
+- HTTP metrics server with `/metrics` endpoint (default port 8080)
+- `/health` endpoint for liveness checks
+- New `metrics` configuration section in config file
+- `MetricsServerConfig::new()` constructor for programmatic configuration
+
+### Changed
+- **Breaking:** Added `metrics: Option<MetricsConfig>` field to `Config` struct
+  - Existing code constructing `Config` with struct literals must add `metrics: None`
+  - YAML configs are unaffected (field is optional with serde default)
+- Marked `MetricsConfig` as `#[non_exhaustive]` to prevent future breaking changes
+
+### Documentation
+- Added Metrics & Monitoring section to README
+- Full metrics reference available at [kafka-backup-docs](https://osodevops.github.io/kafka-backup-docs/docs/reference/metrics)
+- Monitoring stack (Prometheus + Grafana) available in [kafka-backup-demos](https://github.com/osodevops/kafka-backup-demos/tree/main/monitoring-stack)
+
 ## [0.4.0] - 2026-01-09
 
 ### Added
@@ -85,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cargo-dist release workflow with cross-platform binaries
 - Homebrew tap for macOS/Linux installation
 
-[Unreleased]: https://github.com/osodevops/kafka-backup/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/osodevops/kafka-backup/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/osodevops/kafka-backup/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/osodevops/kafka-backup/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/osodevops/kafka-backup/compare/v0.1.4...v0.3.0
 [0.1.4]: https://github.com/osodevops/kafka-backup/compare/v0.1.3...v0.1.4
