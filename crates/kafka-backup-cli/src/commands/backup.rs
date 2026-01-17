@@ -23,12 +23,12 @@ pub async fn run(config_path: &str) -> Result<()> {
     // Start metrics server if enabled
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let metrics_server_handle = if metrics_config.enabled {
-        let server_config = MetricsServerConfig {
-            bind_address: format!("{}:{}", metrics_config.bind_address, metrics_config.port)
+        let server_config = MetricsServerConfig::new(
+            format!("{}:{}", metrics_config.bind_address, metrics_config.port)
                 .parse()
                 .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap()),
-            metrics_path: metrics_config.path.clone(),
-        };
+            metrics_config.path.clone(),
+        );
 
         let server = MetricsServer::new(server_config, prometheus_metrics.clone());
         let shutdown_rx = shutdown_tx.subscribe();

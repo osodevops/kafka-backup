@@ -24,6 +24,7 @@ use crate::health::HealthCheck;
 
 /// Configuration for the metrics server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MetricsServerConfig {
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
@@ -41,6 +42,14 @@ impl Default for MetricsServerConfig {
 }
 
 impl MetricsServerConfig {
+    /// Create a new config with custom bind address and metrics path.
+    pub fn new(bind_address: SocketAddr, metrics_path: String) -> Self {
+        Self {
+            bind_address,
+            metrics_path,
+        }
+    }
+
     /// Create a new config with a custom port.
     pub fn with_port(port: u16) -> Self {
         Self {

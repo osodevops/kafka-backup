@@ -42,6 +42,7 @@ pub struct Config {
 
 /// Metrics server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MetricsConfig {
     /// Whether metrics server is enabled (default: true)
     #[serde(default = "default_metrics_enabled")]
