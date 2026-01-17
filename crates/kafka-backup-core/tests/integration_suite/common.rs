@@ -55,6 +55,7 @@ impl KafkaTestCluster {
             bootstrap_servers: vec![self.bootstrap_servers.clone()],
             security: SecurityConfig::default(),
             topics: TopicSelection::default(),
+            connection: Default::default(),
         };
         KafkaClient::new(config)
     }
@@ -115,6 +116,7 @@ pub fn create_backup_config(
                 include: topics,
                 exclude: vec![],
             },
+            connection: Default::default(),
         }),
         target: None,
         storage: StorageBackendConfig::Filesystem { path: storage_path },
@@ -148,6 +150,7 @@ pub fn create_restore_config(
                 include: topics,
                 exclude: vec![],
             },
+            connection: Default::default(),
         }),
         storage: StorageBackendConfig::Filesystem { path: storage_path },
         backup: None,

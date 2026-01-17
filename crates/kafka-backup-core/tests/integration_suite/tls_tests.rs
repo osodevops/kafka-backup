@@ -74,6 +74,7 @@ async fn test_kafka_connection_with_custom_ca() {
             ..Default::default()
         },
         topics: TopicSelection::default(),
+        connection: Default::default(),
     };
 
     let client = KafkaClient::new(config);
@@ -120,6 +121,7 @@ async fn test_kafka_mtls_authentication() {
             ..Default::default()
         },
         topics: TopicSelection::default(),
+        connection: Default::default(),
     };
 
     let client = KafkaClient::new(config);
@@ -159,6 +161,7 @@ async fn test_connection_fails_without_custom_ca() {
             ..Default::default()
         },
         topics: TopicSelection::default(),
+        connection: Default::default(),
     };
 
     let client = KafkaClient::new(config);
@@ -199,6 +202,7 @@ async fn test_mtls_broker_rejects_without_client_cert() {
             ..Default::default()
         },
         topics: TopicSelection::default(),
+        connection: Default::default(),
     };
 
     let client = KafkaClient::new(config);
