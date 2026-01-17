@@ -1,0 +1,27 @@
+mode: backup
+backup_id: metrics-test-backup
+
+source:
+  bootstrap_servers:
+    - "localhost:9092"
+  topics:
+    include:
+      - "test-backup-topic"
+    exclude: []
+
+storage:
+  backend: filesystem
+  path: /tmp/kafka-backup-test
+
+backup:
+  compression: zstd
+  segment_max_bytes: 1048576  # 1MB
+  segment_max_interval_ms: 5000
+  checkpoint_interval_secs: 5
+  continuous: true  # Keep running to monitor metrics
+
+metrics:
+  enabled: true
+  port: 8080
+  bind_address: "0.0.0.0"
+  path: "/metrics"
