@@ -1,5 +1,9 @@
 use anyhow::Result;
-use kafka_backup_core::{restore::RestoreEngine, Config};
+use kafka_backup_core::{
+    restore::RestoreEngine, Config, MetricsServer, MetricsServerConfig, PrometheusMetrics,
+};
+use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::info;
 
 pub async fn run(config_path: &str) -> Result<()> {
@@ -10,9 +14,45 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     info!("Starting restore from backup: {}", config.backup_id);
 
-    let engine = RestoreEngine::new(config)?;
-    engine.run().await?;
+    // Create Prometheus metrics registry
+    let metrics_config = config.metrics.clone().unwrap_or_default();
+    let prometheus_metrics = Arc::new(PrometheusMetrics::with_max_labels(
+        metrics_config.max_partition_labels,
+    ));
 
+    // Start metrics server if enabled
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let metrics_server_handle = if metrics_config.enabled {
+        let server_config = MetricsServerConfig {
+            bind_address: format!("{}:{}", metrics_config.bind_address, metrics_config.port)
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap()),
+            metrics_path: metrics_config.path.clone(),
+        };
+
+        let server = MetricsServer::new(server_config, prometheus_metrics.clone());
+        let shutdown_rx = shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            if let Err(e) = server.run(shutdown_rx).await {
+                tracing::error!("Metrics server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Run the restore engine
+    let engine = RestoreEngine::new(config)?;
+    let result = engine.run().await;
+
+    // Shutdown metrics server
+    let _ = shutdown_tx.send(());
+    if let Some(handle) = metrics_server_handle {
+        let _ = handle.await;
+    }
+
+    result?;
     info!("Restore completed successfully");
     Ok(())
 }

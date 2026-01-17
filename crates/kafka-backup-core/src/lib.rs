@@ -19,7 +19,8 @@ pub mod storage;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
-    Config, OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreOptions,
+    Config, MetricsConfig, OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy,
+    RestoreOptions,
 };
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
@@ -32,7 +33,11 @@ pub use manifest::{
     PartitionBackup, PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport,
     SegmentMetadata, TopicBackup, TopicRestoreReport,
 };
-pub use metrics::{MetricsReport, MetricsServer, MetricsServerConfig, PerformanceMetrics};
+pub use metrics::{
+    create_instrumented_backend, ErrorType, InstrumentedStorageBackend, MetricsReport,
+    MetricsServer, MetricsServerConfig, OperationStatus, PerformanceMetrics, PrometheusMetrics,
+    StorageOperation, TimerGuard,
+};
 pub use offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 pub use restore::{
     engine::{RestoreEngine, RestoreProgress},

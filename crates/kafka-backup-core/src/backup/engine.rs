@@ -12,7 +12,7 @@ use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
 use crate::health::HealthCheck;
 use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
-use crate::metrics::PerformanceMetrics;
+use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use crate::segment::format::BinaryRecord;
 use crate::segment::writer::{SegmentWriter, SegmentWriterConfig};
@@ -26,6 +26,7 @@ pub struct BackupEngine {
     storage: Arc<dyn StorageBackend>,
     manifest: Arc<Mutex<BackupManifest>>,
     metrics: Arc<PerformanceMetrics>,
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
     health: Arc<HealthCheck>,
     offset_store: Option<Arc<SqliteOffsetStore>>,
     kafka_circuit_breaker: Arc<CircuitBreaker>,
@@ -36,6 +37,14 @@ pub struct BackupEngine {
 impl BackupEngine {
     /// Create a new backup engine
     pub async fn new(config: Config) -> Result<Self> {
+        Self::new_with_metrics(config, None).await
+    }
+
+    /// Create a new backup engine with Prometheus metrics
+    pub async fn new_with_metrics(
+        config: Config,
+        prometheus_metrics: Option<Arc<PrometheusMetrics>>,
+    ) -> Result<Self> {
         config.validate()?;
 
         if config.mode != Mode::Backup {
@@ -109,6 +118,7 @@ impl BackupEngine {
             storage,
             manifest: Arc::new(Mutex::new(manifest)),
             metrics,
+            prometheus_metrics,
             health,
             offset_store,
             kafka_circuit_breaker,
@@ -135,6 +145,11 @@ impl BackupEngine {
     /// Get metrics
     pub fn metrics(&self) -> &PerformanceMetrics {
         &self.metrics
+    }
+
+    /// Get Prometheus metrics (if configured)
+    pub fn prometheus_metrics(&self) -> Option<Arc<PrometheusMetrics>> {
+        self.prometheus_metrics.clone()
     }
 
     /// Get health check
@@ -230,6 +245,7 @@ impl BackupEngine {
                         backup_id: self.config.backup_id.clone(),
                         options: self.config.backup.clone().unwrap_or_default(),
                         metrics: Arc::clone(&self.metrics),
+                        prometheus_metrics: self.prometheus_metrics.clone(),
                         health: Arc::clone(&self.health),
                         offset_store: self.offset_store.clone(),
                         kafka_cb: Arc::clone(&self.kafka_circuit_breaker),
@@ -261,10 +277,19 @@ impl BackupEngine {
                         error!("Error backing up {}:{}: {}", topic, partition, e);
                         error_count += 1;
                         self.metrics.record_error();
+                        // Record error to Prometheus metrics
+                        if let Some(ref prom) = self.prometheus_metrics {
+                            let error_type = ErrorType::from_error(&e);
+                            prom.record_error(&self.config.backup_id, error_type);
+                        }
                     }
                     Err(e) => {
                         error!("Task join error: {}", e);
                         error_count += 1;
+                        // Record as unknown error
+                        if let Some(ref prom) = self.prometheus_metrics {
+                            prom.record_error(&self.config.backup_id, ErrorType::Unknown);
+                        }
                     }
                 }
             }
@@ -405,6 +430,7 @@ struct BackupPartitionContext {
     backup_id: String,
     options: BackupOptions,
     metrics: Arc<PerformanceMetrics>,
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
     health: Arc<HealthCheck>,
     offset_store: Option<Arc<SqliteOffsetStore>>,
     kafka_cb: Arc<CircuitBreaker>,
@@ -434,14 +460,24 @@ impl BackupPartitionContext {
             self.get_configured_start_offset(earliest)
         };
 
+        // Record consumer lag (how many records we need to catch up)
+        let lag = latest - start_offset;
+        if let Some(ref prom) = self.prometheus_metrics {
+            prom.record_lag(&self.topic, self.partition, &self.backup_id, lag, None);
+        }
+
         debug!(
-            "{}:{}: offsets earliest={}, latest={}, starting at {}",
-            self.topic, self.partition, earliest, latest, start_offset
+            "{}:{}: offsets earliest={}, latest={}, starting at {}, lag={}",
+            self.topic, self.partition, earliest, latest, start_offset, lag
         );
 
         // If no data to back up, skip
         if start_offset >= latest {
             debug!("{}:{}: no new data to back up", self.topic, self.partition);
+            // Record zero lag
+            if let Some(ref prom) = self.prometheus_metrics {
+                prom.record_lag(&self.topic, self.partition, &self.backup_id, 0, None);
+            }
             return Ok(());
         }
 
@@ -452,8 +488,13 @@ impl BackupPartitionContext {
             compression: self.options.compression,
             compression_level: self.options.compression_level,
         };
-        let mut segment_writer =
-            SegmentWriter::new(writer_config, self.storage.clone(), self.metrics.clone());
+        let mut segment_writer = SegmentWriter::with_prometheus(
+            writer_config,
+            self.storage.clone(),
+            self.metrics.clone(),
+            self.prometheus_metrics.clone(),
+            self.backup_id.clone(),
+        );
 
         let mut current_offset = start_offset;
         let mut segment_sequence = 0u64;
@@ -468,6 +509,11 @@ impl BackupPartitionContext {
                     self.health
                         .mark_degraded("kafka", &format!("Fetch error: {}", e));
                     self.kafka_cb.record_failure();
+                    // Record error to Prometheus metrics
+                    if let Some(ref prom) = self.prometheus_metrics {
+                        let error_type = ErrorType::from_error(&e);
+                        prom.record_error(&self.backup_id, error_type);
+                    }
                     return Err(e);
                 }
             };
@@ -537,7 +583,32 @@ impl BackupPartitionContext {
             }
 
             // Track progress
-            self.health.record_records(records.len() as u64);
+            let record_count = records.len() as u64;
+            let bytes_processed: u64 = records
+                .iter()
+                .map(|r| {
+                    r.key.as_ref().map(|k| k.len()).unwrap_or(0)
+                        + r.value.as_ref().map(|v| v.len()).unwrap_or(0)
+                })
+                .sum::<usize>() as u64;
+
+            self.health.record_records(record_count);
+
+            // Update Prometheus metrics
+            if let Some(ref prom) = self.prometheus_metrics {
+                prom.inc_records(&self.backup_id, record_count);
+                prom.inc_bytes(&self.backup_id, bytes_processed);
+
+                // Update lag (records remaining to process)
+                let remaining_lag = latest - next_offset;
+                prom.record_lag(
+                    &self.topic,
+                    self.partition,
+                    &self.backup_id,
+                    remaining_lag.max(0),
+                    None,
+                );
+            }
 
             current_offset = next_offset;
         }

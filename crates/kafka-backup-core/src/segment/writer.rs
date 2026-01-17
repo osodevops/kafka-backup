@@ -8,7 +8,7 @@ use super::format::{BinaryRecord, SegmentHeader, FOOTER_SIZE, HEADER_SIZE, MAGIC
 use crate::compression;
 use crate::config::CompressionType;
 use crate::manifest::SegmentMetadata;
-use crate::metrics::PerformanceMetrics;
+use crate::metrics::{PerformanceMetrics, PrometheusMetrics, StorageOperation};
 use crate::storage::StorageBackend;
 use crate::Result;
 
@@ -41,6 +41,8 @@ pub struct SegmentWriter {
     config: SegmentWriterConfig,
     storage: Arc<dyn StorageBackend>,
     metrics: Arc<PerformanceMetrics>,
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
+    backup_id: String,
 
     /// Current buffer for accumulating records
     buffer: BytesMut,
@@ -67,10 +69,23 @@ impl SegmentWriter {
         storage: Arc<dyn StorageBackend>,
         metrics: Arc<PerformanceMetrics>,
     ) -> Self {
+        Self::with_prometheus(config, storage, metrics, None, String::new())
+    }
+
+    /// Create a new segment writer with Prometheus metrics
+    pub fn with_prometheus(
+        config: SegmentWriterConfig,
+        storage: Arc<dyn StorageBackend>,
+        metrics: Arc<PerformanceMetrics>,
+        prometheus_metrics: Option<Arc<PrometheusMetrics>>,
+        backup_id: String,
+    ) -> Self {
         Self {
             config,
             storage,
             metrics,
+            prometheus_metrics,
+            backup_id,
             buffer: BytesMut::with_capacity(1024 * 1024), // 1MB initial capacity
             record_count: 0,
             start_offset: None,
@@ -175,12 +190,29 @@ impl SegmentWriter {
         // Write to storage
         self.storage.put(key, Bytes::from(segment)).await?;
 
-        // Update metrics
+        // Update legacy metrics
         self.metrics
             .record_bytes(compressed_size as u64, uncompressed_size as u64);
         self.metrics.record_records(self.record_count);
         self.metrics.record_segment();
         self.metrics.record_segment_write_latency(start.elapsed());
+
+        // Update Prometheus metrics
+        if let Some(ref prom) = self.prometheus_metrics {
+            let algorithm = format!("{:?}", self.config.compression).to_lowercase();
+            prom.record_compression(
+                &algorithm,
+                &self.backup_id,
+                compressed_size as u64,
+                uncompressed_size as u64,
+            );
+            prom.record_storage_write_latency(
+                "filesystem",
+                StorageOperation::Segment,
+                start.elapsed().as_secs_f64(),
+            );
+            prom.inc_storage_write_bytes("filesystem", &self.backup_id, compressed_size as u64);
+        }
 
         // Build metadata
         let metadata = SegmentMetadata {

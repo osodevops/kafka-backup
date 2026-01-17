@@ -300,6 +300,7 @@ mod tests {
             backup: None,
             restore: None,
             offset_storage: None,
+            metrics: None,
         }
     }
 

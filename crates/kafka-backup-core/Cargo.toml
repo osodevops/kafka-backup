@@ -63,6 +63,12 @@ url.workspace = true
 
 # Metrics
 prometheus.workspace = true
+prometheus-client.workspace = true
+
+# HTTP server
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 
 # Utilities
 parking_lot.workspace = true

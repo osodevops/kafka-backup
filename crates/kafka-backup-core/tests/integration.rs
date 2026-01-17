@@ -97,6 +97,7 @@ fn create_backup_config(
         }),
         restore: None,
         offset_storage: None,
+        metrics: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn create_restore_config(
         backup: None,
         restore: Some(RestoreOptions::default()),
         offset_storage: None,
+        metrics: None,
     }
 }
 
