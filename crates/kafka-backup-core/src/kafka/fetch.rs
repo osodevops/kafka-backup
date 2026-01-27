@@ -119,16 +119,10 @@ pub async fn fetch(
 fn decode_records(data: &Bytes) -> Result<Vec<BackupRecord>> {
     let mut buf = data.clone();
 
-    let decoded_records = RecordBatchDecoder::decode::<
-        _,
-        fn(&mut Bytes, kafka_protocol::records::Compression) -> anyhow::Result<Bytes>,
-    >(&mut buf)
-    .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {:?}", e)))?;
+    let record_set = RecordBatchDecoder::decode(&mut buf)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {:?}", e)))?;
 
-    let records: Vec<BackupRecord> = decoded_records
-        .into_iter()
-        .map(|record| convert_record(&record))
-        .collect();
+    let records: Vec<BackupRecord> = record_set.records.iter().map(convert_record).collect();
 
     Ok(records)
 }

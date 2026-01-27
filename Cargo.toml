@@ -15,7 +15,7 @@ homepage = "https://github.com/osodevops/kafka-backup"
 
 [workspace.dependencies]
 # Kafka protocol
-kafka-protocol = "0.14"
+kafka-protocol = "0.17"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
