@@ -80,12 +80,8 @@ pub async fn produce(
     };
 
     let mut records_buf = BytesMut::new();
-    RecordBatchEncoder::encode::<
-        _,
-        _,
-        fn(&mut BytesMut, &mut BytesMut, Compression) -> anyhow::Result<()>,
-    >(&mut records_buf, kafka_records.iter(), &options)
-    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
+    RecordBatchEncoder::encode(&mut records_buf, kafka_records.iter(), &options)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
 
     let records_bytes = records_buf.freeze();
 
