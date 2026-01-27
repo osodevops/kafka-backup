@@ -1,35 +1,40 @@
 name: Auto Tag Release
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Tests"]
+    types:
+      - completed
     branches: [main]
-    paths:
-      - 'Cargo.toml'
 
 jobs:
-  # Wait for tests to pass first
-  wait-for-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wait for tests workflow
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: 'Tests Complete'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 30
-
   create-tag:
-    needs: wait-for-tests
+    # Only run if Tests workflow succeeded and Cargo.toml was modified
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
+      - name: Check if Cargo.toml was modified
+        id: cargo-check
+        run: |
+          # Get the files changed in the commit that triggered the workflow
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r ${{ github.event.workflow_run.head_sha }})
+          if echo "$CHANGED_FILES" | grep -q "^Cargo.toml$"; then
+            echo "modified=true" >> $GITHUB_OUTPUT
+            echo "Cargo.toml was modified in this commit"
+          else
+            echo "modified=false" >> $GITHUB_OUTPUT
+            echo "Cargo.toml was NOT modified - skipping tag creation"
+          fi
+
       - name: Extract version from Cargo.toml
+        if: steps.cargo-check.outputs.modified == 'true'
         id: version
         run: |
           VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
@@ -38,6 +43,7 @@ jobs:
           echo "Detected version: $VERSION"
 
       - name: Check if tag exists
+        if: steps.cargo-check.outputs.modified == 'true'
         id: tag-check
         run: |
           if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
@@ -49,7 +55,7 @@ jobs:
           fi
 
       - name: Create and push tag
-        if: steps.tag-check.outputs.exists == 'false'
+        if: steps.cargo-check.outputs.modified == 'true' && steps.tag-check.outputs.exists == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
