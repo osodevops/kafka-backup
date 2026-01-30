@@ -603,7 +603,16 @@ data:
     backup:
       compression: zstd
       continuous: true
+
+    # Enable metrics for Prometheus scraping
+    metrics:
+      enabled: true
+      port: 8080
+      bind_address: "0.0.0.0"  # Required for K8s - allows Service routing
+      path: "/metrics"
 ```
+
+> **Important:** When running in Kubernetes, set `bind_address: "0.0.0.0"` to allow the Service to route traffic to the metrics endpoint. The default `127.0.0.1` only accepts localhost connections.
 
 #### Secret (AWS Credentials)
 
@@ -625,6 +634,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kafka-backup
+  labels:
+    app: kafka-backup
 spec:
   replicas: 1
   selector:
@@ -637,11 +648,27 @@ spec:
     spec:
       containers:
         - name: kafka-backup
-          image: kafka-backup:latest
+          image: ghcr.io/osodevops/kafka-backup:latest
           args:
             - backup
             - --config
             - /config/backup.yaml
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
           envFrom:
             - secretRef:
                 name: kafka-backup-aws
@@ -659,6 +686,50 @@ spec:
         - name: config
           configMap:
             name: kafka-backup-config
+```
+
+#### Service (Metrics Endpoint)
+
+Create a Service to expose the metrics endpoint for Prometheus scraping:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-backup-metrics
+  labels:
+    app: kafka-backup
+spec:
+  selector:
+    app: kafka-backup
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+  type: ClusterIP
+```
+
+#### ServiceMonitor (Prometheus Operator)
+
+If using the Prometheus Operator, create a ServiceMonitor:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-backup
+  labels:
+    app: kafka-backup
+    release: prometheus  # Match your Prometheus serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: kafka-backup
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
 ```
 
 #### CronJob (Scheduled Backups)
