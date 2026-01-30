@@ -382,6 +382,20 @@ pub struct BackupOptions {
     /// Useful for tracking which cluster the backup originated from
     #[serde(default)]
     pub source_cluster_id: Option<String>,
+
+    /// Snapshot mode: capture current high watermarks at backup start and stop
+    /// when all partitions have reached their target offsets.
+    ///
+    /// This provides consistent "point-in-time" snapshots for DR backups.
+    /// When enabled:
+    /// 1. At startup, captures high watermarks for ALL partitions
+    /// 2. Each partition backs up until it reaches its snapshot target
+    /// 3. Backup exits cleanly when all partitions are caught up
+    ///
+    /// Incompatible with `continuous: true` mode.
+    /// Default: false
+    #[serde(default)]
+    pub stop_at_current_offsets: bool,
 }
 
 fn default_include_offset_headers() -> bool {
@@ -403,6 +417,7 @@ impl Default for BackupOptions {
             sync_interval_secs: default_sync_interval_secs(),
             include_offset_headers: default_include_offset_headers(),
             source_cluster_id: None,
+            stop_at_current_offsets: false,
         }
     }
 }
@@ -571,6 +586,11 @@ impl Config {
                         "Source configuration is required for backup mode".to_string(),
                     ));
                 }
+
+                // Validate backup-specific options
+                if let Some(backup) = &self.backup {
+                    backup.validate()?;
+                }
             }
             Mode::Restore => {
                 if self.target.is_none() {
@@ -589,6 +609,31 @@ impl Config {
         // Storage config validation is handled by StorageBackendConfig's typed enum
         // Required fields are non-Optional in each variant, so invalid configs
         // fail at deserialization time rather than runtime validation
+
+        Ok(())
+    }
+}
+
+impl BackupOptions {
+    /// Validate backup options
+    pub fn validate(&self) -> crate::Result<()> {
+        // stop_at_current_offsets is incompatible with continuous mode
+        if self.stop_at_current_offsets && self.continuous {
+            return Err(crate::Error::Config(
+                "stop_at_current_offsets cannot be used with continuous mode. \
+                 Use stop_at_current_offsets for snapshot backups (catch up and exit), \
+                 or continuous for streaming replication (run forever)."
+                    .to_string(),
+            ));
+        }
+
+        // Validate compression level
+        if self.compression_level < 1 || self.compression_level > 22 {
+            return Err(crate::Error::Config(format!(
+                "compression_level must be between 1 and 22, got {}",
+                self.compression_level
+            )));
+        }
 
         Ok(())
     }

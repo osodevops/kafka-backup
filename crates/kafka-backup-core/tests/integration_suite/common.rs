@@ -16,7 +16,7 @@ use kafka_backup_core::config::{
     BackupOptions, CompressionType, Config, KafkaConfig, Mode, RestoreOptions, SecurityConfig,
     TopicSelection,
 };
-use kafka_backup_core::kafka::KafkaClient;
+use kafka_backup_core::kafka::{KafkaClient, TopicToCreate};
 use kafka_backup_core::manifest::BackupRecord;
 use kafka_backup_core::storage::StorageBackendConfig;
 
@@ -78,11 +78,34 @@ impl KafkaTestCluster {
         }
     }
 
-    /// Create a topic by producing a message to it (auto-create).
+    /// Create a topic using the Admin API, then populate with test records.
     pub async fn create_topic(&self, topic: &str, num_messages: usize) -> anyhow::Result<()> {
         let client = self.create_client();
         client.connect().await?;
 
+        // First, create the topic explicitly using Admin API
+        let topics_to_create = vec![TopicToCreate {
+            name: topic.to_string(),
+            num_partitions: 3,
+            replication_factor: 1,
+        }];
+
+        let results = client.create_topics(topics_to_create, 30000).await?;
+        for result in &results {
+            if !result.is_success_or_exists() {
+                anyhow::bail!(
+                    "Failed to create topic {}: error_code={}, msg={:?}",
+                    result.name,
+                    result.error_code,
+                    result.error_message
+                );
+            }
+        }
+
+        // Wait for topic to be fully ready
+        sleep(Duration::from_secs(2)).await;
+
+        // Now produce records
         let records = generate_test_records(num_messages, topic);
         for (i, record) in records.iter().enumerate() {
             let partition = (i % 3) as i32; // Distribute across partitions

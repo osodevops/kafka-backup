@@ -1,0 +1,32 @@
+# Test configuration for snapshot backup (stop_at_current_offsets)
+# This backup will capture high watermarks at start and exit when caught up
+mode: backup
+backup_id: "snapshot-test"
+
+source:
+  bootstrap_servers:
+    - localhost:9092
+  topics:
+    include:
+      - "test-*"
+    exclude:
+      - "__*"
+
+storage:
+  backend: filesystem
+  path: /tmp/kafka-backup-test
+
+backup:
+  compression: zstd
+  compression_level: 3
+  stop_at_current_offsets: true  # Snapshot mode - exit when caught up
+  include_offset_headers: true
+
+logging:
+  level: info
+  format: text
+
+metrics:
+  enabled: true
+  port: 8080
+  bind_address: "127.0.0.1"

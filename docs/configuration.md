@@ -327,13 +327,31 @@ Options specific to backup operations.
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `compression` | string | No | `zstd` | Compression algorithm |
-| `continuous` | bool | No | `false` | Run continuously |
+| `continuous` | bool | No | `false` | Run continuously (streaming replication) |
+| `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture HWMs at start, exit when caught up |
 | `checkpoint_interval_secs` | int | No | `60` | Checkpoint interval |
 | `segment_max_records` | int | No | `100000` | Max records per segment |
 | `segment_max_bytes` | int | No | `104857600` | Max bytes per segment (100MB) |
 | `segment_max_age_secs` | int | No | `3600` | Max segment age |
 | `max_concurrent_partitions` | int | No | `4` | Concurrent partitions |
 | `fetch_max_bytes` | int | No | `1048576` | Max bytes per fetch |
+
+### Backup Modes
+
+| Mode | Configuration | Behavior |
+|------|---------------|----------|
+| **One-shot** (default) | `continuous: false` | Backup current data and exit |
+| **Continuous** | `continuous: true` | Run forever, backing up new data as it arrives |
+| **Snapshot** | `stop_at_current_offsets: true` | Capture high watermarks at start, backup until caught up, then exit cleanly |
+
+**Snapshot mode** (`stop_at_current_offsets: true`) is ideal for scheduled DR backups:
+1. At startup, captures high watermarks for ALL partitions (atomic snapshot point)
+2. Backs up all data up to those fixed offsets
+3. Exits cleanly with exit code 0 when complete
+
+This ensures consistent "point-in-time" snapshots for disaster recovery, even with high-throughput topics.
+
+> **Note:** `stop_at_current_offsets` is incompatible with `continuous: true`. Use snapshot mode for scheduled backups (CronJobs), and continuous mode for streaming replication.
 
 ### Compression Options
 
@@ -345,8 +363,9 @@ Options specific to backup operations.
 | `gzip` | Gzip (widely compatible) |
 | `snappy` | Snappy (balanced) |
 
-### Example
+### Examples
 
+**Continuous Backup (Streaming Replication):**
 ```yaml
 backup:
   compression: zstd
@@ -357,6 +376,16 @@ backup:
   segment_max_age_secs: 1800   # 30 minutes
   max_concurrent_partitions: 8
   fetch_max_bytes: 5242880     # 5MB
+```
+
+**Snapshot Backup (DR/Scheduled):**
+```yaml
+backup:
+  compression: zstd
+  stop_at_current_offsets: true  # Exit when caught up
+  include_offset_headers: true    # For offset remapping on restore
+  checkpoint_interval_secs: 30
+  segment_max_bytes: 134217728    # 128MB
 ```
 
 ---
