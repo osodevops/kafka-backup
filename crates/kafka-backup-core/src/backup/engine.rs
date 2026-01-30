@@ -1,9 +1,10 @@
 //! Backup engine orchestration.
 
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -207,11 +208,28 @@ impl BackupEngine {
 
         info!("Backing up {} topics", topics.len());
 
+        // Capture snapshot offsets if stop_at_current_offsets is enabled
+        // This provides a consistent "point-in-time" snapshot for DR backups
+        let snapshot_offsets: Option<HashMap<(String, i32), i64>> =
+            if backup_opts.stop_at_current_offsets {
+                Some(self.capture_snapshot_offsets(&topics).await?)
+            } else {
+                None
+            };
+
         let mut shutdown_rx = self.shutdown_receiver();
+
+        // Create semaphore to limit concurrent partition backups
+        let semaphore = Arc::new(Semaphore::new(backup_opts.max_concurrent_partitions));
+
+        info!(
+            "Backup engine starting with max_concurrent_partitions={}, poll_interval_ms={}",
+            backup_opts.max_concurrent_partitions, backup_opts.poll_interval_ms
+        );
 
         // Run backup loop
         loop {
-            // Process ALL topics in PARALLEL for maximum throughput
+            // Process topics with controlled parallelism
             let mut all_handles = Vec::new();
 
             for topic in &topics {
@@ -234,8 +252,17 @@ impl BackupEngine {
                 let partitions: Vec<i32> =
                     metadata.partitions.iter().map(|p| p.partition_id).collect();
 
-                // Spawn a task for EACH partition (true parallelism)
+                // Spawn a task for each partition (limited by semaphore)
                 for partition in partitions {
+                    // Get target offset for snapshot mode (if enabled)
+                    let target_offset = snapshot_offsets
+                        .as_ref()
+                        .and_then(|m| m.get(&(topic.clone(), partition)))
+                        .copied();
+
+                    // Acquire semaphore permit to limit concurrency
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+
                     let ctx = BackupPartitionContext {
                         topic: topic.to_string(),
                         partition,
@@ -250,19 +277,26 @@ impl BackupEngine {
                         offset_store: self.offset_store.clone(),
                         kafka_cb: Arc::clone(&self.kafka_circuit_breaker),
                         storage_cb: Arc::clone(&self.storage_circuit_breaker),
+                        target_offset,
                     };
 
                     all_handles.push(tokio::spawn(async move {
-                        (
+                        let result = (
                             ctx.topic.clone(),
                             ctx.partition,
                             ctx.backup_partition().await,
-                        )
+                        );
+                        drop(permit); // Release semaphore permit when done
+                        result
                     }));
                 }
             }
 
-            info!("Spawned {} parallel backup tasks", all_handles.len());
+            info!(
+                "Spawned {} backup tasks (max {} concurrent)",
+                all_handles.len(),
+                backup_opts.max_concurrent_partitions
+            );
 
             // Wait for ALL partitions across ALL topics to complete
             let results = futures::future::join_all(all_handles).await;
@@ -317,9 +351,9 @@ impl BackupEngine {
                 break;
             }
 
-            // Wait before next iteration
+            // Wait before next iteration (configurable poll interval)
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(backup_opts.poll_interval_ms)) => {}
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received, stopping backup");
                     break;
@@ -328,7 +362,15 @@ impl BackupEngine {
         }
 
         self.finalize().await?;
-        info!("Backup completed successfully");
+
+        if backup_opts.stop_at_current_offsets {
+            info!(
+                "Snapshot backup completed successfully - all partitions reached their target offsets"
+            );
+        } else {
+            info!("Backup completed successfully");
+        }
+
         Ok(())
     }
 
@@ -418,6 +460,55 @@ impl BackupEngine {
 
         Ok(())
     }
+
+    /// Capture current high watermarks for all partitions (snapshot mode)
+    ///
+    /// This provides a consistent snapshot point - all partitions will backup
+    /// to the same logical point in time (the moment this method is called).
+    async fn capture_snapshot_offsets(
+        &self,
+        topics: &[String],
+    ) -> Result<HashMap<(String, i32), i64>> {
+        let mut offsets = HashMap::new();
+        let mut total_records = 0i64;
+
+        info!(
+            "Snapshot mode: capturing high watermarks for {} topics",
+            topics.len()
+        );
+
+        for topic in topics {
+            let metadata = match self.router.get_topic_metadata(topic).await {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to get metadata for topic {}: {}", topic, e);
+                    return Err(e);
+                }
+            };
+
+            for partition_meta in &metadata.partitions {
+                let partition = partition_meta.partition_id;
+                let (earliest, latest) = self.router.get_offsets(topic, partition).await?;
+                offsets.insert((topic.clone(), partition), latest);
+
+                let partition_records = latest - earliest;
+                total_records += partition_records;
+
+                debug!(
+                    "Snapshot target: {}:{} -> offset {} ({} records available)",
+                    topic, partition, latest, partition_records
+                );
+            }
+        }
+
+        info!(
+            "Captured snapshot offsets for {} partitions ({} total records to backup)",
+            offsets.len(),
+            total_records
+        );
+
+        Ok(offsets)
+    }
 }
 
 /// Context for backing up a single partition
@@ -436,6 +527,9 @@ struct BackupPartitionContext {
     kafka_cb: Arc<CircuitBreaker>,
     #[allow(dead_code)] // Reserved for future storage circuit breaker integration
     storage_cb: Arc<CircuitBreaker>,
+    /// Target offset for snapshot mode (stop_at_current_offsets)
+    /// When set, backup stops when this offset is reached instead of latest
+    target_offset: Option<i64>,
 }
 
 impl BackupPartitionContext {
@@ -444,6 +538,17 @@ impl BackupPartitionContext {
 
         // Get partition offsets (routed to correct partition leader)
         let (earliest, latest) = self.router.get_offsets(&self.topic, self.partition).await?;
+
+        // Determine end offset: use snapshot target if set, otherwise current latest
+        // This enables "stop_at_current_offsets" mode for consistent DR snapshots
+        let end_offset = self.target_offset.unwrap_or(latest);
+
+        if self.target_offset.is_some() {
+            debug!(
+                "{}:{}: snapshot mode - target offset {} (current latest: {})",
+                self.topic, self.partition, end_offset, latest
+            );
+        }
 
         // Determine starting offset
         let start_offset = if let Some(ref offset_store) = self.offset_store {
@@ -461,18 +566,18 @@ impl BackupPartitionContext {
         };
 
         // Record consumer lag (how many records we need to catch up)
-        let lag = latest - start_offset;
+        let lag = end_offset - start_offset;
         if let Some(ref prom) = self.prometheus_metrics {
             prom.record_lag(&self.topic, self.partition, &self.backup_id, lag, None);
         }
 
         debug!(
-            "{}:{}: offsets earliest={}, latest={}, starting at {}, lag={}",
-            self.topic, self.partition, earliest, latest, start_offset, lag
+            "{}:{}: offsets earliest={}, end={}, starting at {}, lag={}",
+            self.topic, self.partition, earliest, end_offset, start_offset, lag
         );
 
         // If no data to back up, skip
-        if start_offset >= latest {
+        if start_offset >= end_offset {
             debug!("{}:{}: no new data to back up", self.topic, self.partition);
             // Record zero lag
             if let Some(ref prom) = self.prometheus_metrics {
@@ -500,8 +605,8 @@ impl BackupPartitionContext {
         let mut segment_sequence = 0u64;
 
         // Fetch and store records in segments
-        while current_offset < latest {
-            let fetch_result = self.fetch_records(current_offset, latest).await;
+        while current_offset < end_offset {
+            let fetch_result = self.fetch_records(current_offset, end_offset).await;
 
             let (records, next_offset) = match fetch_result {
                 Ok(data) => data,
@@ -599,8 +704,8 @@ impl BackupPartitionContext {
                 prom.inc_records(&self.backup_id, record_count);
                 prom.inc_bytes(&self.backup_id, bytes_processed);
 
-                // Update lag (records remaining to process)
-                let remaining_lag = latest - next_offset;
+                // Update lag (records remaining to process towards our target)
+                let remaining_lag = end_offset - next_offset;
                 prom.record_lag(
                     &self.topic,
                     self.partition,
@@ -622,10 +727,17 @@ impl BackupPartitionContext {
             }
         }
 
-        info!(
-            "Completed backup of {}:{} - {} segments",
-            self.topic, self.partition, segment_sequence
-        );
+        if self.target_offset.is_some() {
+            info!(
+                "Completed snapshot backup of {}:{} - {} segments (reached target offset {})",
+                self.topic, self.partition, segment_sequence, end_offset
+            );
+        } else {
+            info!(
+                "Completed backup of {}:{} - {} segments",
+                self.topic, self.partition, segment_sequence
+            );
+        }
 
         Ok(())
     }

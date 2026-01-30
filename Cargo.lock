@@ -934,6 +934,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.4",
 ]
 
 [[package]]
@@ -1189,12 +1190,13 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "kafka-backup-core",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1205,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1865,6 +1867,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots 1.0.4",
 ]
 
 [[package]]

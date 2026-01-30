@@ -382,10 +382,52 @@ pub struct BackupOptions {
     /// Useful for tracking which cluster the backup originated from
     #[serde(default)]
     pub source_cluster_id: Option<String>,
+
+    /// Snapshot mode: capture current high watermarks at backup start and stop
+    /// when all partitions have reached their target offsets.
+    ///
+    /// This provides consistent "point-in-time" snapshots for DR backups.
+    /// When enabled:
+    /// 1. At startup, captures high watermarks for ALL partitions
+    /// 2. Each partition backs up until it reaches its snapshot target
+    /// 3. Backup exits cleanly when all partitions are caught up
+    ///
+    /// Incompatible with `continuous: true` mode.
+    /// Default: false
+    #[serde(default)]
+    pub stop_at_current_offsets: bool,
+
+    /// Maximum concurrent partitions to backup in parallel.
+    ///
+    /// Limits resource usage (CPU, memory, network, storage I/O) by controlling
+    /// how many partitions are processed simultaneously. Higher values increase
+    /// throughput but may cause resource contention.
+    ///
+    /// Default: 8
+    #[serde(default = "default_backup_max_concurrent_partitions")]
+    pub max_concurrent_partitions: usize,
+
+    /// Poll interval in milliseconds for continuous backup mode.
+    ///
+    /// In continuous mode, after each complete pass through all partitions,
+    /// the backup waits this long before starting the next pass.
+    /// Lower values reduce lag but increase CPU usage.
+    ///
+    /// Default: 100ms (was hardcoded to 1000ms)
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 fn default_include_offset_headers() -> bool {
     true
+}
+
+fn default_backup_max_concurrent_partitions() -> usize {
+    8 // Balance between parallelism and resource usage
+}
+
+fn default_poll_interval_ms() -> u64 {
+    100 // 100ms - much lower than old hardcoded 1000ms for better lag reduction
 }
 
 impl Default for BackupOptions {
@@ -403,6 +445,9 @@ impl Default for BackupOptions {
             sync_interval_secs: default_sync_interval_secs(),
             include_offset_headers: default_include_offset_headers(),
             source_cluster_id: None,
+            stop_at_current_offsets: false,
+            max_concurrent_partitions: default_backup_max_concurrent_partitions(),
+            poll_interval_ms: default_poll_interval_ms(),
         }
     }
 }
@@ -571,6 +616,11 @@ impl Config {
                         "Source configuration is required for backup mode".to_string(),
                     ));
                 }
+
+                // Validate backup-specific options
+                if let Some(backup) = &self.backup {
+                    backup.validate()?;
+                }
             }
             Mode::Restore => {
                 if self.target.is_none() {
@@ -589,6 +639,38 @@ impl Config {
         // Storage config validation is handled by StorageBackendConfig's typed enum
         // Required fields are non-Optional in each variant, so invalid configs
         // fail at deserialization time rather than runtime validation
+
+        Ok(())
+    }
+}
+
+impl BackupOptions {
+    /// Validate backup options
+    pub fn validate(&self) -> crate::Result<()> {
+        // stop_at_current_offsets is incompatible with continuous mode
+        if self.stop_at_current_offsets && self.continuous {
+            return Err(crate::Error::Config(
+                "stop_at_current_offsets cannot be used with continuous mode. \
+                 Use stop_at_current_offsets for snapshot backups (catch up and exit), \
+                 or continuous for streaming replication (run forever)."
+                    .to_string(),
+            ));
+        }
+
+        // Validate compression level
+        if self.compression_level < 1 || self.compression_level > 22 {
+            return Err(crate::Error::Config(format!(
+                "compression_level must be between 1 and 22, got {}",
+                self.compression_level
+            )));
+        }
+
+        // Validate max_concurrent_partitions
+        if self.max_concurrent_partitions == 0 {
+            return Err(crate::Error::Config(
+                "max_concurrent_partitions must be > 0".to_string(),
+            ));
+        }
 
         Ok(())
     }

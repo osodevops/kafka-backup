@@ -7,6 +7,7 @@ pub mod offset_reset_bulk;
 pub mod offset_rollback;
 pub mod restore;
 pub mod status;
+pub mod status_watch;
 pub mod three_phase;
 pub mod validate;
 pub mod validate_restore;
