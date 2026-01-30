@@ -396,10 +396,38 @@ pub struct BackupOptions {
     /// Default: false
     #[serde(default)]
     pub stop_at_current_offsets: bool,
+
+    /// Maximum concurrent partitions to backup in parallel.
+    ///
+    /// Limits resource usage (CPU, memory, network, storage I/O) by controlling
+    /// how many partitions are processed simultaneously. Higher values increase
+    /// throughput but may cause resource contention.
+    ///
+    /// Default: 8
+    #[serde(default = "default_backup_max_concurrent_partitions")]
+    pub max_concurrent_partitions: usize,
+
+    /// Poll interval in milliseconds for continuous backup mode.
+    ///
+    /// In continuous mode, after each complete pass through all partitions,
+    /// the backup waits this long before starting the next pass.
+    /// Lower values reduce lag but increase CPU usage.
+    ///
+    /// Default: 100ms (was hardcoded to 1000ms)
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 fn default_include_offset_headers() -> bool {
     true
+}
+
+fn default_backup_max_concurrent_partitions() -> usize {
+    8 // Balance between parallelism and resource usage
+}
+
+fn default_poll_interval_ms() -> u64 {
+    100 // 100ms - much lower than old hardcoded 1000ms for better lag reduction
 }
 
 impl Default for BackupOptions {
@@ -418,6 +446,8 @@ impl Default for BackupOptions {
             include_offset_headers: default_include_offset_headers(),
             source_cluster_id: None,
             stop_at_current_offsets: false,
+            max_concurrent_partitions: default_backup_max_concurrent_partitions(),
+            poll_interval_ms: default_poll_interval_ms(),
         }
     }
 }
@@ -633,6 +663,13 @@ impl BackupOptions {
                 "compression_level must be between 1 and 22, got {}",
                 self.compression_level
             )));
+        }
+
+        // Validate max_concurrent_partitions
+        if self.max_concurrent_partitions == 0 {
+            return Err(crate::Error::Config(
+                "max_concurrent_partitions must be > 0".to_string(),
+            ));
         }
 
         Ok(())

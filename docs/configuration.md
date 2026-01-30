@@ -333,8 +333,15 @@ Options specific to backup operations.
 | `segment_max_records` | int | No | `100000` | Max records per segment |
 | `segment_max_bytes` | int | No | `104857600` | Max bytes per segment (100MB) |
 | `segment_max_age_secs` | int | No | `3600` | Max segment age |
-| `max_concurrent_partitions` | int | No | `4` | Concurrent partitions |
+| `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
+| `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
 | `fetch_max_bytes` | int | No | `1048576` | Max bytes per fetch |
+
+### Performance Tuning
+
+**`max_concurrent_partitions`**: Controls how many partitions are backed up simultaneously. Higher values increase throughput but may cause resource contention (CPU, memory, network, storage I/O). Default is 8.
+
+**`poll_interval_ms`**: In continuous mode, this controls the delay between backup passes. Lower values reduce lag but increase CPU usage. Default is 100ms. Set to 0 for maximum throughput (no delay).
 
 ### Backup Modes
 
@@ -374,7 +381,8 @@ backup:
   segment_max_records: 50000
   segment_max_bytes: 52428800  # 50MB
   segment_max_age_secs: 1800   # 30 minutes
-  max_concurrent_partitions: 8
+  max_concurrent_partitions: 8 # Limit concurrent partition tasks
+  poll_interval_ms: 100        # Delay between backup passes (lower = less lag)
   fetch_max_bytes: 5242880     # 5MB
 ```
 

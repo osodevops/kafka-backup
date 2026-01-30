@@ -8,9 +8,11 @@
 //! - Offset Semantics: Consumer group offset handling tests
 //! - TLS Security: SSL/TLS certificate handling tests
 //! - Snapshot Backup: stop_at_current_offsets feature tests
+//! - Performance Issues: Issue #29 constant lag and throughput tests
 
 pub mod common;
 pub mod offset_semantics;
+pub mod performance_issues;
 pub mod pitr_accuracy;
 pub mod snapshot_backup;
 pub mod tls_tests;

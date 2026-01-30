@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -219,9 +219,17 @@ impl BackupEngine {
 
         let mut shutdown_rx = self.shutdown_receiver();
 
+        // Create semaphore to limit concurrent partition backups
+        let semaphore = Arc::new(Semaphore::new(backup_opts.max_concurrent_partitions));
+
+        info!(
+            "Backup engine starting with max_concurrent_partitions={}, poll_interval_ms={}",
+            backup_opts.max_concurrent_partitions, backup_opts.poll_interval_ms
+        );
+
         // Run backup loop
         loop {
-            // Process ALL topics in PARALLEL for maximum throughput
+            // Process topics with controlled parallelism
             let mut all_handles = Vec::new();
 
             for topic in &topics {
@@ -244,13 +252,16 @@ impl BackupEngine {
                 let partitions: Vec<i32> =
                     metadata.partitions.iter().map(|p| p.partition_id).collect();
 
-                // Spawn a task for EACH partition (true parallelism)
+                // Spawn a task for each partition (limited by semaphore)
                 for partition in partitions {
                     // Get target offset for snapshot mode (if enabled)
                     let target_offset = snapshot_offsets
                         .as_ref()
                         .and_then(|m| m.get(&(topic.clone(), partition)))
                         .copied();
+
+                    // Acquire semaphore permit to limit concurrency
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
 
                     let ctx = BackupPartitionContext {
                         topic: topic.to_string(),
@@ -270,16 +281,22 @@ impl BackupEngine {
                     };
 
                     all_handles.push(tokio::spawn(async move {
-                        (
+                        let result = (
                             ctx.topic.clone(),
                             ctx.partition,
                             ctx.backup_partition().await,
-                        )
+                        );
+                        drop(permit); // Release semaphore permit when done
+                        result
                     }));
                 }
             }
 
-            info!("Spawned {} parallel backup tasks", all_handles.len());
+            info!(
+                "Spawned {} backup tasks (max {} concurrent)",
+                all_handles.len(),
+                backup_opts.max_concurrent_partitions
+            );
 
             // Wait for ALL partitions across ALL topics to complete
             let results = futures::future::join_all(all_handles).await;
@@ -334,9 +351,9 @@ impl BackupEngine {
                 break;
             }
 
-            // Wait before next iteration
+            // Wait before next iteration (configurable poll interval)
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(backup_opts.poll_interval_ms)) => {}
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received, stopping backup");
                     break;
