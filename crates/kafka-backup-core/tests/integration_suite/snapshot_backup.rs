@@ -64,7 +64,8 @@ fn create_continuous_backup_config(
     backup_id: &str,
     topics: Vec<String>,
 ) -> Config {
-    let mut config = create_snapshot_backup_config(bootstrap_server, storage_path, backup_id, topics);
+    let mut config =
+        create_snapshot_backup_config(bootstrap_server, storage_path, backup_id, topics);
     if let Some(ref mut backup) = config.backup {
         backup.stop_at_current_offsets = false;
         backup.continuous = false; // One-shot mode for testing
@@ -223,7 +224,9 @@ async fn test_snapshot_backup_captures_hwm_at_start() {
 
     // Start backup in background task
     let backup_handle = tokio::spawn(async move {
-        let engine = BackupEngine::new(config).await.expect("Failed to create engine");
+        let engine = BackupEngine::new(config)
+            .await
+            .expect("Failed to create engine");
         engine.run().await
     });
 
@@ -251,10 +254,17 @@ async fn test_snapshot_backup_captures_hwm_at_start() {
         .expect("Backup task panicked");
 
     // Verify backup completed successfully
-    assert!(result.is_ok(), "Backup should complete successfully: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Backup should complete successfully: {:?}",
+        result
+    );
 
     // Verify manifest exists
-    let manifest_path = temp_dir.path().join("snapshot-backup-001").join("manifest.json");
+    let manifest_path = temp_dir
+        .path()
+        .join("snapshot-backup-001")
+        .join("manifest.json");
     assert!(
         manifest_path.exists(),
         "Manifest should exist at {:?}",
@@ -279,10 +289,7 @@ async fn test_snapshot_backup_captures_hwm_at_start() {
 
     // Verify topics array exists
     let topics = manifest.get("topics").and_then(|t| t.as_array());
-    assert!(
-        topics.is_some(),
-        "Manifest topics should be an array"
-    );
+    assert!(topics.is_some(), "Manifest topics should be an array");
 }
 
 /// Test that snapshot backup exits with success when all partitions are caught up.
@@ -318,7 +325,9 @@ async fn test_snapshot_backup_exits_cleanly() {
     );
 
     // Run backup - should complete and exit
-    let engine = BackupEngine::new(config).await.expect("Failed to create engine");
+    let engine = BackupEngine::new(config)
+        .await
+        .expect("Failed to create engine");
 
     let result = tokio::time::timeout(Duration::from_secs(30), engine.run())
         .await
@@ -361,7 +370,9 @@ async fn test_oneshot_backup_still_works() {
         vec![topic.to_string()],
     );
 
-    let engine = BackupEngine::new(config).await.expect("Failed to create engine");
+    let engine = BackupEngine::new(config)
+        .await
+        .expect("Failed to create engine");
 
     let result = tokio::time::timeout(Duration::from_secs(30), engine.run())
         .await
@@ -410,7 +421,9 @@ async fn test_snapshot_backup_multiple_partitions() {
         vec![topic.to_string()],
     );
 
-    let engine = BackupEngine::new(config).await.expect("Failed to create engine");
+    let engine = BackupEngine::new(config)
+        .await
+        .expect("Failed to create engine");
 
     let result = tokio::time::timeout(Duration::from_secs(60), engine.run())
         .await
@@ -466,7 +479,9 @@ async fn test_snapshot_backup_empty_topic() {
         vec![topic.to_string()],
     );
 
-    let engine = BackupEngine::new(config).await.expect("Failed to create engine");
+    let engine = BackupEngine::new(config)
+        .await
+        .expect("Failed to create engine");
 
     let result = tokio::time::timeout(Duration::from_secs(30), engine.run())
         .await

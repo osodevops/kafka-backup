@@ -35,12 +35,12 @@ pub async fn run(
     }
 
     // Static inspection mode requires path and backup_id
-    let path = path.ok_or_else(|| anyhow::anyhow!(
-        "Either --config or both --path and --backup-id are required"
-    ))?;
-    let backup_id = backup_id.ok_or_else(|| anyhow::anyhow!(
-        "Either --config or both --path and --backup-id are required"
-    ))?;
+    let path = path.ok_or_else(|| {
+        anyhow::anyhow!("Either --config or both --path and --backup-id are required")
+    })?;
+    let backup_id = backup_id.ok_or_else(|| {
+        anyhow::anyhow!("Either --config or both --path and --backup-id are required")
+    })?;
 
     run_static(path, backup_id, db_path).await
 }

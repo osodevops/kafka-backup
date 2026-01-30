@@ -91,7 +91,10 @@ impl MetricsClient {
             );
         }
 
-        let json: serde_json::Value = response.json().await.context("Failed to parse health JSON")?;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse health JSON")?;
 
         let status = match json["status"].as_str().unwrap_or("unknown") {
             "healthy" => HealthStatus::Healthy,
@@ -138,13 +141,13 @@ impl MetricsClient {
             .context("Failed to connect to metrics server")?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Metrics endpoint returned status: {}",
-                response.status()
-            );
+            anyhow::bail!("Metrics endpoint returned status: {}", response.status());
         }
 
-        let text = response.text().await.context("Failed to read metrics response")?;
+        let text = response
+            .text()
+            .await
+            .context("Failed to read metrics response")?;
         Ok(parse_prometheus_metrics(&text))
     }
 
@@ -194,32 +197,39 @@ fn parse_prometheus_metrics(text: &str) -> ParsedMetrics {
             let value: f64 = value.parse().unwrap_or(0.0);
 
             // Extract metric name (before any labels)
-            let name = name_labels
-                .split('{')
-                .next()
-                .unwrap_or(name_labels);
+            let name = name_labels.split('{').next().unwrap_or(name_labels);
 
             match name {
                 // prometheus-client adds _total suffix to counters
-                "kafka_backup_bytes_total" | "kafka_backup_bytes_total_total" | "kafka_backup_bytes_written_total" => {
+                "kafka_backup_bytes_total"
+                | "kafka_backup_bytes_total_total"
+                | "kafka_backup_bytes_written_total" => {
                     metrics.bytes_total = value as u64;
                 }
-                "kafka_backup_records_total" | "kafka_backup_records_total_total" | "kafka_backup_records_written_total" => {
+                "kafka_backup_records_total"
+                | "kafka_backup_records_total_total"
+                | "kafka_backup_records_written_total" => {
                     metrics.records_total = value as u64;
                 }
                 "kafka_backup_lag_records" => {
                     // Parse labels for topic and partition
                     if let Some((topic, partition)) = parse_topic_partition_labels(name_labels) {
-                        metrics.lag_by_partition.insert((topic, partition), value as i64);
+                        metrics
+                            .lag_by_partition
+                            .insert((topic, partition), value as i64);
                     }
                 }
                 "kafka_backup_compression_ratio" => {
                     metrics.compression_ratio = value;
                 }
-                "kafka_backup_errors_total" | "kafka_backup_storage_errors_total" | "kafka_backup_storage_errors_total_total" => {
+                "kafka_backup_errors_total"
+                | "kafka_backup_storage_errors_total"
+                | "kafka_backup_storage_errors_total_total" => {
                     metrics.error_count += value as u64;
                 }
-                "kafka_backup_segments_total" | "kafka_backup_segments_total_total" | "kafka_backup_segments_written_total" => {
+                "kafka_backup_segments_total"
+                | "kafka_backup_segments_total_total"
+                | "kafka_backup_segments_written_total" => {
                     metrics.segments_written = value as u64;
                 }
                 "kafka_backup_storage_write_bytes_total_total" => {
@@ -276,8 +286,8 @@ fn load_metrics_config(config_path: &str) -> Result<(MetricsConfig, String)> {
     let config_content = std::fs::read_to_string(config_path)
         .context(format!("Failed to read config file: {}", config_path))?;
 
-    let config: Config = serde_yaml::from_str(&config_content)
-        .context("Failed to parse config file")?;
+    let config: Config =
+        serde_yaml::from_str(&config_content).context("Failed to parse config file")?;
 
     let metrics_config = config.metrics.unwrap_or_default();
     let backup_id = config.backup_id.clone();
@@ -362,30 +372,25 @@ fn display_status(status: &LiveStatus, backup_id: &str, interval: u64) {
         backup_id,
         format_uptime(status.uptime_secs)
     );
-    println!(
-        "  Status: {:<44}",
-        status_text(&status.status)
-    );
+    println!("  Status: {:<44}", status_text(&status.status));
     println!("{}", border);
     println!("  Progress");
-    println!(
-        "  |- Records: {}",
-        format_number(status.records_processed)
-    );
+    println!("  |- Records: {}", format_number(status.records_processed));
     println!(
         "  |- Bytes: {} (compressed)",
         format_bytes(status.bytes_total)
     );
 
-    let throughput_str = if status.throughput_records_per_sec > 0.0 || status.throughput_bytes_per_sec > 0.0 {
-        format!(
-            "{:.0} rec/s | {}/s",
-            status.throughput_records_per_sec,
-            format_bytes(status.throughput_bytes_per_sec as u64)
-        )
-    } else {
-        "calculating...".to_string()
-    };
+    let throughput_str =
+        if status.throughput_records_per_sec > 0.0 || status.throughput_bytes_per_sec > 0.0 {
+            format!(
+                "{:.0} rec/s | {}/s",
+                status.throughput_records_per_sec,
+                format_bytes(status.throughput_bytes_per_sec as u64)
+            )
+        } else {
+            "calculating...".to_string()
+        };
     println!("  |- Throughput: {}", throughput_str);
 
     if let Some((topic, partition, _lag)) = &status.lag_max_partition {
@@ -436,8 +441,7 @@ fn display_status(status: &LiveStatus, backup_id: &str, interval: u64) {
     };
     println!(
         "  Compression: {} | Errors: {}",
-        compression_str,
-        status.error_count
+        compression_str, status.error_count
     );
     println!("{}", border);
 
@@ -469,7 +473,10 @@ pub async fn run_watch(config_path: &str, interval_secs: u64) -> Result<()> {
 
     let client = MetricsClient::new(host, metrics_config.port);
 
-    println!("Connecting to metrics server at {}:{}...", host, metrics_config.port);
+    println!(
+        "Connecting to metrics server at {}:{}...",
+        host, metrics_config.port
+    );
 
     // Initial connection test
     match client.fetch_health().await {
@@ -523,9 +530,7 @@ pub async fn run_from_config(config_path: &str) -> Result<()> {
     let (metrics_config, backup_id) = load_metrics_config(config_path)?;
 
     if !metrics_config.enabled {
-        anyhow::bail!(
-            "Metrics server is disabled in config. Enable metrics to query live status."
-        );
+        anyhow::bail!("Metrics server is disabled in config. Enable metrics to query live status.");
     }
 
     let host = if metrics_config.bind_address == "0.0.0.0" {

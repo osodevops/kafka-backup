@@ -195,7 +195,10 @@ async fn test_continuous_backup_constant_lag_issue() {
     // as we produce records during the delay period
 
     let producer_client = cluster.create_client();
-    producer_client.connect().await.expect("Failed to connect producer");
+    producer_client
+        .connect()
+        .await
+        .expect("Failed to connect producer");
 
     let produce_rate = 50; // records per second
     let test_duration_secs = 10;
@@ -228,13 +231,20 @@ async fn test_continuous_backup_constant_lag_issue() {
     println!("Records produced during test: {}", records_produced);
     println!("Test duration: {} seconds", test_duration_secs);
     println!("Produce rate: {} rec/s", produce_rate);
-    println!("");
+    println!();
     println!("AFTER FIX (poll_interval_ms=100):");
     println!("With 100ms delay, lag should be much smaller (~5 records vs ~50).");
     println!("The backup can now keep up better with moderate production rates.");
-    println!("");
-    println!("BEFORE FIX: Lag accumulated ~{} records (1 second * {} rec/s)", produce_rate, produce_rate);
-    println!("AFTER FIX:  Lag should be ~{} records (100ms * {} rec/s)", produce_rate / 10, produce_rate);
+    println!();
+    println!(
+        "BEFORE FIX: Lag accumulated ~{} records (1 second * {} rec/s)",
+        produce_rate, produce_rate
+    );
+    println!(
+        "AFTER FIX:  Lag should be ~{} records (100ms * {} rec/s)",
+        produce_rate / 10,
+        produce_rate
+    );
 
     // The test demonstrates the issue exists - lag accumulates
     // because the 1-second delay gives time for new records to arrive
@@ -274,11 +284,7 @@ async fn test_unbounded_parallelism_throughput() {
     client.connect().await.expect("Failed to connect");
 
     // Create multiple topics to increase partition count
-    let topics = vec![
-        "perf-topic-1",
-        "perf-topic-2",
-        "perf-topic-3",
-    ];
+    let topics = vec!["perf-topic-1", "perf-topic-2", "perf-topic-3"];
 
     let partitions_per_topic = 3;
     let records_per_partition = 500;
@@ -311,11 +317,19 @@ async fn test_unbounded_parallelism_throughput() {
     let total_partitions = topics.len() * partitions_per_topic as usize;
     let total_records = total_partitions * records_per_partition;
 
-    println!("Populating {} topics with {} partitions each...", topics.len(), partitions_per_topic);
-    println!("Total: {} partitions, {} records", total_partitions, total_records);
+    println!(
+        "Populating {} topics with {} partitions each...",
+        topics.len(),
+        partitions_per_topic
+    );
+    println!(
+        "Total: {} partitions, {} records",
+        total_partitions, total_records
+    );
 
     for topic in &topics {
-        let records = generate_test_records(records_per_partition * partitions_per_topic as usize, topic);
+        let records =
+            generate_test_records(records_per_partition * partitions_per_topic as usize, topic);
         for (i, record) in records.iter().enumerate() {
             let partition = (i % partitions_per_topic as usize) as i32;
             client
@@ -353,17 +367,17 @@ async fn test_unbounded_parallelism_throughput() {
 
     let throughput = total_records as f64 / elapsed.as_secs_f64();
 
-    println!("");
+    println!();
     println!("=== Parallelism Test Results (AFTER FIX) ===");
     println!("Total partitions backed up: {}", total_partitions);
     println!("Total records backed up: {}", total_records);
     println!("Elapsed time: {:?}", elapsed);
     println!("Throughput: {:.2} records/second", throughput);
-    println!("");
+    println!();
     println!("AFTER FIX (max_concurrent_partitions=8):");
     println!("Partitions are now processed with controlled parallelism.");
     println!("The semaphore limits to {} concurrent partition tasks.", 8);
-    println!("");
+    println!();
     println!("This prevents:");
     println!("- Manifest lock contention");
     println!("- Storage I/O saturation");
@@ -466,14 +480,14 @@ async fn test_measure_backup_loop_frequency() {
     backup_running.store(false, Ordering::Relaxed);
     sleep(Duration::from_secs(2)).await;
 
-    println!("");
+    println!();
     println!("=== Backup Loop Frequency Test ===");
     println!("Test duration: {:?}", test_duration);
-    println!("");
+    println!();
     println!("AFTER FIX (poll_interval_ms=100):");
     println!("With configurable 100ms delay, backup can do ~50 passes in 5 seconds.");
     println!("This is 10x more frequent than the old hardcoded 1-second delay!");
-    println!("");
+    println!();
     println!("BEFORE FIX: ~5 passes in 5 seconds (1-second hardcoded delay)");
     println!("AFTER FIX:  ~50 passes in 5 seconds (100ms configurable delay)");
 }
@@ -527,7 +541,7 @@ async fn test_snapshot_vs_continuous_lag_comparison() {
     }
 
     // ===== Test 1: Snapshot Mode =====
-    println!("");
+    println!();
     println!("=== Test 1: Snapshot Mode (stop_at_current_offsets: true) ===");
 
     let temp_dir_snapshot = TempDir::new().expect("Failed to create temp dir");
@@ -555,11 +569,15 @@ async fn test_snapshot_vs_continuous_lag_comparison() {
 
     let snapshot_duration = start.elapsed();
 
-    assert!(result.is_ok(), "Snapshot backup should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Snapshot backup should succeed: {:?}",
+        result
+    );
 
     println!("Snapshot backup completed in {:?}", snapshot_duration);
     println!("Exit behavior: Exited cleanly after reaching target offsets");
-    println!("");
+    println!();
 
     // ===== Test 2: Continuous Mode (for comparison) =====
     println!("=== Test 2: Continuous Mode (continuous: true) ===");
@@ -596,18 +614,24 @@ async fn test_snapshot_vs_continuous_lag_comparison() {
     backup_running.store(false, Ordering::Relaxed);
     let continuous_duration = start.elapsed();
 
-    println!("Continuous backup ran for {:?} (manually stopped)", continuous_duration);
+    println!(
+        "Continuous backup ran for {:?} (manually stopped)",
+        continuous_duration
+    );
     println!("Exit behavior: Would run forever, never exits on its own");
-    println!("");
+    println!();
 
     // ===== Summary =====
     println!("=== Summary ===");
-    println!("Snapshot mode: Completes and exits ({:?})", snapshot_duration);
+    println!(
+        "Snapshot mode: Completes and exits ({:?})",
+        snapshot_duration
+    );
     println!("Continuous mode: Runs indefinitely with 1-second delays");
-    println!("");
+    println!();
     println!("For scheduled DR backups, snapshot mode (stop_at_current_offsets: true)");
     println!("is preferred because it provides consistent point-in-time backups.");
-    println!("");
+    println!();
     println!("The constant lag issue (Issue 4) primarily affects continuous mode.");
 }
 
@@ -635,10 +659,16 @@ fn test_backup_options_has_max_concurrent_partitions() {
 
     let debug_output = format!("{:?}", options);
     println!("BackupOptions debug output: {}", debug_output);
-    println!("");
+    println!();
     println!("Issue 4 FIX VERIFIED:");
-    println!("  - max_concurrent_partitions: {} (limits parallelism)", options.max_concurrent_partitions);
-    println!("  - poll_interval_ms: {} (was hardcoded 1000ms)", options.poll_interval_ms);
+    println!(
+        "  - max_concurrent_partitions: {} (limits parallelism)",
+        options.max_concurrent_partitions
+    );
+    println!(
+        "  - poll_interval_ms: {} (was hardcoded 1000ms)",
+        options.poll_interval_ms
+    );
 }
 
 /// Verify that RestoreOptions HAS max_concurrent_partitions field.
@@ -657,7 +687,10 @@ fn test_restore_options_has_max_concurrent_partitions() {
     // When using Default::default(), serde defaults don't apply
     // max_concurrent_partitions will be 0 (usize default)
     // This is a minor inconsistency but the field EXISTS, which is the key point
-    println!("RestoreOptions.max_concurrent_partitions (from Default) = {}", options.max_concurrent_partitions);
+    println!(
+        "RestoreOptions.max_concurrent_partitions (from Default) = {}",
+        options.max_concurrent_partitions
+    );
 
     // Test deserialization to show the serde default works
     let yaml = "dry_run: false";
@@ -669,8 +702,11 @@ fn test_restore_options_has_max_concurrent_partitions() {
         "RestoreOptions should have max_concurrent_partitions=4 when deserialized"
     );
 
-    println!("RestoreOptions.max_concurrent_partitions (from serde) = {}", deserialized.max_concurrent_partitions);
-    println!("");
+    println!(
+        "RestoreOptions.max_concurrent_partitions (from serde) = {}",
+        deserialized.max_concurrent_partitions
+    );
+    println!();
     println!("This setting should be added to BackupOptions as well.");
     println!("The restore engine uses this with a Semaphore to limit concurrency.");
 }
