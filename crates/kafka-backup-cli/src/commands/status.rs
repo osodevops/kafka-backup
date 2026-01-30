@@ -4,7 +4,49 @@ use kafka_backup_core::{BackupManifest, OffsetStore, OffsetStoreConfig, SqliteOf
 use std::path::PathBuf;
 use tracing::info;
 
-pub async fn run(path: &str, backup_id: &str, db_path: Option<&str>) -> Result<()> {
+use super::status_watch;
+
+/// Main entry point for the status command.
+///
+/// Supports two modes:
+/// 1. Static inspection: Use --path and --backup-id to inspect stored backup artifacts
+/// 2. Live monitoring: Use --config to monitor a running backup via metrics endpoints
+///    - Add --watch for continuous polling
+pub async fn run(
+    path: Option<&str>,
+    backup_id: Option<&str>,
+    db_path: Option<&str>,
+    config: Option<&str>,
+    watch: bool,
+    interval: u64,
+) -> Result<()> {
+    // Route to appropriate handler based on arguments
+    if let Some(config_path) = config {
+        if watch {
+            return status_watch::run_watch(config_path, interval).await;
+        } else {
+            return status_watch::run_from_config(config_path).await;
+        }
+    }
+
+    // Watch mode requires --config
+    if watch {
+        anyhow::bail!("--watch requires --config to specify the backup configuration file");
+    }
+
+    // Static inspection mode requires path and backup_id
+    let path = path.ok_or_else(|| anyhow::anyhow!(
+        "Either --config or both --path and --backup-id are required"
+    ))?;
+    let backup_id = backup_id.ok_or_else(|| anyhow::anyhow!(
+        "Either --config or both --path and --backup-id are required"
+    ))?;
+
+    run_static(path, backup_id, db_path).await
+}
+
+/// Run static backup inspection (original behavior).
+async fn run_static(path: &str, backup_id: &str, db_path: Option<&str>) -> Result<()> {
     info!("Getting status for backup: {}", backup_id);
 
     let storage = FilesystemBackend::new(PathBuf::from(path));

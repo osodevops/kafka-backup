@@ -46,17 +46,29 @@ enum Commands {
 
     /// Show status of a backup job
     Status {
-        /// Path to the storage location
-        #[arg(short, long)]
-        path: String,
+        /// Path to the storage location (for static backup inspection)
+        #[arg(short, long, conflicts_with = "config")]
+        path: Option<String>,
 
-        /// Backup ID to show status for
-        #[arg(short, long)]
-        backup_id: String,
+        /// Backup ID to show status for (for static backup inspection)
+        #[arg(short, long, conflicts_with = "config")]
+        backup_id: Option<String>,
 
         /// Path to the offset database
         #[arg(long)]
         db_path: Option<String>,
+
+        /// Path to config file (for live monitoring of a running backup)
+        #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
+        config: Option<String>,
+
+        /// Enable watch mode to continuously poll metrics (requires --config)
+        #[arg(long, requires = "config")]
+        watch: bool,
+
+        /// Refresh interval in seconds for watch mode (default: 2)
+        #[arg(long, default_value = "2")]
+        interval: u64,
     },
 
     /// Validate a backup's integrity
@@ -398,8 +410,19 @@ async fn main() -> Result<()> {
             path,
             backup_id,
             db_path,
+            config,
+            watch,
+            interval,
         } => {
-            commands::status::run(&path, &backup_id, db_path.as_deref()).await?;
+            commands::status::run(
+                path.as_deref(),
+                backup_id.as_deref(),
+                db_path.as_deref(),
+                config.as_deref(),
+                watch,
+                interval,
+            )
+            .await?;
         }
         Commands::Validate {
             path,
