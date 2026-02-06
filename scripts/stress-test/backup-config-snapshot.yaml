@@ -1,0 +1,26 @@
+# Stress test: Snapshot mode
+# Captures current offsets at start and stops when all partitions reach those offsets
+mode: backup
+backup_id: "stress-test-snapshot"
+
+source:
+  bootstrap_servers:
+    - localhost:9092
+  topics:
+    include: ["stress-test-*"]
+
+storage:
+  backend: filesystem
+  path: "/tmp/stress-test-backup/snapshot"
+
+backup:
+  compression: zstd
+  segment_max_bytes: 1048576  # 1MB segments for 3000 topics
+  continuous: false
+  stop_at_current_offsets: true
+  max_concurrent_partitions: 32
+
+metrics:
+  enabled: true
+  port: 8080
+  bind_address: "0.0.0.0"

@@ -11,7 +11,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
 use crate::health::HealthCheck;
-use crate::kafka::PartitionLeaderRouter;
+use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -143,6 +143,11 @@ impl BackupEngine {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Get a clone of the shutdown sender for external signal handling
+    pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
+        self.shutdown_tx.clone()
+    }
+
     /// Get metrics
     pub fn metrics(&self) -> &PerformanceMetrics {
         &self.metrics
@@ -197,22 +202,24 @@ impl BackupEngine {
         }
 
         // Fetch metadata and determine topics to back up
+        // This fetches all topic metadata in a SINGLE bulk call, avoiding per-topic network calls
+        // which was causing severe performance issues with high-latency connections (Issue #29)
         let source = self.config.source.as_ref().unwrap();
         let backup_opts = self.config.backup.clone().unwrap_or_default();
-        let topics = self.resolve_topics(&source.topics, &backup_opts).await?;
+        let topics_metadata = self.resolve_topics(&source.topics, &backup_opts).await?;
 
-        if topics.is_empty() {
+        if topics_metadata.is_empty() {
             warn!("No topics matched the configured patterns");
             return Ok(());
         }
 
-        info!("Backing up {} topics", topics.len());
+        info!("Backing up {} topics", topics_metadata.len());
 
         // Capture snapshot offsets if stop_at_current_offsets is enabled
         // This provides a consistent "point-in-time" snapshot for DR backups
         let snapshot_offsets: Option<HashMap<(String, i32), i64>> =
             if backup_opts.stop_at_current_offsets {
-                Some(self.capture_snapshot_offsets(&topics).await?)
+                Some(self.capture_snapshot_offsets(&topics_metadata).await?)
             } else {
                 None
             };
@@ -230,9 +237,15 @@ impl BackupEngine {
         // Run backup loop
         loop {
             // Process topics with controlled parallelism
+            // NOTE: We use the cached topic metadata from resolve_topics() instead of
+            // making per-topic metadata calls here. This eliminates N network calls
+            // (where N = number of topics), which was causing "stuck" behavior with
+            // high-latency connections like Confluent Cloud (Issue #29).
             let mut all_handles = Vec::new();
 
-            for topic in &topics {
+            for topic_meta in &topics_metadata {
+                let topic = &topic_meta.name;
+
                 // Check for shutdown before spawning
                 if shutdown_rx.try_recv().is_ok() {
                     info!("Shutdown signal received, stopping backup");
@@ -240,19 +253,19 @@ impl BackupEngine {
                     return Ok(());
                 }
 
-                // Get partitions for this topic
-                let metadata = match self.router.get_topic_metadata(topic).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("Failed to get metadata for topic {}: {}", topic, e);
-                        continue;
-                    }
-                };
-
-                let partitions: Vec<i32> =
-                    metadata.partitions.iter().map(|p| p.partition_id).collect();
+                // Use cached partition info from the metadata we already fetched
+                let partitions: Vec<i32> = topic_meta
+                    .partitions
+                    .iter()
+                    .map(|p| p.partition_id)
+                    .collect();
 
                 // Spawn a task for each partition (limited by semaphore)
+                // NOTE: The semaphore is acquired INSIDE the spawned task, not before
+                // spawning. This allows all tasks to be spawned immediately and queued,
+                // with the semaphore controlling how many execute concurrently. Previously,
+                // acquiring the semaphore before spawning serialized the loop and caused
+                // severe slowdowns on high-latency connections (Issue #29).
                 for partition in partitions {
                     // Get target offset for snapshot mode (if enabled)
                     let target_offset = snapshot_offsets
@@ -260,8 +273,7 @@ impl BackupEngine {
                         .and_then(|m| m.get(&(topic.clone(), partition)))
                         .copied();
 
-                    // Acquire semaphore permit to limit concurrency
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let sem = semaphore.clone();
 
                     let ctx = BackupPartitionContext {
                         topic: topic.to_string(),
@@ -281,12 +293,14 @@ impl BackupEngine {
                     };
 
                     all_handles.push(tokio::spawn(async move {
+                        // Acquire permit inside the task - limits concurrency
+                        // without blocking the spawning loop
+                        let _permit = sem.acquire_owned().await.unwrap();
                         let result = (
                             ctx.topic.clone(),
                             ctx.partition,
                             ctx.backup_partition().await,
                         );
-                        drop(permit); // Release semaphore permit when done
                         result
                     }));
                 }
@@ -298,41 +312,57 @@ impl BackupEngine {
                 backup_opts.max_concurrent_partitions
             );
 
-            // Wait for ALL partitions across ALL topics to complete
-            let results = futures::future::join_all(all_handles).await;
+            // Wait for ALL partitions across ALL topics to complete,
+            // but allow interruption by shutdown signal for graceful exit
+            let mut shutdown_join_rx = self.shutdown_receiver();
 
-            let mut error_count = 0;
-            for result in results {
-                match result {
-                    Ok((topic, partition, Ok(_))) => {
-                        debug!("Completed backup of {}:{}", topic, partition);
-                    }
-                    Ok((topic, partition, Err(e))) => {
-                        error!("Error backing up {}:{}: {}", topic, partition, e);
-                        error_count += 1;
-                        self.metrics.record_error();
-                        // Record error to Prometheus metrics
-                        if let Some(ref prom) = self.prometheus_metrics {
-                            let error_type = ErrorType::from_error(&e);
-                            prom.record_error(&self.config.backup_id, error_type);
+            tokio::select! {
+                results = futures::future::join_all(all_handles) => {
+                    let total_tasks = results.len();
+
+                    let mut error_count = 0;
+                    for result in results {
+                        match result {
+                            Ok((topic, partition, Ok(_))) => {
+                                debug!("Completed backup of {}:{}", topic, partition);
+                            }
+                            Ok((topic, partition, Err(e))) => {
+                                error!("Error backing up {}:{}: {}", topic, partition, e);
+                                error_count += 1;
+                                self.metrics.record_error();
+                                // Record error to Prometheus metrics
+                                if let Some(ref prom) = self.prometheus_metrics {
+                                    let error_type = ErrorType::from_error(&e);
+                                    prom.record_error(&self.config.backup_id, error_type);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Task join error: {}", e);
+                                error_count += 1;
+                                // Record as unknown error
+                                if let Some(ref prom) = self.prometheus_metrics {
+                                    prom.record_error(&self.config.backup_id, ErrorType::Unknown);
+                                }
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("Task join error: {}", e);
-                        error_count += 1;
-                        // Record as unknown error
-                        if let Some(ref prom) = self.prometheus_metrics {
-                            prom.record_error(&self.config.backup_id, ErrorType::Unknown);
-                        }
+
+                    if error_count > 0 {
+                        error!(
+                            "{} of {} partition backup tasks failed",
+                            error_count, total_tasks
+                        );
+                        return Err(Error::Io(std::io::Error::other(format!(
+                            "{} of {} partitions failed to backup",
+                            error_count, total_tasks
+                        ))));
                     }
                 }
-            }
-
-            if error_count > 0 && !self.health.is_operational() {
-                return Err(Error::Io(std::io::Error::other(format!(
-                    "{} partitions failed to backup",
-                    error_count
-                ))));
+                _ = shutdown_join_rx.recv() => {
+                    info!("Shutdown signal received during backup cycle, finalizing...");
+                    self.finalize().await?;
+                    return Ok(());
+                }
             }
 
             // Checkpoint offsets
@@ -399,12 +429,18 @@ impl BackupEngine {
         Ok(())
     }
 
-    /// Resolve topic patterns to actual topic names
+    /// Resolve topic patterns to actual topic metadata.
+    ///
+    /// Returns full `TopicMetadata` (including partition info) to avoid
+    /// redundant per-topic metadata calls later. This is critical for
+    /// high-latency connections where per-topic calls would cause severe
+    /// performance issues (Issue #29).
     async fn resolve_topics(
         &self,
         selection: &crate::config::TopicSelection,
         backup_opts: &BackupOptions,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<TopicMetadata>> {
+        // Fetch ALL topic metadata in a single bulk call
         let all_topics = self.router.fetch_metadata(None).await?;
 
         let mut selected = Vec::new();
@@ -441,11 +477,13 @@ impl BackupEngine {
                 .any(|pattern| glob_match(pattern, name));
 
             if included && !excluded {
-                selected.push(name.clone());
+                // Keep full TopicMetadata instead of just the name
+                selected.push(topic);
             }
         }
 
-        selected.sort();
+        // Sort by topic name for consistent ordering
+        selected.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(selected)
     }
 
@@ -465,28 +503,26 @@ impl BackupEngine {
     ///
     /// This provides a consistent snapshot point - all partitions will backup
     /// to the same logical point in time (the moment this method is called).
+    ///
+    /// Uses pre-fetched topic metadata to avoid per-topic metadata calls,
+    /// which is critical for high-latency connections (Issue #29).
     async fn capture_snapshot_offsets(
         &self,
-        topics: &[String],
+        topics_metadata: &[TopicMetadata],
     ) -> Result<HashMap<(String, i32), i64>> {
         let mut offsets = HashMap::new();
         let mut total_records = 0i64;
 
         info!(
             "Snapshot mode: capturing high watermarks for {} topics",
-            topics.len()
+            topics_metadata.len()
         );
 
-        for topic in topics {
-            let metadata = match self.router.get_topic_metadata(topic).await {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to get metadata for topic {}: {}", topic, e);
-                    return Err(e);
-                }
-            };
+        // Use cached partition info instead of making per-topic metadata calls
+        for topic_meta in topics_metadata {
+            let topic = &topic_meta.name;
 
-            for partition_meta in &metadata.partitions {
+            for partition_meta in &topic_meta.partitions {
                 let partition = partition_meta.partition_id;
                 let (earliest, latest) = self.router.get_offsets(topic, partition).await?;
                 offsets.insert((topic.clone(), partition), latest);

@@ -200,6 +200,11 @@ impl RestoreEngine {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Get a clone of the shutdown sender for external signal handling
+    pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
+        self.shutdown_tx.clone()
+    }
+
     /// Get metrics
     pub fn metrics(&self) -> &PerformanceMetrics {
         &self.metrics

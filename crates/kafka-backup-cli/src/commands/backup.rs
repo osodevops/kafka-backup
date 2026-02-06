@@ -3,6 +3,7 @@ use kafka_backup_core::{
     backup::BackupEngine, Config, MetricsServer, MetricsServerConfig, PrometheusMetrics,
 };
 use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -44,7 +45,22 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     // Run the backup engine with Prometheus metrics
     let engine = BackupEngine::new_with_metrics(config, Some(prometheus_metrics)).await?;
+
+    // Spawn signal handler for graceful shutdown (SIGTERM + SIGINT/Ctrl-C)
+    let shutdown_tx_signal = engine.shutdown_handle();
+    let signal_task = tokio::spawn(async move {
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        info!("Received shutdown signal, initiating graceful shutdown...");
+        let _ = shutdown_tx_signal.send(());
+    });
+
     let result = engine.run().await;
+    signal_task.abort(); // Clean up signal watcher if engine finished normally
 
     // Shutdown metrics server
     let _ = shutdown_tx.send(());
