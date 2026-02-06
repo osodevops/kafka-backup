@@ -62,7 +62,7 @@ webpki-roots = "0.26"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # Object storage
-object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
+object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 
 # Metrics
