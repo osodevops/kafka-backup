@@ -408,8 +408,9 @@ impl KafkaClient {
         let auth_request =
             SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(auth_bytes));
         let buf = self.encode_request(ApiKey::SaslAuthenticate, &auth_request)?;
-        let auth_response: kafka_protocol::messages::SaslAuthenticateResponse =
-            self.send_raw_request(ApiKey::SaslAuthenticate, &buf).await?;
+        let auth_response: kafka_protocol::messages::SaslAuthenticateResponse = self
+            .send_raw_request(ApiKey::SaslAuthenticate, &buf)
+            .await?;
 
         if auth_response.error_code != 0 {
             return Err(crate::Error::Authentication(format!(
