@@ -1,0 +1,26 @@
+# Backup config for Issue #29 regression testing
+# Tests v0.8.0 with 3000 topics
+mode: backup
+backup_id: "issue-29-test"
+
+source:
+  bootstrap_servers:
+    - localhost:9092
+  topics:
+    include: ["test-topic-*"]
+
+storage:
+  backend: filesystem
+  path: "/tmp/issue-29-backup"
+
+backup:
+  compression: zstd
+  segment_max_bytes: 1048576  # 1MB
+  continuous: false           # One-shot mode (the problematic case)
+  # Default max_concurrent_partitions: 8
+  # Default poll_interval_ms: 100
+
+metrics:
+  enabled: true
+  port: 8080
+  bind_address: "0.0.0.0"

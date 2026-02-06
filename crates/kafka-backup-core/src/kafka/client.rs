@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
@@ -275,23 +275,172 @@ impl KafkaClient {
         self.correlation_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Send a request and receive a response
+    /// Send a request and receive a response.
+    ///
+    /// On connection errors (broken pipe, early eof), automatically reconnects
+    /// and retries once. This handles TCP connections dropped by cloud Kafka
+    /// providers during idle periods.
+    ///
+    /// Note: Reconnection with retry is skipped for SASL auth requests to avoid
+    /// infinite recursion (connect -> authenticate -> send_request -> reconnect -> connect...).
     pub async fn send_request<Req, Resp>(&self, api_key: ApiKey, request: Req) -> Result<Resp>
     where
         Req: Encodable + Default,
         Resp: Decodable + Default,
     {
+        let buf = self.encode_request(api_key, &request)?;
+
+        // Skip reconnect retry for authentication requests to avoid recursion
+        let can_retry = !matches!(api_key, ApiKey::SaslHandshake | ApiKey::SaslAuthenticate);
+
+        // First attempt
+        match self.send_raw_request::<Resp>(api_key, &buf).await {
+            Ok(response) => Ok(response),
+            Err(e) if can_retry && Self::is_connection_error(&e) => {
+                warn!(
+                    "Connection error on {:?} request, reconnecting and retrying: {}",
+                    api_key, e
+                );
+                // Reconnect (full connect + authenticate)
+                self.reconnect().await?;
+                // Retry once with fresh connection
+                self.send_raw_request::<Resp>(api_key, &buf).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Check if an error is a connection-level error that warrants reconnection.
+    fn is_connection_error(error: &crate::Error) -> bool {
+        match error {
+            crate::Error::Kafka(KafkaError::Protocol(msg)) => {
+                msg.contains("Broken pipe")
+                    || msg.contains("early eof")
+                    || msg.contains("Connection reset")
+                    || msg.contains("Not connected")
+                    || msg.contains("connection abort")
+            }
+            _ => false,
+        }
+    }
+
+    /// Reconnect to the Kafka cluster, dropping the existing connection.
+    ///
+    /// This re-establishes the TCP (and TLS) connection and performs SASL
+    /// authentication directly (without going through send_request) to
+    /// avoid async recursion.
+    async fn reconnect(&self) -> Result<()> {
+        {
+            let mut conn = self.connection.lock().await;
+            *conn = None; // Drop the old connection
+        }
+
+        // Re-establish TCP/TLS connection
+        for server in &self.config.bootstrap_servers {
+            match self.try_connect(server).await {
+                Ok(stream) => {
+                    let mut conn = self.connection.lock().await;
+                    *conn = Some(BrokerConnection {
+                        stream,
+                        broker_id: -1,
+                    });
+
+                    // Re-authenticate if needed, using send_raw_request directly
+                    // to avoid the send_request -> reconnect recursion
+                    if self.config.security.security_protocol == SecurityProtocol::SaslPlaintext
+                        || self.config.security.security_protocol == SecurityProtocol::SaslSsl
+                    {
+                        drop(conn);
+                        self.authenticate_raw().await?;
+                    }
+
+                    debug!("Reconnected to Kafka broker: {}", server);
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("Failed to reconnect to {}: {}", server, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(KafkaError::NoBrokersAvailable.into())
+    }
+
+    /// Authenticate using raw request sending (bypasses send_request retry logic).
+    async fn authenticate_raw(&self) -> Result<()> {
+        let security = &self.config.security;
+
+        match security.sasl_mechanism {
+            Some(SaslMechanism::Plain) => {
+                self.sasl_plain_auth_raw(
+                    security.sasl_username.as_deref().unwrap_or(""),
+                    security.sasl_password.as_deref().unwrap_or(""),
+                )
+                .await
+            }
+            Some(SaslMechanism::ScramSha256) | Some(SaslMechanism::ScramSha512) => {
+                Err(crate::Error::Authentication(
+                    "SCRAM authentication not yet implemented".to_string(),
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// SASL PLAIN auth using raw request sending (no reconnect retry).
+    async fn sasl_plain_auth_raw(&self, username: &str, password: &str) -> Result<()> {
+        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+
+        // Step 1: SASL Handshake
+        let handshake_request = SaslHandshakeRequest::default().with_mechanism("PLAIN".into());
+        let buf = self.encode_request(ApiKey::SaslHandshake, &handshake_request)?;
+        let _handshake_response: kafka_protocol::messages::SaslHandshakeResponse =
+            self.send_raw_request(ApiKey::SaslHandshake, &buf).await?;
+
+        // Step 2: SASL Authenticate
+        let mut auth_bytes = Vec::new();
+        auth_bytes.push(0);
+        auth_bytes.extend_from_slice(username.as_bytes());
+        auth_bytes.push(0);
+        auth_bytes.extend_from_slice(password.as_bytes());
+
+        let auth_request =
+            SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(auth_bytes));
+        let buf = self.encode_request(ApiKey::SaslAuthenticate, &auth_request)?;
+        let auth_response: kafka_protocol::messages::SaslAuthenticateResponse = self
+            .send_raw_request(ApiKey::SaslAuthenticate, &buf)
+            .await?;
+
+        if auth_response.error_code != 0 {
+            return Err(crate::Error::Authentication(format!(
+                "SASL authentication failed: {}",
+                auth_response
+                    .error_message
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("error code {}", auth_response.error_code))
+            )));
+        }
+
+        debug!("SASL PLAIN re-authentication successful");
+        Ok(())
+    }
+
+    /// Encode a request into a wire-format buffer.
+    fn encode_request<Req: Encodable + Default>(
+        &self,
+        api_key: ApiKey,
+        request: &Req,
+    ) -> Result<Bytes> {
         let correlation_id = self.next_correlation_id();
         let api_version = self.get_api_version(api_key);
 
-        // Build request header
         let header = RequestHeader::default()
             .with_request_api_key(api_key as i16)
             .with_request_api_version(api_version)
             .with_correlation_id(correlation_id)
             .with_client_id(Some(StrBytes::from_static_str("kafka-backup")));
 
-        // Encode header and request
         let header_version = api_key.request_header_version(api_version);
         let mut buf = BytesMut::new();
 
@@ -317,14 +466,23 @@ impl KafkaClient {
             len
         );
 
-        // Send request
+        Ok(buf.freeze())
+    }
+
+    /// Send an already-encoded request and read/decode the response.
+    async fn send_raw_request<Resp>(&self, api_key: ApiKey, buf: &[u8]) -> Result<Resp>
+    where
+        Resp: Decodable + Default,
+    {
+        let api_version = self.get_api_version(api_key);
+
         let mut conn = self.connection.lock().await;
         let conn = conn
             .as_mut()
             .ok_or_else(|| KafkaError::Protocol("Not connected".to_string()))?;
 
         conn.stream
-            .write_all(&buf)
+            .write_all(buf)
             .await
             .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
 

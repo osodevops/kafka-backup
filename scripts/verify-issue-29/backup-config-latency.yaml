@@ -1,0 +1,25 @@
+# Backup config for Issue #29 high-latency regression testing
+# Uses toxiproxy to simulate Confluent Cloud latency
+mode: backup
+backup_id: "issue-29-latency-test"
+
+source:
+  bootstrap_servers:
+    - localhost:19092
+  topics:
+    include: ["test-topic-*"]
+
+storage:
+  backend: filesystem
+  path: "/tmp/issue-29-latency-backup"
+
+backup:
+  compression: zstd
+  segment_max_bytes: 1048576  # 1MB
+  continuous: false           # One-shot mode (the problematic case)
+  stop_at_current_offsets: true  # Snapshot mode - same as user's config
+
+metrics:
+  enabled: true
+  port: 8081
+  bind_address: "0.0.0.0"

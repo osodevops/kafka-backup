@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-cli"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-core"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
