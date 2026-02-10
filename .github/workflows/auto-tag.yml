@@ -57,7 +57,9 @@ jobs:
       - name: Create and push tag
         if: steps.cargo-check.outputs.modified == 'true' && steps.tag-check.outputs.exists == 'false'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use PAT instead of GITHUB_TOKEN so the tag push triggers the Release workflow.
+          # Tags pushed by GITHUB_TOKEN don't trigger downstream workflows (GitHub Actions limitation).
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
