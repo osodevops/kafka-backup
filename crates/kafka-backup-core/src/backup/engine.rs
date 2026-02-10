@@ -217,7 +217,8 @@ impl BackupEngine {
 
         // Capture snapshot offsets if stop_at_current_offsets is enabled
         // This provides a consistent "point-in-time" snapshot for DR backups
-        let snapshot_offsets: Option<HashMap<(String, i32), i64>> =
+        // Returns (earliest, latest) pairs to avoid redundant offset fetches later
+        let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
             if backup_opts.stop_at_current_offsets {
                 Some(self.capture_snapshot_offsets(&topics_metadata).await?)
             } else {
@@ -267,11 +268,12 @@ impl BackupEngine {
                 // acquiring the semaphore before spawning serialized the loop and caused
                 // severe slowdowns on high-latency connections (Issue #29).
                 for partition in partitions {
-                    // Get target offset for snapshot mode (if enabled)
-                    let target_offset = snapshot_offsets
+                    // Get cached offsets for snapshot mode (if enabled)
+                    let (earliest_offset, target_offset) = snapshot_offsets
                         .as_ref()
                         .and_then(|m| m.get(&(topic.clone(), partition)))
-                        .copied();
+                        .map(|(earliest, latest)| (Some(*earliest), Some(*latest)))
+                        .unwrap_or((None, None));
 
                     let sem = semaphore.clone();
 
@@ -289,6 +291,7 @@ impl BackupEngine {
                         offset_store: self.offset_store.clone(),
                         kafka_cb: Arc::clone(&self.kafka_circuit_breaker),
                         storage_cb: Arc::clone(&self.storage_circuit_breaker),
+                        earliest_offset,
                         target_offset,
                     };
 
@@ -296,12 +299,10 @@ impl BackupEngine {
                         // Acquire permit inside the task - limits concurrency
                         // without blocking the spawning loop
                         let _permit = sem.acquire_owned().await.unwrap();
-                        let result = (
-                            ctx.topic.clone(),
-                            ctx.partition,
-                            ctx.backup_partition().await,
-                        );
-                        result
+                        let topic_name = ctx.topic.clone();
+                        let partition_id = ctx.partition;
+                        let backup_result = ctx.backup_partition().await;
+                        (topic_name, partition_id, backup_result)
                     }));
                 }
             }
@@ -499,47 +500,49 @@ impl BackupEngine {
         Ok(())
     }
 
-    /// Capture current high watermarks for all partitions (snapshot mode)
+    /// Capture current offsets for all partitions (snapshot mode).
     ///
-    /// This provides a consistent snapshot point - all partitions will backup
-    /// to the same logical point in time (the moment this method is called).
+    /// Returns both earliest and latest offsets for each partition.
+    /// The latest offsets provide a consistent snapshot point - all partitions
+    /// will backup to the same logical point in time.
     ///
-    /// Uses pre-fetched topic metadata to avoid per-topic metadata calls,
-    /// which is critical for high-latency connections (Issue #29).
+    /// Uses batched ListOffsets requests (one per broker per timestamp) instead
+    /// of per-partition requests. For 8,660 partitions across 3 brokers, this
+    /// sends ~6 requests instead of ~17,320 (Issue #29).
     async fn capture_snapshot_offsets(
         &self,
         topics_metadata: &[TopicMetadata],
-    ) -> Result<HashMap<(String, i32), i64>> {
-        let mut offsets = HashMap::new();
-        let mut total_records = 0i64;
-
+    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
         info!(
-            "Snapshot mode: capturing high watermarks for {} topics",
+            "Snapshot mode: capturing offsets for {} topics",
             topics_metadata.len()
         );
 
-        // Use cached partition info instead of making per-topic metadata calls
-        for topic_meta in topics_metadata {
-            let topic = &topic_meta.name;
+        let snapshot_start = Instant::now();
 
-            for partition_meta in &topic_meta.partitions {
-                let partition = partition_meta.partition_id;
-                let (earliest, latest) = self.router.get_offsets(topic, partition).await?;
-                offsets.insert((topic.clone(), partition), latest);
+        // Build the full list of (topic, partition) pairs
+        let all_partitions: Vec<(String, i32)> = topics_metadata
+            .iter()
+            .flat_map(|t| {
+                t.partitions
+                    .iter()
+                    .map(move |p| (t.name.clone(), p.partition_id))
+            })
+            .collect();
 
-                let partition_records = latest - earliest;
-                total_records += partition_records;
+        // Batch fetch all offsets (grouped by leader broker)
+        let offsets = self.router.batch_get_all_offsets(&all_partitions).await?;
 
-                debug!(
-                    "Snapshot target: {}:{} -> offset {} ({} records available)",
-                    topic, partition, latest, partition_records
-                );
-            }
-        }
+        let total_records: i64 = offsets
+            .values()
+            .map(|(earliest, latest)| latest - earliest)
+            .sum();
 
+        let snapshot_elapsed_ms = snapshot_start.elapsed().as_millis();
         info!(
-            "Captured snapshot offsets for {} partitions ({} total records to backup)",
+            "snapshot_capture_complete: {} partitions in {}ms ({} total records to backup)",
             offsets.len(),
+            snapshot_elapsed_ms,
             total_records
         );
 
@@ -563,6 +566,9 @@ struct BackupPartitionContext {
     kafka_cb: Arc<CircuitBreaker>,
     #[allow(dead_code)] // Reserved for future storage circuit breaker integration
     storage_cb: Arc<CircuitBreaker>,
+    /// Cached earliest offset from snapshot capture.
+    /// When set, avoids a redundant get_offsets() call in backup_partition().
+    earliest_offset: Option<i64>,
     /// Target offset for snapshot mode (stop_at_current_offsets)
     /// When set, backup stops when this offset is reached instead of latest
     target_offset: Option<i64>,
@@ -572,8 +578,16 @@ impl BackupPartitionContext {
     async fn backup_partition(self) -> Result<()> {
         debug!("Starting backup of {}:{}", self.topic, self.partition);
 
-        // Get partition offsets (routed to correct partition leader)
-        let (earliest, latest) = self.router.get_offsets(&self.topic, self.partition).await?;
+        // Use cached offsets from snapshot capture if available (avoids redundant
+        // network calls that serialize through the broker mutex - Issue #29).
+        // In snapshot mode, capture_snapshot_offsets() already fetched both earliest
+        // and latest offsets for all partitions in batched requests.
+        let (earliest, latest) =
+            if let (Some(e), Some(l)) = (self.earliest_offset, self.target_offset) {
+                (e, l)
+            } else {
+                self.router.get_offsets(&self.topic, self.partition).await?
+            };
 
         // Determine end offset: use snapshot target if set, otherwise current latest
         // This enables "stop_at_current_offsets" mode for consistent DR snapshots

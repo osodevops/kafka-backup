@@ -238,6 +238,20 @@ pub struct ConnectionConfig {
 
     /// Enable TCP_NODELAY to disable Nagle's algorithm (default: true)
     pub tcp_nodelay: bool,
+
+    /// Number of TCP connections to maintain per broker (default: 4).
+    ///
+    /// Each KafkaClient uses a single TCP connection protected by a mutex.
+    /// With a single connection per broker, all concurrent tasks serialize
+    /// their requests, and network latency amplifies into a bottleneck.
+    /// Multiple connections allow parallel in-flight requests to the same
+    /// broker, dramatically improving throughput on high-latency connections.
+    #[serde(default = "default_connections_per_broker")]
+    pub connections_per_broker: usize,
+}
+
+fn default_connections_per_broker() -> usize {
+    4
 }
 
 impl Default for ConnectionConfig {
@@ -247,6 +261,7 @@ impl Default for ConnectionConfig {
             keepalive_time_secs: 60,
             keepalive_interval_secs: 20,
             tcp_nodelay: true,
+            connections_per_broker: default_connections_per_broker(),
         }
     }
 }

@@ -7,7 +7,7 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use super::KafkaClient;
 use crate::error::KafkaError;
@@ -47,13 +47,20 @@ pub async fn fetch(
 
     let request = FetchRequest::default()
         .with_replica_id(BrokerId(-1)) // Client mode
-        .with_max_wait_ms(5000)
+        .with_max_wait_ms(500)
         .with_min_bytes(1)
         .with_max_bytes(max_bytes)
         .with_isolation_level(0) // READ_UNCOMMITTED
         .with_topics(vec![fetch_topic]);
 
     let response: KafkaFetchResponse = client.send_request(ApiKey::Fetch, request).await?;
+
+    if response.throttle_time_ms > 0 {
+        debug!(
+            "fetch_throttled: {}:{} throttle_time_ms={} offset={}",
+            topic, partition, response.throttle_time_ms, offset
+        );
+    }
 
     // Parse the response
     let mut records = Vec::new();
@@ -99,11 +106,13 @@ pub async fn fetch(
         }
     }
 
-    trace!(
-        "Fetched {} records from {}:{} starting at offset {}",
-        records.len(),
+    debug!(
+        "fetch_result: {}:{} records={} high_watermark={} next_offset={} offset_start={}",
         topic,
         partition,
+        records.len(),
+        high_watermark,
+        next_offset,
         offset
     );
 
@@ -145,6 +154,89 @@ fn convert_record(record: &Record) -> BackupRecord {
         timestamp: record.timestamp,
         offset: record.offset,
     }
+}
+
+/// Batch get offsets for multiple topic-partitions in a single ListOffsets request.
+///
+/// Takes a list of (topic, partition, timestamp) tuples and sends them all in one
+/// batched request to the broker. This is critical for performance on high-latency
+/// connections where per-partition requests would serialize through the connection mutex.
+///
+/// Timestamp values: -2 = earliest, -1 = latest
+pub async fn batch_get_offsets(
+    client: &KafkaClient,
+    requests: &[(String, i32, i64)], // (topic, partition, timestamp)
+) -> Result<std::collections::HashMap<(String, i32), i64>> {
+    use std::collections::HashMap;
+
+    // Group by topic
+    let mut topics_map: HashMap<&str, Vec<(i32, i64)>> = HashMap::new();
+    for (topic, partition, timestamp) in requests {
+        topics_map
+            .entry(topic.as_str())
+            .or_default()
+            .push((*partition, *timestamp));
+    }
+
+    let topics: Vec<_> = topics_map
+        .into_iter()
+        .map(|(topic, partitions)| {
+            let partition_data: Vec<_> = partitions
+                .into_iter()
+                .map(|(partition, timestamp)| {
+                    kafka_protocol::messages::list_offsets_request::ListOffsetsPartition::default()
+                        .with_partition_index(partition)
+                        .with_timestamp(timestamp)
+                })
+                .collect();
+
+            kafka_protocol::messages::list_offsets_request::ListOffsetsTopic::default()
+                .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                .with_partitions(partition_data)
+        })
+        .collect();
+
+    let request = ListOffsetsRequest::default()
+        .with_replica_id(BrokerId(-1))
+        .with_isolation_level(0)
+        .with_topics(topics);
+
+    let response: kafka_protocol::messages::ListOffsetsResponse =
+        client.send_request(ApiKey::ListOffsets, request).await?;
+
+    let mut results = HashMap::new();
+    for topic_response in &response.topics {
+        for partition_response in &topic_response.partitions {
+            if partition_response.error_code != 0 {
+                return Err(KafkaError::BrokerError {
+                    code: partition_response.error_code,
+                    message: format!(
+                        "ListOffsets error for {}:{}: code {}",
+                        topic_response.name.as_str(),
+                        partition_response.partition_index,
+                        partition_response.error_code
+                    ),
+                }
+                .into());
+            }
+
+            results.insert(
+                (
+                    topic_response.name.to_string(),
+                    partition_response.partition_index,
+                ),
+                partition_response.offset,
+            );
+        }
+    }
+
+    debug!(
+        "batch_get_offsets: {} results from {} requests",
+        results.len(),
+        requests.len()
+    );
+
+    Ok(results)
 }
 
 /// Get the earliest and latest offsets for a partition

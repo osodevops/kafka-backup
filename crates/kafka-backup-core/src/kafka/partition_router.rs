@@ -6,6 +6,7 @@
 //! be sent to the leader to avoid NOT_LEADER_FOR_PARTITION errors.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -38,8 +39,14 @@ pub struct PartitionLeaderRouter {
     /// Map of (topic, partition) -> leader broker_id
     partition_leaders: Arc<RwLock<HashMap<(String, i32), i32>>>,
 
-    /// Connection pool: broker_id -> KafkaClient
-    connections: Arc<RwLock<HashMap<i32, Arc<KafkaClient>>>>,
+    /// Connection pool: broker_id -> Vec of KafkaClients
+    /// Multiple connections per broker allow parallel in-flight requests,
+    /// preventing the single-connection mutex from becoming a bottleneck
+    /// on high-latency connections (Issue #29).
+    connections: Arc<RwLock<HashMap<i32, Vec<Arc<KafkaClient>>>>>,
+
+    /// Round-robin counter for distributing requests across connections
+    connection_index: AtomicUsize,
 
     /// Bootstrap client for metadata operations
     bootstrap_client: Arc<KafkaClient>,
@@ -63,6 +70,7 @@ impl PartitionLeaderRouter {
             broker_metadata: Arc::new(RwLock::new(HashMap::new())),
             partition_leaders: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
+            connection_index: AtomicUsize::new(0),
             bootstrap_client,
         };
 
@@ -224,12 +232,22 @@ impl PartitionLeaderRouter {
     }
 
     /// Get or create a connection to a specific broker.
+    ///
+    /// Maintains a pool of N connections per broker (configured via
+    /// `connections_per_broker`). Uses round-robin selection to distribute
+    /// requests across connections, reducing mutex contention.
     async fn get_broker_connection(&self, broker_id: i32) -> Result<Arc<KafkaClient>> {
-        // Check if we already have a connection
+        let pool_size = self.config.connection.connections_per_broker.max(1);
+
+        // Check if we already have a full pool
         {
             let connections = self.connections.read().await;
-            if let Some(client) = connections.get(&broker_id) {
-                return Ok(Arc::clone(client));
+            if let Some(pool) = connections.get(&broker_id) {
+                if pool.len() >= pool_size {
+                    // Round-robin selection
+                    let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
+                    return Ok(Arc::clone(&pool[idx]));
+                }
             }
         }
 
@@ -242,25 +260,32 @@ impl PartitionLeaderRouter {
             format!("{}:{}", broker.host, broker.port)
         };
 
+        // Create the full pool of connections
         debug!(
-            "Creating new connection to broker {} at {}",
-            broker_id, broker_addr
+            "Creating {} connections to broker {} at {}",
+            pool_size, broker_id, broker_addr
         );
 
-        // Create new connection with modified config
-        let mut broker_config = self.config.clone();
-        broker_config.bootstrap_servers = vec![broker_addr];
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let mut broker_config = self.config.clone();
+            broker_config.bootstrap_servers = vec![broker_addr.clone()];
 
-        let client = Arc::new(KafkaClient::new(broker_config));
-        client.connect().await?;
-
-        // Store in connection pool
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(broker_id, Arc::clone(&client));
+            let client = Arc::new(KafkaClient::new(broker_config));
+            client.connect().await?;
+            pool.push(client);
         }
 
-        Ok(client)
+        // Store in connection pool and return one via round-robin
+        let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
+        let selected = Arc::clone(&pool[idx]);
+
+        {
+            let mut connections = self.connections.write().await;
+            connections.insert(broker_id, pool);
+        }
+
+        Ok(selected)
     }
 
     /// Get a client connected to the partition's leader broker.
@@ -315,6 +340,74 @@ impl PartitionLeaderRouter {
     ) -> Result<FetchResponse> {
         let client = self.get_leader_client(topic, partition).await?;
         client.fetch(topic, partition, offset, max_bytes).await
+    }
+
+    /// Batch get offsets for all given topic-partitions in minimal network calls.
+    ///
+    /// Groups partitions by their leader broker and sends one batched ListOffsetsRequest
+    /// per broker per timestamp. For N partitions across B brokers, this makes 2*B requests
+    /// (earliest + latest) instead of 2*N individual requests.
+    ///
+    /// Returns a map of (topic, partition) -> (earliest, latest) offset.
+    pub async fn batch_get_all_offsets(
+        &self,
+        partitions: &[(String, i32)],
+    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
+        // Group partitions by leader broker
+        let mut broker_partitions: HashMap<i32, Vec<(String, i32)>> = HashMap::new();
+        for (topic, partition) in partitions {
+            let leader_id = self.get_leader(topic, *partition).await?;
+            broker_partitions
+                .entry(leader_id)
+                .or_default()
+                .push((topic.clone(), *partition));
+        }
+
+        debug!(
+            "batch_get_all_offsets: {} partitions across {} brokers",
+            partitions.len(),
+            broker_partitions.len()
+        );
+
+        let mut all_results: HashMap<(String, i32), (i64, i64)> = HashMap::new();
+
+        // For each broker, send one batched request for earliest and one for latest
+        for (broker_id, broker_parts) in &broker_partitions {
+            let client = self.get_broker_connection(*broker_id).await?;
+
+            // Build earliest requests (timestamp = -2)
+            let earliest_requests: Vec<(String, i32, i64)> = broker_parts
+                .iter()
+                .map(|(t, p)| (t.clone(), *p, -2i64))
+                .collect();
+
+            // Build latest requests (timestamp = -1)
+            let latest_requests: Vec<(String, i32, i64)> = broker_parts
+                .iter()
+                .map(|(t, p)| (t.clone(), *p, -1i64))
+                .collect();
+
+            let earliest_offsets: HashMap<(String, i32), i64> =
+                super::fetch::batch_get_offsets(&client, &earliest_requests).await?;
+            let latest_offsets: HashMap<(String, i32), i64> =
+                super::fetch::batch_get_offsets(&client, &latest_requests).await?;
+
+            // Merge results
+            for (topic, partition) in broker_parts {
+                let key = (topic.clone(), *partition);
+                let earliest = earliest_offsets.get(&key).copied().unwrap_or(0);
+                let latest = latest_offsets.get(&key).copied().unwrap_or(0);
+                all_results.insert(key, (earliest, latest));
+            }
+        }
+
+        debug!(
+            "batch_get_all_offsets: completed with {} results ({} broker calls)",
+            all_results.len(),
+            broker_partitions.len() * 2
+        );
+
+        Ok(all_results)
     }
 
     /// Get the earliest and latest offsets for a partition.

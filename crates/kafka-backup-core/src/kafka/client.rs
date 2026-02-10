@@ -477,6 +477,7 @@ impl KafkaClient {
         let api_version = self.get_api_version(api_key);
 
         let mut conn = self.connection.lock().await;
+
         let conn = conn
             .as_mut()
             .ok_or_else(|| KafkaError::Protocol("Not connected".to_string()))?;
@@ -625,6 +626,7 @@ mod tests {
                 keepalive_time_secs: 60,
                 keepalive_interval_secs: 20,
                 tcp_nodelay: true,
+                ..Default::default()
             },
         };
 
@@ -701,6 +703,7 @@ mod tests {
                 keepalive_time_secs: 60,
                 keepalive_interval_secs: 20,
                 tcp_nodelay: false,
+                ..Default::default()
             },
         };
 
@@ -737,6 +740,7 @@ mod tests {
                 keepalive_time_secs: 30,     // Custom: 30 seconds
                 keepalive_interval_secs: 10, // Custom: 10 seconds
                 tcp_nodelay: true,
+                ..Default::default()
             },
         };
 

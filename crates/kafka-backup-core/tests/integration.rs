@@ -167,10 +167,9 @@ async fn test_tcp_keepalive_applied_to_kafka_connection() {
         security: SecurityConfig::default(),
         topics: TopicSelection::default(),
         connection: ConnectionConfig {
-            tcp_keepalive: true,
             keepalive_time_secs: 30,
             keepalive_interval_secs: 10,
-            tcp_nodelay: true,
+            ..Default::default()
         },
     };
 
