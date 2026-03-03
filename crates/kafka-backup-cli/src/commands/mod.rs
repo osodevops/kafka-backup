@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod config;
 pub mod describe;
 pub mod list;
 pub mod offset_mapping;

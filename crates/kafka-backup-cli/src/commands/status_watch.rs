@@ -285,6 +285,7 @@ fn parse_topic_partition_labels(metric_line: &str) -> Option<(String, i32)> {
 fn load_metrics_config(config_path: &str) -> Result<(MetricsConfig, String)> {
     let config_content = std::fs::read_to_string(config_path)
         .context(format!("Failed to read config file: {}", config_path))?;
+    let config_content = super::config::expand_env_vars(&config_content);
 
     let config: Config =
         serde_yaml::from_str(&config_content).context("Failed to parse config file")?;

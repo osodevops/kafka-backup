@@ -92,7 +92,9 @@
       "Bash(config/example-backup-azure.yaml )",
       "Bash(config/example-restore-azure.yaml )",
       "Bash(docs/PRD-azure-blob-storage-support.md)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(cargo tree:*)",
+      "Bash(export:*)"
     ],
     "deny": [],
     "ask": []

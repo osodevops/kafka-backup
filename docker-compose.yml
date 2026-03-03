@@ -31,7 +31,7 @@ services:
       KAFKA_PROCESS_ROLES: controller,broker
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1001@kafka-broker-1:9093
       KAFKA_LOG_DIRS: /tmp/kafka-logs
-      AUTO_CREATE_TOPICS_ENABLE: 'false'
+      AUTO_CREATE_TOPICS_ENABLE: "false"
 
   # Topic setup helper
   kafka-setup:
