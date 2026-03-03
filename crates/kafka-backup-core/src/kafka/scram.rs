@@ -447,4 +447,133 @@ mod tests {
             .to_string()
             .contains("invalid-encoding"));
     }
+
+    /// Simulate both client and server sides of a SCRAM handshake
+    /// to verify proof computation and server signature verification.
+    fn full_scram_handshake_test(algorithm: ScramAlgorithm) {
+        let password = "pencil";
+        let salt = b"salty salt bytes!";
+        let iterations = NonZeroU32::new(4096).unwrap();
+
+        // --- Client: create client-first ---
+        let mut client = ScramClient::new(algorithm, "user", password).unwrap();
+        let client_first = String::from_utf8(client.client_first_message()).unwrap();
+        let client_first_bare = client_first.strip_prefix("n,,").unwrap();
+
+        let client_nonce = client_first_bare
+            .split(',')
+            .find(|p| p.starts_with("r="))
+            .unwrap()
+            .strip_prefix("r=")
+            .unwrap();
+
+        // --- Server: produce server-first ---
+        let server_nonce = format!("{}ServerExtra", client_nonce);
+        let salt_b64 = BASE64.encode(salt);
+        let server_first = format!("r={},s={},i={}", server_nonce, salt_b64, iterations);
+
+        // --- Client: process server-first, produce client-final ---
+        let client_final_bytes =
+            client.process_server_first(server_first.as_bytes()).unwrap();
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Extract proof from client-final
+        let proof_b64 = client_final
+            .split(',')
+            .find(|p| p.starts_with("p="))
+            .unwrap()
+            .strip_prefix("p=")
+            .unwrap();
+        let proof = BASE64.decode(proof_b64).unwrap();
+
+        // --- Server: verify client proof ---
+        let salted_password =
+            derive_salted_password(&algorithm, password, salt, iterations);
+        let salted_key =
+            hmac::Key::new(algorithm.hmac_algorithm(), &salted_password);
+        let client_key_tag = hmac::sign(&salted_key, b"Client Key");
+        let stored_key =
+            digest::digest(algorithm.digest_algorithm(), client_key_tag.as_ref());
+
+        let client_final_without_proof = format!("c=biws,r={}", server_nonce);
+        let auth_message = format!(
+            "{},{},{}",
+            client_first_bare, server_first, client_final_without_proof
+        );
+
+        let stored_key_hmac =
+            hmac::Key::new(algorithm.hmac_algorithm(), stored_key.as_ref());
+        let client_signature =
+            hmac::sign(&stored_key_hmac, auth_message.as_bytes());
+
+        // Reconstruct ClientKey = ClientProof XOR ClientSignature
+        let reconstructed_client_key: Vec<u8> = proof
+            .iter()
+            .zip(client_signature.as_ref().iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+
+        // Verify Hash(reconstructed) == StoredKey
+        let reconstructed_stored_key =
+            digest::digest(algorithm.digest_algorithm(), &reconstructed_client_key);
+        assert_eq!(reconstructed_stored_key.as_ref(), stored_key.as_ref());
+
+        // --- Server: produce server-final ---
+        let server_key_tag = hmac::sign(&salted_key, b"Server Key");
+        let server_key_hmac =
+            hmac::Key::new(algorithm.hmac_algorithm(), server_key_tag.as_ref());
+        let server_signature =
+            hmac::sign(&server_key_hmac, auth_message.as_bytes());
+        let server_final =
+            format!("v={}", BASE64.encode(server_signature.as_ref()));
+
+        // --- Client: verify server-final ---
+        client
+            .process_server_final(server_final.as_bytes())
+            .expect("Server signature verification should succeed");
+    }
+
+    #[test]
+    fn test_full_scram_handshake_sha256() {
+        full_scram_handshake_test(ScramAlgorithm::Sha256);
+    }
+
+    #[test]
+    fn test_full_scram_handshake_sha512() {
+        full_scram_handshake_test(ScramAlgorithm::Sha512);
+    }
+
+    #[test]
+    fn test_wrong_server_signature_rejected() {
+        let algorithm = ScramAlgorithm::Sha256;
+        let salt = b"test_salt_bytes!";
+        let iterations = NonZeroU32::new(4096).unwrap();
+
+        let mut client =
+            ScramClient::new(algorithm, "user", "pencil").unwrap();
+        let client_first = String::from_utf8(client.client_first_message()).unwrap();
+        let client_nonce = client_first
+            .strip_prefix("n,,n=user,r=")
+            .unwrap();
+
+        let server_nonce = format!("{}Server", client_nonce);
+        let server_first = format!(
+            "r={},s={},i={}",
+            server_nonce,
+            BASE64.encode(salt),
+            iterations
+        );
+
+        let _ = client.process_server_first(server_first.as_bytes()).unwrap();
+
+        // Wrong server signature
+        let wrong_sig = BASE64.encode(b"this is definitely wrong signature!!");
+        let server_final = format!("v={}", wrong_sig);
+        let result = client.process_server_final(server_final.as_bytes());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("verification failed"));
+    }
 }
