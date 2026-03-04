@@ -46,108 +46,159 @@ pub async fn run(config_path: &str, format: &str) -> Result<()> {
 }
 
 fn print_validation_report(report: &kafka_backup_core::manifest::DryRunReport) {
-    println!("╔══════════════════════════════════════════════════════════════════════╗");
-    println!("║                    RESTORE VALIDATION REPORT                         ║");
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-
+    // Collect all content lines first, then size the box to fit
     let status = if report.valid && report.errors.is_empty() {
         "✓ VALID"
     } else {
         "✗ INVALID"
     };
-    println!("║ Status:         {:55} ║", status);
-    println!("║ Backup ID:      {:55} ║", report.backup_id);
 
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!("║                         RESTORE SUMMARY                              ║");
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Topics to restore:    {:48} ║",
-        report.topics_to_restore.len()
-    );
-    println!(
-        "║ Segments to process:  {:48} ║",
-        report.segments_to_process
-    );
-    println!("║ Records to restore:   {:48} ║", report.records_to_restore);
-    println!(
-        "║ Bytes to restore:     {:48} ║",
-        format_bytes(report.bytes_to_restore)
-    );
+    let mut sections: Vec<Vec<String>> = Vec::new();
 
+    // Header
+    sections.push(vec![center("RESTORE VALIDATION REPORT")]);
+
+    // Status
+    sections.push(vec![
+        kv("Status", status),
+        kv("Backup ID", &report.backup_id),
+    ]);
+
+    // Summary
+    {
+        let mut lines = vec![center("RESTORE SUMMARY")];
+        lines.push(kv(
+            "Topics to restore",
+            &report.topics_to_restore.len().to_string(),
+        ));
+        lines.push(kv(
+            "Segments to process",
+            &report.segments_to_process.to_string(),
+        ));
+        lines.push(kv(
+            "Records to restore",
+            &report.records_to_restore.to_string(),
+        ));
+        lines.push(kv(
+            "Bytes to restore",
+            &format_bytes(report.bytes_to_restore),
+        ));
+        sections.push(lines);
+    }
+
+    // Time range
     if let Some((start, end)) = report.time_range {
-        let start_str = chrono::DateTime::from_timestamp_millis(start)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let end_str = chrono::DateTime::from_timestamp_millis(end)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                           TIME RANGE                                 ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║ From: {:65} ║", start_str);
-        println!("║ To:   {:65} ║", end_str);
+        let fmt = |ts: i64| {
+            chrono::DateTime::from_timestamp_millis(ts)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "Unknown".to_string())
+        };
+        sections.push(vec![
+            center("TIME RANGE"),
+            format!("From: {}", fmt(start)),
+            format!("To:   {}", fmt(end)),
+        ]);
     }
 
     // Topics
     if !report.topics_to_restore.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                        TOPICS TO RESTORE                             ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-
+        let mut lines = vec![center("TOPICS TO RESTORE")];
         for topic in &report.topics_to_restore {
-            println!("║                                                                      ║");
-            println!("║ {} -> {} ║", topic.source_topic, topic.target_topic);
+            lines.push(String::new());
+            lines.push(format!("{} -> {}", topic.source_topic, topic.target_topic));
 
-            for partition in &topic.partitions {
-                let offset_str = format!(
-                    "offsets {}-{}",
-                    partition.offset_range.0, partition.offset_range.1
-                );
-                println!(
-                    "║   P{} -> P{}: {} records, {} ({} segments) ║",
-                    partition.source_partition,
-                    partition.target_partition,
-                    partition.records,
-                    offset_str,
-                    partition.segments
-                );
+            if let Some(ref repart) = topic.repartitioning {
+                lines.push(format!(
+                    "  Repartitioning: {} partitions -> {} partitions ({} strategy)",
+                    repart.source_partitions, repart.target_partitions, repart.strategy
+                ));
+            }
+
+            for p in &topic.partitions {
+                lines.push(format!(
+                    "  P{} -> P{}: {} records, offsets {}-{} ({} segments)",
+                    p.source_partition,
+                    p.target_partition,
+                    p.records,
+                    p.offset_range.0,
+                    p.offset_range.1,
+                    p.segments
+                ));
             }
         }
+        sections.push(lines);
     }
 
     // Consumer offset actions
     if !report.consumer_offset_actions.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                    CONSUMER OFFSET ACTIONS                           ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![center("CONSUMER OFFSET ACTIONS")];
         for action in &report.consumer_offset_actions {
-            println!("║ • {:68} ║", action);
+            lines.push(format!("* {}", action));
         }
+        sections.push(lines);
     }
 
     // Errors
     if !report.errors.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                            ERRORS                                    ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![center("ERRORS")];
         for error in &report.errors {
-            println!("║ ✗ {:68} ║", error);
+            lines.push(format!("✗ {}", error));
         }
+        sections.push(lines);
     }
 
     // Warnings
     if !report.warnings.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                           WARNINGS                                   ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![center("WARNINGS")];
         for warning in &report.warnings {
-            println!("║ ⚠ {:68} ║", warning);
+            lines.push(format!("⚠ {}", warning));
         }
+        sections.push(lines);
     }
 
-    println!("╚══════════════════════════════════════════════════════════════════════╝");
+    // Determine box width from longest visible content line (min 60)
+    let max_content = sections
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|l| {
+            let visible = l.strip_prefix('\x01').unwrap_or(l.as_str());
+            visible.chars().count()
+        })
+        .max()
+        .unwrap_or(0);
+    let w = max_content.max(60) + 4; // 2 spaces padding on each side
+
+    // Print
+    println!("╔{}╗", "═".repeat(w));
+    for (i, section) in sections.iter().enumerate() {
+        if i > 0 {
+            println!("╠{}╣", "═".repeat(w));
+        }
+        for line in section {
+            if let Some(text) = line.strip_prefix('\x01') {
+                // Centered line
+                let text_len = text.chars().count();
+                let left = (w - text_len) / 2;
+                let right = w - text_len - left;
+                println!("║{}{}{}║", " ".repeat(left), text, " ".repeat(right));
+            } else {
+                let chars = line.chars().count();
+                let pad = w - chars - 2;
+                println!("║ {}{}║", line, " ".repeat(pad + 1));
+            }
+        }
+    }
+    println!("╚{}╝", "═".repeat(w));
+}
+
+/// Mark a string for centering in the box
+fn center(s: &str) -> String {
+    format!("\x01{}", s)
+}
+
+/// Format a key-value line with consistent alignment
+fn kv(key: &str, value: &str) -> String {
+    format!("{:<22} {}", format!("{}:", key), value)
 }
 
 fn format_bytes(bytes: u64) -> String {
