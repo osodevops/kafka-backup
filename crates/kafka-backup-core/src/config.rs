@@ -803,13 +803,10 @@ impl RestoreOptions {
             }
         }
 
-        // partition_mapping and repartitioning are mutually exclusive
-        if !self.partition_mapping.is_empty() && !self.repartitioning.is_empty() {
-            return Err(crate::Error::Config(
-                "partition_mapping and repartitioning are mutually exclusive; use one or the other"
-                    .to_string(),
-            ));
-        }
+        // Note: partition_mapping and repartitioning can coexist — repartitioning
+        // takes precedence for topics that have it configured, while partition_mapping
+        // applies to the remaining topics. The engine handles this via early-return
+        // branching in restore_topic().
 
         Ok(())
     }
@@ -873,7 +870,9 @@ connection:
     }
 
     #[test]
-    fn test_repartitioning_mutual_exclusivity() {
+    fn test_repartitioning_and_partition_mapping_coexist() {
+        // partition_mapping and repartitioning can coexist for different topics:
+        // repartitioning takes precedence for its topics, partition_mapping for the rest.
         let mut opts = valid_restore_options();
         opts.partition_mapping.insert(0, 1);
         opts.repartitioning.insert(
@@ -883,10 +882,7 @@ connection:
                 target_partitions: 3,
             },
         );
-        let result = opts.validate();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("mutually exclusive"));
+        assert!(opts.validate().is_ok());
     }
 
     #[test]

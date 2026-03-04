@@ -14,19 +14,18 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, info};
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::compression::{decompress, detect_from_extension};
-use crate::config::{OffsetStrategy, RepartitioningStrategy, RestoreOptions, TopicRepartitioning};
+use crate::config::{RepartitioningStrategy, RestoreOptions, TopicRepartitioning};
 use crate::health::HealthCheck;
 use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::{
-    BackupRecord, PartitionRestoreReport, RecordHeader, RestoreCheckpoint, SegmentMetadata,
-    TopicBackup, TopicRestoreReport,
+    BackupRecord, PartitionRestoreReport, RestoreCheckpoint, SegmentMetadata, TopicBackup,
+    TopicRestoreReport,
 };
 use crate::metrics::PerformanceMetrics;
-use crate::segment::format::MAGIC_BYTES;
-use crate::segment::SegmentReader;
 use crate::storage::StorageBackend;
 use crate::{Error, Result};
+
+use super::helpers;
 
 /// Kafka's default seed for murmur2 hashing (0x9747b28c).
 const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
@@ -306,7 +305,7 @@ async fn run_reader(
             continue;
         }
 
-        let records = match read_segment(storage, segment).await {
+        let records = match helpers::read_segment(storage, segment).await {
             Ok(r) => {
                 storage_cb.record_success();
                 health.mark_healthy("storage");
@@ -319,39 +318,14 @@ async fn run_reader(
             }
         };
 
-        // Filter records by time window
-        let filtered = filter_records_by_time(records, options);
+        let filtered = helpers::filter_records_by_time(records, options);
 
         if filtered.is_empty() {
-            mark_segment_completed(checkpoint, &segment.key).await;
+            helpers::mark_segment_completed(checkpoint, &segment.key).await;
             continue;
         }
 
-        // Optionally add offset headers
-        let records_to_send = if options.include_original_offset_header
-            || options.consumer_group_strategy == OffsetStrategy::HeaderBased
-        {
-            filtered
-                .into_iter()
-                .map(|mut r| {
-                    r.headers.push(RecordHeader {
-                        key: "x-original-offset".to_string(),
-                        value: r.offset.to_le_bytes().to_vec(),
-                    });
-                    r.headers.push(RecordHeader {
-                        key: "x-original-timestamp".to_string(),
-                        value: r.timestamp.to_le_bytes().to_vec(),
-                    });
-                    r.headers.push(RecordHeader {
-                        key: "x-source-partition".to_string(),
-                        value: source_partition.to_le_bytes().to_vec(),
-                    });
-                    r
-                })
-                .collect::<Vec<_>>()
-        } else {
-            filtered
-        };
+        let records_to_send = helpers::inject_offset_headers(filtered, source_partition, options);
 
         // Route each record through the partitioner
         for record in records_to_send {
@@ -370,7 +344,7 @@ async fn run_reader(
             }
         }
 
-        mark_segment_completed(checkpoint, &segment.key).await;
+        helpers::mark_segment_completed(checkpoint, &segment.key).await;
     }
 
     debug!(
@@ -470,72 +444,6 @@ async fn run_writer(
         first_timestamp: 0,
         last_timestamp: 0,
     })
-}
-
-// -- Helpers (extracted from RestorePartitionContext for reuse) --
-
-async fn read_segment(
-    storage: &dyn StorageBackend,
-    segment: &SegmentMetadata,
-) -> Result<Vec<BackupRecord>> {
-    let data = storage.get(&segment.key).await?;
-
-    if data.len() >= 4 && data[0..4] == MAGIC_BYTES {
-        // Binary format
-        let mut reader = SegmentReader::open(data)?;
-        let binary_records = reader.read_all()?;
-        Ok(binary_records
-            .into_iter()
-            .map(|br| BackupRecord {
-                key: br.key.map(|b| b.to_vec()),
-                value: br.value.map(|b| b.to_vec()),
-                headers: br
-                    .headers
-                    .into_iter()
-                    .map(|(k, v)| RecordHeader {
-                        key: k,
-                        value: v.map(|b| b.to_vec()).unwrap_or_default(),
-                    })
-                    .collect(),
-                timestamp: br.timestamp,
-                offset: br.offset,
-            })
-            .collect())
-    } else {
-        // Legacy JSON format — try decompression first
-        let extension = segment.key.rsplit('.').next().unwrap_or("");
-        let algo = detect_from_extension(extension);
-        let decompressed = decompress(&data, algo)?;
-        let records: Vec<BackupRecord> = serde_json::from_slice(&decompressed)?;
-        Ok(records)
-    }
-}
-
-fn filter_records_by_time(
-    records: Vec<BackupRecord>,
-    options: &RestoreOptions,
-) -> Vec<BackupRecord> {
-    records
-        .into_iter()
-        .filter(|r| {
-            let after_start = options
-                .time_window_start
-                .map(|s| r.timestamp >= s)
-                .unwrap_or(true);
-            let before_end = options
-                .time_window_end
-                .map(|e| r.timestamp <= e)
-                .unwrap_or(true);
-            after_start && before_end
-        })
-        .collect()
-}
-
-async fn mark_segment_completed(checkpoint: &Mutex<Option<RestoreCheckpoint>>, key: &str) {
-    let mut cp = checkpoint.lock().await;
-    if let Some(c) = cp.as_mut() {
-        c.mark_segment_completed(key);
-    }
 }
 
 #[cfg(test)]
