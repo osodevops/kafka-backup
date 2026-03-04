@@ -131,7 +131,8 @@ pub async fn restore_topic_repartitioned(
     }
 
     // Create M bounded channels (one per target partition)
-    let mut senders: Vec<mpsc::Sender<BackupRecord>> = Vec::with_capacity(num_target_partitions as usize);
+    let mut senders: Vec<mpsc::Sender<BackupRecord>> =
+        Vec::with_capacity(num_target_partitions as usize);
     let mut receivers: Vec<Option<mpsc::Receiver<BackupRecord>>> =
         Vec::with_capacity(num_target_partitions as usize);
 
@@ -347,10 +348,7 @@ async fn run_reader(
         helpers::mark_segment_completed(checkpoint, &segment.key).await;
     }
 
-    debug!(
-        "Reader for {}:{} finished",
-        source_topic, source_partition
-    );
+    debug!("Reader for {}:{} finished", source_topic, source_partition);
     Ok(())
 }
 
@@ -479,7 +477,11 @@ mod tests {
         for key in &keys {
             let hash = murmur2::murmur2(key, KAFKA_MURMUR2_SEED);
             let positive = (hash as i32) & 0x7fffffff;
-            assert!(positive >= 0, "toPositive must produce non-negative for {:?}", key);
+            assert!(
+                positive >= 0,
+                "toPositive must produce non-negative for {:?}",
+                key
+            );
             let partition = positive % 6;
             assert!((0..6).contains(&partition));
         }
@@ -505,7 +507,11 @@ mod tests {
             seen.insert(p.partition(None));
         }
         // After 9 calls with 3 partitions, should have hit all 3
-        assert_eq!(seen.len(), 3, "Null key must round-robin across all partitions");
+        assert_eq!(
+            seen.len(),
+            3,
+            "Null key must round-robin across all partitions"
+        );
     }
 
     #[test]

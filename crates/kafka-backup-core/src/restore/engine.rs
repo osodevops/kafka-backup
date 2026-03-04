@@ -866,18 +866,17 @@ impl RestoreEngine {
 
             // Use repartitioning target_partitions when configured,
             // otherwise fall back to source partition count
-            let partition_count =
-                if let Some(repart) = options.repartitioning.get(&target_name) {
-                    repart.target_partitions
-                } else {
-                    topic_backup
-                        .partitions
-                        .iter()
-                        .map(|p| p.partition_id)
-                        .max()
-                        .map(|max_id| max_id + 1)
-                        .unwrap_or(1)
-                };
+            let partition_count = if let Some(repart) = options.repartitioning.get(&target_name) {
+                repart.target_partitions
+            } else {
+                topic_backup
+                    .partitions
+                    .iter()
+                    .map(|p| p.partition_id)
+                    .max()
+                    .map(|max_id| max_id + 1)
+                    .unwrap_or(1)
+            };
 
             target_topics
                 .entry(target_name)
