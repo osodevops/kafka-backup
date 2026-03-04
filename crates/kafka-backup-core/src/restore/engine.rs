@@ -7,18 +7,15 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use crate::compression::{decompress, detect_from_extension};
 use crate::config::{Config, Mode, OffsetStrategy, RestoreOptions};
 use crate::health::HealthCheck;
 use crate::kafka::{PartitionLeaderRouter, TopicToCreate};
 use crate::manifest::{
     BackupManifest, BackupRecord, DryRunPartitionReport, DryRunReport, DryRunTopicReport,
-    OffsetMapping, PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport,
-    SegmentMetadata, TopicBackup, TopicRestoreReport,
+    OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport, SegmentMetadata,
+    TopicBackup, TopicRestoreReport,
 };
 use crate::metrics::PerformanceMetrics;
-use crate::segment::format::MAGIC_BYTES;
-use crate::segment::SegmentReader;
 use crate::storage::{create_backend, StorageBackend};
 use crate::{Error, Result};
 
@@ -666,6 +663,39 @@ impl RestoreEngine {
             .cloned()
             .unwrap_or_else(|| topic_backup.name.clone());
 
+        // Repartitioning branch: delegate to fan-out module
+        if let Some(repart_config) = options.repartitioning.get(&target_topic) {
+            info!(
+                "Repartitioning topic {} -> {} ({} source -> {} target partitions)",
+                topic_backup.name,
+                target_topic,
+                topic_backup.partitions.len(),
+                repart_config.target_partitions,
+            );
+
+            let router = self
+                .router
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+
+            return super::repartition::restore_topic_repartitioned(
+                topic_backup,
+                &target_topic,
+                repart_config,
+                options,
+                router,
+                self.storage.clone(),
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.health),
+                Arc::clone(&self.kafka_circuit_breaker),
+                Arc::clone(&self.storage_circuit_breaker),
+                Arc::clone(&self.checkpoint),
+            )
+            .await;
+        }
+
         info!(
             "Restoring topic {} -> {} ({} partitions)",
             topic_backup.name,
@@ -834,14 +864,19 @@ impl RestoreEngine {
                 .cloned()
                 .unwrap_or_else(|| topic_backup.name.clone());
 
-            // Calculate partition count (max partition_id + 1)
-            let partition_count = topic_backup
-                .partitions
-                .iter()
-                .map(|p| p.partition_id)
-                .max()
-                .map(|max_id| max_id + 1)
-                .unwrap_or(1);
+            // Use repartitioning target_partitions when configured,
+            // otherwise fall back to source partition count
+            let partition_count = if let Some(repart) = options.repartitioning.get(&target_name) {
+                repart.target_partitions
+            } else {
+                topic_backup
+                    .partitions
+                    .iter()
+                    .map(|p| p.partition_id)
+                    .max()
+                    .map(|max_id| max_id + 1)
+                    .unwrap_or(1)
+            };
 
             target_topics
                 .entry(target_name)
@@ -1067,34 +1102,11 @@ impl RestorePartitionContext {
             }
 
             // Add original offset headers if configured (header-based strategy)
-            // Use binary encoding (i64 little-endian) for proper deserialization
-            let records_to_produce = if self.options.include_original_offset_header
-                || self.options.consumer_group_strategy == OffsetStrategy::HeaderBased
-            {
-                filtered_records
-                    .into_iter()
-                    .map(|mut r| {
-                        // Store original offset as binary i64 (8 bytes, little-endian)
-                        r.headers.push(RecordHeader {
-                            key: "x-original-offset".to_string(),
-                            value: r.offset.to_le_bytes().to_vec(),
-                        });
-                        // Store original timestamp as binary i64 (8 bytes, little-endian)
-                        r.headers.push(RecordHeader {
-                            key: "x-original-timestamp".to_string(),
-                            value: r.timestamp.to_le_bytes().to_vec(),
-                        });
-                        // Store source cluster info if available
-                        r.headers.push(RecordHeader {
-                            key: "x-source-partition".to_string(),
-                            value: self.source_partition.to_le_bytes().to_vec(),
-                        });
-                        r
-                    })
-                    .collect()
-            } else {
-                filtered_records
-            };
+            let records_to_produce = super::helpers::inject_offset_headers(
+                filtered_records,
+                self.source_partition,
+                &self.options,
+            );
 
             // Track bytes
             let batch_bytes: u64 = records_to_produce
@@ -1203,10 +1215,7 @@ impl RestorePartitionContext {
     }
 
     async fn mark_segment_completed(&self, key: &str) {
-        let mut checkpoint = self.checkpoint.lock().await;
-        if let Some(cp) = checkpoint.as_mut() {
-            cp.mark_segment_completed(key);
-        }
+        super::helpers::mark_segment_completed(&self.checkpoint, key).await;
     }
 
     fn filter_segments_by_time(&self) -> Vec<&SegmentMetadata> {
@@ -1219,75 +1228,11 @@ impl RestorePartitionContext {
     }
 
     async fn read_segment(&self, segment: &SegmentMetadata) -> Result<Vec<BackupRecord>> {
-        // Read from storage
-        let data = self.storage.get(&segment.key).await?;
-
-        // Check if this is binary format (starts with MAGIC_BYTES)
-        if data.len() >= 4 && data[0..4] == MAGIC_BYTES {
-            // Binary format
-            self.read_binary_segment(data).await
-        } else {
-            // Legacy JSON format
-            self.read_json_segment(&segment.key, data)
-        }
-    }
-
-    async fn read_binary_segment(&self, data: bytes::Bytes) -> Result<Vec<BackupRecord>> {
-        let mut reader = SegmentReader::open(data)?;
-        let binary_records = reader.read_all()?;
-
-        // Convert binary records to BackupRecord
-        let records = binary_records
-            .into_iter()
-            .map(|br| BackupRecord {
-                key: br.key.map(|b| b.to_vec()),
-                value: br.value.map(|b| b.to_vec()),
-                headers: br
-                    .headers
-                    .into_iter()
-                    .map(|(k, v)| RecordHeader {
-                        key: k,
-                        value: v.map(|b| b.to_vec()).unwrap_or_default(),
-                    })
-                    .collect(),
-                timestamp: br.timestamp,
-                offset: br.offset,
-            })
-            .collect();
-
-        Ok(records)
-    }
-
-    fn read_json_segment(&self, key: &str, data: bytes::Bytes) -> Result<Vec<BackupRecord>> {
-        // Detect and apply decompression
-        let compression = detect_from_extension(key);
-        let decompressed = decompress(&data, compression)?;
-
-        // Deserialize records
-        let records: Vec<BackupRecord> = serde_json::from_slice(&decompressed)?;
-
-        Ok(records)
+        super::helpers::read_segment(self.storage.as_ref(), segment).await
     }
 
     fn filter_records_by_time(&self, records: Vec<BackupRecord>) -> Vec<BackupRecord> {
-        records
-            .into_iter()
-            .filter(|r| {
-                let after_start = self
-                    .options
-                    .time_window_start
-                    .map(|s| r.timestamp >= s)
-                    .unwrap_or(true);
-
-                let before_end = self
-                    .options
-                    .time_window_end
-                    .map(|e| r.timestamp <= e)
-                    .unwrap_or(true);
-
-                after_start && before_end
-            })
-            .collect()
+        super::helpers::filter_records_by_time(records, &self.options)
     }
 
     /// Extract source offset from record headers or fall back to record.offset

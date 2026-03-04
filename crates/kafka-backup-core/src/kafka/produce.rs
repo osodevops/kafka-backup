@@ -8,7 +8,7 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
+    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
 };
 use tracing::trace;
 
@@ -63,8 +63,8 @@ pub async fn produce(
                 producer_id: NO_PRODUCER_ID,
                 producer_epoch: NO_PRODUCER_EPOCH,
                 timestamp_type: TimestampType::Creation,
-                offset: i as i64, // Will be assigned by broker, relative offset for encoding
-                sequence: NO_SEQUENCE,
+                offset: i as i64,
+                sequence: i as i32, // Must match offset so all records land in a single batch
                 timestamp: r.timestamp,
                 key: r.key.map(Bytes::from),
                 value: r.value.map(Bytes::from),

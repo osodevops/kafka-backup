@@ -1,9 +1,11 @@
 //! Restore engine module.
 
 pub mod engine;
+pub(crate) mod helpers;
 pub mod offset_automation;
 pub mod offset_reset;
 pub mod offset_rollback;
+pub mod repartition;
 pub mod three_phase;
 
 pub use engine::{RestoreEngine, RestoreProgress};

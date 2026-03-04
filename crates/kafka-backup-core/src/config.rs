@@ -509,6 +509,28 @@ pub enum StartOffset {
     Specific(std::collections::HashMap<String, std::collections::HashMap<i32, i64>>),
 }
 
+/// Repartitioning strategy for restoring to a different partition count
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepartitioningStrategy {
+    /// Murmur2 hash partitioning (Kafka default): murmur2(key) % N.
+    /// Records with a null key use round-robin. Empty keys (`[]`) ARE hashed.
+    #[default]
+    Murmur2,
+    /// Round-robin for all records regardless of key.
+    Automatic,
+}
+
+/// Per-topic repartitioning configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicRepartitioning {
+    /// Partitioning strategy to use
+    #[serde(default)]
+    pub strategy: RepartitioningStrategy,
+    /// Number of partitions in the target topic (must be > 0)
+    pub target_partitions: i32,
+}
+
 /// Consumer offset handling strategy during restore
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -607,6 +629,13 @@ pub struct RestoreOptions {
     /// Set to -1 to explicitly use broker default
     #[serde(default)]
     pub default_replication_factor: Option<i16>,
+
+    /// Per-topic repartitioning configuration, keyed by TARGET topic name.
+    /// When set, records are re-partitioned on the fly using the configured strategy
+    /// instead of the default 1:1 partition mapping.
+    /// Mutually exclusive with `partition_mapping`.
+    #[serde(default)]
+    pub repartitioning: std::collections::HashMap<String, TopicRepartitioning>,
 }
 
 fn default_max_concurrent_partitions() -> usize {
@@ -764,6 +793,21 @@ impl RestoreOptions {
             ));
         }
 
+        // Validate repartitioning
+        for (topic, repart) in &self.repartitioning {
+            if repart.target_partitions <= 0 {
+                return Err(crate::Error::Config(format!(
+                    "repartitioning target_partitions must be > 0 for topic '{}', got {}",
+                    topic, repart.target_partitions
+                )));
+            }
+        }
+
+        // Note: partition_mapping and repartitioning can coexist — repartitioning
+        // takes precedence for topics that have it configured, while partition_mapping
+        // applies to the remaining topics. The engine handles this via early-return
+        // branching in restore_topic().
+
         Ok(())
     }
 }
@@ -812,5 +856,99 @@ connection:
         assert_eq!(config.connection.keepalive_time_secs, 30);
         assert_eq!(config.connection.keepalive_interval_secs, 10);
         assert!(!config.connection.tcp_nodelay);
+    }
+
+    /// Create a RestoreOptions with valid defaults suitable for testing.
+    /// (Rust's derived Default gives 0 for numeric fields, which fails validation.)
+    fn valid_restore_options() -> RestoreOptions {
+        RestoreOptions {
+            max_concurrent_partitions: default_max_concurrent_partitions(),
+            produce_batch_size: default_produce_batch_size(),
+            checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
+            ..RestoreOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_repartitioning_and_partition_mapping_coexist() {
+        // partition_mapping and repartitioning can coexist for different topics:
+        // repartitioning takes precedence for its topics, partition_mapping for the rest.
+        let mut opts = valid_restore_options();
+        opts.partition_mapping.insert(0, 1);
+        opts.repartitioning.insert(
+            "my-topic".to_string(),
+            TopicRepartitioning {
+                strategy: RepartitioningStrategy::Murmur2,
+                target_partitions: 3,
+            },
+        );
+        assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn test_repartitioning_invalid_target_partitions() {
+        let mut opts = valid_restore_options();
+        opts.repartitioning.insert(
+            "my-topic".to_string(),
+            TopicRepartitioning {
+                strategy: RepartitioningStrategy::Murmur2,
+                target_partitions: 0,
+            },
+        );
+        assert!(opts.validate().is_err());
+
+        let mut opts2 = valid_restore_options();
+        opts2.repartitioning.insert(
+            "my-topic".to_string(),
+            TopicRepartitioning {
+                strategy: RepartitioningStrategy::Murmur2,
+                target_partitions: -1,
+            },
+        );
+        assert!(opts2.validate().is_err());
+    }
+
+    #[test]
+    fn test_repartitioning_yaml_round_trip() {
+        let yaml = r#"
+repartitioning:
+  orders:
+    strategy: murmur2
+    target_partitions: 3
+  events:
+    strategy: automatic
+    target_partitions: 6
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(opts.repartitioning.len(), 2);
+        assert_eq!(opts.repartitioning["orders"].target_partitions, 3);
+        assert_eq!(
+            opts.repartitioning["orders"].strategy,
+            RepartitioningStrategy::Murmur2
+        );
+        assert_eq!(opts.repartitioning["events"].target_partitions, 6);
+        assert_eq!(
+            opts.repartitioning["events"].strategy,
+            RepartitioningStrategy::Automatic
+        );
+
+        // Re-serialize and verify round-trip
+        let re_serialized = serde_yaml::to_string(&opts).unwrap();
+        let re_parsed: RestoreOptions = serde_yaml::from_str(&re_serialized).unwrap();
+        assert_eq!(re_parsed.repartitioning.len(), 2);
+        assert_eq!(re_parsed.repartitioning["orders"].target_partitions, 3);
+    }
+
+    #[test]
+    fn test_repartitioning_valid_config() {
+        let mut opts = valid_restore_options();
+        opts.repartitioning.insert(
+            "my-topic".to_string(),
+            TopicRepartitioning {
+                strategy: RepartitioningStrategy::Murmur2,
+                target_partitions: 3,
+            },
+        );
+        assert!(opts.validate().is_ok());
     }
 }

@@ -115,8 +115,22 @@ impl ThreePhaseRestore {
             restore_report.offset_mapping.detailed_mapping_count()
         );
 
-        // Phase 3: Offset Reset (if consumer groups configured)
+        // Warn about repartitioned topics — offset reset is not supported for them
         let restore_options = self.config.restore.clone().unwrap_or_default();
+        if !restore_options.repartitioning.is_empty() {
+            let topics: Vec<&String> = restore_options.repartitioning.keys().collect();
+            warn!(
+                "Repartitioned topics {:?} will be skipped during Phase 3 offset reset \
+                 (source→target offset mapping is not available for repartitioned data)",
+                topics
+            );
+            warnings.push(format!(
+                "Repartitioned topics skipped for offset reset: {:?}",
+                topics
+            ));
+        }
+
+        // Phase 3: Offset Reset (if consumer groups configured)
         let (offset_reset_plan, offset_reset_report) = if restore_options.reset_consumer_offsets
             && !restore_options.consumer_groups.is_empty()
         {
