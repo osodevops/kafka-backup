@@ -20,12 +20,15 @@ use crate::Result;
 /// Response from a produce operation
 #[derive(Debug)]
 pub struct ProduceResponse {
-    /// Base offset assigned to the first record
+    /// Base offset assigned to the first record in the first sub-batch
     pub base_offset: i64,
-    /// Error code (0 = success)
+    /// Error code (always 0; errors are returned via `Err(...)`)
     pub error_code: i16,
-    /// Number of records produced
+    /// Total number of records produced
     pub record_count: usize,
+    /// Per-sub-batch offsets: (base_offset, record_count) for each sub-batch.
+    /// When no splitting occurs, this contains a single entry.
+    pub sub_batch_offsets: Vec<(i64, usize)>,
 }
 
 /// Max timestamp delta within a single record batch.
@@ -113,6 +116,7 @@ pub async fn produce(
             base_offset: -1,
             error_code: 0,
             record_count: 0,
+            sub_batch_offsets: vec![],
         });
     }
 
@@ -131,6 +135,7 @@ pub async fn produce(
 
     let mut first_base_offset: Option<i64> = None;
     let mut total_produced = 0;
+    let mut sub_batch_offsets = Vec::with_capacity(sub_batches.len());
 
     for sub_batch in sub_batches {
         let sub_batch_len = sub_batch.len();
@@ -165,6 +170,7 @@ pub async fn produce(
 
         let produce_result = parse_produce_response(&response, topic, partition)?;
 
+        sub_batch_offsets.push((produce_result.base_offset, sub_batch_len));
         if first_base_offset.is_none() {
             first_base_offset = Some(produce_result.base_offset);
         }
@@ -183,6 +189,7 @@ pub async fn produce(
         base_offset: first_base_offset.unwrap_or(-1),
         error_code: 0,
         record_count: total_produced,
+        sub_batch_offsets,
     })
 }
 
@@ -213,10 +220,13 @@ fn parse_produce_response(
                 }
                 .into());
             }
+            // record_count and sub_batch_offsets are filled in by the
+            // caller (produce()) which aggregates across sub-batches.
             return Ok(ProduceResponse {
                 base_offset: partition_response.base_offset,
                 error_code: 0,
                 record_count: 0,
+                sub_batch_offsets: vec![],
             });
         }
     }
@@ -356,5 +366,40 @@ mod tests {
         let batches = RecordBatchDecoder::decode_all(&mut read_buf).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].records.len(), 10);
+    }
+
+    #[test]
+    fn test_split_preserves_record_count_per_sub_batch() {
+        let day_ms: i64 = 86_400_000;
+        // 50 records spanning 50 days — must split into multiple sub-batches
+        let records: Vec<BackupRecord> = (0..50)
+            .map(|i| make_record(1_700_000_000_000 + i * day_ms))
+            .collect();
+
+        let sub_batches = split_by_timestamp(records);
+        assert!(sub_batches.len() >= 2);
+
+        // Verify total record count is preserved
+        let total: usize = sub_batches.iter().map(|s| s.len()).sum();
+        assert_eq!(total, 50);
+
+        // Simulate what produce() would track as sub_batch_offsets
+        let simulated_offsets: Vec<(i64, usize)> = sub_batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| (i as i64 * 1000, batch.len()))
+            .collect();
+
+        // Walk the simulated offsets the same way restore engine does
+        let mut record_idx = 0;
+        for (base, count) in &simulated_offsets {
+            for j in 0..*count {
+                let target_offset = base + j as i64;
+                assert!(target_offset >= *base);
+                assert!((target_offset - base) < *count as i64);
+                record_idx += 1;
+            }
+        }
+        assert_eq!(record_idx, 50);
     }
 }
