@@ -1137,23 +1137,35 @@ impl RestorePartitionContext {
                         self.health.mark_healthy("kafka");
 
                         // Capture offset mapping (Phase 2: detailed offset mapping)
-                        // The base_offset is the offset assigned to the first record in the batch
-                        let base_offset = produce_response.base_offset;
-                        for (i, record) in batch.iter().enumerate() {
-                            let target_offset = base_offset + i as i64;
+                        // Use per-sub-batch offsets for correct mapping when records
+                        // were split across multiple produce requests.
+                        let mut record_idx = 0;
+                        for (sub_base_offset, sub_count) in &produce_response.sub_batch_offsets {
+                            for j in 0..*sub_count {
+                                let record = &batch[record_idx];
+                                let target_offset = sub_base_offset + j as i64;
 
-                            // Extract source offset from header (if available) or use record offset
-                            let source_offset = self.extract_source_offset(record);
+                                // Extract source offset from header (if available) or use record offset
+                                let source_offset = self.extract_source_offset(record);
 
-                            // Add detailed mapping for exact offset lookup during consumer group reset
-                            self.offset_mapping.lock().await.add_detailed(
-                                &self.target_topic,
-                                self.target_partition,
-                                source_offset,
-                                target_offset,
-                                record.timestamp,
-                            );
+                                // Add detailed mapping for exact offset lookup during consumer group reset
+                                self.offset_mapping.lock().await.add_detailed(
+                                    &self.target_topic,
+                                    self.target_partition,
+                                    source_offset,
+                                    target_offset,
+                                    record.timestamp,
+                                );
+                                record_idx += 1;
+                            }
                         }
+                        debug_assert_eq!(
+                            record_idx,
+                            batch.len(),
+                            "sub_batch_offsets total count ({}) != batch length ({})",
+                            record_idx,
+                            batch.len()
+                        );
                     }
                     Err(e) => {
                         self.kafka_cb.record_failure();
