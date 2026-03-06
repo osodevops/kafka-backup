@@ -521,6 +521,15 @@ pub enum RepartitioningStrategy {
     Automatic,
 }
 
+impl std::fmt::Display for RepartitioningStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Murmur2 => write!(f, "murmur2"),
+            Self::Automatic => write!(f, "automatic"),
+        }
+    }
+}
+
 /// Per-topic repartitioning configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicRepartitioning {

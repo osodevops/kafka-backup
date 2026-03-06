@@ -846,8 +846,23 @@ pub struct DryRunTopicReport {
     /// Target topic name
     pub target_topic: String,
 
+    /// Repartitioning info (if configured for this topic)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repartitioning: Option<DryRunRepartitioningInfo>,
+
     /// Partitions to restore
     pub partitions: Vec<DryRunPartitionReport>,
+}
+
+/// Repartitioning details shown in dry-run report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunRepartitioningInfo {
+    /// Strategy used (murmur2 or automatic)
+    pub strategy: String,
+    /// Number of source partitions
+    pub source_partitions: i32,
+    /// Number of target partitions
+    pub target_partitions: i32,
 }
 
 /// Per-partition dry-run report
