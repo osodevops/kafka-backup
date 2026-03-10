@@ -45,109 +45,179 @@ pub async fn run(config_path: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_validation_report(report: &kafka_backup_core::manifest::DryRunReport) {
-    println!("╔══════════════════════════════════════════════════════════════════════╗");
-    println!("║                    RESTORE VALIDATION REPORT                         ║");
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
+/// A line in the box report, either left-aligned or centered
+enum BoxLine {
+    Left(String),
+    Centered(String),
+    Separator,
+}
 
+impl BoxLine {
+    fn content_width(&self) -> usize {
+        match self {
+            BoxLine::Left(s) => s.chars().count(),
+            BoxLine::Centered(s) => s.chars().count(),
+            BoxLine::Separator => 0,
+        }
+    }
+}
+
+fn print_validation_report(report: &kafka_backup_core::manifest::DryRunReport) {
+    // Collect all content lines first, then size the box to fit
     let status = if report.valid && report.errors.is_empty() {
         "✓ VALID"
     } else {
         "✗ INVALID"
     };
-    println!("║ Status:         {:55} ║", status);
-    println!("║ Backup ID:      {:55} ║", report.backup_id);
 
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!("║                         RESTORE SUMMARY                              ║");
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Topics to restore:    {:48} ║",
-        report.topics_to_restore.len()
-    );
-    println!(
-        "║ Segments to process:  {:48} ║",
-        report.segments_to_process
-    );
-    println!("║ Records to restore:   {:48} ║", report.records_to_restore);
-    println!(
-        "║ Bytes to restore:     {:48} ║",
-        format_bytes(report.bytes_to_restore)
-    );
+    let mut sections: Vec<Vec<BoxLine>> = Vec::new();
 
+    // Header
+    sections.push(vec![BoxLine::Centered("RESTORE VALIDATION REPORT".into())]);
+
+    // Status
+    sections.push(vec![
+        BoxLine::Left(kv("Status", status)),
+        BoxLine::Left(kv("Backup ID", &report.backup_id)),
+    ]);
+
+    // Summary
+    {
+        let mut lines = vec![BoxLine::Centered("RESTORE SUMMARY".into())];
+        lines.push(BoxLine::Left(kv(
+            "Topics to restore",
+            &report.topics_to_restore.len().to_string(),
+        )));
+        lines.push(BoxLine::Left(kv(
+            "Segments to process",
+            &report.segments_to_process.to_string(),
+        )));
+        lines.push(BoxLine::Left(kv(
+            "Records to restore",
+            &report.records_to_restore.to_string(),
+        )));
+        lines.push(BoxLine::Left(kv(
+            "Bytes to restore",
+            &format_bytes(report.bytes_to_restore),
+        )));
+        sections.push(lines);
+    }
+
+    // Time range
     if let Some((start, end)) = report.time_range {
-        let start_str = chrono::DateTime::from_timestamp_millis(start)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let end_str = chrono::DateTime::from_timestamp_millis(end)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                           TIME RANGE                                 ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║ From: {:65} ║", start_str);
-        println!("║ To:   {:65} ║", end_str);
+        let fmt = |ts: i64| {
+            chrono::DateTime::from_timestamp_millis(ts)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "Unknown".to_string())
+        };
+        sections.push(vec![
+            BoxLine::Centered("TIME RANGE".into()),
+            BoxLine::Left(format!("From: {}", fmt(start))),
+            BoxLine::Left(format!("To:   {}", fmt(end))),
+        ]);
     }
 
     // Topics
     if !report.topics_to_restore.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                        TOPICS TO RESTORE                             ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![BoxLine::Centered("TOPICS TO RESTORE".into())];
+        for (idx, topic) in report.topics_to_restore.iter().enumerate() {
+            if idx > 0 {
+                lines.push(BoxLine::Separator);
+            }
+            lines.push(BoxLine::Left(format!(
+                "{} -> {}",
+                topic.source_topic, topic.target_topic
+            )));
 
-        for topic in &report.topics_to_restore {
-            println!("║                                                                      ║");
-            println!("║ {} -> {} ║", topic.source_topic, topic.target_topic);
+            if let Some(ref repart) = topic.repartitioning {
+                lines.push(BoxLine::Left(format!(
+                    "  Repartitioning: {} partitions -> {} partitions ({} strategy)",
+                    repart.source_partitions, repart.target_partitions, repart.strategy
+                )));
+            }
 
-            for partition in &topic.partitions {
-                let offset_str = format!(
-                    "offsets {}-{}",
-                    partition.offset_range.0, partition.offset_range.1
-                );
-                println!(
-                    "║   P{} -> P{}: {} records, {} ({} segments) ║",
-                    partition.source_partition,
-                    partition.target_partition,
-                    partition.records,
-                    offset_str,
-                    partition.segments
-                );
+            for p in &topic.partitions {
+                lines.push(BoxLine::Left(format!(
+                    "  P{} -> P{}: {} records, offsets {}-{} ({} segments)",
+                    p.source_partition,
+                    p.target_partition,
+                    p.records,
+                    p.offset_range.0,
+                    p.offset_range.1,
+                    p.segments
+                )));
             }
         }
+        sections.push(lines);
     }
 
     // Consumer offset actions
     if !report.consumer_offset_actions.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                    CONSUMER OFFSET ACTIONS                           ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![BoxLine::Centered("CONSUMER OFFSET ACTIONS".into())];
         for action in &report.consumer_offset_actions {
-            println!("║ • {:68} ║", action);
+            lines.push(BoxLine::Left(format!("* {}", action)));
         }
+        sections.push(lines);
     }
 
     // Errors
     if !report.errors.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                            ERRORS                                    ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![BoxLine::Centered("ERRORS".into())];
         for error in &report.errors {
-            println!("║ ✗ {:68} ║", error);
+            lines.push(BoxLine::Left(format!("✗ {}", error)));
         }
+        sections.push(lines);
     }
 
     // Warnings
     if !report.warnings.is_empty() {
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
-        println!("║                           WARNINGS                                   ║");
-        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        let mut lines = vec![BoxLine::Centered("WARNINGS".into())];
         for warning in &report.warnings {
-            println!("║ ⚠ {:68} ║", warning);
+            lines.push(BoxLine::Left(format!("⚠ {}", warning)));
         }
+        sections.push(lines);
     }
 
-    println!("╚══════════════════════════════════════════════════════════════════════╝");
+    // Determine box width from longest visible content line (min 60)
+    let max_content = sections
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|l| l.content_width())
+        .max()
+        .unwrap_or(0);
+    let w = max_content.max(60) + 4; // 2 spaces padding on each side
+
+    // Print
+    println!("╔{}╗", "═".repeat(w));
+    for (i, section) in sections.iter().enumerate() {
+        if i > 0 {
+            println!("╠{}╣", "═".repeat(w));
+        }
+        for line in section {
+            match line {
+                BoxLine::Centered(text) => {
+                    let text_len = text.chars().count();
+                    let left = (w - text_len) / 2;
+                    let right = w - text_len - left;
+                    println!("║{}{}{}║", " ".repeat(left), text, " ".repeat(right));
+                }
+                BoxLine::Left(text) => {
+                    let chars = text.chars().count();
+                    let pad = w - chars - 2;
+                    println!("║ {}{}║", text, " ".repeat(pad + 1));
+                }
+                BoxLine::Separator => {
+                    println!("║ {}║", "─".repeat(w - 2));
+                }
+            }
+        }
+    }
+    println!("╚{}╝", "═".repeat(w));
+}
+
+/// Format a key-value line with consistent alignment
+fn kv(key: &str, value: &str) -> String {
+    format!("{:<22} {}", format!("{}:", key), value)
 }
 
 fn format_bytes(bytes: u64) -> String {
