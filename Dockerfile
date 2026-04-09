@@ -49,6 +49,11 @@ COPY --from=builder /app/target/release/kafka-backup /usr/local/bin/kafka-backup
 # Ensure binary is executable
 RUN chmod +x /usr/local/bin/kafka-backup
 
+# Create writable data directory for SQLite offset store and other state files.
+# For K8s pods with readOnlyRootFilesystem: true, mount an emptyDir at /data.
+# The offset store defaults to /tmp which is typically a tmpfs (Issue #62).
+RUN mkdir -p /data && chown kafka-backup:kafka-backup /data
+
 # Set non-root user
 USER kafka-backup
 

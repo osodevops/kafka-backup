@@ -17,7 +17,9 @@ type PendingOffsets = std::collections::HashMap<(String, String, i32), i64>;
 
 /// SQLite-based offset store
 pub struct SqliteOffsetStore {
-    pool: SqlitePool,
+    /// Connection pool, wrapped in RwLock to allow replacement after
+    /// loading a database snapshot from remote storage.
+    pool: RwLock<SqlitePool>,
     config: OffsetStoreConfig,
     /// Pending offset updates (topic, partition) -> offset
     pending: Arc<RwLock<PendingOffsets>>,
@@ -31,6 +33,21 @@ impl SqliteOffsetStore {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
+        let pool = Self::open_pool(&config).await?;
+
+        let store = Self {
+            pool: RwLock::new(pool),
+            config,
+            pending: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+
+        store.initialize_schema().await?;
+
+        Ok(store)
+    }
+
+    /// Build a new SQLite connection pool for the configured db_path
+    async fn open_pool(config: &OffsetStoreConfig) -> Result<SqlitePool> {
         let options = SqliteConnectOptions::from_str(&format!(
             "sqlite:{}?mode=rwc",
             config.db_path.display()
@@ -44,19 +61,12 @@ impl SqliteOffsetStore {
             .connect_with(options)
             .await?;
 
-        let store = Self {
-            pool,
-            config,
-            pending: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        };
-
-        store.initialize_schema().await?;
-
-        Ok(store)
+        Ok(pool)
     }
 
     /// Initialize the database schema
     async fn initialize_schema(&self) -> Result<()> {
+        let pool = self.pool.read().await;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS offsets (
@@ -81,7 +91,7 @@ impl SqliteOffsetStore {
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON backup_jobs(status);
             "#,
         )
-        .execute(&self.pool)
+        .execute(&*pool)
         .await?;
 
         debug!("SQLite schema initialized");
@@ -95,9 +105,11 @@ impl SqliteOffsetStore {
         s3_key: &str,
     ) -> Result<bool> {
         // Check if local database already has data
+        let pool = self.pool.read().await;
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM offsets")
-            .fetch_one(&self.pool)
+            .fetch_one(&*pool)
             .await?;
+        drop(pool);
 
         if count.0 > 0 {
             debug!("Local database already has {} offset records", count.0);
@@ -128,13 +140,14 @@ impl OffsetStore for SqliteOffsetStore {
         }
 
         // Query database
+        let pool = self.pool.read().await;
         let result: Option<(i64,)> = sqlx::query_as(
             "SELECT last_offset FROM offsets WHERE backup_id = ? AND topic = ? AND partition = ?",
         )
         .bind(backup_id)
         .bind(topic)
         .bind(partition)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&*pool)
         .await?;
 
         Ok(result.map(|(offset,)| offset))
@@ -157,11 +170,12 @@ impl OffsetStore for SqliteOffsetStore {
     }
 
     async fn get_all_offsets(&self, backup_id: &str) -> Result<Vec<OffsetInfo>> {
+        let pool = self.pool.read().await;
         let rows: Vec<(String, i32, i64, i64)> = sqlx::query_as(
             "SELECT topic, partition, last_offset, checkpoint_ts FROM offsets WHERE backup_id = ?",
         )
         .bind(backup_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&*pool)
         .await?;
 
         Ok(rows
@@ -191,6 +205,7 @@ impl OffsetStore for SqliteOffsetStore {
         let now = chrono::Utc::now().timestamp_millis();
 
         // Batch insert/update
+        let pool = self.pool.read().await;
         for ((backup_id, topic, partition), offset) in updates {
             sqlx::query(
                 r#"
@@ -205,7 +220,7 @@ impl OffsetStore for SqliteOffsetStore {
             .bind(partition)
             .bind(offset)
             .bind(now)
-            .execute(&self.pool)
+            .execute(&*pool)
             .await?;
         }
 
@@ -216,6 +231,15 @@ impl OffsetStore for SqliteOffsetStore {
     async fn sync_to_storage(&self, storage: &dyn StorageBackend, s3_key: &str) -> Result<()> {
         // First checkpoint any pending updates
         self.checkpoint().await?;
+
+        // Force WAL checkpoint so the main DB file has all data
+        {
+            let pool = self.pool.read().await;
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&*pool)
+                .await
+                .ok();
+        }
 
         // Read the SQLite file
         let db_bytes = tokio::fs::read(&self.config.db_path).await?;
@@ -237,19 +261,36 @@ impl OffsetStore for SqliteOffsetStore {
         // Download from storage
         let db_bytes = storage.get(s3_key).await?;
 
+        // Ensure parent directory exists (may not if path was reconfigured)
+        if let Some(parent) = self.config.db_path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+
         // Write to temporary file first
         let temp_path = self.config.db_path.with_extension("db.tmp");
         tokio::fs::write(&temp_path, &db_bytes).await?;
 
-        // Close pool and rename
-        self.pool.close().await;
+        // Close current pool, replace the file, then reconnect.
+        // Previously the pool was closed but never reopened (Issue #62).
+        {
+            let pool = self.pool.read().await;
+            pool.close().await;
+        }
         tokio::fs::rename(&temp_path, &self.config.db_path).await?;
+
+        // Reconnect to the replaced database
+        let new_pool = Self::open_pool(&self.config).await?;
+        {
+            let mut pool = self.pool.write().await;
+            *pool = new_pool;
+        }
 
         info!("Loaded offset database from storage: {}", s3_key);
         Ok(true)
     }
 
     async fn get_or_create_job(&self, backup_id: &str, cluster_id: Option<&str>) -> Result<()> {
+        let pool = self.pool.read().await;
         sqlx::query(
             r#"
             INSERT INTO backup_jobs (backup_id, source_cluster_id, status)
@@ -261,28 +302,30 @@ impl OffsetStore for SqliteOffsetStore {
         )
         .bind(backup_id)
         .bind(cluster_id)
-        .execute(&self.pool)
+        .execute(&*pool)
         .await?;
 
         Ok(())
     }
 
     async fn update_job_status(&self, backup_id: &str, status: &str) -> Result<()> {
+        let pool = self.pool.read().await;
         sqlx::query("UPDATE backup_jobs SET status = ? WHERE backup_id = ?")
             .bind(status)
             .bind(backup_id)
-            .execute(&self.pool)
+            .execute(&*pool)
             .await?;
 
         Ok(())
     }
 
     async fn heartbeat(&self, backup_id: &str) -> Result<()> {
+        let pool = self.pool.read().await;
         sqlx::query(
             "UPDATE backup_jobs SET last_heartbeat = strftime('%s', 'now') * 1000 WHERE backup_id = ?",
         )
         .bind(backup_id)
-        .execute(&self.pool)
+        .execute(&*pool)
         .await?;
 
         Ok(())
@@ -349,5 +392,94 @@ mod tests {
         // Verify all offsets
         let offsets = store.get_all_offsets("backup-1").await.unwrap();
         assert_eq!(offsets.len(), 10);
+    }
+
+    /// Regression test for Issue #62: SqliteOffsetStore::new() fails with
+    /// SQLITE_CANTOPEN (code 14) when the db_path parent is read-only,
+    /// e.g. K8s pods with readOnlyRootFilesystem: true.
+    #[tokio::test]
+    async fn test_issue_62_readonly_directory_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let readonly_dir = temp_dir.path().join("readonly");
+        std::fs::create_dir(&readonly_dir).unwrap();
+
+        // Make directory read-only
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        let config = OffsetStoreConfig {
+            db_path: readonly_dir.join("offsets.db"),
+            ..Default::default()
+        };
+
+        let result = SqliteOffsetStore::new(config).await;
+        assert!(result.is_err(), "Should fail on read-only directory");
+
+        let err_msg = result.err().expect("should be an error").to_string();
+        assert!(
+            err_msg.contains("unable to open database file")
+                || err_msg.contains("read-only")
+                || err_msg.contains("permission denied"),
+            "Expected SQLite CANTOPEN error, got: {}",
+            err_msg
+        );
+
+        // Cleanup
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    }
+
+    /// Regression test for Issue #62: after load_from_storage() replaces the
+    /// database file, subsequent operations must still work (pool reconnection).
+    #[tokio::test]
+    async fn test_load_from_storage_reconnects_pool() {
+        use crate::storage::MemoryBackend;
+
+        // Create store with some data
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("offsets.db");
+        let config = OffsetStoreConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        let store = SqliteOffsetStore::new(config.clone()).await.unwrap();
+        store
+            .set_offset("backup-1", "topic-1", 0, 42)
+            .await
+            .unwrap();
+        store.checkpoint().await.unwrap();
+
+        // Sync to in-memory storage
+        let storage = MemoryBackend::new();
+        store
+            .sync_to_storage(&storage, "state/offsets.db")
+            .await
+            .unwrap();
+
+        // Create a fresh store (simulates process restart)
+        let store2 = SqliteOffsetStore::new(config).await.unwrap();
+
+        // Load from storage — this closes the pool and replaces the DB file
+        let loaded = store2
+            .load_from_storage(&storage, "state/offsets.db")
+            .await
+            .unwrap();
+        assert!(loaded, "Should have loaded from storage");
+
+        // Operations after load_from_storage must work (pool was reconnected)
+        store2
+            .get_or_create_job("backup-1", None)
+            .await
+            .expect("get_or_create_job should work after load_from_storage");
+
+        let offset = store2
+            .get_offset("backup-1", "topic-1", 0)
+            .await
+            .expect("get_offset should work after load_from_storage");
+        assert_eq!(offset, Some(42), "Should recover offset from loaded DB");
     }
 }
