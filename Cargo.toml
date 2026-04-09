@@ -98,7 +98,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 uuid = { version = "1", features = ["v4"] }
 
 # Testing
-testcontainers = "0.23"
+testcontainers = "0.24"
 testcontainers-modules = { version = "0.11", features = ["kafka"] }
 tempfile = "3"
 tokio-test = "0.4"
