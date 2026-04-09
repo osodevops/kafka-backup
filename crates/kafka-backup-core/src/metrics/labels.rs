@@ -299,6 +299,9 @@ impl ErrorType {
             crate::Error::Manifest(_) => ErrorType::Unknown,
             crate::Error::TopicNotFound(_) => ErrorType::NotFound,
             crate::Error::BackupNotFound(_) => ErrorType::NotFound,
+            crate::Error::Validation(_) => ErrorType::Unknown,
+            crate::Error::Evidence(_) => ErrorType::Unknown,
+            crate::Error::Notification(_) => ErrorType::Unknown,
         }
     }
 

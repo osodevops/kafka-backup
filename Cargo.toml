@@ -84,6 +84,19 @@ socket2 = { version = "0.5", features = ["all"] }
 crc32fast = "1.4"
 regex = "1"
 
+# Cryptographic signing (evidence reports)
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+sha2 = "0.10"
+
+# PDF generation (evidence reports)
+printpdf = "0.7"
+
+# HTTP client (webhooks, notifications)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# UUID (validation run IDs)
+uuid = { version = "1", features = ["v4"] }
+
 # Testing
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["kafka"] }
