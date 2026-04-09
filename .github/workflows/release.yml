@@ -353,8 +353,8 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          # Use PAT instead of GITHUB_TOKEN so downstream workflows can be triggered
-          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          # GITHUB_TOKEN has contents: write from the workflow-level permissions
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
