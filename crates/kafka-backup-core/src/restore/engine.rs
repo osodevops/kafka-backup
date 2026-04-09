@@ -11,9 +11,9 @@ use crate::config::{Config, Mode, OffsetStrategy, RestoreOptions};
 use crate::health::HealthCheck;
 use crate::kafka::{PartitionLeaderRouter, TopicToCreate};
 use crate::manifest::{
-    BackupManifest, BackupRecord, DryRunPartitionReport, DryRunReport, DryRunTopicReport,
-    OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport, SegmentMetadata,
-    TopicBackup, TopicRestoreReport,
+    BackupManifest, BackupRecord, DryRunPartitionReport, DryRunRepartitioningInfo, DryRunReport,
+    DryRunTopicReport, OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport,
+    SegmentMetadata, TopicBackup, TopicRestoreReport,
 };
 use crate::metrics::PerformanceMetrics;
 use crate::storage::{create_backend, StorageBackend};
@@ -310,9 +310,20 @@ impl RestoreEngine {
                 .cloned()
                 .unwrap_or_else(|| topic_backup.name.clone());
 
+            let repartitioning_info =
+                restore_options
+                    .repartitioning
+                    .get(&target_topic)
+                    .map(|repart| DryRunRepartitioningInfo {
+                        strategy: repart.strategy.to_string(),
+                        source_partitions: topic_backup.partitions.len() as i32,
+                        target_partitions: repart.target_partitions,
+                    });
+
             let mut topic_report = DryRunTopicReport {
                 source_topic: topic_backup.name.clone(),
                 target_topic,
+                repartitioning: repartitioning_info,
                 partitions: Vec::new(),
             };
 
