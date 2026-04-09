@@ -100,8 +100,19 @@ impl BackupEngine {
         // Initialize offset store for continuous backups
         let backup_opts = config.backup.clone().unwrap_or_default();
         let offset_store = if backup_opts.continuous {
+            // Use config.offset_storage.db_path if provided, otherwise default to
+            // temp directory. Previously this was hardcoded to "./{backup_id}-offsets.db"
+            // which fails on read-only filesystems (Issue #62).
+            let db_path = config
+                .offset_storage
+                .as_ref()
+                .map(|os| os.db_path.clone())
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("{}-offsets.db", config.backup_id))
+                });
+
             let offset_config = OffsetStoreConfig {
-                db_path: std::path::PathBuf::from(format!("./{}-offsets.db", config.backup_id)),
+                db_path,
                 s3_key: Some(format!("{}/offsets.db", config.backup_id)),
                 checkpoint_interval_secs: backup_opts.checkpoint_interval_secs,
                 sync_interval_secs: backup_opts.sync_interval_secs,
