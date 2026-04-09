@@ -18,42 +18,47 @@ Get started with Kafka Backup in 5 minutes. This guide covers the essential oper
 
 ## Prerequisites
 
-- **Rust 1.70+** (for building from source)
 - **Apache Kafka** cluster accessible
 - **Storage**: Local filesystem, S3, Azure, or GCS
+- **Rust 1.75+** (only if building from source)
 
 ---
 
 ## Installation
 
-### Option 1: Build from Source
+### Option 1: macOS (Homebrew)
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/kafka-backup.git
+brew install osodevops/tap/kafka-backup
+```
+
+### Option 2: Linux / macOS (Shell Installer)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osodevops/kafka-backup/releases/latest/download/kafka-backup-cli-installer.sh | sh
+```
+
+### Option 3: Docker
+
+```bash
+docker pull osodevops/kafka-backup
+```
+
+### Option 4: Build from Source
+
+```bash
+git clone https://github.com/osodevops/kafka-backup.git
 cd kafka-backup
-
-# Build in release mode
 cargo build --release
-
 # Binary is at target/release/kafka-backup
-./target/release/kafka-backup --help
 ```
 
-### Option 2: Install with Cargo
-
-```bash
-cargo install --path crates/kafka-backup-cli
-
-# Now available in your PATH
-kafka-backup --help
-```
+See the [full installation guide](https://github.com/osodevops/kafka-backup#installation) for Windows, manual downloads, and more options.
 
 ### Verify Installation
 
 ```bash
 kafka-backup --version
-# kafka-backup 0.1.0
 ```
 
 ---

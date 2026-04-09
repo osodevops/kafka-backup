@@ -220,7 +220,7 @@ This makes OSO Kafka Backup the highest‑leverage choice for teams that need re
 | [Storage Guide](docs/storage_guide.md) | S3, Azure, GCS setup |
 | [Restore Guide](docs/restore_guide.md) | Restore scenarios and examples |
 | [Offset Recovery](docs/Three_Phase_Restore_Guide.md) | Consumer offset strategies |
-| [Architecture](CLAUDE.md) | Technical deep-dive |
+| [Offset Reset & Rollback](docs/offset-reset-guide.md) | Bulk offset resets and rollback safety net |
 
 ## CLI Reference
 
@@ -228,15 +228,31 @@ This makes OSO Kafka Backup the highest‑leverage choice for teams that need re
 # Backup & restore
 kafka-backup backup --config backup.yaml
 kafka-backup restore --config restore.yaml
+kafka-backup three-phase-restore --config restore.yaml   # restore + offset recovery
 
 # Inspect backups
 kafka-backup list --path s3://bucket/prefix
 kafka-backup describe --path s3://bucket --backup-id backup-001 --format json
+kafka-backup status --config backup.yaml --watch          # live monitoring
 kafka-backup validate --path s3://bucket --backup-id backup-001 --deep
 
-# Consumer offset management
+# Restore validation (dry-run)
+kafka-backup validate-restore --config restore.yaml
+
+# Offset mapping & consumer offset management
+kafka-backup show-offset-mapping --path s3://bucket --backup-id backup-001 --format json
 kafka-backup offset-reset plan --path s3://bucket --backup-id backup-001 --groups my-group
 kafka-backup offset-reset execute --path s3://bucket --backup-id backup-001 --groups my-group
+kafka-backup offset-reset script --path s3://bucket --backup-id backup-001 --groups my-group
+
+# Bulk parallel offset reset (~50x faster)
+kafka-backup offset-reset-bulk --path s3://bucket --backup-id backup-001 \
+  --groups group1,group2 --bootstrap-servers kafka:9092
+
+# Offset snapshots & rollback (safety net)
+kafka-backup offset-rollback snapshot --path s3://bucket --groups my-group --bootstrap-servers kafka:9092
+kafka-backup offset-rollback list --path s3://bucket
+kafka-backup offset-rollback rollback --path s3://bucket --snapshot-id <id> --bootstrap-servers kafka:9092
 
 # Validation & compliance evidence
 kafka-backup validation run --config validation.yaml
@@ -401,16 +417,6 @@ kafka-backup/
 ├── config/                       # Example configs
 └── docs/                         # Documentation
 ```
-
-## Contributing
-
-Contributions are welcome! Please read our contributing guidelines before submitting a PR.
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## Looking for Enterprise Apache Kafka Support?
 

@@ -6,7 +6,14 @@ mod commands;
 
 #[derive(Parser)]
 #[command(name = "kafka-backup")]
-#[command(about = "Kafka backup and restore tool", long_about = None)]
+#[command(about = "High-performance Kafka backup and restore with point-in-time recovery")]
+#[command(
+    long_about = "High-performance Kafka backup and restore with point-in-time recovery.\n\n\
+    Back up Kafka topics to S3, Azure Blob, GCS, or local filesystem.\n\
+    Restore with millisecond-precision PITR, topic remapping, and\n\
+    automatic consumer group offset recovery.\n\n\
+    Documentation: https://osodevops.github.io/kafka-backup-docs/"
+)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -19,23 +26,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a backup operation
+    /// Back up Kafka topics to cloud storage or local filesystem
+    #[command(
+        after_help = "Examples:\n  kafka-backup backup --config backup.yaml\n  kafka-backup backup -v --config backup.yaml   # with debug logging"
+    )]
     Backup {
-        /// Path to the configuration file
+        /// Path to the YAML configuration file
         #[arg(short, long)]
         config: String,
     },
 
-    /// Run a restore operation
+    /// Restore Kafka topics from a backup with optional PITR filtering
+    #[command(
+        after_help = "Examples:\n  kafka-backup restore --config restore.yaml\n  kafka-backup validate-restore --config restore.yaml   # dry-run first"
+    )]
     Restore {
-        /// Path to the configuration file
+        /// Path to the YAML configuration file
         #[arg(short, long)]
         config: String,
     },
 
-    /// List available backups
+    /// List available backups in a storage location
     List {
-        /// Path to the storage location
+        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
         #[arg(short, long)]
         path: String,
 
@@ -44,13 +57,17 @@ enum Commands {
         backup_id: Option<String>,
     },
 
-    /// Show status of a backup job
+    /// Show status of a running or completed backup job
+    #[command(long_about = "Show status of a backup job.\n\n\
+        Two modes:\n  \
+        Static:  --path and --backup-id to inspect a completed backup\n  \
+        Live:    --config to monitor a running backup (add --watch for continuous refresh)")]
     Status {
-        /// Path to the storage location (for static backup inspection)
+        /// Path to the storage location (for inspecting a completed backup)
         #[arg(short, long, conflicts_with = "config")]
         path: Option<String>,
 
-        /// Backup ID to show status for (for static backup inspection)
+        /// Backup ID to show status for (for inspecting a completed backup)
         #[arg(short, long, conflicts_with = "config")]
         backup_id: Option<String>,
 
@@ -66,14 +83,17 @@ enum Commands {
         #[arg(long, requires = "config")]
         watch: bool,
 
-        /// Refresh interval in seconds for watch mode (default: 2)
+        /// Refresh interval in seconds for watch mode
         #[arg(long, default_value = "2")]
         interval: u64,
     },
 
-    /// Validate a backup's integrity
+    /// Validate a backup's integrity (checksums, segment counts, manifests)
+    #[command(
+        after_help = "Examples:\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
+    )]
     Validate {
-        /// Path to the storage location
+        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
         #[arg(short, long)]
         path: String,
 
@@ -86,9 +106,9 @@ enum Commands {
         deep: bool,
     },
 
-    /// Show detailed backup manifest information
+    /// Show detailed backup manifest (topics, partitions, time ranges, record counts)
     Describe {
-        /// Path to the storage location
+        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
         #[arg(short, long)]
         path: String,
 
@@ -101,7 +121,7 @@ enum Commands {
         format: String,
     },
 
-    /// Validate a restore configuration (dry-run)
+    /// Validate a restore configuration without writing any data (dry-run)
     ValidateRestore {
         /// Path to the restore configuration file
         #[arg(short, long)]
@@ -112,9 +132,9 @@ enum Commands {
         format: String,
     },
 
-    /// Show offset mapping for a backup
+    /// Show source-to-target offset mapping from a completed restore
     ShowOffsetMapping {
-        /// Path to the storage location
+        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
         #[arg(short, long)]
         path: String,
 
@@ -127,22 +147,29 @@ enum Commands {
         format: String,
     },
 
-    /// Generate or execute consumer group offset reset plan (Phase 3)
+    /// Plan, execute, or script consumer group offset resets after a restore
     OffsetReset {
         #[command(subcommand)]
         action: OffsetResetAction,
     },
 
-    /// Run three-phase restore (restore + offset reset)
+    /// Run a complete restore with automatic consumer group offset recovery
+    #[command(
+        long_about = "Run a complete restore with automatic consumer group offset recovery.\n\n\
+        Orchestrates three phases:\n  \
+        1. Restore records to target cluster\n  \
+        2. Collect source-to-target offset mapping\n  \
+        3. Reset consumer group offsets using the mapping"
+    )]
     ThreePhaseRestore {
-        /// Path to the configuration file
+        /// Path to the YAML configuration file
         #[arg(short, long)]
         config: String,
     },
 
-    /// Execute bulk parallel offset reset (Phase 3 optimization)
+    /// Reset consumer group offsets in parallel after a restore (~50x faster than sequential)
     OffsetResetBulk {
-        /// Path to the storage location
+        /// Storage path containing the offset mapping from a completed restore
         #[arg(short, long)]
         path: String,
 
@@ -158,11 +185,11 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         bootstrap_servers: Vec<String>,
 
-        /// Maximum concurrent requests (default: 50)
+        /// Maximum concurrent reset operations [default: 50]
         #[arg(long, default_value = "50")]
         max_concurrent: usize,
 
-        /// Maximum retry attempts for failed partitions (default: 3)
+        /// Maximum retry attempts for failed partitions [default: 3]
         #[arg(long, default_value = "3")]
         max_retries: u32,
 
@@ -175,7 +202,7 @@ enum Commands {
         format: String,
     },
 
-    /// Offset snapshot and rollback operations
+    /// Snapshot and rollback consumer group offsets (safety net for offset changes)
     OffsetRollback {
         #[command(subcommand)]
         action: OffsetRollbackAction,

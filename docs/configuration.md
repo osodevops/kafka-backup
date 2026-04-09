@@ -68,13 +68,13 @@ Configuration for the Kafka cluster to read from (backup mode).
 | `bootstrap_servers` | list[string] | Yes | - | Kafka broker addresses |
 | `topics.include` | list[string] | No | `["*"]` | Topics to include (glob patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude (glob patterns) |
-| `security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) |
-| `sasl_username` | string | No | - | SASL username |
-| `sasl_password` | string | No | - | SASL password |
-| `ssl_ca_location` | string | No | - | Path to CA certificate |
-| `ssl_certificate_location` | string | No | - | Path to client certificate |
-| `ssl_key_location` | string | No | - | Path to client key |
+| `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) |
+| `security.sasl_username` | string | No | - | SASL username |
+| `security.sasl_password` | string | No | - | SASL password |
+| `security.ssl_ca_location` | string | No | - | Path to CA certificate |
+| `security.ssl_certificate_location` | string | No | - | Path to client certificate |
+| `security.ssl_key_location` | string | No | - | Path to client key |
 
 ### Topic Patterns
 
@@ -104,11 +104,12 @@ source:
     exclude:
       - "*-test"
       - "*-staging"
-  security_protocol: SASL_SSL
-  sasl_mechanism: SCRAM-SHA-512
-  sasl_username: backup-user
-  sasl_password: ${KAFKA_PASSWORD}
-  ssl_ca_location: /etc/kafka/certs/ca.pem
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA-512
+    sasl_username: backup-user
+    sasl_password: ${KAFKA_PASSWORD}
+    ssl_ca_location: /etc/kafka/certs/ca.pem
 ```
 
 ### TLS/SSL Configuration
@@ -190,13 +191,13 @@ Configuration for the Kafka cluster to write to (restore mode).
 | `bootstrap_servers` | list[string] | Yes | - | Kafka broker addresses |
 | `topics.include` | list[string] | No | `["*"]` | Topics to restore (glob/regex patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude |
-| `security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `sasl_mechanism` | string | No | - | SASL mechanism |
-| `sasl_username` | string | No | - | SASL username |
-| `sasl_password` | string | No | - | SASL password |
-| `ssl_ca_location` | string | No | - | Path to CA certificate |
-| `ssl_certificate_location` | string | No | - | Path to client certificate |
-| `ssl_key_location` | string | No | - | Path to client key |
+| `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism |
+| `security.sasl_username` | string | No | - | SASL username |
+| `security.sasl_password` | string | No | - | SASL password |
+| `security.ssl_ca_location` | string | No | - | Path to CA certificate |
+| `security.ssl_certificate_location` | string | No | - | Path to client certificate |
+| `security.ssl_key_location` | string | No | - | Path to client key |
 
 ### Regex Pattern Support
 
@@ -220,10 +221,11 @@ target:
       - "~payments-v[0-9]+"  # Regex pattern
     exclude:
       - "*-internal"
-  security_protocol: SASL_SSL
-  sasl_mechanism: PLAIN
-  sasl_username: restore-user
-  sasl_password: ${KAFKA_PASSWORD}
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: PLAIN
+    sasl_username: restore-user
+    sasl_password: ${KAFKA_PASSWORD}
 ```
 
 ---
@@ -459,6 +461,47 @@ offset_storage:
   db_path: /data/my-backup-offsets.db
   sync_interval_secs: 60
 ```
+
+---
+
+## Metrics Configuration
+
+Configuration for the Prometheus metrics and health check HTTP server.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `metrics.enabled` | bool | No | `false` | Enable the metrics HTTP server |
+| `metrics.port` | int | No | `8080` | Port for the metrics server |
+| `metrics.bind_address` | string | No | `127.0.0.1` | Bind address (use `0.0.0.0` for Kubernetes) |
+| `metrics.path` | string | No | `/metrics` | Path for the Prometheus metrics endpoint |
+
+When enabled, the server exposes:
+- `GET /metrics` — Prometheus/OpenMetrics scrape endpoint
+- `GET /health` — Liveness check (returns 200 OK)
+
+### Example
+
+```yaml
+metrics:
+  enabled: true
+  port: 8080
+  bind_address: "0.0.0.0"   # Required for Kubernetes Service routing
+  path: "/metrics"
+```
+
+> **Kubernetes note:** Set `bind_address: "0.0.0.0"` when running in Kubernetes. The default `127.0.0.1` only accepts localhost connections and will not be reachable via a Service.
+
+### Key Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kafka_backup_lag_records` | Gauge | Consumer lag per topic/partition |
+| `kafka_backup_records_total` | Counter | Total records backed up |
+| `kafka_backup_bytes_total` | Counter | Total bytes backed up |
+| `kafka_backup_compression_ratio` | Gauge | Compression efficiency |
+| `kafka_backup_storage_write_latency_seconds` | Histogram | Storage write latency |
+| `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
+| `kafka_backup_errors_total` | Counter | Errors by type |
 
 ---
 
@@ -782,7 +825,100 @@ kafka-backup show-offset-mapping --path /path/to/storage --backup-id BACKUP_ID [
 |----------|-------------|
 | `--path` | Path to storage location |
 | `--backup-id` | Backup identifier |
-| `--format` | Output format |
+| `--format` | Output format (text, json, yaml, csv) |
+
+### Status Command
+
+```bash
+kafka-backup status [OPTIONS]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--path` | Path to storage location (static inspection mode) |
+| `--backup-id` | Backup ID to inspect |
+| `--config` | Path to config file (live monitoring mode) |
+| `--watch` | Enable continuous refresh (requires `--config`) |
+| `--interval` | Refresh interval in seconds (default: 2) |
+| `--db-path` | Path to the offset database |
+
+### Three-Phase-Restore Command
+
+```bash
+kafka-backup three-phase-restore --config restore.yaml
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--config` | Path to restore configuration file |
+
+### Offset-Reset Command
+
+```bash
+kafka-backup offset-reset <plan|execute|script> [OPTIONS]
+```
+
+**Subcommands:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `plan` | Generate an offset reset plan (dry-run by default) |
+| `execute` | Execute an offset reset plan |
+| `script` | Generate a shell script for manual offset reset |
+
+Common arguments for all subcommands:
+
+| Argument | Description |
+|----------|-------------|
+| `--path` | Path to storage location |
+| `--backup-id` | Backup ID with offset mapping |
+| `--groups` | Consumer groups (comma-separated) |
+| `--bootstrap-servers` | Kafka brokers (comma-separated) |
+
+### Offset-Reset-Bulk Command
+
+```bash
+kafka-backup offset-reset-bulk --path /path --backup-id ID --groups g1,g2 --bootstrap-servers kafka:9092
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--path` | Path to storage location |
+| `--backup-id` | Backup ID with offset mapping |
+| `--groups` | Consumer groups (comma-separated) |
+| `--bootstrap-servers` | Kafka brokers (comma-separated) |
+| `--max-concurrent` | Maximum parallel operations (default: 50) |
+| `--max-retries` | Retry attempts (default: 3) |
+| `--security-protocol` | Security protocol |
+| `--format` | Output format (text, json) |
+
+### Offset-Rollback Command
+
+```bash
+kafka-backup offset-rollback <snapshot|list|show|rollback|verify|delete> [OPTIONS]
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `snapshot` | Create a snapshot of current consumer group offsets |
+| `list` | List available snapshots |
+| `show` | Show details of a specific snapshot |
+| `rollback` | Rollback offsets to a previous snapshot |
+| `verify` | Verify current offsets match a snapshot |
+| `delete` | Delete a snapshot |
+
+### Validation Command
+
+```bash
+kafka-backup validation <run|evidence-list|evidence-get|evidence-verify> [OPTIONS]
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `run` | Run validation checks and generate evidence reports |
+| `evidence-list` | List evidence reports in storage |
+| `evidence-get` | Download an evidence report |
+| `evidence-verify` | Verify an evidence report's cryptographic signature |
 
 ---
 
@@ -843,7 +979,7 @@ storage:
 
 ```yaml
 mode: backup
-backup_id: "prod-backup-$(date +%Y%m%d)"
+backup_id: "prod-backup-20250115"
 
 source:
   bootstrap_servers:
@@ -856,10 +992,11 @@ source:
     exclude:
       - "__*"
       - "*-test"
-  security_protocol: SASL_SSL
-  sasl_mechanism: SCRAM-SHA-512
-  sasl_username: backup-service
-  sasl_password: ${KAFKA_PASSWORD}
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA-512
+    sasl_username: backup-service
+    sasl_password: ${KAFKA_PASSWORD}
 
 storage:
   backend: s3

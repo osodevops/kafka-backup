@@ -222,11 +222,11 @@ if !plan.dry_run {
 
 ```bash
 # After restore, generate a shell script for manual offset reset
-kafka-backup offset-mapping \
+kafka-backup offset-reset script \
+    --path /backups \
     --backup-id prod-backup-2024 \
-    --storage-path /backups \
-    --format shell-script \
     --groups order-processor,payment-processor \
+    --bootstrap-servers kafka-1:9092,kafka-2:9092 \
     --output /var/kafka-backup/offset-reset.sh
 
 # Review and execute
@@ -235,25 +235,25 @@ chmod +x /var/kafka-backup/offset-reset.sh
 ./var/kafka-backup/offset-reset.sh
 ```
 
-### Generate Offset Mapping Report
+### View Offset Mapping Report
 
 ```bash
+# Text summary
+kafka-backup show-offset-mapping \
+    --path /backups \
+    --backup-id prod-backup-2024
+
 # JSON format
-kafka-backup offset-mapping \
+kafka-backup show-offset-mapping \
+    --path /backups \
     --backup-id prod-backup-2024 \
-    --format json \
-    --output offset-mapping.json
+    --format json
 
 # CSV format for analysis
-kafka-backup offset-mapping \
+kafka-backup show-offset-mapping \
+    --path /backups \
     --backup-id prod-backup-2024 \
-    --format csv \
-    --output offset-mapping.csv
-
-# Text summary
-kafka-backup offset-mapping \
-    --backup-id prod-backup-2024 \
-    --format text
+    --format csv
 ```
 
 ## Offset Strategies
