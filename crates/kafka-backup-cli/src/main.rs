@@ -180,6 +180,12 @@ enum Commands {
         #[command(subcommand)]
         action: OffsetRollbackAction,
     },
+
+    /// Run backup validation checks and generate compliance evidence reports
+    Validation {
+        #[command(subcommand)]
+        action: ValidationAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,6 +378,69 @@ enum OffsetResetAction {
         /// Output file path (prints to stdout if not specified)
         #[arg(short, long)]
         output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ValidationAction {
+    /// Run validation checks against a restored cluster and generate evidence
+    Run {
+        /// Path to the validation configuration file
+        #[arg(short, long)]
+        config: String,
+
+        /// PITR timestamp override (epoch milliseconds)
+        #[arg(long)]
+        pitr: Option<i64>,
+
+        /// Record who/what triggered this run (e.g. "KPMG Q1 2026 audit")
+        #[arg(long)]
+        triggered_by: Option<String>,
+    },
+
+    /// List evidence reports in storage
+    EvidenceList {
+        /// Path to the storage location (e.g. s3://bucket/prefix)
+        #[arg(short, long)]
+        path: String,
+
+        /// Maximum number of reports to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Download an evidence report
+    EvidenceGet {
+        /// Path to the storage location
+        #[arg(short, long)]
+        path: String,
+
+        /// Report ID to download
+        #[arg(short, long)]
+        report_id: String,
+
+        /// Format to download (json, pdf)
+        #[arg(short, long, default_value = "json")]
+        format: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+    },
+
+    /// Verify an evidence report's cryptographic signature
+    EvidenceVerify {
+        /// Path to the JSON evidence report file
+        #[arg(short, long)]
+        report: String,
+
+        /// Path to the detached signature (.sig) file
+        #[arg(short, long)]
+        signature: String,
+
+        /// Path to the PEM-encoded public key (optional)
+        #[arg(long)]
+        public_key: Option<String>,
     },
 }
 
@@ -599,6 +668,34 @@ async fn main() -> Result<()> {
             }
             OffsetRollbackAction::Delete { path, snapshot_id } => {
                 commands::offset_rollback::delete_snapshot(&path, &snapshot_id).await?;
+            }
+        },
+        Commands::Validation { action } => match action {
+            ValidationAction::Run {
+                config,
+                pitr,
+                triggered_by,
+            } => {
+                commands::validation::run(&config, pitr, triggered_by.as_deref()).await?;
+            }
+            ValidationAction::EvidenceList { path, limit } => {
+                commands::validation::evidence_list(&path, limit).await?;
+            }
+            ValidationAction::EvidenceGet {
+                path,
+                report_id,
+                format,
+                output,
+            } => {
+                commands::validation::evidence_get(&path, &report_id, &format, &output).await?;
+            }
+            ValidationAction::EvidenceVerify {
+                report,
+                signature,
+                public_key,
+            } => {
+                commands::validation::evidence_verify(&report, &signature, public_key.as_deref())
+                    .await?;
             }
         },
     }

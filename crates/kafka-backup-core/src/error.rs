@@ -51,6 +51,18 @@ pub enum Error {
     /// Authentication error
     #[error("Authentication error: {0}")]
     Authentication(String),
+
+    /// Validation check error
+    #[error("Validation error: {0}")]
+    Validation(String),
+
+    /// Evidence generation or signing error
+    #[error("Evidence error: {0}")]
+    Evidence(String),
+
+    /// Notification delivery error
+    #[error("Notification error: {0}")]
+    Notification(String),
 }
 
 /// Kafka-specific errors

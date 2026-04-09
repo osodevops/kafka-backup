@@ -16,3 +16,4 @@ pub mod performance_issues;
 pub mod pitr_accuracy;
 pub mod snapshot_backup;
 pub mod tls_tests;
+pub mod validation;

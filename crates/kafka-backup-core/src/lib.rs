@@ -8,14 +8,17 @@ pub mod circuit_breaker;
 pub mod compression;
 pub mod config;
 pub mod error;
+pub mod evidence;
 pub mod health;
 pub mod kafka;
 pub mod manifest;
 pub mod metrics;
+pub mod notification;
 pub mod offset_store;
 pub mod restore;
 pub mod segment;
 pub mod storage;
+pub mod validation;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{

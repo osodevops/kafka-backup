@@ -1,0 +1,53 @@
+networks:
+  validation-net:
+    driver: bridge
+
+services:
+  # Apache Kafka (KRaft mode)
+  kafka:
+    image: apache/kafka:3.7.1
+    hostname: kafka
+    container_name: validation-kafka
+    networks:
+      - validation-net
+    ports:
+      - "19092:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9094,EXTERNAL://kafka:19092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9094,EXTERNAL://localhost:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LOG_DIRS: /tmp/kafka-logs
+      AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  # Topic setup + data generation
+  kafka-setup:
+    image: apache/kafka:3.7.1
+    hostname: kafka-setup
+    networks:
+      - validation-net
+    depends_on:
+      - kafka
+    restart: "no"
+    command: >
+      bash -c '
+      echo "Waiting for Kafka..." && sleep 15 &&
+      echo "Creating topics..." &&
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9094 --partitions 3 --replication-factor 1 --topic orders &&
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9094 --partitions 3 --replication-factor 1 --topic payments &&
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9094 --partitions 3 --replication-factor 1 --topic events &&
+      echo "Producing test data..." &&
+      seq 1 500 | while read i; do echo "order-$$i:value-$$i"; done | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9094 --topic orders --property parse.key=true --property key.separator=: &&
+      seq 1 300 | while read i; do echo "payment-$$i:amount-$$i"; done | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9094 --topic payments --property parse.key=true --property key.separator=: &&
+      seq 1 200 | while read i; do echo "event-$$i:data-$$i"; done | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9094 --topic events --property parse.key=true --property key.separator=: &&
+      echo "Test data produced successfully"
+      '

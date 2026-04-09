@@ -79,6 +79,19 @@ crc32fast.workspace = true
 regex.workspace = true
 socket2.workspace = true
 
+# Cryptographic signing (evidence reports)
+p256.workspace = true
+sha2.workspace = true
+
+# PDF generation (evidence reports)
+printpdf.workspace = true
+
+# HTTP client (webhooks, notifications)
+reqwest.workspace = true
+
+# UUID (validation run IDs)
+uuid.workspace = true
+
 [dev-dependencies]
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
