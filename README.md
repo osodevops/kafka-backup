@@ -26,9 +26,11 @@
 - **Multi-cloud storage** — S3, Azure Blob, GCS, or local filesystem
 - **Point-in-time recovery** — Restore to any millisecond within your backup window
 - **Consumer offset recovery** — Automatically reset consumer group offsets after restore
+- **Compliance evidence** — Signed JSON/PDF reports for SOX, CMMC, and GDPR auditors
 - **High performance** — 100+ MB/s throughput with zstd/lz4 compression
 - **Incremental backups** — Resume from where you left off
 - **Topic filtering** — Wildcard patterns for include/exclude
+- **Auto-repartitioning** — Restore to clusters with different partition counts
 - **Deployment agnostic** — Bare metal, VM, Docker, or Kubernetes
 
 ## Installation
@@ -178,15 +180,17 @@ kafka-backup restore --config restore.yaml
 
 ## Why OSO Kafka Backup?
 
-| Feature | OSO Kafka Backup | itadventurer/kafka-backup | Kannika Armory                    | Confluent Replicator | MirrorMaker 2 | Lenses K2K |
-|---------|------------------|---------------------------|-----------------------------------|---------------------|---------------|------------|
-| **PITR** | Yes (ms precision) | No | Yes (ms precision)                | No | No | No |
-| **Cloud storage** | S3, Azure, GCS | Filesystem only | S3, Azure, GCS & K8s PV (any CSI) | No | No | No (separate connectors) |
-| **Offset recovery** | Yes (multi-strategy) | Partial | Yes                               | Limited | Limited | Limited |
-| **Air-gapped DR** | Yes | Partial | Yes (commercial)                  | No | No | No |
-| **Platform dependency** | None (single binary) | Kafka Connect | K8s platform                      | Confluent Platform | MM2 framework | Lenses platform |
-| **Operational simplicity** | High | Medium | Medium/Low                        | Medium | Low | Medium |
-| **License** | MIT (OSS) | MIT (unmaintained) | Commercial                        | Commercial | Apache 2.0 | Commercial |
+| Feature | OSO Kafka Backup | itadventurer/kafka-backup | Kannika Armory | Confluent Replicator | MirrorMaker 2 | Lenses K2K |
+|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| **PITR** | Yes (ms precision) | No | Yes (ms precision) | No | No | No |
+| **Cloud storage** | S3, Azure, GCS | Filesystem only | S3, Azure, GCS & K8s PV | No | No | No |
+| **Offset recovery** | Yes (multi-strategy) | Partial | Yes | Limited | Limited | Limited |
+| **Compliance evidence** | Yes (signed JSON/PDF) | No | No | No | No | No |
+| **SOX/CMMC/GDPR mapping** | Yes (automatic) | No | No | No | No | No |
+| **Air-gapped DR** | Yes | Partial | Yes (commercial) | No | No | No |
+| **Auto-repartitioning** | Yes | No | No | No | No | No |
+| **Platform dependency** | None (single binary) | Kafka Connect | K8s platform | Confluent Platform | MM2 framework | Lenses platform |
+| **License** | MIT (OSS) | MIT (unmaintained) | Commercial | Commercial | Apache 2.0 | Commercial |
 
 > 📖 **[See the full comparison guide](docs/comparison.md)** for detailed analysis of each solution.
 
@@ -221,25 +225,65 @@ This makes OSO Kafka Backup the highest‑leverage choice for teams that need re
 ## CLI Reference
 
 ```bash
-# Backup operations
+# Backup & restore
 kafka-backup backup --config backup.yaml
-
-# Restore operations
 kafka-backup restore --config restore.yaml
 
-# List available backups
+# Inspect backups
 kafka-backup list --path s3://bucket/prefix
-
-# Describe a specific backup
 kafka-backup describe --path s3://bucket --backup-id backup-001 --format json
-
-# Validate backup integrity
 kafka-backup validate --path s3://bucket --backup-id backup-001 --deep
 
 # Consumer offset management
 kafka-backup offset-reset plan --path s3://bucket --backup-id backup-001 --groups my-group
 kafka-backup offset-reset execute --path s3://bucket --backup-id backup-001 --groups my-group
+
+# Validation & compliance evidence
+kafka-backup validation run --config validation.yaml
+kafka-backup validation run --config validation.yaml --triggered-by "KPMG Q1 audit"
+kafka-backup validation evidence-list --path s3://bucket
+kafka-backup validation evidence-get --path s3://bucket --report-id <id> --format pdf --output report.pdf
+kafka-backup validation evidence-verify --report report.json --signature report.sig --public-key key.pem
 ```
+
+### Backup Validation & Compliance Evidence
+
+Validate restored data against the original backup and generate signed evidence reports for auditors:
+
+```yaml
+# validation.yaml
+backup_id: "production-daily-001"
+storage:
+  backend: s3
+  bucket: my-kafka-backups
+target:
+  bootstrap_servers: ["restored-kafka:9092"]
+checks:
+  message_count:
+    enabled: true
+    mode: exact
+  offset_range:
+    enabled: true
+evidence:
+  formats: [json, pdf]
+  signing:
+    enabled: true
+    private_key_path: "/etc/kafka-backup/signing-key.pem"
+  storage:
+    prefix: "evidence-reports/"
+    retention_days: 2555  # 7 years (SOX)
+notifications:
+  slack:
+    webhook_url: "https://hooks.slack.com/services/..."
+```
+
+**Validation checks:** MessageCountCheck, OffsetRangeCheck, ConsumerGroupOffsetCheck, CustomWebhookCheck
+
+**Evidence outputs:** JSON (machine-readable) + PDF (auditor-ready) + ECDSA-P256-SHA256 signatures
+
+**Compliance mappings:** SOX ITGC, CMMC RE.3.139, GDPR Article 32 — automatically included in every report
+
+> 📖 **[Full validation & compliance guide](https://osodevops.github.io/kafka-backup-docs/guides/validation-compliance)**
 
 ## Storage Layout
 
@@ -275,6 +319,8 @@ metrics:
 - `kafka_backup_records_total` — Total records backed up
 - `kafka_backup_compression_ratio` — Compression efficiency
 - `kafka_backup_storage_write_latency_seconds` — Storage I/O latency
+- `kafka_backup_validation_checks_passed_total` — Validation checks passed
+- `kafka_backup_validation_consecutive_failures` — Consecutive validation failures (SLO alerting)
 
 A complete **Grafana + Prometheus monitoring stack** is available in the [demos repository](https://github.com/osodevops/kafka-backup-demos/tree/main/monitoring-stack):
 
@@ -337,17 +383,21 @@ cargo tarpaulin --out Html
 ```
 kafka-backup/
 ├── crates/
-│   ├── kafka-backup-core/    # Core library
+│   ├── kafka-backup-core/        # Core library
 │   │   ├── src/
-│   │   │   ├── backup/       # Backup engine
-│   │   │   ├── restore/      # Restore engine
-│   │   │   ├── kafka/        # Kafka protocol client
-│   │   │   ├── storage/      # Storage backends
+│   │   │   ├── backup/           # Backup engine
+│   │   │   ├── restore/          # Restore engine + offset recovery
+│   │   │   ├── validation/       # Validation check framework
+│   │   │   ├── evidence/         # Evidence reports, signing, PDF
+│   │   │   ├── notification/     # Slack, PagerDuty webhooks
+│   │   │   ├── kafka/            # Kafka protocol client
+│   │   │   ├── storage/          # S3, Azure, GCS, filesystem
+│   │   │   ├── metrics/          # Prometheus metrics
 │   │   │   └── compression.rs
-│   │   └── tests/            # Test suites
-│   └── kafka-backup-cli/     # CLI binary
-├── config/                   # Example configs
-└── docs/                     # Documentation
+│   │   └── tests/                # Unit, integration, chaos tests
+│   └── kafka-backup-cli/         # CLI binary
+├── config/                       # Example configs
+└── docs/                         # Documentation
 ```
 
 ## Contributing
