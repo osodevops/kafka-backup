@@ -71,7 +71,7 @@ url = "2"
 prometheus-client = "0.24"
 
 # HTTP server
-hyper = { version = "1.0", features = ["server", "http1"] }
+hyper = { version = "1.9", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 
