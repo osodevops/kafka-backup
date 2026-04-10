@@ -10,7 +10,7 @@ mod produce;
 mod scram;
 pub mod tls;
 
-pub use admin::{create_topics, CreateTopicResult, TopicToCreate};
+pub use admin::{create_topics, delete_records, CreateTopicResult, TopicToCreate};
 pub use client::KafkaClient;
 pub use consumer_groups::{
     commit_offsets, describe_groups, fetch_offsets, list_groups, offsets_for_times,

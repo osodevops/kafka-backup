@@ -453,7 +453,7 @@ impl RestoreEngine {
     }
 
     async fn run_internal(&self) -> Result<RestoreReport> {
-        let restore_options = self.config.restore.clone().unwrap_or_default();
+        let mut restore_options = self.config.restore.clone().unwrap_or_default();
 
         // Check for dry-run mode
         if restore_options.dry_run {
@@ -536,6 +536,26 @@ impl RestoreEngine {
                 .await?;
         }
 
+        // Auto-load consumer groups from snapshot if configured
+        if restore_options.auto_consumer_groups && restore_options.consumer_groups.is_empty() {
+            match self.load_auto_consumer_groups().await {
+                Ok(groups) => {
+                    info!("auto_consumer_groups: loaded {} groups from snapshot", groups.len());
+                    restore_options.consumer_groups = groups;
+                    restore_options.reset_consumer_offsets = true;
+                }
+                Err(e) => {
+                    warn!("auto_consumer_groups: failed to load snapshot ({}); continuing without group reset", e);
+                }
+            }
+        }
+
+        // Purge target topics before restore if configured
+        if restore_options.purge_topics {
+            self.purge_topics_before_restore(&topics_to_restore, &restore_options)
+                .await?;
+        }
+
         info!("Restoring {} topics", topics_to_restore.len());
 
         let mut shutdown_rx = self.shutdown_receiver();
@@ -600,6 +620,106 @@ impl RestoreEngine {
             errors,
             offset_mapping,
         })
+    }
+
+    /// Purge target topics before restore by advancing their log-start-offset to the
+    /// current end offset via the DeleteRecords API.
+    ///
+    /// This empties each topic without deleting it — safe for Strimzi-managed topics.
+    async fn purge_topics_before_restore(
+        &self,
+        topics_to_restore: &[TopicBackup],
+        restore_options: &RestoreOptions,
+    ) -> Result<()> {
+        let router = {
+            let guard = self.router.read().await;
+            guard
+                .as_ref()
+                .ok_or_else(|| Error::Config("Router not initialized".to_string()))?
+                .clone()
+        };
+
+        info!(
+            "Purging {} topics before restore (DeleteRecords to log-start-offset=end)",
+            topics_to_restore.len()
+        );
+
+        for topic_backup in topics_to_restore {
+            let target_name = restore_options
+                .topic_mapping
+                .get(&topic_backup.name)
+                .cloned()
+                .unwrap_or_else(|| topic_backup.name.clone());
+
+            let partition_ids: Vec<i32> = topic_backup
+                .partitions
+                .iter()
+                .map(|p| p.partition_id)
+                .collect();
+
+            // Collect (partition, end_offset) pairs — skip partitions already empty
+            let mut to_purge: Vec<(i32, i64)> = Vec::new();
+            for pid in partition_ids {
+                match router.get_offsets(&target_name, pid).await {
+                    Ok((_earliest, latest)) => {
+                        if latest > 0 {
+                            to_purge.push((pid, latest));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not get offsets for {}[{}], skipping purge: {}",
+                            target_name, pid, e
+                        );
+                    }
+                }
+            }
+
+            if to_purge.is_empty() {
+                debug!("Topic {} is already empty, skipping purge", target_name);
+                continue;
+            }
+
+            router
+                .delete_records(&target_name, &to_purge, 30_000)
+                .await?;
+            info!(
+                "Purged topic {} ({} partitions)",
+                target_name,
+                to_purge.len()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Load the consumer groups snapshot from storage and return the list of group IDs.
+    ///
+    /// Reads `{backup_id}/consumer-groups-snapshot.json` from the configured storage
+    /// backend. Returns an error (which the caller may treat as a warning) when the
+    /// file is absent.
+    async fn load_auto_consumer_groups(&self) -> Result<Vec<String>> {
+        let snapshot_key = format!("{}/consumer-groups-snapshot.json", self.config.backup_id);
+
+        let data = self.storage.get(&snapshot_key).await.map_err(|e| {
+            Error::BackupNotFound(format!(
+                "consumer-groups-snapshot.json not found at '{}': {}",
+                snapshot_key, e
+            ))
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct Snapshot {
+            groups: Vec<GroupEntry>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct GroupEntry {
+            group_id: String,
+        }
+
+        let snapshot: Snapshot = serde_json::from_slice(&data)?;
+        Ok(snapshot.groups.into_iter().map(|g| g.group_id).collect())
     }
 
     /// Load the backup manifest from storage
@@ -876,9 +996,13 @@ impl RestoreEngine {
                 .unwrap_or_else(|| topic_backup.name.clone());
 
             // Use repartitioning target_partitions when configured,
-            // otherwise fall back to source partition count
+            // otherwise use the original partition count stored at backup time,
+            // falling back to max(partition_id)+1 for older backups that lack
+            // the original_partition_count field.
             let partition_count = if let Some(repart) = options.repartitioning.get(&target_name) {
                 repart.target_partitions
+            } else if let Some(count) = topic_backup.original_partition_count {
+                count
             } else {
                 topic_backup
                     .partitions
@@ -1064,13 +1188,17 @@ impl RestorePartitionContext {
         let mut first_timestamp = i64::MAX;
         let mut last_timestamp = i64::MIN;
 
+        let total_segments_count = segments.len();
+
         // Process each segment
-        for segment in segments {
+        for segment in &segments {
             // Skip if already completed
             if completed_segments.contains(&segment.key) {
                 debug!("Skipping completed segment: {}", segment.key);
                 continue;
             }
+
+            let t_segment_start = Instant::now();
 
             let records = match self.read_segment(segment).await {
                 Ok(r) => {
@@ -1086,8 +1214,18 @@ impl RestorePartitionContext {
                 }
             };
 
+            debug!(
+                "{}:{} [TIMING] read_segment({}) took {:?}",
+                self.source_topic, self.source_partition, segment.key, t_segment_start.elapsed()
+            );
+
             // Filter records by time window
+            let t_filter = Instant::now();
             let filtered_records = self.filter_records_by_time(records);
+            debug!(
+                "{}:{} [TIMING] filter_records_by_time({} records) took {:?}",
+                self.source_topic, self.source_partition, filtered_records.len(), t_filter.elapsed()
+            );
 
             if filtered_records.is_empty() {
                 // Mark segment as completed even if no records match
@@ -1096,6 +1234,7 @@ impl RestorePartitionContext {
             }
 
             // Track offset range
+            let t_offset_loop = Instant::now();
             for record in &filtered_records {
                 first_offset = first_offset.min(record.offset);
                 last_offset = last_offset.max(record.offset);
@@ -1111,12 +1250,21 @@ impl RestorePartitionContext {
                     record.timestamp,
                 );
             }
+            debug!(
+                "{}:{} [TIMING] offset_mapping update_range loop ({} records, {} locks) took {:?}",
+                self.source_topic, self.source_partition, filtered_records.len(), filtered_records.len(), t_offset_loop.elapsed()
+            );
 
             // Add original offset headers if configured (header-based strategy)
+            let t_headers = Instant::now();
             let records_to_produce = super::helpers::inject_offset_headers(
                 filtered_records,
                 self.source_partition,
                 &self.options,
+            );
+            debug!(
+                "{}:{} [TIMING] inject_offset_headers({} records) took {:?}",
+                self.source_topic, self.source_partition, records_to_produce.len(), t_headers.elapsed()
             );
 
             // Track bytes
@@ -1130,26 +1278,42 @@ impl RestorePartitionContext {
 
             // Produce records in batches
             let batch_size = self.options.produce_batch_size;
+            let mut batch_idx = 0usize;
             for batch in records_to_produce.chunks(batch_size) {
+                batch_idx += 1;
                 // Apply rate limiting if configured
                 if let Some(rate) = self.options.rate_limit_records_per_sec {
                     let delay = Duration::from_secs_f64(batch.len() as f64 / rate as f64);
+                    debug!(
+                        "{}:{} [TIMING] rate-limit batch #{} ({} records, rate={}/s): sleeping {:?}",
+                        self.source_topic, self.source_partition, batch_idx, batch.len(), rate, delay
+                    );
                     tokio::time::sleep(delay).await;
                 }
 
                 // Produce using router (automatically routes to partition leader)
+                let t_produce = Instant::now();
+                debug!(
+                    "{}:{} [TIMING] calling produce() for batch #{} ({} records)",
+                    self.source_topic, self.source_partition, batch_idx, batch.len()
+                );
                 match self
                     .router
                     .produce(&self.target_topic, self.target_partition, batch.to_vec())
                     .await
                 {
                     Ok(produce_response) => {
+                        debug!(
+                            "{}:{} [TIMING] produce() batch #{} ({} records) took {:?}",
+                            self.source_topic, self.source_partition, batch_idx, batch.len(), t_produce.elapsed()
+                        );
                         self.kafka_cb.record_success();
                         self.health.mark_healthy("kafka");
 
                         // Capture offset mapping (Phase 2: detailed offset mapping)
                         // Use per-sub-batch offsets for correct mapping when records
                         // were split across multiple produce requests.
+                        let t_add_detailed = Instant::now();
                         let mut record_idx = 0;
                         for (sub_base_offset, sub_count) in &produce_response.sub_batch_offsets {
                             for j in 0..*sub_count {
@@ -1170,6 +1334,10 @@ impl RestorePartitionContext {
                                 record_idx += 1;
                             }
                         }
+                        debug!(
+                            "{}:{} [TIMING] add_detailed loop ({} records, {} locks) took {:?}",
+                            self.source_topic, self.source_partition, record_idx, record_idx, t_add_detailed.elapsed()
+                        );
                         debug_assert_eq!(
                             record_idx,
                             batch.len(),
@@ -1193,6 +1361,17 @@ impl RestorePartitionContext {
 
             total_bytes += batch_bytes;
             segments_processed += 1;
+
+            debug!(
+                "{}:{} [TIMING] segment {}/{} total processing took {:?} ({} records so far, {} records this segment)",
+                self.source_topic,
+                self.source_partition,
+                segments_processed,
+                total_segments_count,
+                t_segment_start.elapsed(),
+                total_records,
+                batch_bytes,
+            );
 
             // Mark segment as completed
             self.mark_segment_completed(&segment.key).await;

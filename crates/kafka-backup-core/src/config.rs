@@ -431,6 +431,15 @@ pub struct BackupOptions {
     /// Default: 100ms (was hardcoded to 1000ms)
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+
+    /// Snapshot consumer group offsets after each backup cycle (default: true).
+    ///
+    /// After every `save_manifest()` call, the backup engine lists all consumer
+    /// groups from every broker, filters to groups that have offsets on backed-up
+    /// topics, and writes `{backup_id}/consumer-groups-snapshot.json` to storage.
+    /// This file is consumed by `auto_consumer_groups: true` at restore time.
+    #[serde(default = "default_consumer_group_snapshot")]
+    pub consumer_group_snapshot: bool,
 }
 
 fn default_include_offset_headers() -> bool {
@@ -443,6 +452,10 @@ fn default_backup_max_concurrent_partitions() -> usize {
 
 fn default_poll_interval_ms() -> u64 {
     100 // 100ms - much lower than old hardcoded 1000ms for better lag reduction
+}
+
+fn default_consumer_group_snapshot() -> bool {
+    true
 }
 
 impl Default for BackupOptions {
@@ -463,6 +476,7 @@ impl Default for BackupOptions {
             stop_at_current_offsets: false,
             max_concurrent_partitions: default_backup_max_concurrent_partitions(),
             poll_interval_ms: default_poll_interval_ms(),
+            consumer_group_snapshot: default_consumer_group_snapshot(),
         }
     }
 }
@@ -645,6 +659,22 @@ pub struct RestoreOptions {
     /// Mutually exclusive with `partition_mapping`.
     #[serde(default)]
     pub repartitioning: std::collections::HashMap<String, TopicRepartitioning>,
+
+    /// Purge target topics before restore by advancing their log-start-offset to
+    /// the current end (via the DeleteRecords API). This empties the topic without
+    /// deleting it — safe for Strimzi-managed topics that cannot be recreated.
+    /// Default: false.
+    #[serde(default)]
+    pub purge_topics: bool,
+
+    /// Automatically load the consumer-groups snapshot produced by `snapshot-groups`
+    /// and use it to populate `consumer_groups` before starting the restore.
+    /// The snapshot is read from `{backup_id}/consumer-groups-snapshot.json` in the
+    /// configured storage backend. When the file is missing the option is silently
+    /// ignored. `reset_consumer_offsets` is also set to `true` automatically.
+    /// Default: false.
+    #[serde(default)]
+    pub auto_consumer_groups: bool,
 }
 
 fn default_max_concurrent_partitions() -> usize {

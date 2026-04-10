@@ -162,8 +162,8 @@ pub async fn produce(
             .with_partition_data(vec![partition_data]);
 
         let request = ProduceRequest::default()
-            .with_acks(-1) // Wait for all replicas
-            .with_timeout_ms(30000)
+            .with_acks(1) // Wait for leader only (acks=1): avoids blocking on replica lag
+            .with_timeout_ms(5000) // Broker must respond within 5s; with acks=1 this is >50× normal
             .with_topic_data(vec![topic_data]);
 
         let response: KafkaProduceResponse = client.send_request(ApiKey::Produce, request).await?;

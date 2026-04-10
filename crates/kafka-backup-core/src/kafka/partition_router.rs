@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -442,24 +443,67 @@ impl PartitionLeaderRouter {
         partition: i32,
         records: Vec<BackupRecord>,
     ) -> Result<ProduceResponse> {
-        // First attempt
+        const MAX_CONNECTION_RETRIES: u32 = 5;
+
+        // One-shot retry for NOT_LEADER (metadata refresh needed)
         match self
             .produce_internal(topic, partition, records.clone())
             .await
         {
-            Ok(response) => Ok(response),
+            Ok(response) => return Ok(response),
             Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
                 warn!(
                     "NOT_LEADER_FOR_PARTITION error for {}/{} during produce, refreshing metadata",
                     topic, partition
                 );
                 self.refresh_partition_leader(topic, partition).await?;
                 self.clear_connection_cache().await;
-                self.produce_internal(topic, partition, records).await
+                match self.produce_internal(topic, partition, records.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(e) if !is_connection_error(&e) => return Err(e),
+                    Err(e) => {
+                        // Connection error even after leader refresh — fall through to retry loop
+                        warn!(
+                            "Connection error after leader refresh for {}/{}: {}",
+                            topic, partition, e
+                        );
+                        self.clear_connection_cache().await;
+                    }
+                }
             }
-            Err(e) => Err(e),
+            Err(e) if !is_connection_error(&e) => return Err(e),
+            Err(e) => {
+                warn!(
+                    "Connection error for {}/{} (attempt 0), will retry: {}",
+                    topic, partition, e
+                );
+                self.clear_connection_cache().await;
+            }
         }
+
+        // Retry loop for connection errors with exponential backoff
+        for attempt in 1..=MAX_CONNECTION_RETRIES {
+            let backoff_ms = 500 * attempt as u64; // 500ms, 1s, 1.5s, 2s, 2.5s
+            warn!(
+                "Connection error for {}/{}, retry {}/{} after {}ms backoff",
+                topic, partition, attempt, MAX_CONNECTION_RETRIES, backoff_ms
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+            match self.produce_internal(topic, partition, records.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(e) if is_connection_error(&e) => {
+                    self.clear_connection_cache().await;
+                    // continue loop
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(crate::Error::Kafka(KafkaError::Protocol(format!(
+            "Produce failed for {}/{} after {} connection retries",
+            topic, partition, MAX_CONNECTION_RETRIES
+        ))))
     }
 
     /// Internal produce implementation.
@@ -512,6 +556,61 @@ impl PartitionLeaderRouter {
         let metadata = self.get_topic_metadata(topic).await?;
         Ok(metadata.partitions)
     }
+
+    /// List consumer groups from ALL brokers in the cluster.
+    ///
+    /// In KRaft mode each broker is group coordinator only for a subset of
+    /// consumer groups. Querying a single broker via `ListGroups` misses groups
+    /// whose coordinator lives on other brokers. This method iterates every
+    /// known broker and merges the results, deduplicating by `group_id`.
+    pub async fn list_groups_all_brokers(
+        &self,
+    ) -> Result<Vec<super::consumer_groups::ConsumerGroup>> {
+        let broker_ids: Vec<i32> = {
+            let meta = self.broker_metadata.read().await;
+            meta.keys().copied().collect()
+        };
+
+        let mut all_groups: Vec<super::consumer_groups::ConsumerGroup> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for broker_id in broker_ids {
+            match self.get_broker_connection(broker_id).await {
+                Ok(client) => {
+                    match super::consumer_groups::list_groups(&client).await {
+                        Ok(groups) => {
+                            for g in groups {
+                                if seen.insert(g.group_id.clone()) {
+                                    all_groups.push(g);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("list_groups from broker {}: {}", broker_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect to broker {} for list_groups: {}", broker_id, e);
+                }
+            }
+        }
+
+        debug!("list_groups_all_brokers: found {} unique groups", all_groups.len());
+        Ok(all_groups)
+    }
+
+    /// Delete records from a topic's partitions by advancing the log-start-offset.
+    ///
+    /// Sends `DeleteRecords` via the bootstrap client (broker handles leader routing).
+    pub async fn delete_records(
+        &self,
+        topic: &str,
+        partitions: &[(i32, i64)],
+        timeout_ms: i32,
+    ) -> Result<()> {
+        super::admin::delete_records(&self.bootstrap_client, topic, partitions, timeout_ms).await
+    }
 }
 
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).
@@ -523,6 +622,21 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
             let msg = error.to_string();
             msg.contains("NOT_LEADER") || msg.contains("code 6")
         }
+    }
+}
+
+/// Check if an error is a connection-level error (broken pipe, early eof, etc.).
+fn is_connection_error(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::Kafka(KafkaError::Protocol(msg)) => {
+            msg.contains("Broken pipe")
+                || msg.contains("early eof")
+                || msg.contains("Connection reset")
+                || msg.contains("Not connected")
+                || msg.contains("connection abort")
+                || msg.contains("timed out after")
+        }
+        _ => false,
     }
 }
 

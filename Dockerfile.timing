@@ -1,0 +1,9 @@
+# Patch image: inject locally-built binary with timing debug logs
+# into the existing osodevops/kafka-backup:debug base
+FROM osodevops/kafka-backup:debug
+
+USER root
+COPY kafka-backup-timing-bin /usr/local/bin/kafka-backup
+RUN chmod +x /usr/local/bin/kafka-backup
+
+USER kafka-backup

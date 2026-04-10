@@ -1,6 +1,7 @@
 //! Backup engine orchestration.
 
 use bytes::Bytes;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
 use crate::health::HealthCheck;
-use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
+use crate::kafka::{consumer_groups::fetch_offsets, PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -212,29 +213,8 @@ impl BackupEngine {
                 .await?;
         }
 
-        // Fetch metadata and determine topics to back up
-        // This fetches all topic metadata in a SINGLE bulk call, avoiding per-topic network calls
-        // which was causing severe performance issues with high-latency connections (Issue #29)
         let source = self.config.source.as_ref().unwrap();
         let backup_opts = self.config.backup.clone().unwrap_or_default();
-        let topics_metadata = self.resolve_topics(&source.topics, &backup_opts).await?;
-
-        if topics_metadata.is_empty() {
-            warn!("No topics matched the configured patterns");
-            return Ok(());
-        }
-
-        info!("Backing up {} topics", topics_metadata.len());
-
-        // Capture snapshot offsets if stop_at_current_offsets is enabled
-        // This provides a consistent "point-in-time" snapshot for DR backups
-        // Returns (earliest, latest) pairs to avoid redundant offset fetches later
-        let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
-            if backup_opts.stop_at_current_offsets {
-                Some(self.capture_snapshot_offsets(&topics_metadata).await?)
-            } else {
-                None
-            };
 
         let mut shutdown_rx = self.shutdown_receiver();
 
@@ -248,11 +228,40 @@ impl BackupEngine {
 
         // Run backup loop
         loop {
-            // Process topics with controlled parallelism
-            // NOTE: We use the cached topic metadata from resolve_topics() instead of
-            // making per-topic metadata calls here. This eliminates N network calls
-            // (where N = number of topics), which was causing "stuck" behavior with
-            // high-latency connections like Confluent Cloud (Issue #29).
+            // Re-discover topics at the start of every cycle so that new topics
+            // created since the last cycle are picked up automatically — no process
+            // restart required.  The Metadata request costs a few ms and is
+            // negligible compared to the poll_interval_ms wait.
+            let topics_metadata = self.resolve_topics(&source.topics, &backup_opts).await?;
+
+            if topics_metadata.is_empty() {
+                warn!("No topics matched the configured patterns — skipping cycle");
+                // Still wait before the next cycle instead of spinning
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(backup_opts.poll_interval_ms)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Shutdown signal received, stopping backup");
+                        return Ok(());
+                    }
+                }
+                if !backup_opts.continuous {
+                    break;
+                }
+                continue;
+            }
+
+            info!("Backing up {} topics", topics_metadata.len());
+
+            // Capture snapshot offsets if stop_at_current_offsets is enabled
+            // This provides a consistent "point-in-time" snapshot for DR backups
+            // Returns (earliest, latest) pairs to avoid redundant offset fetches later
+            let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
+                if backup_opts.stop_at_current_offsets {
+                    Some(self.capture_snapshot_offsets(&topics_metadata).await?)
+                } else {
+                    None
+                };
+
             let mut all_handles = Vec::new();
 
             for topic_meta in &topics_metadata {
@@ -271,6 +280,14 @@ impl BackupEngine {
                     .iter()
                     .map(|p| p.partition_id)
                     .collect();
+
+                // Record original partition count in manifest so restore can
+                // recreate the topic correctly even if some partitions are empty.
+                {
+                    let mut manifest = self.manifest.lock().await;
+                    let topic_entry = manifest.get_or_create_topic(topic);
+                    topic_entry.original_partition_count = Some(partitions.len() as i32);
+                }
 
                 // Spawn a task for each partition (limited by semaphore)
                 // NOTE: The semaphore is acquired INSIDE the spawned task, not before
@@ -388,6 +405,14 @@ impl BackupEngine {
             // Save manifest periodically
             self.save_manifest().await?;
 
+            // Snapshot consumer groups after each manifest write so that
+            // restore can use auto_consumer_groups: true.
+            if backup_opts.consumer_group_snapshot {
+                if let Err(e) = self.snapshot_consumer_groups().await {
+                    warn!("Consumer group snapshot failed (non-fatal): {}", e);
+                }
+            }
+
             // If not continuous, exit after one pass
             if !backup_opts.continuous {
                 break;
@@ -499,15 +524,123 @@ impl BackupEngine {
         Ok(selected)
     }
 
-    /// Save the manifest to storage
+    /// Save the manifest to storage, merging with any existing manifest.
+    ///
+    /// Continuous backups may run multiple cycles. Each cycle writes new segments
+    /// and must not overwrite entries from previous cycles. This performs a
+    /// union-merge: topics/partitions/segments from both the stored manifest and
+    /// the current in-memory one are combined before saving.
     async fn save_manifest(&self) -> Result<()> {
-        let manifest = self.manifest.lock().await;
-        let manifest_json = serde_json::to_string_pretty(&*manifest)?;
+        let current_manifest = self.manifest.lock().await.clone();
         let key = format!("{}/manifest.json", self.config.backup_id);
 
-        self.storage.put(&key, Bytes::from(manifest_json)).await?;
-        debug!("Saved manifest to {}", key);
+        // Try to load and merge with an existing manifest (continuous backup mode)
+        let merged = match self.storage.get(&key).await {
+            Ok(data) => match serde_json::from_slice::<BackupManifest>(&data) {
+                Ok(existing) => merge_manifests(existing, current_manifest),
+                Err(e) => {
+                    warn!("Failed to parse existing manifest, overwriting: {}", e);
+                    current_manifest
+                }
+            },
+            Err(_) => current_manifest, // First run — no existing manifest
+        };
 
+        let manifest_json = serde_json::to_string_pretty(&merged)?;
+        self.storage.put(&key, Bytes::from(manifest_json)).await?;
+        debug!(
+            "Saved manifest to {} ({} topics)",
+            key,
+            merged.topics.len()
+        );
+
+        Ok(())
+    }
+
+    /// Snapshot consumer group offsets to storage after each backup cycle.
+    ///
+    /// Lists all consumer groups across every broker (KRaft-safe), fetches
+    /// their committed offsets, filters to groups that have offsets on backed-up
+    /// topics, and writes `{backup_id}/consumer-groups-snapshot.json`.
+    async fn snapshot_consumer_groups(&self) -> Result<()> {
+        let source = self.config.source.as_ref().unwrap();
+
+        // Load current backed-up topic names from the in-memory manifest
+        let backed_topics: std::collections::HashSet<String> = {
+            let manifest = self.manifest.lock().await;
+            manifest.topics.iter().map(|t| t.name.clone()).collect()
+        };
+
+        if backed_topics.is_empty() {
+            debug!("Skipping consumer group snapshot: no topics in manifest yet");
+            return Ok(());
+        }
+
+        // List all groups from every broker (one ListGroups per broker, KRaft-safe)
+        let all_groups = self.router.list_groups_all_brokers().await?;
+        debug!(
+            "Consumer group snapshot: {} groups across all brokers",
+            all_groups.len()
+        );
+
+        // Bootstrap client for OffsetFetch (broker routes to correct coordinator)
+        let bootstrap_client = crate::kafka::KafkaClient::new(source.clone());
+        bootstrap_client.connect().await?;
+
+        let mut snapshot_groups: Vec<SnapshotGroupOffsets> = Vec::new();
+
+        for group in &all_groups {
+            let committed =
+                match fetch_offsets(&bootstrap_client, &group.group_id, None).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!(
+                            "Could not fetch offsets for group {}: {}",
+                            group.group_id, e
+                        );
+                        continue;
+                    }
+                };
+
+            if committed.is_empty() {
+                continue;
+            }
+
+            let mut offsets_by_topic: HashMap<String, HashMap<String, i64>> = HashMap::new();
+            for co in &committed {
+                if backed_topics.contains(&co.topic) && co.offset >= 0 {
+                    offsets_by_topic
+                        .entry(co.topic.clone())
+                        .or_default()
+                        .insert(co.partition.to_string(), co.offset);
+                }
+            }
+
+            if !offsets_by_topic.is_empty() {
+                snapshot_groups.push(SnapshotGroupOffsets {
+                    group_id: group.group_id.clone(),
+                    offsets: offsets_by_topic,
+                });
+            }
+        }
+
+        let snapshot = ConsumerGroupsSnapshot {
+            snapshot_time: chrono::Utc::now().timestamp_millis(),
+            groups: snapshot_groups,
+        };
+
+        let key = format!(
+            "{}/consumer-groups-snapshot.json",
+            self.config.backup_id
+        );
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        self.storage.put(&key, Bytes::from(json)).await?;
+
+        info!(
+            "Consumer groups snapshot saved ({} groups) to {}",
+            snapshot.groups.len(),
+            key
+        );
         Ok(())
     }
 
@@ -559,6 +692,20 @@ impl BackupEngine {
 
         Ok(offsets)
     }
+}
+
+/// Serialised format — matches the shape produced by the old Python snapshot_groups.py.
+#[derive(Serialize)]
+struct SnapshotGroupOffsets {
+    group_id: String,
+    /// topic -> partition_id (as string) -> committed offset
+    offsets: HashMap<String, HashMap<String, i64>>,
+}
+
+#[derive(Serialize)]
+struct ConsumerGroupsSnapshot {
+    snapshot_time: i64,
+    groups: Vec<SnapshotGroupOffsets>,
 }
 
 /// Context for backing up a single partition
@@ -732,7 +879,8 @@ impl BackupPartitionContext {
 
                 // Check if we should rotate
                 if segment_writer.should_rotate() {
-                    let key = self.segment_key(segment_sequence);
+                    let seg_start = segment_writer.start_offset().unwrap();
+                    let key = self.segment_key(seg_start);
                     if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                         self.add_segment_to_manifest(segment_metadata).await;
                         segment_sequence += 1;
@@ -781,7 +929,8 @@ impl BackupPartitionContext {
 
         // Flush any remaining records
         if segment_writer.has_data() {
-            let key = self.segment_key(segment_sequence);
+            let seg_start = segment_writer.start_offset().unwrap();
+            let key = self.segment_key(seg_start);
             if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                 self.add_segment_to_manifest(segment_metadata).await;
                 segment_sequence += 1;
@@ -815,11 +964,11 @@ impl BackupPartitionContext {
         }
     }
 
-    fn segment_key(&self, sequence: u64) -> String {
+    fn segment_key(&self, start_offset: i64) -> String {
         let ext = extension(self.options.compression);
         format!(
-            "{}/topics/{}/partition={}/segment-{:06}.bin{}",
-            self.backup_id, self.topic, self.partition, sequence, ext
+            "{}/topics/{}/partition={}/segment-{:020}.bin{}",
+            self.backup_id, self.topic, self.partition, start_offset, ext
         )
     }
 
@@ -848,6 +997,69 @@ impl BackupPartitionContext {
 }
 
 /// Simple glob pattern matching (supports * and ?)
+
+/// Merge two backup manifests, performing a union of topics/partitions/segments.
+///
+/// Rules:
+/// - Topics only in `existing`: preserved as-is (may cover inactive topics)
+/// - Topics only in `current`: taken from current
+/// - Topics in both: partitions are merged recursively
+///   - Partitions only in existing: preserved
+///   - Partitions only in current: taken from current
+///   - Partitions in both: segments merged by deduplication on (key OR start_offset).
+///     When a conflict exists `existing` wins. Output is sorted by start_offset.
+fn merge_manifests(
+    mut existing: crate::manifest::BackupManifest,
+    current: crate::manifest::BackupManifest,
+) -> crate::manifest::BackupManifest {
+    use std::collections::HashMap;
+
+    for cur_topic in current.topics {
+        if let Some(ex_topic) = existing.topics.iter_mut().find(|t| t.name == cur_topic.name) {
+            // Update original_partition_count if current has it
+            if cur_topic.original_partition_count.is_some() {
+                ex_topic.original_partition_count = cur_topic.original_partition_count;
+            }
+            for cur_part in cur_topic.partitions {
+                if let Some(ex_part) = ex_topic
+                    .partitions
+                    .iter_mut()
+                    .find(|p| p.partition_id == cur_part.partition_id)
+                {
+                    // Merge segments: deduplicate by key and start_offset, existing wins
+                    let mut seen_keys: HashMap<String, ()> = ex_part
+                        .segments
+                        .iter()
+                        .map(|s| (s.key.clone(), ()))
+                        .collect();
+                    let mut seen_offsets: HashMap<i64, ()> = ex_part
+                        .segments
+                        .iter()
+                        .map(|s| (s.start_offset, ()))
+                        .collect();
+                    for seg in cur_part.segments {
+                        if !seen_keys.contains_key(&seg.key)
+                            && !seen_offsets.contains_key(&seg.start_offset)
+                        {
+                            seen_keys.insert(seg.key.clone(), ());
+                            seen_offsets.insert(seg.start_offset, ());
+                            ex_part.segments.push(seg);
+                        }
+                    }
+                    ex_part
+                        .segments
+                        .sort_by_key(|s| (s.start_offset, s.key.clone()));
+                } else {
+                    ex_topic.partitions.push(cur_part);
+                }
+            }
+        } else {
+            existing.topics.push(cur_topic);
+        }
+    }
+
+    existing
+}
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern_chars: Vec<char> = pattern.chars().collect();
     let text_chars: Vec<char> = text.chars().collect();
