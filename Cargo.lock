@@ -1316,6 +1316,7 @@ name = "kafka-backup-cli"
 version = "0.11.4"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "kafka-backup-core",

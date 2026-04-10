@@ -755,8 +755,10 @@ impl KafkaClient {
         topic: &str,
         partition: i32,
         records: Vec<crate::manifest::BackupRecord>,
+        acks: i16,
+        timeout_ms: i32,
     ) -> Result<ProduceResponse> {
-        super::produce::produce(self, topic, partition, records).await
+        super::produce::produce(self, topic, partition, records, acks, timeout_ms).await
     }
 
     /// Create topics in the Kafka cluster

@@ -622,6 +622,15 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_batch_size")]
     pub produce_batch_size: usize,
 
+    /// Producer acknowledgement level.
+    /// 0 = fire-and-forget, 1 = leader ack (default), -1 = all in-sync replicas
+    #[serde(default = "default_produce_acks")]
+    pub produce_acks: i16,
+
+    /// Broker-side produce timeout in milliseconds (default: 5000).
+    #[serde(default = "default_produce_timeout_ms")]
+    pub produce_timeout_ms: i32,
+
     /// Checkpoint state file path for resumable restores
     #[serde(default)]
     pub checkpoint_state: Option<std::path::PathBuf>,
@@ -683,6 +692,14 @@ fn default_max_concurrent_partitions() -> usize {
 
 fn default_produce_batch_size() -> usize {
     1000
+}
+
+fn default_produce_acks() -> i16 {
+    1
+}
+
+fn default_produce_timeout_ms() -> i32 {
+    5000
 }
 
 fn default_restore_checkpoint_interval_secs() -> u64 {
@@ -903,6 +920,8 @@ connection:
         RestoreOptions {
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_acks: default_produce_acks(),
+            produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
             ..RestoreOptions::default()
         }
