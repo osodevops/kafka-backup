@@ -149,6 +149,12 @@ impl SegmentWriter {
         self.record_count
     }
 
+    /// Get the start offset of the current segment (first record's offset).
+    /// Returns `None` if no records have been added yet.
+    pub fn start_offset(&self) -> Option<i64> {
+        self.start_offset
+    }
+
     /// Flush the current segment to storage
     pub async fn flush(&mut self, key: &str) -> Result<Option<SegmentMetadata>> {
         if self.record_count == 0 {

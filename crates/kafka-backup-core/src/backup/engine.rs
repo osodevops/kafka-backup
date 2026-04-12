@@ -663,7 +663,7 @@ impl BackupPartitionContext {
         );
 
         let mut current_offset = start_offset;
-        let mut segment_sequence = 0u64;
+        let mut segments_written = 0u64;
 
         // Fetch and store records in segments
         while current_offset < end_offset {
@@ -732,10 +732,11 @@ impl BackupPartitionContext {
 
                 // Check if we should rotate
                 if segment_writer.should_rotate() {
-                    let key = self.segment_key(segment_sequence);
+                    let seg_start = segment_writer.start_offset().unwrap();
+                    let key = self.segment_key(seg_start);
                     if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                         self.add_segment_to_manifest(segment_metadata).await;
-                        segment_sequence += 1;
+                        segments_written += 1;
                     }
                 }
             }
@@ -781,22 +782,23 @@ impl BackupPartitionContext {
 
         // Flush any remaining records
         if segment_writer.has_data() {
-            let key = self.segment_key(segment_sequence);
+            let seg_start = segment_writer.start_offset().unwrap();
+            let key = self.segment_key(seg_start);
             if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                 self.add_segment_to_manifest(segment_metadata).await;
-                segment_sequence += 1;
+                segments_written += 1;
             }
         }
 
         if self.target_offset.is_some() {
             info!(
                 "Completed snapshot backup of {}:{} - {} segments (reached target offset {})",
-                self.topic, self.partition, segment_sequence, end_offset
+                self.topic, self.partition, segments_written, end_offset
             );
         } else {
             info!(
                 "Completed backup of {}:{} - {} segments",
-                self.topic, self.partition, segment_sequence
+                self.topic, self.partition, segments_written
             );
         }
 
@@ -815,11 +817,11 @@ impl BackupPartitionContext {
         }
     }
 
-    fn segment_key(&self, sequence: u64) -> String {
+    fn segment_key(&self, start_offset: i64) -> String {
         let ext = extension(self.options.compression);
         format!(
-            "{}/topics/{}/partition={}/segment-{:06}.bin{}",
-            self.backup_id, self.topic, self.partition, sequence, ext
+            "{}/topics/{}/partition={}/segment-{:020}.bin{}",
+            self.backup_id, self.topic, self.partition, start_offset, ext
         )
     }
 
