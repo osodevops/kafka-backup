@@ -12,9 +12,19 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, trace, warn};
+
+/// Client-side deadline for writing a request to the broker socket.
+/// If the broker's receive buffer is full for this long, something is wrong.
+const WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// Client-side deadline for receiving a broker response.
+/// A healthy broker with acks=1 responds in <100ms; 10s is very generous.
+/// Must be kept larger than produce_timeout_ms to avoid false positives.
+const RESPONSE_TIMEOUT_SECS: u64 = 10;
 
 use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
@@ -394,6 +404,7 @@ impl KafkaClient {
                     || msg.contains("Connection reset")
                     || msg.contains("Not connected")
                     || msg.contains("connection abort")
+                    || msg.contains("timed out after")
             }
             _ => false,
         }
@@ -635,27 +646,55 @@ impl KafkaClient {
             .as_mut()
             .ok_or_else(|| KafkaError::Protocol("Not connected".to_string()))?;
 
-        conn.stream
-            .write_all(buf)
-            .await
-            .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
+        // Write request (with deadline — avoids hanging if broker's receive buffer is full)
+        timeout(
+            Duration::from_secs(WRITE_TIMEOUT_SECS),
+            conn.stream.write_all(buf),
+        )
+        .await
+        .map_err(|_| {
+            KafkaError::Protocol(format!(
+                "Request timed out after {}s sending to broker",
+                WRITE_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
 
-        // Read response length
+        // Read response length (4 bytes) with deadline.
+        // Without a deadline, a broker that accepts the TCP connection but never
+        // responds will hang the process indefinitely (Issue #67 bug 7).
         let mut len_buf = [0u8; 4];
-        conn.stream
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| KafkaError::Protocol(format!("Failed to read response length: {}", e)))?;
+        timeout(
+            Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+            conn.stream.read_exact(&mut len_buf),
+        )
+        .await
+        .map_err(|_| {
+            KafkaError::Protocol(format!(
+                "Request timed out after {}s waiting for broker response",
+                RESPONSE_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| KafkaError::Protocol(format!("Failed to read response length: {}", e)))?;
         let response_len = i32::from_be_bytes(len_buf) as usize;
 
         trace!("Receiving response: len={}", response_len);
 
-        // Read response body
+        // Read response body — also needs a deadline. A broker can send the 4-byte
+        // length then stall on the body, leaving us hung without this timeout.
         let mut response_buf = vec![0u8; response_len];
-        conn.stream
-            .read_exact(&mut response_buf)
-            .await
-            .map_err(|e| KafkaError::Protocol(format!("Failed to read response body: {}", e)))?;
+        timeout(
+            Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+            conn.stream.read_exact(&mut response_buf),
+        )
+        .await
+        .map_err(|_| {
+            KafkaError::Protocol(format!(
+                "Response body read timed out after {}s",
+                RESPONSE_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| KafkaError::Protocol(format!("Failed to read response body: {}", e)))?;
 
         // Decode response
         let mut response_bytes = Bytes::from(response_buf);
