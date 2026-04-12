@@ -212,29 +212,8 @@ impl BackupEngine {
                 .await?;
         }
 
-        // Fetch metadata and determine topics to back up
-        // This fetches all topic metadata in a SINGLE bulk call, avoiding per-topic network calls
-        // which was causing severe performance issues with high-latency connections (Issue #29)
         let source = self.config.source.as_ref().unwrap();
         let backup_opts = self.config.backup.clone().unwrap_or_default();
-        let topics_metadata = self.resolve_topics(&source.topics, &backup_opts).await?;
-
-        if topics_metadata.is_empty() {
-            warn!("No topics matched the configured patterns");
-            return Ok(());
-        }
-
-        info!("Backing up {} topics", topics_metadata.len());
-
-        // Capture snapshot offsets if stop_at_current_offsets is enabled
-        // This provides a consistent "point-in-time" snapshot for DR backups
-        // Returns (earliest, latest) pairs to avoid redundant offset fetches later
-        let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
-            if backup_opts.stop_at_current_offsets {
-                Some(self.capture_snapshot_offsets(&topics_metadata).await?)
-            } else {
-                None
-            };
 
         let mut shutdown_rx = self.shutdown_receiver();
 
@@ -248,11 +227,39 @@ impl BackupEngine {
 
         // Run backup loop
         loop {
-            // Process topics with controlled parallelism
-            // NOTE: We use the cached topic metadata from resolve_topics() instead of
-            // making per-topic metadata calls here. This eliminates N network calls
-            // (where N = number of topics), which was causing "stuck" behavior with
-            // high-latency connections like Confluent Cloud (Issue #29).
+            // Re-discover topics at the start of every cycle so that topics created
+            // after the backup process started are picked up automatically (Issue #67 bug 1).
+            // The Metadata request is a single bulk call and costs only a few milliseconds
+            // — negligible compared to poll_interval_ms (Issue #29 optimisation preserved).
+            let topics_metadata = self.resolve_topics(&source.topics, &backup_opts).await?;
+
+            if topics_metadata.is_empty() {
+                warn!("No topics matched the configured patterns — skipping cycle");
+                if !backup_opts.continuous {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(backup_opts.poll_interval_ms)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Shutdown signal received, stopping backup");
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+
+            info!("Backing up {} topics", topics_metadata.len());
+
+            // Capture snapshot offsets if stop_at_current_offsets is enabled
+            // This provides a consistent "point-in-time" snapshot for DR backups
+            // Returns (earliest, latest) pairs to avoid redundant offset fetches later
+            let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
+                if backup_opts.stop_at_current_offsets {
+                    Some(self.capture_snapshot_offsets(&topics_metadata).await?)
+                } else {
+                    None
+                };
+
             let mut all_handles = Vec::new();
 
             for topic_meta in &topics_metadata {
