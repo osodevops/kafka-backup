@@ -213,6 +213,22 @@ enum Commands {
         #[command(subcommand)]
         action: ValidationAction,
     },
+
+    /// Snapshot consumer group offsets for backed-up topics
+    ///
+    /// Queries every broker for consumer groups (KRaft-safe), fetches their committed
+    /// offsets, filters to groups that have offsets on backed-up topics, and saves the
+    /// result to {backup_id}/consumer-groups-snapshot.json in the configured storage
+    /// backend.
+    ///
+    /// The snapshot is loaded automatically at restore time when
+    /// `auto_consumer_groups: true` is set in the restore configuration.
+    #[command(name = "snapshot-groups")]
+    SnapshotGroups {
+        /// Path to the backup configuration file (mode must be 'backup')
+        #[arg(short, long)]
+        config: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -725,6 +741,9 @@ async fn main() -> Result<()> {
                     .await?;
             }
         },
+        Commands::SnapshotGroups { config } => {
+            commands::snapshot_groups::run(&config).await?;
+        }
     }
 
     Ok(())
