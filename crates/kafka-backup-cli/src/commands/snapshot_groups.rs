@@ -78,7 +78,10 @@ pub async fn run(config_path: &str) -> Result<()> {
     // List all consumer groups across ALL brokers (KRaft: each broker is coordinator
     // only for a subset of groups — must query all brokers to get the full list)
     let all_groups = router.list_groups_all_brokers().await?;
-    info!("Found {} consumer groups across all brokers", all_groups.len());
+    info!(
+        "Found {} consumer groups across all brokers",
+        all_groups.len()
+    );
 
     // Use bootstrap client for OffsetFetch (broker routes to correct coordinator)
     let bootstrap_client = router.bootstrap_client();

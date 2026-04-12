@@ -683,17 +683,15 @@ impl RestoreEngine {
                 .cloned()
                 .unwrap_or_else(|| topic_backup.name.clone());
 
-            let partition_count = topic_backup
-                .original_partition_count
-                .unwrap_or_else(|| {
-                    topic_backup
-                        .partitions
-                        .iter()
-                        .map(|p| p.partition_id)
-                        .max()
-                        .map(|m| m + 1)
-                        .unwrap_or(0)
-                });
+            let partition_count = topic_backup.original_partition_count.unwrap_or_else(|| {
+                topic_backup
+                    .partitions
+                    .iter()
+                    .map(|p| p.partition_id)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0)
+            });
 
             let mut to_purge: Vec<(i32, i64)> = Vec::new();
             for pid in 0..partition_count {

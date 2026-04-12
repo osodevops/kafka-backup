@@ -551,11 +551,7 @@ impl BackupEngine {
 
         let manifest_json = serde_json::to_string_pretty(&merged)?;
         self.storage.put(&key, Bytes::from(manifest_json)).await?;
-        debug!(
-            "Saved manifest to {} ({} topics)",
-            key,
-            merged.topics.len()
-        );
+        debug!("Saved manifest to {} ({} topics)", key, merged.topics.len());
 
         Ok(())
     }
@@ -604,17 +600,16 @@ impl BackupEngine {
         let mut snapshot_groups: Vec<GroupEntry> = Vec::new();
 
         for group in &all_groups {
-            let committed =
-                match fetch_offsets(bootstrap_client, &group.group_id, None).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        debug!(
-                            "Could not fetch offsets for group {}: {}",
-                            group.group_id, e
-                        );
-                        continue;
-                    }
-                };
+            let committed = match fetch_offsets(bootstrap_client, &group.group_id, None).await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(
+                        "Could not fetch offsets for group {}: {}",
+                        group.group_id, e
+                    );
+                    continue;
+                }
+            };
 
             if committed.is_empty() {
                 continue;
@@ -1011,7 +1006,11 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
     use std::collections::HashMap as HM;
 
     for cur_topic in current.topics {
-        if let Some(ex_topic) = existing.topics.iter_mut().find(|t| t.name == cur_topic.name) {
+        if let Some(ex_topic) = existing
+            .topics
+            .iter_mut()
+            .find(|t| t.name == cur_topic.name)
+        {
             // Update partition count when the current session has fresh metadata
             if cur_topic.original_partition_count.is_some() {
                 ex_topic.original_partition_count = cur_topic.original_partition_count;
@@ -1023,10 +1022,16 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                     .find(|p| p.partition_id == cur_part.partition_id)
                 {
                     // Merge segments: deduplicate by key and start_offset; existing wins
-                    let mut seen_keys: HM<String, ()> =
-                        ex_part.segments.iter().map(|s| (s.key.clone(), ())).collect();
-                    let mut seen_offsets: HM<i64, ()> =
-                        ex_part.segments.iter().map(|s| (s.start_offset, ())).collect();
+                    let mut seen_keys: HM<String, ()> = ex_part
+                        .segments
+                        .iter()
+                        .map(|s| (s.key.clone(), ()))
+                        .collect();
+                    let mut seen_offsets: HM<i64, ()> = ex_part
+                        .segments
+                        .iter()
+                        .map(|s| (s.start_offset, ()))
+                        .collect();
                     for seg in cur_part.segments {
                         if !seen_keys.contains_key(&seg.key)
                             && !seen_offsets.contains_key(&seg.start_offset)

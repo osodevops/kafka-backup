@@ -65,12 +65,7 @@ fn backup_cfg(
     }
 }
 
-fn restore_cfg(
-    bs: &str,
-    storage_path: PathBuf,
-    backup_id: &str,
-    opts: RestoreOptions,
-) -> Config {
+fn restore_cfg(bs: &str, storage_path: PathBuf, backup_id: &str, opts: RestoreOptions) -> Config {
     Config {
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
@@ -136,7 +131,10 @@ async fn run_restore(
 }
 
 /// Read and parse a manifest from filesystem storage.
-fn read_manifest(storage_path: &std::path::Path, backup_id: &str) -> anyhow::Result<BackupManifest> {
+fn read_manifest(
+    storage_path: &std::path::Path,
+    backup_id: &str,
+) -> anyhow::Result<BackupManifest> {
     let path = storage_path.join(backup_id).join("manifest.json");
     let data = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("Cannot read manifest at {:?}: {}", path, e))?;
@@ -144,11 +142,7 @@ fn read_manifest(storage_path: &std::path::Path, backup_id: &str) -> anyhow::Res
 }
 
 /// Create a Kafka topic with explicit partition count via the Admin API.
-async fn create_topic_n(
-    client: &KafkaClient,
-    topic: &str,
-    partitions: i32,
-) -> anyhow::Result<()> {
+async fn create_topic_n(client: &KafkaClient, topic: &str, partitions: i32) -> anyhow::Result<()> {
     let results = client
         .create_topics(
             vec![TopicToCreate {
@@ -180,7 +174,10 @@ async fn produce(client: &KafkaClient, topic: &str, n: usize) -> anyhow::Result<
 
 /// Return (earliest_offset, latest_offset) for partition 0 of `topic`.
 async fn offsets(client: &KafkaClient, topic: &str) -> anyhow::Result<(i64, i64)> {
-    client.get_offsets(topic, 0).await.map_err(|e| anyhow::anyhow!("{}", e))
+    client
+        .get_offsets(topic, 0)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 // ── Bug #3 ──────────────────────────────────────────────────────────────────
@@ -451,9 +448,10 @@ async fn test_bug4_original_partition_count_preserves_empty_partitions() {
 
     // ── Restore and verify the target topic has 8 partitions ─────────────
     let mut restore_opts = test_restore_opts();
-    restore_opts
-        .topic_mapping
-        .insert("bug4-sparse".to_string(), "bug4-sparse-restored".to_string());
+    restore_opts.topic_mapping.insert(
+        "bug4-sparse".to_string(),
+        "bug4-sparse-restored".to_string(),
+    );
 
     run_restore(
         restore_cfg(bs, dir.path().to_path_buf(), "bug4", restore_opts),
@@ -515,13 +513,7 @@ async fn test_bug1_new_topics_discovered_between_cycles() {
         ..Default::default()
     };
 
-    let config = backup_cfg(
-        bs,
-        dir.path().to_path_buf(),
-        "bug1",
-        &["bug1-*"],
-        opts,
-    );
+    let config = backup_cfg(bs, dir.path().to_path_buf(), "bug1", &["bug1-*"], opts);
 
     let engine = BackupEngine::new(config).await.unwrap();
     let engine = Arc::new(engine);
@@ -627,19 +619,25 @@ async fn test_bug5_and_bug6_consumer_group_snapshot_infrastructure() {
     .unwrap();
 
     // ── Verify snapshot file is always written (Bug #5 infrastructure) ────
-    let snapshot_path = dir.path().join("bug5").join("consumer-groups-snapshot.json");
+    let snapshot_path = dir
+        .path()
+        .join("bug5")
+        .join("consumer-groups-snapshot.json");
     assert!(
         snapshot_path.exists(),
         "consumer-groups-snapshot.json was NOT written — backup engine ignoring consumer_group_snapshot: true"
     );
 
     let snapshot_data = std::fs::read_to_string(&snapshot_path).unwrap();
-    let snapshot: serde_json::Value =
-        serde_json::from_str(&snapshot_data).expect("consumer-groups-snapshot.json is not valid JSON");
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_data)
+        .expect("consumer-groups-snapshot.json is not valid JSON");
 
     // Structural assertions — both fields must always be present
     assert!(
-        snapshot.get("snapshot_time").and_then(|t| t.as_i64()).is_some(),
+        snapshot
+            .get("snapshot_time")
+            .and_then(|t| t.as_i64())
+            .is_some(),
         "snapshot_time field missing or wrong type"
     );
     assert!(
@@ -661,8 +659,8 @@ async fn test_bug5_and_bug6_consumer_group_snapshot_infrastructure() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_bug6_list_groups_all_brokers_callable() {
-    use kafka_backup_core::kafka::PartitionLeaderRouter;
     use kafka_backup_core::config::{KafkaConfig, SecurityConfig, TopicSelection};
+    use kafka_backup_core::kafka::PartitionLeaderRouter;
 
     let cluster = KafkaTestCluster::start().await.unwrap();
     cluster
@@ -699,9 +697,9 @@ async fn test_bug6_list_groups_deduplication_logic() {
     // Simulate what list_groups_all_brokers does: collect groups from N brokers,
     // dedup by group_id. This mirrors the implementation exactly.
     let broker_responses = vec![
-        vec!["group-alpha", "group-beta"],       // broker 1
-        vec!["group-beta", "group-gamma"],       // broker 2 — group-beta is duplicate
-        vec!["group-gamma", "group-delta"],      // broker 3 — group-gamma is duplicate
+        vec!["group-alpha", "group-beta"],  // broker 1
+        vec!["group-beta", "group-gamma"],  // broker 2 — group-beta is duplicate
+        vec!["group-gamma", "group-delta"], // broker 3 — group-gamma is duplicate
     ];
 
     let mut all_groups: Vec<&str> = Vec::new();
@@ -714,7 +712,12 @@ async fn test_bug6_list_groups_deduplication_logic() {
         }
     }
 
-    assert_eq!(all_groups.len(), 4, "Expected 4 unique groups, got {}", all_groups.len());
+    assert_eq!(
+        all_groups.len(),
+        4,
+        "Expected 4 unique groups, got {}",
+        all_groups.len()
+    );
     assert!(all_groups.contains(&"group-alpha"));
     assert!(all_groups.contains(&"group-beta"));
     assert!(all_groups.contains(&"group-gamma"));
@@ -745,9 +748,10 @@ async fn test_bug7_socket_timeout_constants_all_io_paths_protected() {
 
     // The timeout error message must be classified as a connection error so it
     // triggers the existing reconnect-and-retry path in send_request().
-    let timeout_err = kafka_backup_core::Error::Kafka(kafka_backup_core::error::KafkaError::Protocol(
-        "Request timed out after 10s waiting for broker response".to_string(),
-    ));
+    let timeout_err =
+        kafka_backup_core::Error::Kafka(kafka_backup_core::error::KafkaError::Protocol(
+            "Request timed out after 10s waiting for broker response".to_string(),
+        ));
     assert!(
         kafka_backup_core::kafka::is_connection_error_public(&timeout_err),
         "Timeout error must be classified as a connection error to trigger reconnect"
@@ -808,8 +812,10 @@ async fn test_bug8_produce_retries_on_errors() {
 
     // Restore with acks=-1 and verify it succeeds (exercises produce path via router)
     let mut opts = test_restore_opts();
-    opts.topic_mapping
-        .insert("bug8-orders".to_string(), "bug8-orders-restored".to_string());
+    opts.topic_mapping.insert(
+        "bug8-orders".to_string(),
+        "bug8-orders-restored".to_string(),
+    );
 
     let report = run_restore(
         restore_cfg(bs, dir.path().to_path_buf(), "bug8", opts),
@@ -905,7 +911,8 @@ async fn test_bug9_configurable_produce_acks() {
     let mut opts2 = test_restore_opts();
     opts2.produce_acks = -1;
     opts2.produce_timeout_ms = 30_000;
-    opts2.topic_mapping
+    opts2
+        .topic_mapping
         .insert("bug9-orders".to_string(), "bug9-orders-acksall".to_string());
 
     let report2 = run_restore(

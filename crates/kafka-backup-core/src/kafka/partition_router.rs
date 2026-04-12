@@ -232,7 +232,10 @@ impl PartitionLeaderRouter {
         }
 
         // Topic not found in cache — refresh and retry once
-        debug!("Leader for {}:{} not in cache, refreshing metadata", topic, partition);
+        debug!(
+            "Leader for {}:{} not in cache, refreshing metadata",
+            topic, partition
+        );
         self.refresh_partition_leader(topic, partition).await?;
 
         let leaders = self.partition_leaders.read().await;
@@ -476,7 +479,10 @@ impl PartitionLeaderRouter {
         const MAX_CONNECTION_RETRIES: u32 = 5;
 
         // First attempt — no clone yet
-        let err = match self.produce_internal(topic, partition, &records, acks, timeout_ms).await {
+        let err = match self
+            .produce_internal(topic, partition, &records, acks, timeout_ms)
+            .await
+        {
             Ok(response) => return Ok(response),
             Err(e) if is_not_leader_error(&e) => {
                 warn!(
@@ -485,7 +491,10 @@ impl PartitionLeaderRouter {
                 );
                 self.refresh_partition_leader(topic, partition).await?;
                 self.clear_connection_cache().await;
-                match self.produce_internal(topic, partition, &records, acks, timeout_ms).await {
+                match self
+                    .produce_internal(topic, partition, &records, acks, timeout_ms)
+                    .await
+                {
                     Ok(response) => return Ok(response),
                     Err(e) if !is_connection_error(&e) => return Err(e),
                     Err(e) => {
@@ -619,20 +628,18 @@ impl PartitionLeaderRouter {
 
         for broker_id in broker_ids {
             match self.get_broker_connection(broker_id).await {
-                Ok(client) => {
-                    match super::consumer_groups::list_groups(&client).await {
-                        Ok(groups) => {
-                            for g in groups {
-                                if seen.insert(g.group_id.clone()) {
-                                    all_groups.push(g);
-                                }
+                Ok(client) => match super::consumer_groups::list_groups(&client).await {
+                    Ok(groups) => {
+                        for g in groups {
+                            if seen.insert(g.group_id.clone()) {
+                                all_groups.push(g);
                             }
                         }
-                        Err(e) => {
-                            warn!("list_groups from broker {}: {}", broker_id, e);
-                        }
                     }
-                }
+                    Err(e) => {
+                        warn!("list_groups from broker {}: {}", broker_id, e);
+                    }
+                },
                 Err(e) => {
                     warn!(
                         "Failed to connect to broker {} for ListGroups: {}",
