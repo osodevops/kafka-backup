@@ -586,9 +586,6 @@ impl BackupEngine {
             all_groups.len()
         );
 
-        // Use the bootstrap client for OffsetFetch (broker routes to correct coordinator)
-        let bootstrap = &self.router;
-
         #[derive(serde::Serialize)]
         struct GroupEntry {
             group_id: String,
