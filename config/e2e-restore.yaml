@@ -1,0 +1,25 @@
+mode: restore
+backup_id: "e2e-test"
+
+target:
+  bootstrap_servers:
+    - localhost:9092
+  topics:
+    include:
+      - "*"
+
+storage:
+  backend: s3
+  bucket: kafka-backups
+  region: us-east-1
+  endpoint: http://localhost:9000
+  access_key: minioadmin
+  secret_key: minioadmin
+  path_style: true
+  allow_http: true
+
+restore:
+  create_topics: true
+  produce_acks: -1
+  produce_timeout_ms: 30000
+  dry_run: false

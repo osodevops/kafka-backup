@@ -1,0 +1,29 @@
+mode: backup
+backup_id: "e2e-test"
+
+source:
+  bootstrap_servers:
+    - localhost:9092
+  topics:
+    include:
+      - "e2e-*"
+    exclude:
+      - "__*"
+
+storage:
+  backend: s3
+  bucket: kafka-backups
+  region: us-east-1
+  endpoint: http://localhost:9000
+  access_key: minioadmin
+  secret_key: minioadmin
+  path_style: true
+  allow_http: true
+
+backup:
+  compression: zstd
+  segment_max_bytes: 65536
+  segment_max_interval_ms: 5000
+  continuous: false
+  start_offset: earliest
+  consumer_group_snapshot: false

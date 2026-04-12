@@ -218,7 +218,23 @@ impl PartitionLeaderRouter {
     }
 
     /// Get the leader broker ID for a partition.
+    ///
+    /// If the topic is not in the cache (e.g. newly created after the router was
+    /// initialised), refreshes partition-leader metadata from the cluster once before
+    /// returning an error.  This prevents `PartitionNotAvailable` failures for
+    /// topics discovered between continuous-backup cycles.
     pub async fn get_leader(&self, topic: &str, partition: i32) -> Result<i32> {
+        {
+            let leaders = self.partition_leaders.read().await;
+            if let Some(&id) = leaders.get(&(topic.to_string(), partition)) {
+                return Ok(id);
+            }
+        }
+
+        // Topic not found in cache — refresh and retry once
+        debug!("Leader for {}:{} not in cache, refreshing metadata", topic, partition);
+        self.refresh_partition_leader(topic, partition).await?;
+
         let leaders = self.partition_leaders.read().await;
         leaders
             .get(&(topic.to_string(), partition))
