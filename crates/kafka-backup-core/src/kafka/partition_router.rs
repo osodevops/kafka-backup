@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -436,41 +437,95 @@ impl PartitionLeaderRouter {
     }
 
     /// Produce records to a partition, routing to the correct leader.
+    ///
+    /// Handles two failure classes (Issue #67 bug 8):
+    ///
+    /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
+    ///    cache and retries once. This covers planned leader elections and rolling
+    ///    restarts.
+    ///
+    /// 2. Connection errors (broken pipe, timeout, etc.): retries up to
+    ///    `MAX_CONNECTION_RETRIES` times with linear back-off. This covers transient
+    ///    network blips and broker restarts.
+    ///
+    /// Records are only cloned when a retry is actually required.
     pub async fn produce(
         &self,
         topic: &str,
         partition: i32,
         records: Vec<BackupRecord>,
     ) -> Result<ProduceResponse> {
-        // First attempt
-        match self
-            .produce_internal(topic, partition, records.clone())
-            .await
-        {
-            Ok(response) => Ok(response),
+        const MAX_CONNECTION_RETRIES: u32 = 5;
+
+        // First attempt — no clone yet
+        let err = match self.produce_internal(topic, partition, &records).await {
+            Ok(response) => return Ok(response),
             Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
                 warn!(
-                    "NOT_LEADER_FOR_PARTITION error for {}/{} during produce, refreshing metadata",
+                    "NOT_LEADER_FOR_PARTITION for {}/{}, refreshing metadata and retrying",
                     topic, partition
                 );
                 self.refresh_partition_leader(topic, partition).await?;
                 self.clear_connection_cache().await;
-                self.produce_internal(topic, partition, records).await
+                match self.produce_internal(topic, partition, &records).await {
+                    Ok(response) => return Ok(response),
+                    Err(e) if !is_connection_error(&e) => return Err(e),
+                    Err(e) => {
+                        warn!(
+                            "Connection error after leader refresh for {}/{}: {}",
+                            topic, partition, e
+                        );
+                        self.clear_connection_cache().await;
+                        e
+                    }
+                }
             }
-            Err(e) => Err(e),
+            Err(e) if !is_connection_error(&e) => return Err(e),
+            Err(e) => {
+                warn!(
+                    "Connection error for {}/{} (attempt 0), will retry: {}",
+                    topic, partition, e
+                );
+                self.clear_connection_cache().await;
+                e
+            }
+        };
+
+        // Connection-error retry loop with linear back-off (500ms, 1s, 1.5s, 2s, 2.5s)
+        let mut last_err = err;
+        for attempt in 1..=MAX_CONNECTION_RETRIES {
+            let backoff = Duration::from_millis(500 * attempt as u64);
+            warn!(
+                "Retrying produce for {}/{} (attempt {}/{}) after {:?}: {}",
+                topic, partition, attempt, MAX_CONNECTION_RETRIES, backoff, last_err
+            );
+            tokio::time::sleep(backoff).await;
+
+            match self.produce_internal(topic, partition, &records).await {
+                Ok(response) => return Ok(response),
+                Err(e) if is_connection_error(&e) => {
+                    self.clear_connection_cache().await;
+                    last_err = e;
+                }
+                Err(e) => return Err(e),
+            }
         }
+
+        Err(crate::Error::Kafka(KafkaError::Protocol(format!(
+            "Produce failed for {}/{} after {} connection retries: {}",
+            topic, partition, MAX_CONNECTION_RETRIES, last_err
+        ))))
     }
 
-    /// Internal produce implementation.
+    /// Internal produce implementation — borrows records to avoid unnecessary cloning.
     async fn produce_internal(
         &self,
         topic: &str,
         partition: i32,
-        records: Vec<BackupRecord>,
+        records: &[BackupRecord],
     ) -> Result<ProduceResponse> {
         let client = self.get_leader_client(topic, partition).await?;
-        client.produce(topic, partition, records).await
+        client.produce(topic, partition, records.to_vec()).await
     }
 
     /// Clear the connection cache (useful after metadata refresh).
@@ -511,6 +566,21 @@ impl PartitionLeaderRouter {
     pub async fn get_partitions(&self, topic: &str) -> Result<Vec<PartitionMetadata>> {
         let metadata = self.get_topic_metadata(topic).await?;
         Ok(metadata.partitions)
+    }
+}
+
+/// Check if an error is a connection-level error that warrants a retry.
+fn is_connection_error(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::Kafka(KafkaError::Protocol(msg)) => {
+            msg.contains("Broken pipe")
+                || msg.contains("early eof")
+                || msg.contains("Connection reset")
+                || msg.contains("Not connected")
+                || msg.contains("connection abort")
+                || msg.contains("timed out after")
+        }
+        _ => false,
     }
 }
 
