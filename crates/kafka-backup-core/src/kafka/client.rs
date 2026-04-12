@@ -726,6 +726,7 @@ impl KafkaClient {
             ApiKey::OffsetFetch => 5,
             ApiKey::OffsetCommit => 5,
             ApiKey::ListGroups => 2,
+            ApiKey::DeleteRecords => 1,
             _ => 0,
         }
     }

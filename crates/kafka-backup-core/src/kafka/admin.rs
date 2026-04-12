@@ -1,8 +1,9 @@
-//! Kafka Admin API implementation (CreateTopics, etc.)
+//! Kafka Admin API implementation (CreateTopics, DeleteRecords, etc.)
 
 use kafka_protocol::messages::{
     create_topics_request::{CreatableTopic, CreateTopicsRequest},
-    ApiKey, CreateTopicsResponse, TopicName,
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
+    ApiKey, CreateTopicsResponse, DeleteRecordsRequest, DeleteRecordsResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use tracing::{debug, info, warn};
@@ -142,6 +143,67 @@ pub async fn create_topics(
     }
 
     Ok(results)
+}
+
+/// Delete records from Kafka partitions by advancing the log-start-offset.
+///
+/// Records **before** `before_offset` in each partition become inaccessible
+/// (the new log-start-offset is set to `before_offset`). This empties a topic
+/// without deleting it — the approach required for Strimzi-managed topics that
+/// cannot be deleted and recreated (Issue #67 bug 10).
+///
+/// # Arguments
+/// * `client`       – Kafka client (broker routes internally)
+/// * `topic`        – Target topic name
+/// * `partitions`   – `(partition_id, before_offset)` pairs
+/// * `timeout_ms`   – Broker-side request timeout
+pub async fn delete_records(
+    client: &KafkaClient,
+    topic: &str,
+    partitions: &[(i32, i64)],
+    timeout_ms: i32,
+) -> Result<()> {
+    if partitions.is_empty() {
+        return Ok(());
+    }
+
+    let dr_partitions: Vec<DeleteRecordsPartition> = partitions
+        .iter()
+        .map(|(pid, offset)| {
+            DeleteRecordsPartition::default()
+                .with_partition_index(*pid)
+                .with_offset(*offset)
+        })
+        .collect();
+
+    let topics = vec![DeleteRecordsTopic::default()
+        .with_name(TopicName(StrBytes::from_string(topic.to_owned())))
+        .with_partitions(dr_partitions)];
+
+    let request = DeleteRecordsRequest::default()
+        .with_topics(topics)
+        .with_timeout_ms(timeout_ms);
+
+    let response: DeleteRecordsResponse =
+        client.send_request(ApiKey::DeleteRecords, request).await?;
+
+    for topic_result in &response.topics {
+        for part in &topic_result.partitions {
+            if part.error_code != 0 {
+                warn!(
+                    "DeleteRecords failed for {}[{}]: error_code={}",
+                    topic_result.name.0, part.partition_index, part.error_code
+                );
+            } else {
+                debug!(
+                    "Purged {}[{}] new log-start-offset={}",
+                    topic_result.name.0, part.partition_index, part.low_watermark
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

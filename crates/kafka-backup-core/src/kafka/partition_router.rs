@@ -571,10 +571,82 @@ impl PartitionLeaderRouter {
         self.bootstrap_client.get_topic_metadata(topic).await
     }
 
+    /// Access the bootstrap client for direct requests (e.g. OffsetFetch).
+    pub fn bootstrap_client(&self) -> &KafkaClient {
+        &self.bootstrap_client
+    }
+
     /// Get partition metadata for a topic.
     pub async fn get_partitions(&self, topic: &str) -> Result<Vec<PartitionMetadata>> {
         let metadata = self.get_topic_metadata(topic).await?;
         Ok(metadata.partitions)
+    }
+
+    /// List consumer groups from **every** broker in the cluster.
+    ///
+    /// In KRaft mode each broker acts as group coordinator only for a subset of
+    /// consumer groups. A single `ListGroups` request to the bootstrap broker
+    /// therefore misses groups whose coordinator is on a different broker.
+    ///
+    /// This method sends a `ListGroups` request to each known broker separately
+    /// and merges the results, deduplicating by `group_id` (Issue #67 bug 6).
+    pub async fn list_groups_all_brokers(
+        &self,
+    ) -> Result<Vec<super::consumer_groups::ConsumerGroup>> {
+        let broker_ids: Vec<i32> = {
+            let meta = self.broker_metadata.read().await;
+            meta.keys().copied().collect()
+        };
+
+        let mut all_groups: Vec<super::consumer_groups::ConsumerGroup> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for broker_id in broker_ids {
+            match self.get_broker_connection(broker_id).await {
+                Ok(client) => {
+                    match super::consumer_groups::list_groups(&client).await {
+                        Ok(groups) => {
+                            for g in groups {
+                                if seen.insert(g.group_id.clone()) {
+                                    all_groups.push(g);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("list_groups from broker {}: {}", broker_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to broker {} for ListGroups: {}",
+                        broker_id, e
+                    );
+                }
+            }
+        }
+
+        debug!(
+            "list_groups_all_brokers: {} unique groups across {} brokers",
+            all_groups.len(),
+            self.broker_metadata.read().await.len()
+        );
+        Ok(all_groups)
+    }
+
+    /// Delete records from a topic by advancing the log-start-offset to `before_offset`.
+    ///
+    /// Records with offset < `before_offset` become inaccessible. This empties a topic
+    /// without deleting it — safe for Strimzi-managed topics.
+    ///
+    /// `partitions` is a slice of `(partition_id, before_offset)` pairs.
+    pub async fn delete_records(
+        &self,
+        topic: &str,
+        partitions: &[(i32, i64)],
+        timeout_ms: i32,
+    ) -> Result<()> {
+        super::admin::delete_records(&self.bootstrap_client, topic, partitions, timeout_ms).await
     }
 }
 

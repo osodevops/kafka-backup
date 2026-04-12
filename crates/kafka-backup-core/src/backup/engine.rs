@@ -11,7 +11,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
 use crate::health::HealthCheck;
-use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
+use crate::kafka::{consumer_groups::fetch_offsets, PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -404,6 +404,13 @@ impl BackupEngine {
             // Save manifest periodically
             self.save_manifest().await?;
 
+            // Optionally snapshot consumer group offsets (Issue #67 bug 5/6)
+            if backup_opts.consumer_group_snapshot {
+                if let Err(e) = self.snapshot_consumer_groups().await {
+                    warn!("Consumer group snapshot failed (non-fatal): {}", e);
+                }
+            }
+
             // If not continuous, exit after one pass
             if !backup_opts.continuous {
                 break;
@@ -550,6 +557,107 @@ impl BackupEngine {
             merged.topics.len()
         );
 
+        Ok(())
+    }
+
+    /// Snapshot consumer group committed offsets to storage.
+    ///
+    /// Queries every broker individually (KRaft-safe), fetches committed offsets for
+    /// each group, filters to groups that have offsets on backed-up topics, and writes
+    /// `{backup_id}/consumer-groups-snapshot.json` (Issue #67 bugs 5 & 6).
+    ///
+    /// Uses the existing router connections — does NOT open new TCP connections.
+    async fn snapshot_consumer_groups(&self) -> Result<()> {
+        // Collect backed-up topic names from in-memory manifest
+        let backed_topics: std::collections::HashSet<String> = {
+            let manifest = self.manifest.lock().await;
+            manifest.topics.iter().map(|t| t.name.clone()).collect()
+        };
+
+        if backed_topics.is_empty() {
+            debug!("Skipping consumer group snapshot: no topics in manifest yet");
+            return Ok(());
+        }
+
+        // List groups from every broker (KRaft: each broker is coordinator for a subset)
+        let all_groups = self.router.list_groups_all_brokers().await?;
+        debug!(
+            "Consumer group snapshot: {} groups across all brokers",
+            all_groups.len()
+        );
+
+        // Use the bootstrap client for OffsetFetch (broker routes to correct coordinator)
+        let bootstrap = &self.router;
+
+        #[derive(serde::Serialize)]
+        struct GroupEntry {
+            group_id: String,
+            /// topic -> partition_id (string) -> committed offset
+            offsets: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Snapshot {
+            snapshot_time: i64,
+            groups: Vec<GroupEntry>,
+        }
+
+        // Fetch offsets via bootstrap_client through the router
+        let bootstrap_client = self.router.bootstrap_client();
+        let mut snapshot_groups: Vec<GroupEntry> = Vec::new();
+
+        for group in &all_groups {
+            let committed =
+                match fetch_offsets(bootstrap_client, &group.group_id, None).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!(
+                            "Could not fetch offsets for group {}: {}",
+                            group.group_id, e
+                        );
+                        continue;
+                    }
+                };
+
+            if committed.is_empty() {
+                continue;
+            }
+
+            let mut offsets_by_topic: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, i64>,
+            > = std::collections::HashMap::new();
+            for co in &committed {
+                if backed_topics.contains(&co.topic) && co.offset >= 0 {
+                    offsets_by_topic
+                        .entry(co.topic.clone())
+                        .or_default()
+                        .insert(co.partition.to_string(), co.offset);
+                }
+            }
+
+            if !offsets_by_topic.is_empty() {
+                snapshot_groups.push(GroupEntry {
+                    group_id: group.group_id.clone(),
+                    offsets: offsets_by_topic,
+                });
+            }
+        }
+
+        let snapshot = Snapshot {
+            snapshot_time: chrono::Utc::now().timestamp_millis(),
+            groups: snapshot_groups,
+        };
+
+        let key = format!("{}/consumer-groups-snapshot.json", self.config.backup_id);
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        self.storage.put(&key, Bytes::from(json)).await?;
+
+        info!(
+            "Consumer groups snapshot saved ({} groups) to {}",
+            snapshot.groups.len(),
+            key
+        );
         Ok(())
     }
 

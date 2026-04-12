@@ -453,7 +453,7 @@ impl RestoreEngine {
     }
 
     async fn run_internal(&self) -> Result<RestoreReport> {
-        let restore_options = self.config.restore.clone().unwrap_or_default();
+        let mut restore_options = self.config.restore.clone().unwrap_or_default();
 
         // Check for dry-run mode
         if restore_options.dry_run {
@@ -536,6 +536,32 @@ impl RestoreEngine {
                 .await?;
         }
 
+        // Auto-load consumer groups from snapshot if requested (Issue #67 bug 5)
+        if restore_options.auto_consumer_groups && restore_options.consumer_groups.is_empty() {
+            match self.load_auto_consumer_groups().await {
+                Ok(groups) => {
+                    info!(
+                        "auto_consumer_groups: loaded {} groups from snapshot",
+                        groups.len()
+                    );
+                    restore_options.consumer_groups = groups;
+                    restore_options.reset_consumer_offsets = true;
+                }
+                Err(e) => {
+                    warn!(
+                        "auto_consumer_groups: failed to load snapshot ({}); continuing without group reset",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Purge target topics before restore if requested (Issue #67 bug 10)
+        if restore_options.purge_topics {
+            self.purge_topics_before_restore(&topics_to_restore, &restore_options)
+                .await?;
+        }
+
         info!("Restoring {} topics", topics_to_restore.len());
 
         let mut shutdown_rx = self.shutdown_receiver();
@@ -600,6 +626,108 @@ impl RestoreEngine {
             errors,
             offset_mapping,
         })
+    }
+
+    /// Load consumer group IDs from the snapshot written by `snapshot_consumer_groups()`.
+    ///
+    /// Reads `{backup_id}/consumer-groups-snapshot.json`. Returns an error when the
+    /// file is absent so the caller can treat it as a non-fatal warning.
+    async fn load_auto_consumer_groups(&self) -> Result<Vec<String>> {
+        let key = format!("{}/consumer-groups-snapshot.json", self.config.backup_id);
+        let data = self.storage.get(&key).await.map_err(|e| {
+            Error::BackupNotFound(format!(
+                "consumer-groups-snapshot.json not found at '{}': {}",
+                key, e
+            ))
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct Snapshot {
+            groups: Vec<GroupEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GroupEntry {
+            group_id: String,
+        }
+
+        let snapshot: Snapshot = serde_json::from_slice(&data)?;
+        Ok(snapshot.groups.into_iter().map(|g| g.group_id).collect())
+    }
+
+    /// Purge target topics before restore by advancing log-start-offset to the current end.
+    ///
+    /// Uses the `DeleteRecords` API so the topic resource is preserved — required for
+    /// Strimzi-managed topics (Issue #67 bug 10).
+    async fn purge_topics_before_restore(
+        &self,
+        topics_to_restore: &[TopicBackup],
+        restore_options: &RestoreOptions,
+    ) -> Result<()> {
+        let router = {
+            let guard = self.router.read().await;
+            guard
+                .as_ref()
+                .ok_or_else(|| Error::Config("Router not initialized".to_string()))?
+                .clone()
+        };
+
+        info!(
+            "Purging {} topics before restore (DeleteRecords to log-start-offset=end)",
+            topics_to_restore.len()
+        );
+
+        for topic_backup in topics_to_restore {
+            let target_name = restore_options
+                .topic_mapping
+                .get(&topic_backup.name)
+                .cloned()
+                .unwrap_or_else(|| topic_backup.name.clone());
+
+            let partition_count = topic_backup
+                .original_partition_count
+                .unwrap_or_else(|| {
+                    topic_backup
+                        .partitions
+                        .iter()
+                        .map(|p| p.partition_id)
+                        .max()
+                        .map(|m| m + 1)
+                        .unwrap_or(0)
+                });
+
+            let mut to_purge: Vec<(i32, i64)> = Vec::new();
+            for pid in 0..partition_count {
+                match router.get_offsets(&target_name, pid).await {
+                    Ok((_earliest, latest)) => {
+                        if latest > 0 {
+                            to_purge.push((pid, latest));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not get offsets for {}[{}], skipping purge: {}",
+                            target_name, pid, e
+                        );
+                    }
+                }
+            }
+
+            if to_purge.is_empty() {
+                debug!("Topic {} is already empty, nothing to purge", target_name);
+                continue;
+            }
+
+            router
+                .delete_records(&target_name, &to_purge, 30_000)
+                .await?;
+            info!(
+                "Purged topic {} ({} partitions)",
+                target_name,
+                to_purge.len()
+            );
+        }
+
+        Ok(())
     }
 
     /// Load the backup manifest from storage

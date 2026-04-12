@@ -431,6 +431,17 @@ pub struct BackupOptions {
     /// Default: 100ms (was hardcoded to 1000ms)
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+
+    /// Snapshot consumer group offsets to storage after each backup cycle.
+    ///
+    /// When `true`, the backup engine queries every broker for consumer groups,
+    /// fetches their committed offsets, filters to groups with offsets on
+    /// backed-up topics, and writes `{backup_id}/consumer-groups-snapshot.json`.
+    ///
+    /// This file is consumed by `auto_consumer_groups: true` at restore time.
+    /// Default: `false` — opt in explicitly to avoid unexpected overhead.
+    #[serde(default)]
+    pub consumer_group_snapshot: bool,
 }
 
 fn default_include_offset_headers() -> bool {
@@ -463,6 +474,7 @@ impl Default for BackupOptions {
             stop_at_current_offsets: false,
             max_concurrent_partitions: default_backup_max_concurrent_partitions(),
             poll_interval_ms: default_poll_interval_ms(),
+            consumer_group_snapshot: false,
         }
     }
 }
@@ -665,6 +677,30 @@ pub struct RestoreOptions {
     /// Mutually exclusive with `partition_mapping`.
     #[serde(default)]
     pub repartitioning: std::collections::HashMap<String, TopicRepartitioning>,
+
+    /// Purge target topics before restoring by advancing each partition's
+    /// log-start-offset to its current end-offset via the `DeleteRecords` API.
+    ///
+    /// This makes the topic appear empty without deleting it — required for
+    /// Strimzi-managed topics which cannot be deleted and recreated via the
+    /// standard Kafka admin API.
+    ///
+    /// **Irreversible.** Default: `false`.
+    #[serde(default)]
+    pub purge_topics: bool,
+
+    /// Automatically load the consumer-groups snapshot written by the backup
+    /// engine (or the `snapshot-groups` command) and use it to populate
+    /// `consumer_groups` before starting the restore.
+    ///
+    /// The snapshot is read from `{backup_id}/consumer-groups-snapshot.json`
+    /// in the configured storage backend. When the file is absent the option
+    /// is silently ignored and the restore continues without offset reset.
+    ///
+    /// Setting this also enables `reset_consumer_offsets` automatically.
+    /// Default: `false`.
+    #[serde(default)]
+    pub auto_consumer_groups: bool,
 }
 
 fn default_max_concurrent_partitions() -> usize {
