@@ -570,7 +570,7 @@ pub enum OffsetStrategy {
 }
 
 /// Restore-specific options
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOptions {
     /// Time window start (epoch milliseconds) for PITR
     #[serde(default)]
@@ -701,6 +701,41 @@ pub struct RestoreOptions {
     /// Default: `false`.
     #[serde(default)]
     pub auto_consumer_groups: bool,
+}
+
+/// Hand-written `Default` so that `RestoreOptions::default()` in Rust code
+/// matches the serde defaults used when deserialising from YAML — the derived
+/// `Default` would give `0` for all numeric fields, which breaks callers that
+/// do `RestoreOptions { field: value, ..RestoreOptions::default() }`.
+impl Default for RestoreOptions {
+    fn default() -> Self {
+        Self {
+            time_window_start: None,
+            time_window_end: None,
+            source_partitions: None,
+            partition_mapping: Default::default(),
+            topic_mapping: Default::default(),
+            consumer_group_strategy: OffsetStrategy::default(),
+            dry_run: false,
+            include_original_offset_header: false,
+            rate_limit_records_per_sec: None,
+            rate_limit_bytes_per_sec: None,
+            max_concurrent_partitions: default_max_concurrent_partitions(),
+            produce_batch_size: default_produce_batch_size(),
+            produce_acks: default_produce_acks(),
+            produce_timeout_ms: default_produce_timeout_ms(),
+            checkpoint_state: None,
+            checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
+            consumer_groups: Vec::new(),
+            reset_consumer_offsets: false,
+            offset_report: None,
+            create_topics: false,
+            default_replication_factor: None,
+            repartitioning: Default::default(),
+            purge_topics: false,
+            auto_consumer_groups: false,
+        }
+    }
 }
 
 fn default_max_concurrent_partitions() -> usize {
