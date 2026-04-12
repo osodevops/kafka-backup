@@ -403,7 +403,13 @@ async fn run_writer(
             .sum();
 
         match router
-            .produce(target_topic, target_partition, batch.clone())
+            .produce(
+                target_topic,
+                target_partition,
+                batch.clone(),
+                options.produce_acks,
+                options.produce_timeout_ms,
+            )
             .await
         {
             Ok(_) => {

@@ -110,7 +110,7 @@ impl KafkaTestCluster {
         for (i, record) in records.iter().enumerate() {
             let partition = (i % 3) as i32; // Distribute across partitions
             client
-                .produce(topic, partition, vec![record.clone()])
+                .produce(topic, partition, vec![record.clone()], -1, 30_000)
                 .await?;
         }
 

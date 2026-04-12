@@ -235,7 +235,7 @@ async fn test_backup_and_restore() {
     client.connect().await.expect("Failed to connect");
     for record in &test_records {
         client
-            .produce(test_topic, 0, vec![record.clone()])
+            .produce(test_topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }
@@ -313,7 +313,7 @@ async fn test_backup_compression() {
     client.connect().await.expect("Failed to connect");
     for record in &test_records {
         client
-            .produce(test_topic, 0, vec![record.clone()])
+            .produce(test_topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }
@@ -413,7 +413,7 @@ async fn test_bulk_offset_reset_parallel() {
         let records = generate_test_records(10, topic);
         for record in &records {
             client
-                .produce(topic, 0, vec![record.clone()])
+                .produce(topic, 0, vec![record.clone()], -1, 30_000)
                 .await
                 .expect("Failed to produce record");
         }
@@ -477,7 +477,7 @@ async fn test_bulk_offset_reset_performance() {
     let records = generate_test_records(10, topic);
     for record in &records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }
@@ -571,7 +571,7 @@ async fn test_bulk_offset_reset_metrics() {
     let records = generate_test_records(5, topic);
     for record in &records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }
@@ -636,7 +636,7 @@ async fn test_offset_snapshot_creation() {
     let records = generate_test_records(20, topic);
     for record in &records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }
@@ -773,7 +773,7 @@ async fn test_offset_rollback() {
     let records = generate_test_records(50, topic);
     for record in &records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce record");
     }

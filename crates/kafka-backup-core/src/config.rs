@@ -608,6 +608,26 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_batch_size")]
     pub produce_batch_size: usize,
 
+    /// Producer acknowledgement level sent to the broker.
+    ///
+    /// - `-1` (default): wait for all in-sync replicas — highest durability.
+    /// - `1`: wait for the partition leader only — lower latency on clusters with
+    ///   lagging replicas at the cost of reduced durability.
+    /// - `0`: fire-and-forget — fastest but no delivery guarantee.
+    ///
+    /// Change from `-1` only when restore speed is critical and the cluster
+    /// replication factor is known to be > 1 (Issue #67 bug 9).
+    #[serde(default = "default_produce_acks")]
+    pub produce_acks: i16,
+
+    /// Broker-side produce timeout in milliseconds (default: 30 000).
+    ///
+    /// The broker waits up to this duration for the required acks before
+    /// returning REQUEST_TIMED_OUT. The client-side socket timeout
+    /// (RESPONSE_TIMEOUT_SECS = 10 s) is a hard ceiling regardless.
+    #[serde(default = "default_produce_timeout_ms")]
+    pub produce_timeout_ms: i32,
+
     /// Checkpoint state file path for resumable restores
     #[serde(default)]
     pub checkpoint_state: Option<std::path::PathBuf>,
@@ -653,6 +673,14 @@ fn default_max_concurrent_partitions() -> usize {
 
 fn default_produce_batch_size() -> usize {
     1000
+}
+
+fn default_produce_acks() -> i16 {
+    -1 // acks=all — highest durability (safe default)
+}
+
+fn default_produce_timeout_ms() -> i32 {
+    30_000 // 30 seconds, matching the previous hardcoded value
 }
 
 fn default_restore_checkpoint_interval_secs() -> u64 {
@@ -873,6 +901,8 @@ connection:
         RestoreOptions {
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_acks: default_produce_acks(),
+            produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
             ..RestoreOptions::default()
         }

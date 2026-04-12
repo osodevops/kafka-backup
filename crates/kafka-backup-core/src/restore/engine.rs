@@ -1144,7 +1144,13 @@ impl RestorePartitionContext {
                 // Produce using router (automatically routes to partition leader)
                 match self
                     .router
-                    .produce(&self.target_topic, self.target_partition, batch.to_vec())
+                    .produce(
+                        &self.target_topic,
+                        self.target_partition,
+                        batch.to_vec(),
+                        self.options.produce_acks,
+                        self.options.produce_timeout_ms,
+                    )
                     .await
                 {
                     Ok(produce_response) => {

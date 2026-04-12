@@ -454,11 +454,13 @@ impl PartitionLeaderRouter {
         topic: &str,
         partition: i32,
         records: Vec<BackupRecord>,
+        acks: i16,
+        timeout_ms: i32,
     ) -> Result<ProduceResponse> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
 
         // First attempt — no clone yet
-        let err = match self.produce_internal(topic, partition, &records).await {
+        let err = match self.produce_internal(topic, partition, &records, acks, timeout_ms).await {
             Ok(response) => return Ok(response),
             Err(e) if is_not_leader_error(&e) => {
                 warn!(
@@ -467,7 +469,7 @@ impl PartitionLeaderRouter {
                 );
                 self.refresh_partition_leader(topic, partition).await?;
                 self.clear_connection_cache().await;
-                match self.produce_internal(topic, partition, &records).await {
+                match self.produce_internal(topic, partition, &records, acks, timeout_ms).await {
                     Ok(response) => return Ok(response),
                     Err(e) if !is_connection_error(&e) => return Err(e),
                     Err(e) => {
@@ -501,7 +503,10 @@ impl PartitionLeaderRouter {
             );
             tokio::time::sleep(backoff).await;
 
-            match self.produce_internal(topic, partition, &records).await {
+            match self
+                .produce_internal(topic, partition, &records, acks, timeout_ms)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) if is_connection_error(&e) => {
                     self.clear_connection_cache().await;
@@ -523,9 +528,13 @@ impl PartitionLeaderRouter {
         topic: &str,
         partition: i32,
         records: &[BackupRecord],
+        acks: i16,
+        timeout_ms: i32,
     ) -> Result<ProduceResponse> {
         let client = self.get_leader_client(topic, partition).await?;
-        client.produce(topic, partition, records.to_vec()).await
+        client
+            .produce(topic, partition, records.to_vec(), acks, timeout_ms)
+            .await
     }
 
     /// Clear the connection cache (useful after metadata refresh).

@@ -110,6 +110,8 @@ pub async fn produce(
     topic: &str,
     partition: i32,
     records: Vec<BackupRecord>,
+    acks: i16,
+    timeout_ms: i32,
 ) -> Result<ProduceResponse> {
     if records.is_empty() {
         return Ok(ProduceResponse {
@@ -162,8 +164,8 @@ pub async fn produce(
             .with_partition_data(vec![partition_data]);
 
         let request = ProduceRequest::default()
-            .with_acks(-1) // Wait for all replicas
-            .with_timeout_ms(30000)
+            .with_acks(acks)
+            .with_timeout_ms(timeout_ms)
             .with_topic_data(vec![topic_data]);
 
         let response: KafkaProduceResponse = client.send_request(ApiKey::Produce, request).await?;

@@ -242,7 +242,7 @@ async fn test_snapshot_backup_captures_hwm_at_start() {
     let new_records = generate_test_records(additional_records, topic);
     for record in new_records {
         client
-            .produce(topic, 0, vec![record])
+            .produce(topic, 0, vec![record], -1, 30_000)
             .await
             .expect("Failed to produce");
     }

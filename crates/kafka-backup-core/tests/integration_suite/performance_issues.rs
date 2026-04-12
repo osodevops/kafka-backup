@@ -150,7 +150,7 @@ async fn test_continuous_backup_constant_lag_issue() {
     let initial_records = generate_test_records(100, topic);
     for record in &initial_records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce");
     }
@@ -209,7 +209,7 @@ async fn test_continuous_backup_constant_lag_issue() {
     while start.elapsed() < Duration::from_secs(test_duration_secs) {
         let record = generate_test_records(1, topic).pop().unwrap();
         producer_client
-            .produce(topic, 0, vec![record])
+            .produce(topic, 0, vec![record], -1, 30_000)
             .await
             .expect("Failed to produce");
         records_produced += 1;
@@ -333,7 +333,7 @@ async fn test_unbounded_parallelism_throughput() {
         for (i, record) in records.iter().enumerate() {
             let partition = (i % partitions_per_topic as usize) as i32;
             client
-                .produce(topic, partition, vec![record.clone()])
+                .produce(topic, partition, vec![record.clone()], -1, 30_000)
                 .await
                 .expect("Failed to produce");
         }
@@ -439,7 +439,7 @@ async fn test_measure_backup_loop_frequency() {
     let records = generate_test_records(10, topic);
     for record in &records {
         client
-            .produce(topic, 0, vec![record.clone()])
+            .produce(topic, 0, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce");
     }
@@ -535,7 +535,7 @@ async fn test_snapshot_vs_continuous_lag_comparison() {
     for (i, record) in records.iter().enumerate() {
         let partition = (i % 3) as i32;
         client
-            .produce(topic, partition, vec![record.clone()])
+            .produce(topic, partition, vec![record.clone()], -1, 30_000)
             .await
             .expect("Failed to produce");
     }
