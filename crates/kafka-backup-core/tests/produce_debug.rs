@@ -32,7 +32,7 @@ async fn test_produce_with_no_constants() {
     let client = KafkaClient::new(test_config());
     client.connect().await.expect("Failed to connect");
 
-    let records = vec![Record {
+    let records = [Record {
         transactional: false,
         control: false,
         partition_leader_epoch: NO_PARTITION_LEADER_EPOCH, // -1
@@ -79,7 +79,7 @@ async fn test_produce_with_zero_epoch() {
     client.connect().await.expect("Failed to connect");
 
     let now = chrono::Utc::now().timestamp_millis();
-    let records = vec![
+    let records = [
         Record {
             transactional: false,
             control: false,
@@ -207,7 +207,7 @@ async fn test_batch_sequence_fix() {
             producer_epoch: NO_PRODUCER_EPOCH,
             timestamp_type: TimestampType::Creation,
             offset: i as i64,
-            sequence: i as i32, // matches offset
+            sequence: i, // matches offset
             timestamp: now + i as i64,
             key: Some(Bytes::from(format!("key-{}", i))),
             value: Some(Bytes::from(format!("val-{}", i))),
@@ -340,13 +340,17 @@ async fn test_produce_from_backup_segment() {
         "\n--- Test 4c: All {} records from backup ---",
         backup_records.len()
     );
-    let result = client.produce("orders", 0, backup_records.clone(), -1, 30_000).await;
+    let result = client
+        .produce("orders", 0, backup_records.clone(), -1, 30_000)
+        .await;
     println!("All records produce: {:?}", result);
 
     // Test 4d: produce to the target topic orders-restored
     println!("\n--- Test 4d: Produce to orders-restored ---");
     let single = vec![backup_records[0].clone()];
-    let result = client.produce("orders-restored", 0, single, -1, 30_000).await;
+    let result = client
+        .produce("orders-restored", 0, single, -1, 30_000)
+        .await;
     println!("Produce to orders-restored: {:?}", result);
 }
 
