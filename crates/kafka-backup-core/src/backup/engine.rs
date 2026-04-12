@@ -515,14 +515,40 @@ impl BackupEngine {
         Ok(selected)
     }
 
-    /// Save the manifest to storage
+    /// Save the manifest to storage, merging with any existing manifest.
+    ///
+    /// Continuous backups and restarts both produce a fresh in-memory manifest that
+    /// only contains topics active in the current session. Without merging, topics
+    /// with no new data in this session would be silently dropped from the stored
+    /// manifest on the next write (Issue #67 bug 2).
+    ///
+    /// The merge is a union: topics/partitions/segments from the stored manifest are
+    /// preserved and new entries from the current session are appended. Duplicate
+    /// segments (same key or same start_offset) are deduplicated — the stored entry
+    /// wins on conflict.
     async fn save_manifest(&self) -> Result<()> {
-        let manifest = self.manifest.lock().await;
-        let manifest_json = serde_json::to_string_pretty(&*manifest)?;
+        let current = self.manifest.lock().await.clone();
         let key = format!("{}/manifest.json", self.config.backup_id);
 
+        // Load existing manifest and merge; fall back to current-only on any error
+        let merged = match self.storage.get(&key).await {
+            Ok(data) => match serde_json::from_slice::<BackupManifest>(&data) {
+                Ok(existing) => merge_manifests(existing, current),
+                Err(e) => {
+                    warn!("Existing manifest is unparseable, overwriting: {}", e);
+                    current
+                }
+            },
+            Err(_) => current, // First run — no manifest yet
+        };
+
+        let manifest_json = serde_json::to_string_pretty(&merged)?;
         self.storage.put(&key, Bytes::from(manifest_json)).await?;
-        debug!("Saved manifest to {}", key);
+        debug!(
+            "Saved manifest to {} ({} topics)",
+            key,
+            merged.topics.len()
+        );
 
         Ok(())
     }
@@ -863,6 +889,59 @@ impl BackupPartitionContext {
 
         Ok((fetch_response.records, fetch_response.next_offset))
     }
+}
+
+/// Merge two backup manifests, performing a union of topics/partitions/segments.
+///
+/// Rules:
+/// - Topics only in `existing` — preserved as-is (covers inactive topics from prior sessions)
+/// - Topics only in `current`  — appended
+/// - Topics in both            — partitions are merged recursively:
+///   - `original_partition_count` updated from `current` when present
+///   - Partitions only in existing → preserved
+///   - Partitions only in current  → appended
+///   - Partitions in both: segments deduplicated by (key, start_offset); existing wins on
+///     conflict. Output sorted by start_offset.
+fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> BackupManifest {
+    use std::collections::HashMap as HM;
+
+    for cur_topic in current.topics {
+        if let Some(ex_topic) = existing.topics.iter_mut().find(|t| t.name == cur_topic.name) {
+            // Update partition count when the current session has fresh metadata
+            if cur_topic.original_partition_count.is_some() {
+                ex_topic.original_partition_count = cur_topic.original_partition_count;
+            }
+            for cur_part in cur_topic.partitions {
+                if let Some(ex_part) = ex_topic
+                    .partitions
+                    .iter_mut()
+                    .find(|p| p.partition_id == cur_part.partition_id)
+                {
+                    // Merge segments: deduplicate by key and start_offset; existing wins
+                    let mut seen_keys: HM<String, ()> =
+                        ex_part.segments.iter().map(|s| (s.key.clone(), ())).collect();
+                    let mut seen_offsets: HM<i64, ()> =
+                        ex_part.segments.iter().map(|s| (s.start_offset, ())).collect();
+                    for seg in cur_part.segments {
+                        if !seen_keys.contains_key(&seg.key)
+                            && !seen_offsets.contains_key(&seg.start_offset)
+                        {
+                            seen_keys.insert(seg.key.clone(), ());
+                            seen_offsets.insert(seg.start_offset, ());
+                            ex_part.segments.push(seg);
+                        }
+                    }
+                    ex_part.segments.sort_by_key(|s| s.start_offset);
+                } else {
+                    ex_topic.partitions.push(cur_part);
+                }
+            }
+        } else {
+            existing.topics.push(cur_topic);
+        }
+    }
+
+    existing
 }
 
 /// Simple glob pattern matching (supports * and ?)
