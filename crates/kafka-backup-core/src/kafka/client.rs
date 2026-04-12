@@ -19,12 +19,12 @@ use tracing::{debug, trace, warn};
 
 /// Client-side deadline for writing a request to the broker socket.
 /// If the broker's receive buffer is full for this long, something is wrong.
-const WRITE_TIMEOUT_SECS: u64 = 10;
+pub const WRITE_TIMEOUT_SECS: u64 = 10;
 
 /// Client-side deadline for receiving a broker response.
 /// A healthy broker with acks=1 responds in <100ms; 10s is very generous.
 /// Must be kept larger than produce_timeout_ms to avoid false positives.
-const RESPONSE_TIMEOUT_SECS: u64 = 10;
+pub const RESPONSE_TIMEOUT_SECS: u64 = 10;
 
 use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
@@ -393,6 +393,11 @@ impl KafkaClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Public wrapper for integration tests that verify timeout classification.
+    pub fn is_connection_error_pub(error: &crate::Error) -> bool {
+        Self::is_connection_error(error)
     }
 
     /// Check if an error is a connection-level error that warrants reconnection.

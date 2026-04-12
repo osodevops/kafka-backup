@@ -719,6 +719,16 @@ fn default_produce_timeout_ms() -> i32 {
     30_000 // 30 seconds, matching the previous hardcoded value
 }
 
+/// Public accessor for integration tests that assert the default acks value.
+pub fn default_produce_acks_pub() -> i16 {
+    default_produce_acks()
+}
+
+/// Public accessor for integration tests that assert the default timeout value.
+pub fn default_produce_timeout_ms_pub() -> i32 {
+    default_produce_timeout_ms()
+}
+
 fn default_restore_checkpoint_interval_secs() -> u64 {
     60
 }
