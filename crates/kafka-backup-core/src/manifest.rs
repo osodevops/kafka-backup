@@ -45,6 +45,7 @@ impl BackupManifest {
         if !self.topics.iter().any(|t| t.name == name) {
             self.topics.push(TopicBackup {
                 name: name.to_string(),
+                original_partition_count: None,
                 partitions: Vec::new(),
             });
         }
@@ -76,6 +77,16 @@ impl BackupManifest {
 pub struct TopicBackup {
     /// Topic name
     pub name: String,
+
+    /// Original number of partitions in the source topic.
+    ///
+    /// Stored at backup time from Kafka metadata so that restore can recreate
+    /// the topic with the correct partition count even when some partitions
+    /// hold no data and are therefore absent from `partitions`.
+    /// Old manifests that lack this field deserialize as `None`, and the
+    /// restore engine falls back to `max(partition_id) + 1`.
+    #[serde(default)]
+    pub original_partition_count: Option<i32>,
 
     /// Partitions in this topic
     pub partitions: Vec<PartitionBackup>,

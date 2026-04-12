@@ -272,6 +272,15 @@ impl BackupEngine {
                     .map(|p| p.partition_id)
                     .collect();
 
+                // Record the real partition count from Kafka metadata so restore can
+                // recreate the topic correctly even when some partitions are empty
+                // and therefore have no segments in the manifest (Issue #67 bug 4).
+                {
+                    let mut manifest = self.manifest.lock().await;
+                    let topic_entry = manifest.get_or_create_topic(topic);
+                    topic_entry.original_partition_count = Some(partitions.len() as i32);
+                }
+
                 // Spawn a task for each partition (limited by semaphore)
                 // NOTE: The semaphore is acquired INSIDE the spawned task, not before
                 // spawning. This allows all tasks to be spawned immediately and queued,

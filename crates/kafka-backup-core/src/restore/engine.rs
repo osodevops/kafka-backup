@@ -876,9 +876,13 @@ impl RestoreEngine {
                 .unwrap_or_else(|| topic_backup.name.clone());
 
             // Use repartitioning target_partitions when configured,
-            // otherwise fall back to source partition count
+            // otherwise use the original partition count stored at backup time,
+            // falling back to max(partition_id)+1 for older backups that lack
+            // the original_partition_count field (Issue #67 bug 4).
             let partition_count = if let Some(repart) = options.repartitioning.get(&target_name) {
                 repart.target_partitions
+            } else if let Some(count) = topic_backup.original_partition_count {
+                count
             } else {
                 topic_backup
                     .partitions
