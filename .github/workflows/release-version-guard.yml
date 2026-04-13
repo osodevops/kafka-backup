@@ -1,0 +1,50 @@
+name: Release Version Guard
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  require-version-bump:
+    name: Require release version bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify release version bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            if ! git cat-file -e "${BASE_REF}^{commit}" 2> /dev/null; then
+              git fetch --no-tags origin "$BASE_REF"
+            fi
+          else
+            BASE_REF="${{ github.event.before }}"
+            if [[ "$BASE_REF" =~ ^0+$ ]]; then
+              BASE_REF="$(git rev-list --max-parents=0 HEAD | head -n1)"
+            fi
+          fi
+
+          git diff --name-only "$BASE_REF"...HEAD > changed-files.txt
+          cat changed-files.txt
+
+          if ! grep -Eq '^(crates/|Cargo\.toml$|Cargo\.lock$|Dockerfile$)' changed-files.txt; then
+            echo "No release-impacting changes detected; version bump not required."
+            exit 0
+          fi
+
+          python3 scripts/ci/check-release-version.py \
+            --base-ref "$BASE_REF" \
+            --mode guard \
+            --event-name "${{ github.event_name }}"

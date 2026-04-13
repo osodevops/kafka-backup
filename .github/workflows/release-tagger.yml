@@ -1,0 +1,66 @@
+name: Release Tagger
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'Dockerfile'
+
+jobs:
+  tag-release:
+    name: Tag release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_REF="${{ github.event.before }}"
+          if [[ "$BASE_REF" =~ ^0+$ ]]; then
+            BASE_REF="$(git rev-list --max-parents=0 HEAD | head -n1)"
+          fi
+
+          python3 scripts/ci/check-release-version.py \
+            --base-ref "$BASE_REF" \
+            --mode tagger \
+            --event-name "${{ github.event_name }}"
+
+      - name: Create release tag
+        if: ${{ env.VERSION_CHANGED == 'true' }}
+        shell: bash
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}" > /dev/null; then
+            TAG_COMMIT="$(git rev-list -n 1 "${RELEASE_TAG}")"
+            if [[ "$TAG_COMMIT" == "${GITHUB_SHA}" ]]; then
+              echo "${RELEASE_TAG} already points at ${GITHUB_SHA}; nothing to do."
+              exit 0
+            fi
+
+            echo "::error::${RELEASE_TAG} already exists at ${TAG_COMMIT}; refusing to retag ${GITHUB_SHA}."
+            exit 1
+          fi
+
+          if [[ -z "${RELEASE_PAT}" ]]; then
+            echo "::error::RELEASE_PAT is required so the tag push triggers the Release workflow."
+            exit 1
+          fi
+
+          git tag "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git remote set-url origin "https://x-access-token:${RELEASE_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "refs/tags/${RELEASE_TAG}"
