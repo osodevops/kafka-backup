@@ -39,6 +39,7 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
+  workflow_dispatch:
   pull_request:
   push:
     tags:
@@ -96,9 +97,9 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ !github.event.pull_request && github.ref_type == 'tag' && github.ref_name || '' }}
+      tag-flag: ${{ !github.event.pull_request && github.ref_type == 'tag' && format('--tag={0}', github.ref_name) || '' }}
+      publishing: ${{ !github.event.pull_request && github.ref_type == 'tag' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -123,7 +124,7 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ (!github.event.pull_request && github.ref_type == 'tag' && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
