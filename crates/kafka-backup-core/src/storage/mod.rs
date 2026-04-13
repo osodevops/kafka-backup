@@ -51,7 +51,6 @@ pub fn create_backend_from_config(
             endpoint,
             access_key,
             secret_key,
-            session_token,
             prefix,
             path_style: _,
             allow_http,
@@ -62,7 +61,6 @@ pub fn create_backend_from_config(
                 endpoint: endpoint.clone(),
                 access_key_id: access_key.clone(),
                 secret_access_key: secret_key.clone(),
-                session_token: session_token.clone(),
                 prefix: prefix.clone(),
                 allow_http: *allow_http,
             };
@@ -157,7 +155,6 @@ pub fn create_backend_legacy(
                 endpoint: config.endpoint.clone(),
                 access_key_id: config.access_key.clone(),
                 secret_access_key: config.secret_key.clone(),
-                session_token: None,
                 prefix: config.prefix.clone(),
                 allow_http: config
                     .endpoint
