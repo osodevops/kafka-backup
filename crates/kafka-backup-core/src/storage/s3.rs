@@ -25,6 +25,8 @@ pub struct S3Config {
     pub access_key_id: Option<String>,
     /// Secret access key
     pub secret_access_key: Option<String>,
+    /// Session token for temporary credentials (STS)
+    pub session_token: Option<String>,
     /// Key prefix for all operations
     pub prefix: Option<String>,
     /// Allow HTTP (insecure) connections
@@ -39,6 +41,7 @@ impl Default for S3Config {
             endpoint: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
             prefix: None,
             allow_http: false,
         }
@@ -72,6 +75,10 @@ impl S3Backend {
 
         if let Some(secret_key) = &config.secret_access_key {
             builder = builder.with_secret_access_key(secret_key);
+        }
+
+        if let Some(token) = &config.session_token {
+            builder = builder.with_token(token);
         }
 
         if config.allow_http {
@@ -254,6 +261,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             access_key_id: Some("minioadmin".to_string()),
             secret_access_key: Some("minioadmin".to_string()),
+            session_token: None,
             allow_http: true,
             ..Default::default()
         };
