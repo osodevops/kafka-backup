@@ -31,6 +31,9 @@ pub enum StorageBackendConfig {
         /// Secret access key (falls back to AWS_SECRET_ACCESS_KEY env var)
         #[serde(default)]
         secret_key: Option<String>,
+        /// Session token for temporary credentials (STS). Falls back to AWS_SESSION_TOKEN env var.
+        #[serde(default)]
+        session_token: Option<String>,
         /// Key prefix for all operations
         #[serde(default)]
         prefix: Option<String>,
@@ -143,6 +146,7 @@ impl StorageBackendConfig {
                     endpoint,
                     access_key: std::env::var("AWS_ACCESS_KEY_ID").ok(),
                     secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+                    session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
                     prefix: None,
                     path_style,
                     allow_http: false,
@@ -267,6 +271,51 @@ allow_http: true
                 assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
                 assert!(path_style);
                 assert!(allow_http);
+            }
+            _ => panic!("Expected S3 config"),
+        }
+    }
+
+    #[test]
+    fn test_yaml_deserialization_s3_with_session_token() {
+        let yaml = r#"
+backend: s3
+bucket: kafka-backups
+region: us-east-1
+access_key: AKIAIOSFODNN7EXAMPLE
+secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+session_token: FwoGZXIvYXdzEBYaDHqa0AP
+"#;
+        let config: StorageBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            StorageBackendConfig::S3 {
+                bucket,
+                session_token,
+                ..
+            } => {
+                assert_eq!(bucket, "kafka-backups");
+                assert_eq!(
+                    session_token,
+                    Some("FwoGZXIvYXdzEBYaDHqa0AP".to_string())
+                );
+            }
+            _ => panic!("Expected S3 config"),
+        }
+    }
+
+    #[test]
+    fn test_yaml_deserialization_s3_without_session_token() {
+        let yaml = r#"
+backend: s3
+bucket: kafka-backups
+region: us-east-1
+"#;
+        let config: StorageBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            StorageBackendConfig::S3 {
+                session_token, ..
+            } => {
+                assert_eq!(session_token, None);
             }
             _ => panic!("Expected S3 config"),
         }
