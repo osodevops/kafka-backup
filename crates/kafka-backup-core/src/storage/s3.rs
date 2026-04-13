@@ -54,7 +54,7 @@ pub struct S3Backend {
 impl S3Backend {
     /// Create a new S3 backend
     pub fn new(config: S3Config) -> Result<Self> {
-        let mut builder = AmazonS3Builder::new().with_bucket_name(&config.bucket);
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.bucket);
 
         if let Some(region) = &config.region {
             builder = builder.with_region(region);
