@@ -214,7 +214,7 @@ self.storage.put(&key, ...).await?;
 
 // After (skip write if empty)
 if snapshot_groups.is_empty() {
-    debug!("No groups with committed offsets, keeping existing snapshot");
+    debug!("Consumer group snapshot: no groups with committed offsets on backed topics, keeping existing snapshot");
     return Ok(());
 }
 let snapshot = Snapshot { snapshot_time: ..., groups: snapshot_groups };
@@ -226,3 +226,44 @@ self.storage.put(&key, ...).await?;
 - No behaviour change when groups are present (normal operation)
 - Protects the snapshot across pod restarts during DR / upgrade sequences
 - **Correct restore order**: snapshot is captured while apps are live → kafka-backup can restart freely → restore runs → apps start and find their offsets already reset
+
+---
+
+## Fix 5 — Consumer group snapshot incomplete on multi-broker clusters (NOT_COORDINATOR)
+
+**Status:** Implemented — commit on `fix/auto-consumer-groups-phase3`  
+**Affected upstream version:** ≤ v0.11.4 (commit `91cedda`)
+
+### Root cause
+
+`snapshot_consumer_groups()` calls `list_groups_all_brokers()` to enumerate all groups (per-broker, Issue #67 bug #6), but then calls `fetch_offsets(bootstrap_client, group_id)` for **every group** through the **same bootstrap broker**.
+
+In Kafka / KRaft, `OffsetFetch` must be routed to the **group coordinator** — the specific broker assigned as coordinator for that group. If the request arrives at a non-coordinator broker, it responds with error `NOT_COORDINATOR` (error 16) or returns empty offsets. The code silently `continue`s on error, so groups coordinated by non-bootstrap brokers are dropped from the snapshot.
+
+**Example on a 3-broker cluster:**
+
+| Group | Coordinator | Bootstrap | In snapshot |
+|-------|-------------|-----------|-------------|
+| `app-service` | 2 | 2 | ✅ captured |
+| `app-jobs` | 0 | 2 | ❌ missing |
+| `app-workers` | 0 | 2 | ❌ missing |
+| `app-consumers` | 1 | 2 | ❌ missing |
+
+Only `app-service` (whose coordinator = bootstrap broker 2) appeared in the snapshot.
+
+### Fix
+
+Add `fetch_group_offsets_all_coordinators()` to `PartitionLeaderRouter`. It iterates every broker, calls `ListGroups` on each (groups returned = groups for which THAT broker is coordinator), then calls `OffsetFetch` on the **same broker** for those groups.
+
+Replace `list_groups_all_brokers()` + `fetch_offsets(bootstrap_client)` in `snapshot_consumer_groups()` with a single call to the new method.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `crates/kafka-backup-core/src/kafka/partition_router.rs` | New method `fetch_group_offsets_all_coordinators()` |
+| `crates/kafka-backup-core/src/backup/engine.rs` | Use `fetch_group_offsets_all_coordinators()`; remove `fetch_offsets` direct call |
+
+### Expected result after fix
+
+All STABLE groups with committed offsets on backed-up topics appear in the snapshot, regardless of which broker is their coordinator.
