@@ -378,6 +378,10 @@ pub struct RestoreReport {
 
     /// Offset mapping (for consumer group reset)
     pub offset_mapping: OffsetMapping,
+
+    /// Consumer groups resolved during restore (includes auto-loaded groups from snapshot)
+    #[serde(default)]
+    pub resolved_consumer_groups: Vec<String>,
 }
 
 /// Per-topic restore report

@@ -131,8 +131,16 @@ impl ThreePhaseRestore {
         }
 
         // Phase 3: Offset Reset (if consumer groups configured)
-        let (offset_reset_plan, offset_reset_report) = if restore_options.reset_consumer_offsets
-            && !restore_options.consumer_groups.is_empty()
+        // Use resolved_consumer_groups which includes auto-loaded groups from snapshot
+        let effective_consumer_groups = if !restore_report.resolved_consumer_groups.is_empty() {
+            restore_report.resolved_consumer_groups.clone()
+        } else {
+            restore_options.consumer_groups.clone()
+        };
+        let effective_reset = restore_options.reset_consumer_offsets
+            || (restore_options.auto_consumer_groups && !effective_consumer_groups.is_empty());
+        let (offset_reset_plan, offset_reset_report) = if effective_reset
+            && !effective_consumer_groups.is_empty()
         {
             info!("Phase 3: Generating and applying offset reset plan...");
 
@@ -144,7 +152,7 @@ impl ThreePhaseRestore {
             let plan = self
                 .generate_offset_reset_plan(
                     &restore_report.offset_mapping,
-                    &restore_options.consumer_groups,
+                    &effective_consumer_groups,
                     strategy,
                 )
                 .await?;
@@ -159,8 +167,9 @@ impl ThreePhaseRestore {
 
             (Some(plan), report)
         } else {
-            if !restore_options.consumer_groups.is_empty()
+            if !effective_consumer_groups.is_empty()
                 && !restore_options.reset_consumer_offsets
+                && !restore_options.auto_consumer_groups
             {
                 warnings.push(
                     "Consumer groups specified but reset_consumer_offsets=false, skipping Phase 3"

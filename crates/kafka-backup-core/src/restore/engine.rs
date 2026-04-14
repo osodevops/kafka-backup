@@ -472,6 +472,7 @@ impl RestoreEngine {
                 throughput_bytes_per_sec: 0.0,
                 errors: dry_run_report.errors,
                 offset_mapping: OffsetMapping::new(),
+                resolved_consumer_groups: Vec::new(),
             });
         }
 
@@ -527,6 +528,7 @@ impl RestoreEngine {
                 throughput_bytes_per_sec: 0.0,
                 errors: Vec::new(),
                 offset_mapping: OffsetMapping::new(),
+                resolved_consumer_groups: Vec::new(),
             });
         }
 
@@ -625,6 +627,7 @@ impl RestoreEngine {
             throughput_bytes_per_sec: 0.0,
             errors,
             offset_mapping,
+            resolved_consumer_groups: restore_options.consumer_groups.clone(),
         })
     }
 
