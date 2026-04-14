@@ -176,3 +176,53 @@ Call `initialize_schema()` after the pool is replaced in `load_from_storage()`. 
 ### Workaround (before rebuild)
 
 Delete `kafka-backup/offsets.db` from object storage when resetting backup data.
+
+---
+
+## Fix 4 — Consumer groups snapshot overwritten with empty list on restart
+
+**Status:** Implemented — commit `695efa4` on `fix/auto-consumer-groups-phase3`  
+**Affected upstream version:** ≤ v0.11.4 (commit `91cedda`)
+
+### Root cause
+
+`snapshot_consumer_groups()` is called at every backup loop iteration with `consumer_group_snapshot: true`. It builds the list of groups with committed offsets for the backed-up topics, then **unconditionally overwrites** `consumer-groups-snapshot.json` in storage — even when the resulting list is empty.
+
+This causes data loss in a common DR / upgrade scenario:
+
+1. Applications run normally → snapshot is populated with real consumer groups ✅
+2. `kafka-backup` pod is deleted/restarted (reinstall, crash, upgrade)
+3. Pod restarts; backup loop begins; **applications are not yet reconnected** (still starting up)
+4. `list_groups_all_brokers()` returns groups, but none have committed offsets on the backed-up topics yet
+5. `snapshot_groups` is empty → snapshot written as `{ "groups": [] }` → **previous valid snapshot is lost** ❌
+6. Restore runs → `auto_consumer_groups` reads the empty snapshot → Phase 3 skipped → **consumer offsets not restored**
+
+### Fix
+
+Skip the `storage.put()` call when `snapshot_groups` is empty. The existing snapshot (if any) is preserved.
+
+#### File changed
+
+| File | Change |
+|------|--------|
+| `crates/kafka-backup-core/src/backup/engine.rs` | Early return in `snapshot_consumer_groups()` when `snapshot_groups.is_empty()` |
+
+```rust
+// Before (always overwrites)
+let snapshot = Snapshot { snapshot_time: ..., groups: snapshot_groups };
+self.storage.put(&key, ...).await?;
+
+// After (skip write if empty)
+if snapshot_groups.is_empty() {
+    debug!("No groups with committed offsets, keeping existing snapshot");
+    return Ok(());
+}
+let snapshot = Snapshot { snapshot_time: ..., groups: snapshot_groups };
+self.storage.put(&key, ...).await?;
+```
+
+### Impact
+
+- No behaviour change when groups are present (normal operation)
+- Protects the snapshot across pod restarts during DR / upgrade sequences
+- **Correct restore order**: snapshot is captured while apps are live → kafka-backup can restart freely → restore runs → apps start and find their offsets already reset
