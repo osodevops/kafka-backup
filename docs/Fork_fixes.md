@@ -99,18 +99,18 @@ let effective_reset = restore_options.reset_consumer_offsets
 
 ## Fix 2 — Validation: `MessageCountCheck` / `OffsetRangeCheck` fail on multi-broker clusters
 
-**Status:** Pending implementation + upstream PR  
+**Status:** Implemented — commit on `fix/auto-consumer-groups-phase3`  
 **Affected upstream version:** ≤ v0.11.4 (commit `91cedda`)
 
 ### Root cause
 
-The `ValidationContext` holds a `KafkaClient` — a single TCP connection to one bootstrap broker. Both `MessageCountCheck` and `OffsetRangeCheck` call `ctx.target_client.get_offsets(topic, partition)`, which sends a `ListOffsets` request to that single broker.
+The `ValidationContext` held a `KafkaClient` — a single TCP connection to one bootstrap broker. Both `MessageCountCheck` and `OffsetRangeCheck` called `ctx.target_client.get_offsets(topic, partition)`, which sent a `ListOffsets` request to that single broker.
 
-In a multi-broker cluster, partition leaders are distributed. When the connected broker is **not** the leader for a given partition, Kafka responds with error code **6 = NOT_LEADER_FOR_PARTITION**. The check treats this as a failure and does not add the partition's count to `total_restored`.
+In a multi-broker cluster, partition leaders are distributed. When the connected broker is **not** the leader for a given partition, Kafka responds with error code **6 = NOT_LEADER_FOR_PARTITION**. The check treated this as a failure and did not add the partition's count to `total_restored`.
 
 On a 3-broker cluster with balanced leadership, ~67% of partitions fail → the validation reports a large fraction of the cluster as "not restored", even after a successful restore.
 
-### Evidence
+### Evidence (before fix)
 
 ```
 [FAILED] MessageCountCheck — 39 topics; 3638 messages expected, 917 restored; 37 discrepancies
@@ -119,12 +119,26 @@ On a 3-broker cluster with balanced leadership, ~67% of partitions fail → the 
 
 The restore itself succeeded (3637 records restored, 0 errors).
 
-### Fix (pending)
+### Fix
 
-Replace `Arc<KafkaClient>` with `Arc<PartitionRouter>` in `ValidationContext`. The `PartitionRouter` already has `get_offsets()` with per-partition leader routing and automatic retry on `NOT_LEADER_FOR_PARTITION`.
+Replace `Arc<KafkaClient>` with `Arc<PartitionLeaderRouter>` in `ValidationContext`. The `PartitionLeaderRouter` already has `get_offsets()` with per-partition leader routing and automatic retry on `NOT_LEADER_FOR_PARTITION`.
 
-Files to change:
-- `crates/kafka-backup-core/src/validation/context.rs` — change field type
-- `crates/kafka-backup-cli/src/commands/validation.rs` — instantiate `PartitionRouter` instead of `KafkaClient`
-- `crates/kafka-backup-core/src/validation/message_count.rs` — update call site
-- `crates/kafka-backup-core/src/validation/offset_range.rs` — update call site
+The `ConsumerGroupOffsetCheck` uses `ListGroups` / `OffsetFetch` which are forwarded by the broker to the group coordinator — no partition-leader routing needed. It accesses the underlying bootstrap client via the new `PartitionLeaderRouter::client()` accessor.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `crates/kafka-backup-core/src/kafka/partition_router.rs` | Added `pub fn client() -> &KafkaClient` accessor |
+| `crates/kafka-backup-core/src/validation/context.rs` | `target_client: Arc<PartitionLeaderRouter>` |
+| `crates/kafka-backup-cli/src/commands/validation.rs` | Instantiate `PartitionLeaderRouter::new(config.target).await?`; remove old `create_kafka_client` helper |
+| `crates/kafka-backup-core/src/validation/consumer_group.rs` | Use `ctx.target_client.client()` for ListGroups / OffsetFetch |
+| `crates/kafka-backup-core/src/validation/message_count.rs` | No change — `get_offsets()` signature identical |
+| `crates/kafka-backup-core/src/validation/offset_range.rs` | No change — `get_offsets()` signature identical |
+
+### Expected result after fix
+
+```
+[PASSED] MessageCountCheck — 39 topics; 3638 messages expected, 3637 restored; 0 discrepancies
+[PASSED] OffsetRangeCheck  — 45 partitions checked; 45 passed; 0 issues
+```

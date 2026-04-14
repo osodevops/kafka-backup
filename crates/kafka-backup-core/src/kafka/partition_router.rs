@@ -81,6 +81,15 @@ impl PartitionLeaderRouter {
         Ok(router)
     }
 
+    /// Returns a reference to the bootstrap KafkaClient.
+    ///
+    /// Useful for operations that do not require partition-leader routing
+    /// (e.g. ListGroups, OffsetFetch for consumer groups) where any broker
+    /// will forward the request to the group coordinator.
+    pub fn client(&self) -> &KafkaClient {
+        &self.bootstrap_client
+    }
+
     /// Refresh cluster metadata and update partition leader mappings.
     ///
     /// This should be called periodically or when a NOT_LEADER_FOR_PARTITION

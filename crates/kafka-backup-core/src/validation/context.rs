@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::kafka::KafkaClient;
+use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::BackupManifest;
 use crate::storage::StorageBackend;
 
@@ -14,8 +14,11 @@ pub struct ValidationContext {
     /// The backup manifest loaded from object storage.
     pub backup_manifest: BackupManifest,
 
-    /// Kafka client connected to the restored (target) cluster.
-    pub target_client: Arc<KafkaClient>,
+    /// Partition-leader-aware Kafka client connected to the restored (target) cluster.
+    /// Uses PartitionLeaderRouter so that ListOffsets requests are routed to the
+    /// correct broker leader for each partition, avoiding NOT_LEADER_FOR_PARTITION
+    /// errors (error code 6) on multi-broker clusters.
+    pub target_client: Arc<PartitionLeaderRouter>,
 
     /// Storage backend for reading backup data / uploading evidence.
     pub storage: Arc<dyn StorageBackend>,

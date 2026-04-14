@@ -7,12 +7,11 @@ use chrono::Utc;
 use tracing::info;
 use uuid::Uuid;
 
-use kafka_backup_core::config::KafkaConfig;
 use kafka_backup_core::evidence::report::{
     hex_encode, BackupInfo, EvidenceReport, IntegrityInfo, RestoreInfo, ToolInfo,
 };
 use kafka_backup_core::evidence::{pdf, signing, storage as evidence_storage};
-use kafka_backup_core::kafka::KafkaClient;
+use kafka_backup_core::kafka::PartitionLeaderRouter;
 use kafka_backup_core::manifest::BackupManifest;
 use kafka_backup_core::notification::pagerduty::PagerDutyNotifier;
 use kafka_backup_core::notification::slack::SlackNotifier;
@@ -66,14 +65,18 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
         "Manifest loaded"
     );
 
-    // Connect to restored Kafka cluster
-    let target_client = create_kafka_client(&config.target).await?;
+    // Connect to restored Kafka cluster via PartitionLeaderRouter so that
+    // ListOffsets requests are routed to the leader of each partition.
+    // This prevents NOT_LEADER_FOR_PARTITION errors (error code 6) on
+    // multi-broker clusters where leadership is distributed across brokers.
+    let target_router = PartitionLeaderRouter::new(config.target.clone()).await
+        .with_context(|| "Failed to connect to target Kafka cluster")?;
 
     // Build validation context
     let ctx = ValidationContext {
         backup_id: config.backup_id.clone(),
         backup_manifest: manifest.clone(),
-        target_client: Arc::new(target_client),
+        target_client: Arc::new(target_router),
         storage: storage.clone(),
         pitr_timestamp: config.pitr_timestamp,
         http_client: reqwest::Client::new(),
@@ -351,15 +354,6 @@ pub async fn evidence_verify(
 
     println!("\nEvidence report integrity: VERIFIED");
     Ok(())
-}
-
-async fn create_kafka_client(config: &KafkaConfig) -> Result<KafkaClient> {
-    let client = KafkaClient::new(config.clone());
-    client
-        .connect()
-        .await
-        .with_context(|| "Failed to connect to target Kafka cluster")?;
-    Ok(client)
 }
 
 fn build_notification_senders(
