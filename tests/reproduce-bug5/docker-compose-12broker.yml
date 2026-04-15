@@ -1,0 +1,164 @@
+# 12-broker KRaft cluster for stress-testing partition leader routing.
+#
+# Ports exposed to host: localhost:29092 through localhost:29103
+#
+# With 12 brokers, a topic with 36 partitions (RF=3) distributes leadership
+# across all brokers. Before the fix, only ~8% of partitions (those led by
+# the bootstrap broker) would pass validation.
+
+networks:
+  kafka-12broker:
+    driver: bridge
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:3.7.1
+  networks:
+    - kafka-12broker
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: controller,broker
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093,4@kafka4:9093,5@kafka5:9093,6@kafka6:9093,7@kafka7:9093,8@kafka8:9093,9@kafka9:9093,10@kafka10:9093,11@kafka11:9093,12@kafka12:9093
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 12
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_MIN_INSYNC_REPLICAS: 1
+    KAFKA_NUM_PARTITIONS: 12
+    KAFKA_LOG_DIRS: /tmp/kafka-logs
+    CLUSTER_ID: xtzWWN4bTjitpL3kfd9s5g
+
+services:
+  kafka1:
+    <<: *kafka-common
+    hostname: kafka1
+    container_name: bug2-kafka1
+    ports: ["29092:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:19092,EXTERNAL://localhost:29092
+
+  kafka2:
+    <<: *kafka-common
+    hostname: kafka2
+    container_name: bug2-kafka2
+    ports: ["29093:29093"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19093,EXTERNAL://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:19093,EXTERNAL://localhost:29093
+
+  kafka3:
+    <<: *kafka-common
+    hostname: kafka3
+    container_name: bug2-kafka3
+    ports: ["29094:29094"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19094,EXTERNAL://0.0.0.0:29094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:19094,EXTERNAL://localhost:29094
+
+  kafka4:
+    <<: *kafka-common
+    hostname: kafka4
+    container_name: bug2-kafka4
+    ports: ["29095:29095"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 4
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19095,EXTERNAL://0.0.0.0:29095
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka4:19095,EXTERNAL://localhost:29095
+
+  kafka5:
+    <<: *kafka-common
+    hostname: kafka5
+    container_name: bug2-kafka5
+    ports: ["29096:29096"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 5
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19096,EXTERNAL://0.0.0.0:29096
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka5:19096,EXTERNAL://localhost:29096
+
+  kafka6:
+    <<: *kafka-common
+    hostname: kafka6
+    container_name: bug2-kafka6
+    ports: ["29097:29097"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 6
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19097,EXTERNAL://0.0.0.0:29097
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka6:19097,EXTERNAL://localhost:29097
+
+  kafka7:
+    <<: *kafka-common
+    hostname: kafka7
+    container_name: bug2-kafka7
+    ports: ["29098:29098"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 7
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19098,EXTERNAL://0.0.0.0:29098
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka7:19098,EXTERNAL://localhost:29098
+
+  kafka8:
+    <<: *kafka-common
+    hostname: kafka8
+    container_name: bug2-kafka8
+    ports: ["29099:29099"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 8
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19099,EXTERNAL://0.0.0.0:29099
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka8:19099,EXTERNAL://localhost:29099
+
+  kafka9:
+    <<: *kafka-common
+    hostname: kafka9
+    container_name: bug2-kafka9
+    ports: ["29100:29100"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 9
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19100,EXTERNAL://0.0.0.0:29100
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka9:19100,EXTERNAL://localhost:29100
+
+  kafka10:
+    <<: *kafka-common
+    hostname: kafka10
+    container_name: bug2-kafka10
+    ports: ["29101:29101"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 10
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19101,EXTERNAL://0.0.0.0:29101
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka10:19101,EXTERNAL://localhost:29101
+
+  kafka11:
+    <<: *kafka-common
+    hostname: kafka11
+    container_name: bug2-kafka11
+    ports: ["29102:29102"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 11
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19102,EXTERNAL://0.0.0.0:29102
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka11:19102,EXTERNAL://localhost:29102
+
+  kafka12:
+    <<: *kafka-common
+    hostname: kafka12
+    container_name: bug2-kafka12
+    ports: ["29103:29103"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 12
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,PLAINTEXT://0.0.0.0:19103,EXTERNAL://0.0.0.0:29103
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka12:19103,EXTERNAL://localhost:29103
