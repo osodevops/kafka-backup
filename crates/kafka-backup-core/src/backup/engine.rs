@@ -636,6 +636,14 @@ impl BackupEngine {
             }
         }
 
+        // Do not overwrite an existing non-empty snapshot with an empty one.
+        // This protects against losing group offsets when kafka-backup restarts
+        // before consuming applications have reconnected and committed offsets.
+        if snapshot_groups.is_empty() {
+            debug!("Consumer group snapshot: no groups with committed offsets on backed topics, keeping existing snapshot");
+            return Ok(());
+        }
+
         let snapshot = Snapshot {
             snapshot_time: chrono::Utc::now().timestamp_millis(),
             groups: snapshot_groups,
