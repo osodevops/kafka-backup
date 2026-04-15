@@ -35,8 +35,10 @@ impl ValidationCheck for ConsumerGroupOffsetCheck {
     async fn run(&self, ctx: &ValidationContext) -> Result<ValidationResult> {
         let start = Instant::now();
 
-        // List all consumer groups on the restored cluster
-        let groups = consumer_groups::list_groups(&ctx.target_client).await?;
+        // List all consumer groups on the restored cluster.
+        // ListGroups/OffsetFetch are forwarded by the broker to the group
+        // coordinator, so partition-leader routing is not needed here.
+        let groups = consumer_groups::list_groups(ctx.target_client.bootstrap_client()).await?;
 
         let group_ids: Vec<String> =
             if self.config.verify_all_groups || self.config.groups.is_empty() {
@@ -64,7 +66,13 @@ impl ValidationCheck for ConsumerGroupOffsetCheck {
         let mut issues: Vec<serde_json::Value> = Vec::new();
 
         for group_id in &group_ids {
-            match consumer_groups::fetch_offsets(&ctx.target_client, group_id, None).await {
+            match consumer_groups::fetch_offsets(
+                ctx.target_client.bootstrap_client(),
+                group_id,
+                None,
+            )
+            .await
+            {
                 Ok(offsets) => {
                     groups_verified += 1;
                     let offset_count = offsets.len() as u64;

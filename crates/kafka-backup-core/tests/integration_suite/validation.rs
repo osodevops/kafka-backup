@@ -144,16 +144,20 @@ async fn run_validation(
         path: storage_path.to_path_buf(),
     };
     let storage = create_backend(&storage_config)?;
-    let client = cluster.create_client();
-    client
-        .connect()
+    let kafka_config = kafka_backup_core::config::KafkaConfig {
+        bootstrap_servers: vec![cluster.bootstrap_servers.clone()],
+        security: kafka_backup_core::config::SecurityConfig::default(),
+        topics: kafka_backup_core::config::TopicSelection::default(),
+        connection: Default::default(),
+    };
+    let router = kafka_backup_core::kafka::PartitionLeaderRouter::new(kafka_config)
         .await
         .map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
 
     let ctx = ValidationContext {
         backup_id: backup_id.to_string(),
         backup_manifest: manifest,
-        target_client: Arc::new(client),
+        target_client: Arc::new(router),
         storage,
         pitr_timestamp: None,
         http_client: reqwest::Client::new(),
