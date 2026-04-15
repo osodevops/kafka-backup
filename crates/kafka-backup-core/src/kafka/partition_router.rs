@@ -657,6 +657,77 @@ impl PartitionLeaderRouter {
         Ok(all_groups)
     }
 
+    /// Fetch committed offsets for all consumer groups, routing each `OffsetFetch`
+    /// to the broker that coordinates the group.
+    ///
+    /// In KRaft mode, each broker is group coordinator for a subset of consumer
+    /// groups (those whose `__consumer_offsets` partition it leads). Sending
+    /// `OffsetFetch` to the bootstrap broker only returns offsets for groups
+    /// coordinated by that broker; all others return `NOT_COORDINATOR` (error 16)
+    /// or an empty response.
+    ///
+    /// This method lists groups per-broker and fetches their offsets from the same
+    /// broker, ensuring complete coverage across all coordinators.
+    ///
+    /// Returns a map: `group_id → Vec<CommittedOffset>`.
+    pub async fn fetch_group_offsets_all_coordinators(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<super::consumer_groups::CommittedOffset>>>
+    {
+        let broker_ids: Vec<i32> = {
+            let meta = self.broker_metadata.read().await;
+            meta.keys().copied().collect()
+        };
+
+        let mut all_offsets: std::collections::HashMap<
+            String,
+            Vec<super::consumer_groups::CommittedOffset>,
+        > = std::collections::HashMap::new();
+
+        for broker_id in broker_ids {
+            match self.get_broker_connection(broker_id).await {
+                Ok(client) => match super::consumer_groups::list_groups(&client).await {
+                    Ok(groups) => {
+                        for g in &groups {
+                            match super::consumer_groups::fetch_offsets(&client, &g.group_id, None)
+                                .await
+                            {
+                                Ok(offsets) if !offsets.is_empty() => {
+                                    all_offsets.insert(g.group_id.clone(), offsets);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    debug!(
+                                        "fetch_offsets for group {} on broker {}: {}",
+                                        g.group_id, broker_id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "list_groups from broker {} for offset fetching: {}",
+                            broker_id, e
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to broker {} for group offsets: {}",
+                        broker_id, e
+                    );
+                }
+            }
+        }
+
+        debug!(
+            "fetch_group_offsets_all_coordinators: {} groups with committed offsets",
+            all_offsets.len()
+        );
+        Ok(all_offsets)
+    }
+
     /// Delete records from a topic by advancing the log-start-offset to `before_offset`.
     ///
     /// Records with offset < `before_offset` become inaccessible. This empties a topic

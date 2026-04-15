@@ -11,7 +11,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
 use crate::health::HealthCheck;
-use crate::kafka::{consumer_groups::fetch_offsets, PartitionLeaderRouter, TopicMetadata};
+use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -575,11 +575,14 @@ impl BackupEngine {
             return Ok(());
         }
 
-        // List groups from every broker (KRaft: each broker is coordinator for a subset)
-        let all_groups = self.router.list_groups_all_brokers().await?;
+        // Fetch offsets per coordinator broker: each broker handles OffsetFetch only
+        // for groups it coordinates. Using the bootstrap client for all groups causes
+        // NOT_COORDINATOR (error 16) responses for groups on other brokers, silently
+        // producing empty offset lists.
+        let group_offsets = self.router.fetch_group_offsets_all_coordinators().await?;
         debug!(
-            "Consumer group snapshot: {} groups across all brokers",
-            all_groups.len()
+            "Consumer group snapshot: {} groups with committed offsets across all coordinators",
+            group_offsets.len()
         );
 
         #[derive(serde::Serialize)]
@@ -595,26 +598,9 @@ impl BackupEngine {
             groups: Vec<GroupEntry>,
         }
 
-        // Fetch offsets via bootstrap_client through the router
-        let bootstrap_client = self.router.bootstrap_client();
         let mut snapshot_groups: Vec<GroupEntry> = Vec::new();
 
-        for group in &all_groups {
-            let committed = match fetch_offsets(bootstrap_client, &group.group_id, None).await {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!(
-                        "Could not fetch offsets for group {}: {}",
-                        group.group_id, e
-                    );
-                    continue;
-                }
-            };
-
-            if committed.is_empty() {
-                continue;
-            }
-
+        for (group_id, committed) in group_offsets {
             let mut offsets_by_topic: std::collections::HashMap<
                 String,
                 std::collections::HashMap<String, i64>,
@@ -630,7 +616,7 @@ impl BackupEngine {
 
             if !offsets_by_topic.is_empty() {
                 snapshot_groups.push(GroupEntry {
-                    group_id: group.group_id.clone(),
+                    group_id,
                     offsets: offsets_by_topic,
                 });
             }
