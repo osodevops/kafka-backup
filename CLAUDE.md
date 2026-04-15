@@ -73,6 +73,49 @@ cargo run -p kafka-backup-cli -- backup --config config/backup.yaml
 cargo run -p kafka-backup-cli -- restore --config config/restore.yaml
 ```
 
+## CI Pre-commit Checklist
+
+**You MUST run these checks before every commit. CI will reject PRs that fail any of them.**
+
+```bash
+# 1. Format code (CI runs: cargo fmt --all -- --check)
+cargo fmt --all
+
+# 2. Clippy with CI-identical flags (CI runs with -D warnings)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 3. Run tests
+cargo test
+```
+
+### Version Bumping Rules
+
+Any PR that changes files under `crates/`, `Cargo.toml`, `Cargo.lock`, or `Dockerfile` **must** bump `[workspace.package].version` in the root `Cargo.toml`. CI enforces this via `scripts/ci/check-release-version.py`.
+
+**Semver for 0.x crates (current):**
+- **Patch bump** (0.12.1 → 0.12.2): bug fixes, internal changes, no public API changes
+- **Minor bump** (0.12.x → 0.13.0): any breaking change to `kafka-backup-core` public API
+
+**What counts as a breaking change** (detected by `cargo-semver-checks`):
+- Adding a public field to a public struct (breaks struct literal construction)
+- Removing or renaming public fields, methods, or types
+- Changing the type of a public field or method signature
+- Adding required parameters to public functions
+
+**After bumping the version:**
+```bash
+# Update Cargo.lock to match
+cargo check
+# Then stage both Cargo.toml and Cargo.lock
+```
+
+### Semver-safe patterns
+
+To add data to public structs without a breaking change:
+- Use `#[non_exhaustive]` on the struct (but adding it is itself a one-time break)
+- Add methods instead of public fields
+- Use builder patterns for construction
+
 ## Architecture Overview
 
 ```
