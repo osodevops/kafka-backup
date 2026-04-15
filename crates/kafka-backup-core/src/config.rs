@@ -905,7 +905,7 @@ impl RestoreOptions {
         }
 
         // Validate consumer group offset reset
-        if self.reset_consumer_offsets && self.consumer_groups.is_empty() {
+        if self.reset_consumer_offsets && self.consumer_groups.is_empty() && !self.auto_consumer_groups {
             return Err(crate::Error::Config(
                 "consumer_groups must be specified when reset_consumer_offsets is true".to_string(),
             ));
