@@ -51,8 +51,9 @@ backup:
   # Continuous mode (keep running and backing up new data)
   continuous: false  # true for continuous, false for one-shot
 
-# Offset storage (only used when continuous: true)
-# Tracks backup progress for resumable incremental backups.
+# Offset storage — enables resumable incremental backups.
+# Used automatically with continuous: true. For one-shot or snapshot mode,
+# add this section explicitly to resume from where the last run stopped.
 # Default: SQLite database in $TMPDIR (e.g. /tmp/backup-2025-01-15-001-offsets.db)
 # offset_storage:
 #   db_path: /data/offsets.db       # Custom path (useful for K8s volume mounts)

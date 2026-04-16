@@ -403,7 +403,7 @@ backup:
 
 ## Offset Storage Configuration
 
-Configuration for the local SQLite database used to track backup progress in continuous mode. This enables resumable backups after process restarts.
+Configuration for the local SQLite database used to track backup progress. When present, this enables resumable incremental backups in **any** mode (one-shot, snapshot, or continuous). For continuous mode, the offset store is created automatically even without this section.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -412,7 +412,18 @@ Configuration for the local SQLite database used to track backup progress in con
 | `offset_storage.s3_key` | string | No | - | Remote storage key for syncing the database |
 | `offset_storage.sync_interval_secs` | int | No | `30` | How often to sync the local DB to remote storage |
 
-The offset store is only created when `continuous: true` is set in backup options.
+The offset store is created when `continuous: true` is set **or** when `offset_storage` is explicitly configured. This allows incremental one-shot and snapshot backups by adding the `offset_storage` section to your config:
+
+```yaml
+# Incremental one-shot backup (resume from last run):
+backup:
+  compression: zstd
+  stop_at_current_offsets: true
+
+offset_storage:
+  db_path: /data/offsets.db
+  sync_interval_secs: 30
+```
 
 ### Default Behavior
 
