@@ -319,7 +319,7 @@ s3://kafka-backups/
                     └── segment-0002.zst
 ```
 
-A local SQLite offset database is maintained at `$TMPDIR/{backup_id}-offsets.db` (configurable via `offset_storage.db_path`) and periodically synced to remote storage for durability.
+A local SQLite offset database is maintained at `$TMPDIR/{backup_id}-offsets.db` (configurable via `offset_storage.db_path`) and periodically synced to remote storage for durability. To enable incremental one-shot backups (resume from where the last run stopped), add the `offset_storage` section to your config.
 
 ## Metrics & Monitoring
 

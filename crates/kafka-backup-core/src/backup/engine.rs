@@ -97,9 +97,12 @@ impl BackupEngine {
             name: "storage".to_string(),
         }));
 
-        // Initialize offset store for continuous backups
+        // Initialize offset store for continuous backups or when explicitly configured
         let backup_opts = config.backup.clone().unwrap_or_default();
-        let offset_store = if backup_opts.continuous {
+        let offset_store = if should_create_offset_store(
+            backup_opts.continuous,
+            config.offset_storage.is_some(),
+        ) {
             // Use config.offset_storage.db_path if provided, otherwise default to
             // temp directory. Previously this was hardcoded to "./{backup_id}-offsets.db"
             // which fails on read-only filesystems (Issue #62).
@@ -1096,9 +1099,19 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+/// Determine whether the offset store should be created.
+///
+/// The offset store is created when continuous mode is enabled (backward compat)
+/// OR when the user explicitly configures `offset_storage` in their YAML config,
+/// enabling incremental one-shot and snapshot backups.
+fn should_create_offset_store(continuous: bool, offset_storage_configured: bool) -> bool {
+    continuous || offset_storage_configured
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{PartitionBackup, TopicBackup};
 
     #[test]
     fn test_glob_match() {
@@ -1110,5 +1123,222 @@ mod tests {
         assert!(glob_match("order?", "orders"));
         assert!(!glob_match("order?", "order"));
         assert!(!glob_match("orders", "payments"));
+    }
+
+    // -- should_create_offset_store tests --
+
+    #[test]
+    fn test_offset_store_created_for_continuous() {
+        assert!(should_create_offset_store(true, false));
+    }
+
+    #[test]
+    fn test_offset_store_created_for_explicit_config() {
+        assert!(should_create_offset_store(false, true));
+    }
+
+    #[test]
+    fn test_offset_store_not_created_default_oneshot() {
+        assert!(!should_create_offset_store(false, false));
+    }
+
+    #[test]
+    fn test_offset_store_created_for_both() {
+        assert!(should_create_offset_store(true, true));
+    }
+
+    // -- merge_manifests tests --
+
+    fn make_segment(key: &str, start_offset: i64, end_offset: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            key: key.to_string(),
+            start_offset,
+            end_offset,
+            start_timestamp: start_offset * 1000,
+            end_timestamp: end_offset * 1000,
+            record_count: end_offset - start_offset + 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+        }
+    }
+
+    fn make_partition(id: i32, segments: Vec<SegmentMetadata>) -> PartitionBackup {
+        PartitionBackup {
+            partition_id: id,
+            segments,
+        }
+    }
+
+    fn make_topic(
+        name: &str,
+        partition_count: Option<i32>,
+        partitions: Vec<PartitionBackup>,
+    ) -> TopicBackup {
+        TopicBackup {
+            name: name.to_string(),
+            original_partition_count: partition_count,
+            partitions,
+        }
+    }
+
+    #[test]
+    fn test_merge_manifests_disjoint_topics() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(0, vec![make_segment("seg-a", 0, 99)])],
+        ));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic(
+            "payments",
+            Some(1),
+            vec![make_partition(0, vec![make_segment("seg-b", 0, 49)])],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics.len(), 2);
+        assert!(merged.topics.iter().any(|t| t.name == "orders"));
+        assert!(merged.topics.iter().any(|t| t.name == "payments"));
+    }
+
+    #[test]
+    fn test_merge_manifests_same_topic_disjoint_partitions() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(2),
+            vec![make_partition(0, vec![make_segment("seg-a", 0, 99)])],
+        ));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic(
+            "orders",
+            Some(2),
+            vec![make_partition(1, vec![make_segment("seg-b", 0, 49)])],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics.len(), 1);
+        assert_eq!(merged.topics[0].partitions.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_manifests_same_partition_dedup_by_offset() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(
+                0,
+                vec![
+                    make_segment("seg-a", 0, 99),
+                    make_segment("seg-b", 100, 199),
+                ],
+            )],
+        ));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(
+                0,
+                vec![
+                    make_segment("seg-c", 100, 199), // overlaps by start_offset
+                    make_segment("seg-d", 200, 299),
+                ],
+            )],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        let segs = &merged.topics[0].partitions[0].segments;
+        assert_eq!(segs.len(), 3); // dedup removes duplicate offset 100
+        assert_eq!(segs[0].start_offset, 0);
+        assert_eq!(segs[1].start_offset, 100);
+        assert_eq!(segs[1].key, "seg-b"); // existing wins
+        assert_eq!(segs[2].start_offset, 200);
+    }
+
+    #[test]
+    fn test_merge_manifests_same_key_dedup() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(0, vec![make_segment("seg-001", 0, 99)])],
+        ));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(
+                0,
+                vec![make_segment("seg-001", 50, 149)], // same key, different offset
+            )],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        let segs = &merged.topics[0].partitions[0].segments;
+        assert_eq!(segs.len(), 1); // dedup by key
+        assert_eq!(segs[0].start_offset, 0); // existing wins
+    }
+
+    #[test]
+    fn test_merge_manifests_updates_partition_count() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic("orders", Some(3), vec![]));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic("orders", Some(6), vec![]));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics[0].original_partition_count, Some(6));
+    }
+
+    #[test]
+    fn test_merge_manifests_preserves_partition_count_when_none() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic("orders", Some(3), vec![]));
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic("orders", None, vec![]));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics[0].original_partition_count, Some(3));
+    }
+
+    #[test]
+    fn test_merge_manifests_empty_current() {
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(0, vec![make_segment("seg-a", 0, 99)])],
+        ));
+
+        let current = BackupManifest::new("test".to_string());
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics.len(), 1);
+        assert_eq!(merged.topics[0].partitions[0].segments.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_manifests_empty_existing() {
+        let existing = BackupManifest::new("test".to_string());
+
+        let mut current = BackupManifest::new("test".to_string());
+        current.topics.push(make_topic(
+            "orders",
+            Some(1),
+            vec![make_partition(0, vec![make_segment("seg-a", 0, 99)])],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.topics.len(), 1);
+        assert_eq!(merged.topics[0].name, "orders");
     }
 }

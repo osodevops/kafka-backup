@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.5] - 2026-04-16
+
+### Fixed
+- **Incremental one-shot backups now work** — offset tracking was previously gated on `continuous: true`,
+  making one-shot and snapshot backups always start from `earliest`. Now, adding `offset_storage` to the
+  config enables resume-from-last-offset in any backup mode.
+
+### Added
+- Unit tests for `merge_manifests()` function (previously untested)
+- Integration test for incremental one-shot backup resume behavior
+
 ## [0.5.0] - 2026-01-17
 
 ### Added

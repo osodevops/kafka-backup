@@ -449,6 +449,207 @@ async fn test_snapshot_backup_multiple_partitions() {
     );
 }
 
+/// Test that incremental one-shot backup resumes from the last saved offset.
+///
+/// This test:
+/// 1. Creates a topic with initial data
+/// 2. Runs a snapshot backup with offset_storage configured
+/// 3. Produces more data
+/// 4. Runs a second backup with the same backup_id and offset_storage
+/// 5. Verifies the second run only backed up new data (resume, not full re-backup)
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn test_incremental_oneshot_backup_resumes_from_offset() {
+    use kafka_backup_core::config::OffsetStorageConfig;
+    use kafka_backup_core::manifest::BackupManifest;
+
+    let cluster = KafkaTestCluster::start()
+        .await
+        .expect("Failed to start Kafka");
+
+    cluster
+        .wait_for_ready(Duration::from_secs(30))
+        .await
+        .expect("Kafka not ready");
+
+    let topic = "incremental-oneshot-test";
+    let initial_records = 60; // 20 per partition (3 partitions)
+
+    // Create topic with initial data
+    cluster
+        .create_topic(topic, initial_records)
+        .await
+        .expect("Failed to create topic");
+
+    sleep(Duration::from_secs(2)).await;
+
+    // Set up storage and offset DB in temp dirs
+    let storage_dir = TempDir::new().expect("Failed to create storage temp dir");
+    let offset_dir = TempDir::new().expect("Failed to create offset temp dir");
+    let offset_db_path = offset_dir.path().join("offsets.db");
+
+    let backup_id = "incremental-test-001";
+
+    // --- First backup run ---
+    let config1 = Config {
+        mode: Mode::Backup,
+        backup_id: backup_id.to_string(),
+        source: Some(KafkaConfig {
+            bootstrap_servers: vec![cluster.bootstrap_servers.clone()],
+            security: SecurityConfig::default(),
+            topics: TopicSelection {
+                include: vec![topic.to_string()],
+                exclude: vec![],
+            },
+            connection: Default::default(),
+        }),
+        target: None,
+        storage: StorageBackendConfig::Filesystem {
+            path: storage_dir.path().to_path_buf(),
+        },
+        backup: Some(BackupOptions {
+            segment_max_bytes: 1024 * 1024,
+            segment_max_interval_ms: 10000,
+            compression: CompressionType::Zstd,
+            stop_at_current_offsets: true,
+            continuous: false,
+            ..Default::default()
+        }),
+        restore: None,
+        offset_storage: Some(OffsetStorageConfig {
+            db_path: offset_db_path.clone(),
+            ..Default::default()
+        }),
+        metrics: None,
+    };
+
+    let engine1 = BackupEngine::new(config1)
+        .await
+        .expect("Failed to create engine for first run");
+
+    let result1 = tokio::time::timeout(Duration::from_secs(60), engine1.run())
+        .await
+        .expect("First backup timed out");
+    assert!(
+        result1.is_ok(),
+        "First backup should complete: {:?}",
+        result1
+    );
+
+    // Read manifest after first run
+    let manifest_path = storage_dir.path().join(backup_id).join("manifest.json");
+    let manifest1_content =
+        std::fs::read_to_string(&manifest_path).expect("Failed to read manifest after run 1");
+    let manifest1: BackupManifest =
+        serde_json::from_str(&manifest1_content).expect("Failed to parse manifest after run 1");
+
+    let records_run1 = manifest1.total_records();
+    let segments_run1 = manifest1.total_segments();
+    assert!(
+        records_run1 > 0,
+        "First backup should have backed up records"
+    );
+
+    // Verify offset DB was created
+    assert!(
+        offset_db_path.exists(),
+        "Offset database should exist after first run"
+    );
+
+    // --- Produce more data ---
+    let additional_records = 60;
+    let client = cluster.create_client();
+    client.connect().await.expect("Failed to connect");
+
+    let new_records = generate_test_records(additional_records, topic);
+    for (i, record) in new_records.iter().enumerate() {
+        let partition = (i % 3) as i32;
+        client
+            .produce(topic, partition, vec![record.clone()], -1, 30_000)
+            .await
+            .expect("Failed to produce additional records");
+    }
+
+    sleep(Duration::from_secs(2)).await;
+
+    // --- Second backup run (same backup_id, same offset_storage) ---
+    let config2 = Config {
+        mode: Mode::Backup,
+        backup_id: backup_id.to_string(),
+        source: Some(KafkaConfig {
+            bootstrap_servers: vec![cluster.bootstrap_servers.clone()],
+            security: SecurityConfig::default(),
+            topics: TopicSelection {
+                include: vec![topic.to_string()],
+                exclude: vec![],
+            },
+            connection: Default::default(),
+        }),
+        target: None,
+        storage: StorageBackendConfig::Filesystem {
+            path: storage_dir.path().to_path_buf(),
+        },
+        backup: Some(BackupOptions {
+            segment_max_bytes: 1024 * 1024,
+            segment_max_interval_ms: 10000,
+            compression: CompressionType::Zstd,
+            stop_at_current_offsets: true,
+            continuous: false,
+            ..Default::default()
+        }),
+        restore: None,
+        offset_storage: Some(OffsetStorageConfig {
+            db_path: offset_db_path.clone(),
+            ..Default::default()
+        }),
+        metrics: None,
+    };
+
+    let engine2 = BackupEngine::new(config2)
+        .await
+        .expect("Failed to create engine for second run");
+
+    let result2 = tokio::time::timeout(Duration::from_secs(60), engine2.run())
+        .await
+        .expect("Second backup timed out");
+    assert!(
+        result2.is_ok(),
+        "Second backup should complete: {:?}",
+        result2
+    );
+
+    // Read manifest after second run
+    let manifest2_content =
+        std::fs::read_to_string(&manifest_path).expect("Failed to read manifest after run 2");
+    let manifest2: BackupManifest =
+        serde_json::from_str(&manifest2_content).expect("Failed to parse manifest after run 2");
+
+    let records_run2 = manifest2.total_records();
+    let segments_run2 = manifest2.total_segments();
+
+    // The merged manifest should have MORE records and segments than run 1
+    assert!(
+        records_run2 > records_run1,
+        "Second run manifest should have more records ({} > {})",
+        records_run2,
+        records_run1
+    );
+    assert!(
+        segments_run2 >= segments_run1,
+        "Second run should have at least as many segments ({} >= {})",
+        segments_run2,
+        segments_run1
+    );
+
+    // Total records should cover both batches
+    let expected_total = (initial_records + additional_records) as i64;
+    assert_eq!(
+        records_run2, expected_total,
+        "Merged manifest should have all {} records, got {}",
+        expected_total, records_run2
+    );
+}
+
 /// Test that backup handles empty topics gracefully in snapshot mode.
 #[tokio::test]
 #[ignore] // Requires Docker
