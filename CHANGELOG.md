@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-04-21
+
+### Added
+- **Pluggable SASL mechanism extension point** (`SaslMechanismPlugin` trait)
+  — lets downstream crates implement OAUTHBEARER, MSK IAM, or custom
+  SASL mechanisms without forking `kafka-backup-core`.
+  - Handshake + single- or multi-round `SaslAuthenticate` dispatch.
+  - KIP-368 re-authentication scheduler: spawns a task post-handshake
+    when the broker advertises `session_lifetime_ms > 0`; fires
+    `reauth_payload` at 80 % of the advertised lifetime with a 30 s
+    minimum floor and ±5 s jitter.
+  - Default `interpret_server_error` handles both RFC 7628 JSON and
+    Apache Kafka 3.5+ free-form `error_message` bytes.
+  - New field `SecurityConfig.sasl_mechanism_plugin: Option<Arc<dyn SaslMechanismPlugin>>`
+    (marked `#[serde(skip)]` — programmatic wiring only, no YAML surface).
+- 14 unit tests + 4 integration tests exercising single-round,
+  multi-round, server-error, and scheduler paths against an
+  in-process Kafka-wire mock (no Docker required).
+- `#[ignore]` E2E test against Confluent cp-kafka 7.7.0 configured for
+  SASL_PLAINTEXT + OAUTHBEARER with the bundled unsecured-JWS validator.
+  Fixture: `tests/sasl-oauth-test-infra/`.
+- Example: `examples/custom_sasl_plugin.rs` — minimal static-token
+  OAUTHBEARER plugin (reference implementation).
+
+### Changed
+- SASL dispatch in `KafkaClient` unified: the four duplicated
+  `sasl_{plain,scram}_auth{,_raw}` methods collapse into a single
+  dispatch function called by both initial-connect and reconnect.
+  Behaviour for existing `PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512`
+  configurations is unchanged.
+
 ## [0.13.5] - 2026-04-16
 
 ### Fixed

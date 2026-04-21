@@ -207,6 +207,15 @@ pub struct SecurityConfig {
     /// Path to client key file (for mTLS)
     #[serde(default)]
     pub ssl_key_location: Option<PathBuf>,
+
+    /// Optional pluggable SASL mechanism implementation.
+    ///
+    /// When set, overrides [`sasl_mechanism`] and drives the handshake
+    /// through the plugin (e.g. `OAUTHBEARER` for MSK IAM). Not YAML-
+    /// configurable — downstream crates inject this programmatically
+    /// after parsing the config.
+    #[serde(skip)]
+    pub sasl_mechanism_plugin: Option<crate::kafka::SaslMechanismPluginHandle>,
 }
 
 /// Security protocol
@@ -958,6 +967,42 @@ bootstrap_servers:
         assert_eq!(config.connection.keepalive_time_secs, 60);
         assert_eq!(config.connection.keepalive_interval_secs, 20);
         assert!(config.connection.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_security_config_serde_skips_plugin_field() {
+        // `sasl_mechanism_plugin` is `#[serde(skip)]` — programmatic only.
+        // Regressions would leak a non-serializable trait object into
+        // YAML and break config round-tripping. This test pins it.
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct NoopPlugin;
+        #[async_trait::async_trait]
+        impl crate::kafka::SaslMechanismPlugin for NoopPlugin {
+            fn mechanism_name(&self) -> &str {
+                "NOOP"
+            }
+            async fn initial_payload(&self) -> Result<Vec<u8>, crate::kafka::SaslPluginError> {
+                Ok(vec![])
+            }
+        }
+
+        let cfg = SecurityConfig {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism_plugin: Some(Arc::new(NoopPlugin)),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize security config");
+        assert!(
+            !yaml.contains("sasl_mechanism_plugin"),
+            "serde(skip) must keep the plugin field out of YAML; got:\n{yaml}"
+        );
+
+        // Round-trip: deserialization into a config without the field
+        // yields `None` — we never try to rehydrate a trait object.
+        let back: SecurityConfig = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert!(back.sasl_mechanism_plugin.is_none());
     }
 
     #[test]

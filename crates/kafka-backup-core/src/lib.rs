@@ -28,7 +28,8 @@ pub use config::{
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
 pub use kafka::{
-    CommittedOffset, ConsumerGroup, ConsumerGroupDescription, ConsumerGroupMember, TimestampOffset,
+    CommittedOffset, ConsumerGroup, ConsumerGroupDescription, ConsumerGroupMember, SaslAuthOutcome,
+    SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError, TimestampOffset,
 };
 pub use manifest::{
     BackupManifest, BackupRecord, ConsumerGroupOffset, ConsumerGroupOffsets, DryRunPartitionReport,
