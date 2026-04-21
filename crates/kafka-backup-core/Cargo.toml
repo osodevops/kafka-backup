@@ -55,6 +55,9 @@ rustls-pemfile.workspace = true
 ring.workspace = true
 webpki-roots.workspace = true
 
+# GSSAPI
+libgssapi.workspace = true
+
 # Database
 sqlx.workspace = true
 

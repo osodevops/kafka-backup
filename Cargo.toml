@@ -60,6 +60,9 @@ rustls-pemfile = "2"
 webpki-roots = "1.0"
 ring = "0.17"
 
+# GSSAPI
+libgssapi = "0.9"
+
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 

@@ -8,6 +8,7 @@ use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -85,6 +86,7 @@ struct BrokerConnection {
     stream: ConnectionStream,
     #[allow(dead_code)]
     broker_id: i32,
+    hostname: String,
 }
 
 impl KafkaClient {
@@ -106,9 +108,15 @@ impl KafkaClient {
             match self.try_connect(server).await {
                 Ok(stream) => {
                     let mut conn = self.connection.lock().await;
+                    let hostname = server
+                    .split(':')
+                    .next()
+                    .unwrap_or(server)
+                    .to_string();
                     *conn = Some(BrokerConnection {
                         stream,
                         broker_id: -1, // Unknown until metadata fetch
+                        hostname,
                     });
 
                     // Perform SASL authentication if configured
@@ -239,6 +247,25 @@ impl KafkaClient {
                     security.sasl_username.as_deref().unwrap_or(""),
                     security.sasl_password.as_deref().unwrap_or(""),
                     mechanism,
+                )
+                .await
+            }
+            Some(SaslMechanism::Gssapi) => {
+            let service_name = security
+                .sasl_kerberos_service_name
+                .as_deref()
+                .unwrap_or("kafka");
+            let hostname = {
+                let conn = self.connection.lock().await;
+                    conn.as_ref()
+                        .map(|c| c.hostname.clone())
+                        .unwrap_or_default()
+                };
+                self.sasl_gssapi_auth(
+                    service_name,
+                    &hostname,
+                    security.sasl_keytab_path.as_deref(),
+                    security.sasl_krb5_config_path.as_deref(),
                 )
                 .await
             }
@@ -431,9 +458,15 @@ impl KafkaClient {
             match self.try_connect(server).await {
                 Ok(stream) => {
                     let mut conn = self.connection.lock().await;
+                    let hostname = server
+                        .split(':')
+                        .next()
+                        .unwrap_or(server)
+                        .to_string();
                     *conn = Some(BrokerConnection {
                         stream,
                         broker_id: -1,
+                        hostname,
                     });
 
                     // Re-authenticate if needed, using send_raw_request directly
@@ -476,6 +509,25 @@ impl KafkaClient {
                     security.sasl_username.as_deref().unwrap_or(""),
                     security.sasl_password.as_deref().unwrap_or(""),
                     mechanism,
+                )
+                .await
+            }
+            Some(SaslMechanism::Gssapi) => {
+                let service_name = security
+                    .sasl_kerberos_service_name
+                    .as_deref()
+                    .unwrap_or("kafka");
+                let hostname = {
+                    let conn = self.connection.lock().await;
+                    conn.as_ref()
+                        .map(|c| c.hostname.clone())
+                        .unwrap_or_default()
+                };
+                self.sasl_gssapi_auth_raw(
+                    service_name,
+                    &hostname,
+                    security.sasl_keytab_path.as_deref(),
+                    security.sasl_krb5_config_path.as_deref(),
                 )
                 .await
             }
@@ -591,6 +643,194 @@ impl KafkaClient {
         debug!(
             "SASL {} re-authentication successful",
             algorithm.mechanism_name()
+        );
+        Ok(())
+    }
+
+    /// SASL GSSAPI/Kerberos auth using send_request (initial connection path).
+    ///
+    /// Mirrors the structure of `sasl_scram_auth`: uses `send_request` which
+    /// has auto-reconnect logic, and is called only during the first connect.
+    async fn sasl_gssapi_auth(
+        &self,
+        service_name: &str,
+        broker_host: &str,
+        keytab_path: Option<&Path>,
+        krb5_config_path: Option<&Path>,
+    ) -> Result<()> {
+        use super::gssapi::GssapiClient;
+        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+
+        // Step 1: announce the mechanism.
+        let handshake = SaslHandshakeRequest::default().with_mechanism("GSSAPI".into());
+        let _: kafka_protocol::messages::SaslHandshakeResponse =
+            self.send_request(ApiKey::SaslHandshake, handshake).await?;
+
+        let mut gss = GssapiClient::new(service_name, broker_host, keytab_path, krb5_config_path)?;
+
+        // Phase 1: GSS context establishment (one or more round-trips).
+        let first_token = gss
+            .initial_token()?
+            .ok_or_else(|| {
+                crate::Error::Authentication(
+                    "GSSAPI: initial_token() returned None — expected a non-empty token"
+                        .to_string(),
+                )
+            })?;
+
+        let mut client_token = first_token;
+        let mut context_established = false;
+
+        loop {
+            let req = SaslAuthenticateRequest::default()
+                .with_auth_bytes(Bytes::from(client_token));
+            let resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                self.send_request(ApiKey::SaslAuthenticate, req).await?;
+
+            if resp.error_code != 0 {
+                return Err(crate::Error::Authentication(format!(
+                    "GSSAPI: broker rejected token (Phase 1): {}",
+                    resp.error_message
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("error code {}", resp.error_code))
+                )));
+            }
+
+            if context_established {
+                // The broker's response in the first post-establishment
+                // round-trip is the Phase 2 security-layer proposal.
+                if !resp.auth_bytes.is_empty() {
+                    let wrapped_reply = gss.handle_security_layer(&resp.auth_bytes, "")?;
+                    let req = SaslAuthenticateRequest::default()
+                        .with_auth_bytes(Bytes::from(wrapped_reply));
+                    let final_resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                        self.send_request(ApiKey::SaslAuthenticate, req).await?;
+                    if final_resp.error_code != 0 {
+                        return Err(crate::Error::Authentication(format!(
+                            "GSSAPI: broker rejected security-layer reply (Phase 2): \
+                             error code {}",
+                            final_resp.error_code
+                        )));
+                    }
+                }
+                break;
+            }
+
+            if resp.auth_bytes.is_empty() {
+                return Err(crate::Error::Authentication(
+                    "GSSAPI: broker sent an empty token before context was established"
+                        .to_string(),
+                ));
+            }
+
+            // Advance the context with the server's token.
+            match gss.step(&resp.auth_bytes)? {
+                Some(next_token) => {
+                    client_token = next_token;
+                }
+                None => {
+                    // Context is fully established.  Send an empty authenticate
+                    // to prompt the Phase 2 security-layer message from the broker.
+                    context_established = true;
+                    client_token = Vec::new();
+                }
+            }
+        }
+
+        debug!("SASL GSSAPI authentication successful (broker: {})", broker_host);
+        Ok(())
+    }
+
+    /// SASL GSSAPI/Kerberos auth using raw requests (reconnect path).
+    ///
+    /// Mirrors `sasl_scram_auth_raw`: uses `send_raw_request` directly to
+    /// avoid the reconnect → authenticate → send_request recursion.
+    async fn sasl_gssapi_auth_raw(
+        &self,
+        service_name: &str,
+        broker_host: &str,
+        keytab_path: Option<&Path>,
+        krb5_config_path: Option<&Path>,
+    ) -> Result<()> {
+        use super::gssapi::GssapiClient;
+        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+
+        // Step 1: SASL Handshake.
+        let handshake = SaslHandshakeRequest::default().with_mechanism("GSSAPI".into());
+        let buf = self.encode_request(ApiKey::SaslHandshake, &handshake)?;
+        let _: kafka_protocol::messages::SaslHandshakeResponse =
+            self.send_raw_request(ApiKey::SaslHandshake, &buf).await?;
+
+        let mut gss = GssapiClient::new(service_name, broker_host, keytab_path, krb5_config_path)?;
+
+        // Phase 1: GSS context establishment.
+        let first_token = gss
+            .initial_token()?
+            .ok_or_else(|| {
+                crate::Error::Authentication(
+                    "GSSAPI: initial_token() returned None".to_string(),
+                )
+            })?;
+
+        let mut client_token = first_token;
+        let mut context_established = false;
+
+        loop {
+            let req = SaslAuthenticateRequest::default()
+                .with_auth_bytes(Bytes::from(client_token));
+            let buf = self.encode_request(ApiKey::SaslAuthenticate, &req)?;
+            let resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                self.send_raw_request(ApiKey::SaslAuthenticate, &buf).await?;
+
+            if resp.error_code != 0 {
+                return Err(crate::Error::Authentication(format!(
+                    "GSSAPI: broker rejected token (Phase 1): {}",
+                    resp.error_message
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("error code {}", resp.error_code))
+                )));
+            }
+
+            if context_established {
+                if !resp.auth_bytes.is_empty() {
+                    let wrapped_reply = gss.handle_security_layer(&resp.auth_bytes, "")?;
+                    let req = SaslAuthenticateRequest::default()
+                        .with_auth_bytes(Bytes::from(wrapped_reply));
+                    let buf = self.encode_request(ApiKey::SaslAuthenticate, &req)?;
+                    let final_resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                        self.send_raw_request(ApiKey::SaslAuthenticate, &buf).await?;
+                    if final_resp.error_code != 0 {
+                        return Err(crate::Error::Authentication(format!(
+                            "GSSAPI: broker rejected security-layer reply (Phase 2): \
+                             error code {}",
+                            final_resp.error_code
+                        )));
+                    }
+                }
+                break;
+            }
+
+            if resp.auth_bytes.is_empty() {
+                return Err(crate::Error::Authentication(
+                    "GSSAPI: broker sent an empty token before context was established"
+                        .to_string(),
+                ));
+            }
+
+            match gss.step(&resp.auth_bytes)? {
+                Some(next_token) => {
+                    client_token = next_token;
+                }
+                None => {
+                    context_established = true;
+                    client_token = Vec::new();
+                }
+            }
+        }
+
+        debug!(
+            "SASL GSSAPI re-authentication successful (broker: {})",
+            broker_host
         );
         Ok(())
     }

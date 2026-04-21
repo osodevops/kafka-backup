@@ -8,6 +8,7 @@ mod metadata;
 mod partition_router;
 mod produce;
 mod scram;
+mod gssapi;
 pub mod tls;
 
 pub use admin::{create_topics, delete_records, CreateTopicResult, TopicToCreate};

@@ -207,6 +207,18 @@ pub struct SecurityConfig {
     /// Path to client key file (for mTLS)
     #[serde(default)]
     pub ssl_key_location: Option<PathBuf>,
+
+    /// Must match broker sasl.kerberos.service.name, default 'kafka' (only used with sasl_mechanism: GSSAPI)
+    #[serde(default)]
+    pub sasl_kerberos_service_name: Option<String>,
+
+    /// Path to a Kerberos keytab file, use this if preferred to the default credentials cache (kinit)
+    #[serde(default)]
+    pub sasl_keytab_path: Option<PathBuf>,
+
+    /// Path to a Kerberos configuration file (krb5.conf), defaults to /etc/krb5.conf
+    #[serde(default)]
+    pub sasl_krb5_config_path: Option<PathBuf>,
 }
 
 /// Security protocol
@@ -273,6 +285,7 @@ pub enum SaslMechanism {
     Plain,
     ScramSha256,
     ScramSha512,
+    Gssapi,
 }
 
 /// Topic selection configuration
