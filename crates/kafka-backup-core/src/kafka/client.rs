@@ -40,7 +40,7 @@ pub struct KafkaClient {
     config: KafkaConfig,
 
     /// Connection to the current broker
-    connection: Arc<Mutex<Option<BrokerConnection>>>,
+    pub(super) connection: Arc<Mutex<Option<BrokerConnection>>>,
 
     /// Broker metadata cache
     brokers: Arc<Mutex<HashMap<i32, BrokerMetadata>>>,
@@ -49,18 +49,20 @@ pub struct KafkaClient {
     #[allow(dead_code)]
     topics: Arc<Mutex<HashMap<String, TopicMetadata>>>,
 
-    /// Correlation ID counter
-    correlation_id: AtomicI32,
+    /// Correlation ID counter. `Arc` so the KIP-368 re-auth scheduler task
+    /// (spawned from `sasl_plugin_auth`) can share the same monotonic
+    /// counter as the main client.
+    pub(super) correlation_id: Arc<AtomicI32>,
 }
 
 /// A stream that can be either plain TCP or TLS-wrapped
-enum ConnectionStream {
+pub(super) enum ConnectionStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl ConnectionStream {
-    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub(super) async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         match self {
             ConnectionStream::Plain(s) => {
                 s.read_exact(buf).await?;
@@ -73,7 +75,7 @@ impl ConnectionStream {
         }
     }
 
-    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+    pub(super) async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         match self {
             ConnectionStream::Plain(s) => s.write_all(buf).await,
             ConnectionStream::Tls(s) => s.write_all(buf).await,
@@ -81,10 +83,10 @@ impl ConnectionStream {
     }
 }
 
-struct BrokerConnection {
-    stream: ConnectionStream,
+pub(super) struct BrokerConnection {
+    pub(super) stream: ConnectionStream,
     #[allow(dead_code)]
-    broker_id: i32,
+    pub(super) broker_id: i32,
 }
 
 impl KafkaClient {
@@ -95,7 +97,7 @@ impl KafkaClient {
             connection: Arc::new(Mutex::new(None)),
             brokers: Arc::new(Mutex::new(HashMap::new())),
             topics: Arc::new(Mutex::new(HashMap::new())),
-            correlation_id: AtomicI32::new(1),
+            correlation_id: Arc::new(AtomicI32::new(1)),
         }
     }
 
@@ -225,6 +227,10 @@ impl KafkaClient {
     async fn authenticate(&self) -> Result<()> {
         let security = &self.config.security;
 
+        if let Some(plugin) = security.sasl_mechanism_plugin.clone() {
+            return self.sasl_plugin_auth(plugin).await;
+        }
+
         match security.sasl_mechanism {
             Some(SaslMechanism::Plain) => {
                 self.sasl_plain_auth(
@@ -243,6 +249,64 @@ impl KafkaClient {
                 .await
             }
             None => Ok(()), // No authentication needed
+        }
+    }
+
+    /// Drive a handshake through a [`SaslMechanismPlugin`]. The client owns
+    /// the wire protocol (`SaslHandshake` + repeated `SaslAuthenticate`);
+    /// the plugin owns the mechanism-specific bytes.
+    async fn sasl_plugin_auth(&self, plugin: super::SaslMechanismPluginHandle) -> Result<()> {
+        use super::sasl::SaslAuthOutcome;
+        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+
+        let mechanism_name = plugin.mechanism_name().to_string();
+
+        let handshake =
+            SaslHandshakeRequest::default().with_mechanism(mechanism_name.clone().into());
+        let _handshake_resp: kafka_protocol::messages::SaslHandshakeResponse =
+            self.send_request(ApiKey::SaslHandshake, handshake).await?;
+
+        let mut payload = plugin
+            .initial_payload()
+            .await
+            .map_err(|e| crate::Error::Authentication(e.to_string()))?;
+
+        loop {
+            let req =
+                SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(payload.clone()));
+            let resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                self.send_request(ApiKey::SaslAuthenticate, req).await?;
+
+            if resp.error_code != 0 {
+                // Let the plugin interpret the server-side error body
+                // (RFC 7628 JSON or Kafka 3.5+ free-form text).
+                let err_bytes: Vec<u8> = resp
+                    .error_message
+                    .as_ref()
+                    .map(|s| s.as_bytes().to_vec())
+                    .unwrap_or_default();
+                return Err(crate::Error::Authentication(
+                    plugin.interpret_server_error(&err_bytes).to_string(),
+                ));
+            }
+
+            match plugin
+                .continue_payload(&resp.auth_bytes)
+                .await
+                .map_err(|e| crate::Error::Authentication(e.to_string()))?
+            {
+                SaslAuthOutcome::Continue(next) => payload = next,
+                SaslAuthOutcome::Done => {
+                    debug!("SASL {} plugin authentication successful", mechanism_name);
+                    super::sasl::reauth::spawn_reauth_task(
+                        Arc::downgrade(&self.connection),
+                        self.correlation_id.clone(),
+                        plugin.clone(),
+                        resp.session_lifetime_ms,
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -355,11 +419,6 @@ impl KafkaClient {
         Ok(())
     }
 
-    /// Get the next correlation ID
-    fn next_correlation_id(&self) -> i32 {
-        self.correlation_id.fetch_add(1, Ordering::SeqCst)
-    }
-
     /// Send a request and receive a response.
     ///
     /// On connection errors (broken pipe, early eof), automatically reconnects
@@ -436,13 +495,17 @@ impl KafkaClient {
                         broker_id: -1,
                     });
 
-                    // Re-authenticate if needed, using send_raw_request directly
-                    // to avoid the send_request -> reconnect recursion
+                    // Re-authenticate if needed. `authenticate` routes through
+                    // `send_request`, but `can_retry` is false for
+                    // SaslHandshake/SaslAuthenticate (see `send_request`),
+                    // so no runtime recursion into `reconnect` is possible.
+                    // The `Box::pin` indirection is only there to satisfy
+                    // the compiler's static recursion check.
                     if self.config.security.security_protocol == SecurityProtocol::SaslPlaintext
                         || self.config.security.security_protocol == SecurityProtocol::SaslSsl
                     {
                         drop(conn);
-                        self.authenticate_raw().await?;
+                        Box::pin(self.authenticate()).await?;
                     }
 
                     debug!("Reconnected to Kafka broker: {}", server);
@@ -458,184 +521,18 @@ impl KafkaClient {
         Err(KafkaError::NoBrokersAvailable.into())
     }
 
-    /// Authenticate using raw request sending (bypasses send_request retry logic).
-    async fn authenticate_raw(&self) -> Result<()> {
-        let security = &self.config.security;
-
-        match security.sasl_mechanism {
-            Some(SaslMechanism::Plain) => {
-                self.sasl_plain_auth_raw(
-                    security.sasl_username.as_deref().unwrap_or(""),
-                    security.sasl_password.as_deref().unwrap_or(""),
-                )
-                .await
-            }
-            Some(mechanism @ SaslMechanism::ScramSha256)
-            | Some(mechanism @ SaslMechanism::ScramSha512) => {
-                self.sasl_scram_auth_raw(
-                    security.sasl_username.as_deref().unwrap_or(""),
-                    security.sasl_password.as_deref().unwrap_or(""),
-                    mechanism,
-                )
-                .await
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// SASL PLAIN auth using raw request sending (no reconnect retry).
-    async fn sasl_plain_auth_raw(&self, username: &str, password: &str) -> Result<()> {
-        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
-
-        // Step 1: SASL Handshake
-        let handshake_request = SaslHandshakeRequest::default().with_mechanism("PLAIN".into());
-        let buf = self.encode_request(ApiKey::SaslHandshake, &handshake_request)?;
-        let _handshake_response: kafka_protocol::messages::SaslHandshakeResponse =
-            self.send_raw_request(ApiKey::SaslHandshake, &buf).await?;
-
-        // Step 2: SASL Authenticate
-        let mut auth_bytes = Vec::new();
-        auth_bytes.push(0);
-        auth_bytes.extend_from_slice(username.as_bytes());
-        auth_bytes.push(0);
-        auth_bytes.extend_from_slice(password.as_bytes());
-
-        let auth_request =
-            SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(auth_bytes));
-        let buf = self.encode_request(ApiKey::SaslAuthenticate, &auth_request)?;
-        let auth_response: kafka_protocol::messages::SaslAuthenticateResponse = self
-            .send_raw_request(ApiKey::SaslAuthenticate, &buf)
-            .await?;
-
-        if auth_response.error_code != 0 {
-            return Err(crate::Error::Authentication(format!(
-                "SASL authentication failed: {}",
-                auth_response
-                    .error_message
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("error code {}", auth_response.error_code))
-            )));
-        }
-
-        debug!("SASL PLAIN re-authentication successful");
-        Ok(())
-    }
-
-    /// SCRAM-SHA-256/512 authentication using raw requests (no reconnect retry).
-    async fn sasl_scram_auth_raw(
-        &self,
-        username: &str,
-        password: &str,
-        mechanism: SaslMechanism,
-    ) -> Result<()> {
-        use super::scram::{ScramAlgorithm, ScramClient};
-        use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
-
-        let algorithm = ScramAlgorithm::from_mechanism(mechanism).ok_or_else(|| {
-            crate::Error::Authentication(format!("Unsupported SCRAM mechanism: {:?}", mechanism))
-        })?;
-
-        // Step 1: SASL Handshake
-        let handshake_request =
-            SaslHandshakeRequest::default().with_mechanism(algorithm.mechanism_name().into());
-        let buf = self.encode_request(ApiKey::SaslHandshake, &handshake_request)?;
-        let _handshake_response: kafka_protocol::messages::SaslHandshakeResponse =
-            self.send_raw_request(ApiKey::SaslHandshake, &buf).await?;
-
-        // Step 2: Client-first message
-        let mut scram_client = ScramClient::new(algorithm, username, password)?;
-        let client_first = scram_client.client_first_message();
-
-        let auth_request =
-            SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(client_first));
-        let buf = self.encode_request(ApiKey::SaslAuthenticate, &auth_request)?;
-        let server_first_response: kafka_protocol::messages::SaslAuthenticateResponse = self
-            .send_raw_request(ApiKey::SaslAuthenticate, &buf)
-            .await?;
-
-        if server_first_response.error_code != 0 {
-            return Err(crate::Error::Authentication(format!(
-                "SCRAM handshake failed: {}",
-                server_first_response
-                    .error_message
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("error code {}", server_first_response.error_code))
-            )));
-        }
-
-        // Step 3: Process server-first, send client-final
-        let client_final = scram_client.process_server_first(&server_first_response.auth_bytes)?;
-
-        let auth_request =
-            SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(client_final));
-        let buf = self.encode_request(ApiKey::SaslAuthenticate, &auth_request)?;
-        let server_final_response: kafka_protocol::messages::SaslAuthenticateResponse = self
-            .send_raw_request(ApiKey::SaslAuthenticate, &buf)
-            .await?;
-
-        if server_final_response.error_code != 0 {
-            return Err(crate::Error::Authentication(format!(
-                "SCRAM authentication failed: {}",
-                server_final_response
-                    .error_message
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        format!("error code {}", server_final_response.error_code)
-                    })
-            )));
-        }
-
-        // Step 4: Verify server signature
-        scram_client.process_server_final(&server_final_response.auth_bytes)?;
-
-        debug!(
-            "SASL {} re-authentication successful",
-            algorithm.mechanism_name()
-        );
-        Ok(())
-    }
-
     /// Encode a request into a wire-format buffer.
     fn encode_request<Req: Encodable + Default>(
         &self,
         api_key: ApiKey,
         request: &Req,
     ) -> Result<Bytes> {
-        let correlation_id = self.next_correlation_id();
-        let api_version = self.get_api_version(api_key);
-
-        let header = RequestHeader::default()
-            .with_request_api_key(api_key as i16)
-            .with_request_api_version(api_version)
-            .with_correlation_id(correlation_id)
-            .with_client_id(Some(StrBytes::from_static_str("kafka-backup")));
-
-        let header_version = api_key.request_header_version(api_version);
-        let mut buf = BytesMut::new();
-
-        // Reserve space for the length prefix
-        buf.put_i32(0);
-
-        header
-            .encode(&mut buf, header_version)
-            .map_err(|e| KafkaError::Protocol(format!("Failed to encode header: {:?}", e)))?;
-        request
-            .encode(&mut buf, api_version)
-            .map_err(|e| KafkaError::Protocol(format!("Failed to encode request: {:?}", e)))?;
-
-        // Update length prefix
-        let len = (buf.len() - 4) as i32;
-        buf[0..4].copy_from_slice(&len.to_be_bytes());
-
-        trace!(
-            "Sending request: api_key={:?}, api_version={}, correlation_id={}, len={}",
+        encode_kafka_request(
+            &self.correlation_id,
             api_key,
-            api_version,
-            correlation_id,
-            len
-        );
-
-        Ok(buf.freeze())
+            self.get_api_version(api_key),
+            request,
+        )
     }
 
     /// Send an already-encoded request and read/decode the response.
@@ -644,75 +541,12 @@ impl KafkaClient {
         Resp: Decodable + Default,
     {
         let api_version = self.get_api_version(api_key);
-
         let mut conn = self.connection.lock().await;
-
         let conn = conn
             .as_mut()
             .ok_or_else(|| KafkaError::Protocol("Not connected".to_string()))?;
 
-        // Write request (with deadline — avoids hanging if broker's receive buffer is full)
-        timeout(
-            Duration::from_secs(WRITE_TIMEOUT_SECS),
-            conn.stream.write_all(buf),
-        )
-        .await
-        .map_err(|_| {
-            KafkaError::Protocol(format!(
-                "Request timed out after {}s sending to broker",
-                WRITE_TIMEOUT_SECS
-            ))
-        })?
-        .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
-
-        // Read response length (4 bytes) with deadline.
-        // Without a deadline, a broker that accepts the TCP connection but never
-        // responds will hang the process indefinitely (Issue #67 bug 7).
-        let mut len_buf = [0u8; 4];
-        timeout(
-            Duration::from_secs(RESPONSE_TIMEOUT_SECS),
-            conn.stream.read_exact(&mut len_buf),
-        )
-        .await
-        .map_err(|_| {
-            KafkaError::Protocol(format!(
-                "Request timed out after {}s waiting for broker response",
-                RESPONSE_TIMEOUT_SECS
-            ))
-        })?
-        .map_err(|e| KafkaError::Protocol(format!("Failed to read response length: {}", e)))?;
-        let response_len = i32::from_be_bytes(len_buf) as usize;
-
-        trace!("Receiving response: len={}", response_len);
-
-        // Read response body — also needs a deadline. A broker can send the 4-byte
-        // length then stall on the body, leaving us hung without this timeout.
-        let mut response_buf = vec![0u8; response_len];
-        timeout(
-            Duration::from_secs(RESPONSE_TIMEOUT_SECS),
-            conn.stream.read_exact(&mut response_buf),
-        )
-        .await
-        .map_err(|_| {
-            KafkaError::Protocol(format!(
-                "Response body read timed out after {}s",
-                RESPONSE_TIMEOUT_SECS
-            ))
-        })?
-        .map_err(|e| KafkaError::Protocol(format!("Failed to read response body: {}", e)))?;
-
-        // Decode response
-        let mut response_bytes = Bytes::from(response_buf);
-        let response_header_version = api_key.response_header_version(api_version);
-        let _response_header = ResponseHeader::decode(&mut response_bytes, response_header_version)
-            .map_err(|e| {
-                KafkaError::Protocol(format!("Failed to decode response header: {:?}", e))
-            })?;
-
-        let response = Resp::decode(&mut response_bytes, api_version)
-            .map_err(|e| KafkaError::Protocol(format!("Failed to decode response: {:?}", e)))?;
-
-        Ok(response)
+        send_rpc_on_stream(&mut conn.stream, api_key, api_version, buf).await
     }
 
     /// Get the API version to use for a given API key
@@ -801,6 +635,116 @@ impl KafkaClient {
             cache.insert(broker.node_id, broker);
         }
     }
+}
+
+/// Encode a Kafka request (header + body + length prefix) against a shared
+/// correlation counter. Pulled out of `KafkaClient` so the KIP-368 re-auth
+/// task in `sasl::reauth` can produce wire-compatible frames without
+/// depending on an `&KafkaClient`.
+pub(super) fn encode_kafka_request<Req: Encodable + Default>(
+    correlation_id: &AtomicI32,
+    api_key: ApiKey,
+    api_version: i16,
+    request: &Req,
+) -> Result<Bytes> {
+    let correlation_id = correlation_id.fetch_add(1, Ordering::SeqCst);
+
+    let header = RequestHeader::default()
+        .with_request_api_key(api_key as i16)
+        .with_request_api_version(api_version)
+        .with_correlation_id(correlation_id)
+        .with_client_id(Some(StrBytes::from_static_str("kafka-backup")));
+
+    let header_version = api_key.request_header_version(api_version);
+    let mut buf = BytesMut::new();
+    buf.put_i32(0);
+
+    header
+        .encode(&mut buf, header_version)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to encode header: {:?}", e)))?;
+    request
+        .encode(&mut buf, api_version)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to encode request: {:?}", e)))?;
+
+    let len = (buf.len() - 4) as i32;
+    buf[0..4].copy_from_slice(&len.to_be_bytes());
+
+    trace!(
+        "Sending request: api_key={:?}, api_version={}, correlation_id={}, len={}",
+        api_key,
+        api_version,
+        correlation_id,
+        len
+    );
+
+    Ok(buf.freeze())
+}
+
+/// Write an already-encoded frame to `stream`, read the response, and
+/// decode it. Counterpart to [`encode_kafka_request`] for use by the
+/// re-auth scheduler.
+pub(super) async fn send_rpc_on_stream<Resp>(
+    stream: &mut ConnectionStream,
+    api_key: ApiKey,
+    api_version: i16,
+    buf: &[u8],
+) -> Result<Resp>
+where
+    Resp: Decodable + Default,
+{
+    timeout(
+        Duration::from_secs(WRITE_TIMEOUT_SECS),
+        stream.write_all(buf),
+    )
+    .await
+    .map_err(|_| {
+        KafkaError::Protocol(format!(
+            "Request timed out after {}s sending to broker",
+            WRITE_TIMEOUT_SECS
+        ))
+    })?
+    .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
+
+    let mut len_buf = [0u8; 4];
+    timeout(
+        Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+        stream.read_exact(&mut len_buf),
+    )
+    .await
+    .map_err(|_| {
+        KafkaError::Protocol(format!(
+            "Request timed out after {}s waiting for broker response",
+            RESPONSE_TIMEOUT_SECS
+        ))
+    })?
+    .map_err(|e| KafkaError::Protocol(format!("Failed to read response length: {}", e)))?;
+    let response_len = i32::from_be_bytes(len_buf) as usize;
+
+    trace!("Receiving response: len={}", response_len);
+
+    let mut response_buf = vec![0u8; response_len];
+    timeout(
+        Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+        stream.read_exact(&mut response_buf),
+    )
+    .await
+    .map_err(|_| {
+        KafkaError::Protocol(format!(
+            "Response body read timed out after {}s",
+            RESPONSE_TIMEOUT_SECS
+        ))
+    })?
+    .map_err(|e| KafkaError::Protocol(format!("Failed to read response body: {}", e)))?;
+
+    let mut response_bytes = Bytes::from(response_buf);
+    let response_header_version = api_key.response_header_version(api_version);
+    let _response_header = ResponseHeader::decode(&mut response_bytes, response_header_version)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to decode response header: {:?}", e)))?;
+
+    let response = Resp::decode(&mut response_bytes, api_version)
+        .map_err(|e| KafkaError::Protocol(format!("Failed to decode response: {:?}", e)))?;
+
+    Ok(response)
 }
 
 #[cfg(test)]

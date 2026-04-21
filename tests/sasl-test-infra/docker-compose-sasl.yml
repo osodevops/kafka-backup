@@ -1,0 +1,92 @@
+# Docker Compose for SASL-enabled Kafka testing.
+#
+# One broker, one client-facing listener (SASL_PLAINTEXT on port 9095),
+# enabling PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512. Client chooses the
+# mechanism in its handshake; broker accepts any of the three.
+#
+# Prerequisites:
+#   docker-compose -f docker-compose-sasl.yml up -d
+#
+# This stack boots ZK, Kafka, and a one-shot init container that seeds
+# SCRAM credentials into Kafka's metadata (SCRAM users cannot live in JAAS).
+# The init container exits 0 once users are written.
+#
+# Credentials:
+#   PLAIN        : alice / alice-secret
+#   SCRAM-SHA-256: bob   / bob-secret
+#   SCRAM-SHA-512: carol / carol-secret
+#
+# Inter-broker traffic uses a separate PLAINTEXT INTERNAL listener so the
+# broker can bootstrap without needing its own SASL creds.
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper-sasl-test
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "22181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kafka-sasl:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-sasl-test
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,SASL:SASL_PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,SASL://0.0.0.0:9095
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-sasl:9092,SASL://localhost:9095
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN,SCRAM-SHA-256,SCRAM-SHA-512
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/secrets/jaas.conf"
+    volumes:
+      - ./jaas.conf:/etc/kafka/secrets/jaas.conf:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9095"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  scram-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-sasl-scram-init
+    depends_on:
+      kafka-sasl:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "Seeding SCRAM-SHA-256 user: bob"
+        kafka-configs \
+          --zookeeper zookeeper:2181 \
+          --alter \
+          --add-config 'SCRAM-SHA-256=[password=bob-secret]' \
+          --entity-type users \
+          --entity-name bob
+        echo "Seeding SCRAM-SHA-512 user: carol"
+        kafka-configs \
+          --zookeeper zookeeper:2181 \
+          --alter \
+          --add-config 'SCRAM-SHA-512=[password=carol-secret]' \
+          --entity-type users \
+          --entity-name carol
+        echo "SCRAM users seeded."
+    restart: "no"

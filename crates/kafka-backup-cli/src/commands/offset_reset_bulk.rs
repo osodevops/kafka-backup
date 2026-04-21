@@ -324,5 +324,6 @@ fn parse_security_config(protocol: Option<&str>) -> SecurityConfig {
         ssl_ca_location,
         ssl_certificate_location: None,
         ssl_key_location: None,
+        sasl_mechanism_plugin: None,
     }
 }

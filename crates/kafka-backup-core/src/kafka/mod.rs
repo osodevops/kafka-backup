@@ -7,6 +7,7 @@ mod fetch;
 mod metadata;
 mod partition_router;
 mod produce;
+pub mod sasl;
 mod scram;
 pub mod tls;
 
@@ -20,6 +21,7 @@ pub use fetch::FetchResponse;
 pub use metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
 pub use partition_router::PartitionLeaderRouter;
 pub use produce::ProduceResponse;
+pub use sasl::{SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError};
 
 /// Public test helper: returns true if `error` is a connection-level error that
 /// the client classifies as retriable (broken pipe, timeout, etc.).
