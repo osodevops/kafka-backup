@@ -50,13 +50,14 @@ services:
       # Listener-scoped callback handler; omitting this would make the
       # broker require a secured JWT validator plugin.
       KAFKA_LISTENER_NAME_SASL_OAUTHBEARER_SASL_SERVER_CALLBACK_HANDLER_CLASS: "org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredValidatorCallbackHandler"
+      # Listener-scoped inline JAAS — avoids setting
+      # java.security.auth.login.config at the JVM level, which would
+      # make the cp-kafka preflight ZK client try SASL auth and hang.
+      KAFKA_LISTENER_NAME_SASL_OAUTHBEARER_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required unsecuredLoginStringClaim_sub="broker-self";'
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/secrets/jaas.conf"
-    volumes:
-      - ./jaas.conf:/etc/kafka/secrets/jaas.conf:ro
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9097"]
       interval: 5s
