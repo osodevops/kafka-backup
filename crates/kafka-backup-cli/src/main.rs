@@ -4,6 +4,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod commands;
 
+use commands::security_args::SecurityCliArgs;
+
 #[derive(Parser)]
 #[command(name = "kafka-backup")]
 #[command(about = "High-performance Kafka backup and restore with point-in-time recovery")]
@@ -193,9 +195,8 @@ enum Commands {
         #[arg(long, default_value = "3")]
         max_retries: u32,
 
-        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
-        #[arg(long)]
-        security_protocol: Option<String>,
+        #[command(flatten)]
+        security: SecurityCliArgs,
 
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
@@ -251,9 +252,8 @@ enum OffsetRollbackAction {
         #[arg(short, long)]
         description: Option<String>,
 
-        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
-        #[arg(long)]
-        security_protocol: Option<String>,
+        #[command(flatten)]
+        security: SecurityCliArgs,
 
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
@@ -300,9 +300,8 @@ enum OffsetRollbackAction {
         #[arg(long, value_delimiter = ',')]
         bootstrap_servers: Vec<String>,
 
-        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
-        #[arg(long)]
-        security_protocol: Option<String>,
+        #[command(flatten)]
+        security: SecurityCliArgs,
 
         /// Verify offsets after rollback
         #[arg(long, default_value = "true")]
@@ -327,9 +326,8 @@ enum OffsetRollbackAction {
         #[arg(long, value_delimiter = ',')]
         bootstrap_servers: Vec<String>,
 
-        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
-        #[arg(long)]
-        security_protocol: Option<String>,
+        #[command(flatten)]
+        security: SecurityCliArgs,
 
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
@@ -395,9 +393,8 @@ enum OffsetResetAction {
         #[arg(long, value_delimiter = ',')]
         bootstrap_servers: Vec<String>,
 
-        /// Security protocol (PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT)
-        #[arg(long)]
-        security_protocol: Option<String>,
+        #[command(flatten)]
+        security: SecurityCliArgs,
     },
 
     /// Generate a shell script for manual offset reset
@@ -584,14 +581,15 @@ async fn main() -> Result<()> {
                 backup_id,
                 groups,
                 bootstrap_servers,
-                security_protocol,
+                security,
             } => {
+                let security = security.into_security_config()?;
                 commands::offset_reset::execute_plan(
                     &path,
                     &backup_id,
                     &groups,
                     &bootstrap_servers,
-                    security_protocol.as_deref(),
+                    security,
                 )
                 .await?;
             }
@@ -622,9 +620,10 @@ async fn main() -> Result<()> {
             bootstrap_servers,
             max_concurrent,
             max_retries,
-            security_protocol,
+            security,
             format,
         } => {
+            let security = security.into_security_config()?;
             commands::offset_reset_bulk::execute_bulk(
                 &path,
                 &backup_id,
@@ -632,7 +631,7 @@ async fn main() -> Result<()> {
                 &bootstrap_servers,
                 max_concurrent,
                 max_retries,
-                security_protocol.as_deref(),
+                security,
                 commands::offset_reset_bulk::OutputFormat::from(format.as_str()),
             )
             .await?;
@@ -643,15 +642,16 @@ async fn main() -> Result<()> {
                 groups,
                 bootstrap_servers,
                 description,
-                security_protocol,
+                security,
                 format,
             } => {
+                let security = security.into_security_config()?;
                 commands::offset_rollback::create_snapshot(
                     &path,
                     &groups,
                     &bootstrap_servers,
                     description.as_deref(),
-                    security_protocol.as_deref(),
+                    security,
                     commands::offset_rollback::OutputFormat::from(format.as_str()),
                 )
                 .await?;
@@ -679,15 +679,16 @@ async fn main() -> Result<()> {
                 path,
                 snapshot_id,
                 bootstrap_servers,
-                security_protocol,
+                security,
                 verify,
                 format,
             } => {
+                let security = security.into_security_config()?;
                 commands::offset_rollback::execute_rollback(
                     &path,
                     &snapshot_id,
                     &bootstrap_servers,
-                    security_protocol.as_deref(),
+                    security,
                     verify,
                     commands::offset_rollback::OutputFormat::from(format.as_str()),
                 )
@@ -697,14 +698,15 @@ async fn main() -> Result<()> {
                 path,
                 snapshot_id,
                 bootstrap_servers,
-                security_protocol,
+                security,
                 format,
             } => {
+                let security = security.into_security_config()?;
                 commands::offset_rollback::verify_snapshot(
                     &path,
                     &snapshot_id,
                     &bootstrap_servers,
-                    security_protocol.as_deref(),
+                    security,
                     commands::offset_rollback::OutputFormat::from(format.as_str()),
                 )
                 .await?;

@@ -13,7 +13,9 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     let config_content = tokio::fs::read_to_string(config_path).await?;
     let config_content = super::config::expand_env_vars(&config_content);
-    let config: Config = serde_yaml::from_str(&config_content)?;
+    let mut config: Config = serde_yaml::from_str(&config_content)?;
+    super::sasl_plugin::populate_sasl_plugin_opt(&mut config.source)?;
+    super::sasl_plugin::populate_sasl_plugin_opt(&mut config.target)?;
 
     info!(
         "Starting three-phase restore from backup: {}",

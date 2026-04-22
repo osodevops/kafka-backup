@@ -25,7 +25,7 @@ use std::sync::Arc;
 use kafka_backup_core::config::{KafkaConfig, SecurityConfig, SecurityProtocol, TopicSelection};
 use kafka_backup_core::kafka::KafkaClient;
 
-use super::sasl_test_fixtures::StaticOAuthBearerPlugin;
+use super::sasl_test_fixtures::{factory_for, StaticOAuthBearerPlugin};
 
 const OAUTH_BOOTSTRAP: &str = "localhost:9097";
 
@@ -34,7 +34,7 @@ fn oauth_config(plugin: kafka_backup_core::kafka::SaslMechanismPluginHandle) -> 
         bootstrap_servers: vec![OAUTH_BOOTSTRAP.to_string()],
         security: SecurityConfig {
             security_protocol: SecurityProtocol::SaslPlaintext,
-            sasl_mechanism_plugin: Some(plugin),
+            sasl_mechanism_plugin_factory: Some(factory_for(plugin)),
             ..Default::default()
         },
         topics: TopicSelection::default(),

@@ -1,0 +1,35 @@
+# MIT Kerberos KDC for SASL/GSSAPI E2E tests.
+#
+# Builds a minimal KDC container that hosts realm TEST.LOCAL and bootstraps
+# two principals (kafka service + test client). Keytabs are written to
+# /keytabs (bind-mounted back into the host so Rust and Java consumers can
+# read them) by init-kdc.sh on container start.
+#
+# Ubuntu 22.04 gives us krb5 1.19 which matches the libgssapi 0.9 wire
+# expectations; 24.04 would work too but 22.04 is what cp-kafka 7.7.0 is
+# built against, so we keep them aligned.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        krb5-kdc \
+        krb5-admin-server \
+        krb5-user \
+        netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Drop the stock krb5.conf — init-kdc.sh installs one wired for TEST.LOCAL
+# pointing at this container by name.
+COPY krb5.conf /etc/krb5.conf
+COPY kdc.conf /etc/krb5kdc/kdc.conf
+COPY kadm5.acl /etc/krb5kdc/kadm5.acl
+COPY init-kdc.sh /usr/local/bin/init-kdc.sh
+
+RUN chmod +x /usr/local/bin/init-kdc.sh && \
+    mkdir -p /keytabs
+
+EXPOSE 88/tcp 88/udp 749/tcp
+
+CMD ["/usr/local/bin/init-kdc.sh"]

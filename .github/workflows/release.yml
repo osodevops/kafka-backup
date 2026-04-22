@@ -66,6 +66,12 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
+      # Required by `--all-features` (pulls in the `gssapi` feature). Release
+      # *binaries* don't include gssapi (cargo-dist uses default features), so
+      # only the pre-release test step here needs the krb5 headers.
+      - name: Install krb5 development headers
+        run: sudo apt-get install -y libkrb5-dev
+
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:

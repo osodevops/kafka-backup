@@ -1,0 +1,42 @@
+# Example Kafka Restore Configuration — SASL/GSSAPI (Kerberos)
+#
+# Pair for config/gssapi-backup.yaml. Restores `smoke-topic` back into
+# the same fixture broker under the new name `smoke-topic-restored`, so
+# the source and the restored copy can coexist without collision.
+#
+# Usage (requires --features gssapi):
+#   ./target/release/kafka-backup restore --config config/gssapi-restore.yaml
+#
+# Paths below are resolved relative to the current working directory —
+# run from the repo root so they match the checked-in fixture files.
+
+mode: restore
+backup_id: "gssapi-smoke"
+
+target:
+  bootstrap_servers:
+    - kafka.test.local:9098
+
+  security:
+    security_protocol: SASL_PLAINTEXT
+    sasl_mechanism: GSSAPI
+    sasl_kerberos_service_name: kafka
+    sasl_keytab_path: tests/sasl-gssapi-test-infra/keytabs/client.keytab
+    sasl_krb5_config_path: tests/sasl-gssapi-test-infra/krb5.conf
+
+  topics:
+    include:
+      - smoke-topic
+
+storage:
+  backend: filesystem
+  path: /tmp/gssapi-backup-smoke
+
+restore:
+  topic_mapping:
+    smoke-topic: smoke-topic-restored
+  consumer_group_strategy: skip
+  dry_run: false
+  include_original_offset_header: true
+  max_concurrent_partitions: 1
+  produce_batch_size: 100

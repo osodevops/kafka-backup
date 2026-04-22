@@ -208,14 +208,43 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub ssl_key_location: Option<PathBuf>,
 
-    /// Optional pluggable SASL mechanism implementation.
+    /// Kerberos service name. Must match the broker's
+    /// `sasl.kerberos.service.name` (typically `kafka`). Only meaningful
+    /// when `sasl_mechanism: GSSAPI`. Defaults to `kafka` at the CLI
+    /// wiring layer if unset.
+    #[serde(default)]
+    pub sasl_kerberos_service_name: Option<String>,
+
+    /// Path to a Kerberos keytab file. If unset, the OS credential cache
+    /// (populated via `kinit`) is used. Only meaningful when
+    /// `sasl_mechanism: GSSAPI`.
+    #[serde(default)]
+    pub sasl_keytab_path: Option<PathBuf>,
+
+    /// Path to a Kerberos `krb5.conf`. If unset, the system default is
+    /// used. Only meaningful when `sasl_mechanism: GSSAPI`.
+    #[serde(default)]
+    pub sasl_krb5_config_path: Option<PathBuf>,
+
+    /// Optional pluggable SASL mechanism factory.
     ///
     /// When set, overrides [`sasl_mechanism`] and drives the handshake
-    /// through the plugin (e.g. `OAUTHBEARER` for MSK IAM). Not YAML-
-    /// configurable — downstream crates inject this programmatically
-    /// after parsing the config.
+    /// through a plugin built per `KafkaClient` (e.g. `OAUTHBEARER` for
+    /// MSK IAM, or `GSSAPI` for Kerberos). Not YAML-configurable —
+    /// downstream crates inject this programmatically after parsing the
+    /// config.
+    ///
+    /// The factory is invoked once per `KafkaClient` in
+    /// `KafkaClient::authenticate`, with the broker endpoint from
+    /// `bootstrap_servers[0]`. The `PartitionLeaderRouter` rewrites that
+    /// field to the advertised per-broker `host:port` before spawning
+    /// pooled clients, so stateful mechanisms (GSSAPI) receive the
+    /// correct SPN hostname and stateless mechanisms (PLAIN,
+    /// OAUTHBEARER) can ignore the argument via [`SharedPluginFactory`].
+    ///
+    /// [`SharedPluginFactory`]: crate::kafka::SharedPluginFactory
     #[serde(skip)]
-    pub sasl_mechanism_plugin: Option<crate::kafka::SaslMechanismPluginHandle>,
+    pub sasl_mechanism_plugin_factory: Option<crate::kafka::SaslMechanismPluginFactoryHandle>,
 }
 
 /// Security protocol
@@ -282,6 +311,12 @@ pub enum SaslMechanism {
     Plain,
     ScramSha256,
     ScramSha512,
+    /// SASL/GSSAPI (Kerberos). The enum variant is always present, but
+    /// constructing a working client requires the `gssapi` cargo feature
+    /// on `kafka-backup-cli` (which propagates to `kafka-backup-core`).
+    /// CLI builds without the feature surface a clear runtime error when
+    /// a config requests `GSSAPI`.
+    Gssapi,
 }
 
 /// Topic selection configuration
@@ -970,10 +1005,11 @@ bootstrap_servers:
     }
 
     #[test]
-    fn test_security_config_serde_skips_plugin_field() {
-        // `sasl_mechanism_plugin` is `#[serde(skip)]` — programmatic only.
-        // Regressions would leak a non-serializable trait object into
-        // YAML and break config round-tripping. This test pins it.
+    fn test_security_config_serde_skips_plugin_factory_field() {
+        // `sasl_mechanism_plugin_factory` is `#[serde(skip)]` —
+        // programmatic only. Regressions would leak a non-serializable
+        // trait object into YAML and break config round-tripping. This
+        // test pins it.
         use std::sync::Arc;
 
         #[derive(Debug)]
@@ -988,21 +1024,75 @@ bootstrap_servers:
             }
         }
 
+        let plugin: crate::kafka::SaslMechanismPluginHandle = Arc::new(NoopPlugin);
+        let factory = crate::kafka::SharedPluginFactory::new(plugin).into_handle();
+
         let cfg = SecurityConfig {
             security_protocol: SecurityProtocol::SaslPlaintext,
-            sasl_mechanism_plugin: Some(Arc::new(NoopPlugin)),
+            sasl_mechanism_plugin_factory: Some(factory),
             ..Default::default()
         };
         let yaml = serde_yaml::to_string(&cfg).expect("serialize security config");
         assert!(
-            !yaml.contains("sasl_mechanism_plugin"),
-            "serde(skip) must keep the plugin field out of YAML; got:\n{yaml}"
+            !yaml.contains("sasl_mechanism_plugin_factory"),
+            "serde(skip) must keep the factory field out of YAML; got:\n{yaml}"
         );
 
         // Round-trip: deserialization into a config without the field
         // yields `None` — we never try to rehydrate a trait object.
         let back: SecurityConfig = serde_yaml::from_str(&yaml).expect("deserialize");
-        assert!(back.sasl_mechanism_plugin.is_none());
+        assert!(back.sasl_mechanism_plugin_factory.is_none());
+    }
+
+    #[test]
+    fn test_security_config_gssapi_serde_roundtrip() {
+        // Pins the YAML spelling `GSSAPI` (SCREAMING-KEBAB-CASE) and that
+        // all three Kerberos path fields deserialize into Options.
+        let yaml = r#"
+security_protocol: SASL_PLAINTEXT
+sasl_mechanism: GSSAPI
+sasl_kerberos_service_name: kafka
+sasl_keytab_path: /etc/kafka/client.keytab
+sasl_krb5_config_path: /etc/krb5.conf
+"#;
+        let cfg: SecurityConfig = serde_yaml::from_str(yaml).expect("deserialize GSSAPI config");
+        assert_eq!(cfg.security_protocol, SecurityProtocol::SaslPlaintext);
+        assert_eq!(cfg.sasl_mechanism, Some(SaslMechanism::Gssapi));
+        assert_eq!(cfg.sasl_kerberos_service_name.as_deref(), Some("kafka"));
+        assert_eq!(
+            cfg.sasl_keytab_path.as_deref(),
+            Some(std::path::Path::new("/etc/kafka/client.keytab"))
+        );
+        assert_eq!(
+            cfg.sasl_krb5_config_path.as_deref(),
+            Some(std::path::Path::new("/etc/krb5.conf"))
+        );
+
+        // Round-trip back to YAML — variant must spell as `GSSAPI`, not
+        // `Gssapi` or `GSS-API`.
+        let back = serde_yaml::to_string(&cfg).expect("serialize");
+        assert!(
+            back.contains("sasl_mechanism: GSSAPI"),
+            "expected GSSAPI spelling in:\n{back}"
+        );
+    }
+
+    #[test]
+    fn test_security_config_gssapi_fields_default_to_none() {
+        // A pre-GSSAPI config (no kerberos fields) must still parse, with
+        // the new fields defaulting to None. Guards backwards-compat for
+        // existing deployed configs.
+        let yaml = r#"
+security_protocol: SASL_SSL
+sasl_mechanism: SCRAM-SHA512
+sasl_username: alice
+sasl_password: hunter2
+"#;
+        let cfg: SecurityConfig = serde_yaml::from_str(yaml).expect("deserialize legacy config");
+        assert_eq!(cfg.sasl_mechanism, Some(SaslMechanism::ScramSha512));
+        assert!(cfg.sasl_kerberos_service_name.is_none());
+        assert!(cfg.sasl_keytab_path.is_none());
+        assert!(cfg.sasl_krb5_config_path.is_none());
     }
 
     #[test]

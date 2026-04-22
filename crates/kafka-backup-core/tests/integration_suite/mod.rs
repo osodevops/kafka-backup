@@ -15,6 +15,7 @@ pub mod issue_67_fixes;
 pub mod offset_semantics;
 pub mod performance_issues;
 pub mod pitr_accuracy;
+pub mod sasl_gssapi_tests;
 pub mod sasl_mock_broker;
 pub mod sasl_oauth_tests;
 pub mod sasl_plugin_mock_tests;

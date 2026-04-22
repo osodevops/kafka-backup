@@ -1,0 +1,4 @@
+# Keytabs are re-generated on every `docker compose up` by init-kdc.sh.
+# They contain randomly-keyed test principals with zero production value,
+# but checking them in would create a needless security-alert false positive.
+keytabs/

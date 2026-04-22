@@ -45,3 +45,10 @@ uuid.workspace = true
 
 # Crypto for SHA-256 verification
 sha2.workspace = true
+
+[features]
+default = []
+# Enables SASL/GSSAPI (Kerberos) authentication. Propagates to
+# kafka-backup-core/gssapi, which pulls the `libgssapi` crate and
+# requires system krb5 dev headers at build time.
+gssapi = ["kafka-backup-core/gssapi"]

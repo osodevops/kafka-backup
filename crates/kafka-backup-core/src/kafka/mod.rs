@@ -21,7 +21,14 @@ pub use fetch::FetchResponse;
 pub use metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
 pub use partition_router::PartitionLeaderRouter;
 pub use produce::ProduceResponse;
-pub use sasl::{SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError};
+pub use sasl::{
+    SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginFactory,
+    SaslMechanismPluginFactoryHandle, SaslMechanismPluginHandle, SaslPluginError,
+    SharedPluginFactory,
+};
+
+#[cfg(feature = "gssapi")]
+pub use sasl::{GssapiPlugin, GssapiPluginError, GssapiPluginFactory};
 
 /// Public test helper: returns true if `error` is a connection-level error that
 /// the client classifies as retriable (broken pipe, timeout, etc.).

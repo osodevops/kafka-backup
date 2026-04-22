@@ -7,7 +7,7 @@
 //! - Progress reporting and observability
 
 use anyhow::{Context, Result};
-use kafka_backup_core::config::{KafkaConfig, SaslMechanism, SecurityConfig, SecurityProtocol};
+use kafka_backup_core::config::{KafkaConfig, SecurityConfig};
 use kafka_backup_core::kafka::KafkaClient;
 use kafka_backup_core::manifest::OffsetMapping;
 use kafka_backup_core::restore::offset_automation::{
@@ -15,7 +15,6 @@ use kafka_backup_core::restore::offset_automation::{
     OffsetMapping as BulkOffsetMapping,
 };
 use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
-use std::path::PathBuf;
 use tracing::{info, warn};
 
 /// Output format for bulk offset reset reports
@@ -43,7 +42,7 @@ pub async fn execute_bulk(
     bootstrap_servers: &[String],
     max_concurrent: usize,
     max_retries: u32,
-    security_protocol: Option<&str>,
+    security: SecurityConfig,
     format: OutputFormat,
 ) -> Result<()> {
     let storage = FilesystemBackend::new(path.into());
@@ -79,7 +78,7 @@ pub async fn execute_bulk(
     // Create Kafka client
     let kafka_config = KafkaConfig {
         bootstrap_servers: bootstrap_servers.to_vec(),
-        security: parse_security_config(security_protocol),
+        security,
         topics: Default::default(),
         connection: Default::default(),
     };
@@ -282,48 +281,5 @@ fn print_report_text(report: &BulkOffsetResetReport) {
                 }
             }
         }
-    }
-}
-
-/// Parse security configuration from protocol string
-fn parse_security_config(protocol: Option<&str>) -> SecurityConfig {
-    let security_protocol = match protocol.map(|p| p.to_uppercase()).as_deref() {
-        Some("SASL_SSL") => SecurityProtocol::SaslSsl,
-        Some("SSL") => SecurityProtocol::Ssl,
-        Some("SASL_PLAINTEXT") => SecurityProtocol::SaslPlaintext,
-        _ => SecurityProtocol::Plaintext,
-    };
-
-    let (sasl_mechanism, sasl_username, sasl_password) = if matches!(
-        security_protocol,
-        SecurityProtocol::SaslSsl | SecurityProtocol::SaslPlaintext
-    ) {
-        (
-            Some(SaslMechanism::Plain),
-            std::env::var("KAFKA_USERNAME").ok(),
-            std::env::var("KAFKA_PASSWORD").ok(),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    let ssl_ca_location = if matches!(
-        security_protocol,
-        SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
-    ) {
-        std::env::var("KAFKA_SSL_CA_CERT").ok().map(PathBuf::from)
-    } else {
-        None
-    };
-
-    SecurityConfig {
-        security_protocol,
-        sasl_mechanism,
-        sasl_username,
-        sasl_password,
-        ssl_ca_location,
-        ssl_certificate_location: None,
-        ssl_key_location: None,
-        sasl_mechanism_plugin: None,
     }
 }

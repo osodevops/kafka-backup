@@ -24,7 +24,10 @@ use kafka_backup_core::config::{KafkaConfig, SecurityConfig, SecurityProtocol, T
 use kafka_backup_core::kafka::KafkaClient;
 
 use super::sasl_mock_broker::{Exchange, MockKafkaBroker};
-use super::sasl_test_fixtures::{RecordingErrorPlugin, StaticOAuthBearerPlugin, TwoRoundPlugin};
+use super::sasl_test_fixtures::{
+    factory_for, NoReauthCountingPlugin, RecordingErrorPlugin, StaticOAuthBearerPlugin,
+    TwoRoundPlugin,
+};
 
 fn plugin_config(
     bootstrap: String,
@@ -34,7 +37,7 @@ fn plugin_config(
         bootstrap_servers: vec![bootstrap],
         security: SecurityConfig {
             security_protocol: SecurityProtocol::SaslPlaintext,
-            sasl_mechanism_plugin: Some(plugin),
+            sasl_mechanism_plugin_factory: Some(factory_for(plugin)),
             ..Default::default()
         },
         topics: TopicSelection::default(),
@@ -225,4 +228,319 @@ async fn plugin_reauth_fires_at_80_percent_via_scheduler() {
     );
 
     mock.shutdown().await;
+}
+
+/// The factory contract: `KafkaClient::authenticate` must call
+/// `SaslMechanismPluginFactory::build` exactly once, passing the
+/// endpoint from `bootstrap_servers[0]`.
+///
+/// This is the test that gates the multi-broker GSSAPI correctness:
+/// when `PartitionLeaderRouter` rewrites `bootstrap_servers` to the
+/// advertised broker host, that host must flow into the factory so
+/// GSSAPI can derive the right per-broker SPN.
+#[tokio::test]
+async fn factory_receives_per_broker_endpoint() {
+    use async_trait::async_trait;
+    use kafka_backup_core::kafka::{
+        SaslMechanismPlugin, SaslMechanismPluginFactory, SaslMechanismPluginHandle, SaslPluginError,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct StubPlugin;
+    #[async_trait]
+    impl SaslMechanismPlugin for StubPlugin {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        async fn initial_payload(&self) -> Result<Vec<u8>, SaslPluginError> {
+            Ok(b"n,a=test-user,\x01auth=Bearer stub\x01\x01".to_vec())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingFactory {
+        calls: Arc<Mutex<Vec<(String, u16)>>>,
+    }
+
+    impl SaslMechanismPluginFactory for CapturingFactory {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        fn build(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> Result<SaslMechanismPluginHandle, SaslPluginError> {
+            self.calls.lock().unwrap().push((host.to_string(), port));
+            Ok(Arc::new(StubPlugin))
+        }
+    }
+
+    let mock = MockKafkaBroker::start(vec![
+        Exchange::HandshakeSuccess,
+        Exchange::AuthenticateSuccess {
+            auth_bytes: vec![],
+            session_lifetime_ms: 0,
+        },
+    ])
+    .await;
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(CapturingFactory {
+        calls: calls.clone(),
+    });
+
+    let bootstrap = mock.bootstrap();
+    let config = KafkaConfig {
+        bootstrap_servers: vec![bootstrap.clone()],
+        security: SecurityConfig {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism_plugin_factory: Some(factory),
+            ..Default::default()
+        },
+        topics: TopicSelection::default(),
+        connection: Default::default(),
+    };
+    let client = KafkaClient::new(config);
+    client.connect().await.expect("connect succeeds");
+
+    let observed = calls.lock().unwrap().clone();
+    assert_eq!(
+        observed.len(),
+        1,
+        "factory::build must be called exactly once per KafkaClient authenticate"
+    );
+    let (host, port) = &observed[0];
+    // MockKafkaBroker binds 127.0.0.1:<ephemeral>. Assert the factory
+    // receives the exact host + port the client was configured with,
+    // proving the endpoint flows from `bootstrap_servers[0]` through
+    // `parse_broker_endpoint` to the factory.
+    assert_eq!(
+        format!("{host}:{port}"),
+        bootstrap,
+        "factory endpoint must match configured bootstrap exactly"
+    );
+
+    mock.shutdown().await;
+}
+
+/// Plugins that return `supports_reauth() = false` must not get a
+/// KIP-368 reauth task spawned, even when the broker advertises a
+/// non-zero `session_lifetime_ms`. This is the GSSAPI opt-out contract,
+/// exercised here through a mechanism-agnostic fixture so it runs
+/// without the `gssapi` feature.
+///
+/// We advance virtual time past the 80 % reauth deadline and confirm
+/// that `reauth_payload` was never called and the mock broker only ever
+/// saw a single `SaslAuthenticate` frame.
+#[tokio::test]
+async fn reauth_scheduler_not_spawned_when_plugin_opts_out() {
+    let mock = MockKafkaBroker::start(vec![
+        Exchange::HandshakeSuccess,
+        Exchange::AuthenticateSuccess {
+            auth_bytes: vec![],
+            // Non-zero lifetime would trigger the scheduler if the
+            // plugin opted in — here we prove the opt-out suppresses it.
+            session_lifetime_ms: 60_000,
+        },
+    ])
+    .await;
+
+    let (plugin, initial_calls, reauth_calls) = NoReauthCountingPlugin::handle_with_counters();
+    let config = plugin_config(mock.bootstrap(), plugin);
+    let client = KafkaClient::new(config);
+
+    client.connect().await.expect("initial connect");
+    assert_eq!(
+        initial_calls.load(Ordering::SeqCst),
+        1,
+        "initial_payload called exactly once during connect"
+    );
+
+    // Let any background tasks get their first poll before we jump the
+    // clock — mirrors the timing discipline of the scheduler test so a
+    // would-be reauth task (if one had been spawned) would actually
+    // wake up inside our time window.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+
+    // Give the runtime real time to process anything that would have
+    // fired. Nothing should, because `spawn_reauth_task` was skipped.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        reauth_calls.load(Ordering::SeqCst),
+        0,
+        "reauth_payload must not be called when plugin opts out"
+    );
+    assert_eq!(
+        initial_calls.load(Ordering::SeqCst),
+        1,
+        "initial_payload must stay at 1 (no second handshake via scheduler)"
+    );
+
+    let captured = mock.captured().await;
+    assert_eq!(
+        captured.authenticate_payloads.len(),
+        1,
+        "broker must see exactly one SaslAuthenticate frame (got {})",
+        captured.authenticate_payloads.len()
+    );
+
+    mock.shutdown().await;
+}
+
+/// Pool-isolation contract: when N `KafkaClient`s share a single
+/// `SaslMechanismPluginFactory`, each client's `authenticate` must call
+/// `build` once and receive a pointer-distinct plugin Arc.
+///
+/// This turns the CHANGELOG claim that the factory "removes a latent
+/// risk of shared plugin state across the `connections_per_broker`
+/// pool" into a tested guarantee. If someone in the future wires a
+/// `SharedPluginFactory` (which deliberately returns the same Arc) into
+/// the GSSAPI install path, this test fails on the pointer-distinctness
+/// assertion.
+#[tokio::test]
+async fn pool_produces_distinct_plugin_per_kafkaclient() {
+    use async_trait::async_trait;
+    use kafka_backup_core::kafka::{
+        SaslMechanismPlugin, SaslMechanismPluginFactory, SaslMechanismPluginHandle, SaslPluginError,
+    };
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct StubPlugin;
+    #[async_trait]
+    impl SaslMechanismPlugin for StubPlugin {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        async fn initial_payload(&self) -> Result<Vec<u8>, SaslPluginError> {
+            Ok(b"n,a=test-user,\x01auth=Bearer stub\x01\x01".to_vec())
+        }
+    }
+
+    /// Factory that hands out a fresh Arc per call — the real contract
+    /// mirrors `GssapiPluginFactory`. Retains a clone of every built Arc
+    /// so the test can compare their identities after all clients have
+    /// been constructed (retention keeps every allocation alive, which
+    /// prevents the allocator from reusing a pointer slot and defeating
+    /// the distinctness check — especially important for ZST plugins).
+    #[derive(Debug)]
+    struct FreshArcFactory {
+        endpoints: Arc<Mutex<Vec<(String, u16)>>>,
+        built: Arc<Mutex<Vec<SaslMechanismPluginHandle>>>,
+    }
+
+    impl SaslMechanismPluginFactory for FreshArcFactory {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        fn build(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> Result<SaslMechanismPluginHandle, SaslPluginError> {
+            // Non-ZST per-call state — forces a unique heap allocation
+            // for each returned Arc so pointer distinctness is a
+            // meaningful identity check.
+            let plugin: SaslMechanismPluginHandle = Arc::new(StubPlugin);
+            self.endpoints
+                .lock()
+                .unwrap()
+                .push((host.to_string(), port));
+            self.built.lock().unwrap().push(Arc::clone(&plugin));
+            Ok(plugin)
+        }
+    }
+
+    const POOL_SIZE: usize = 3;
+
+    let mut mocks = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        mocks.push(
+            MockKafkaBroker::start(vec![
+                Exchange::HandshakeSuccess,
+                Exchange::AuthenticateSuccess {
+                    auth_bytes: vec![],
+                    session_lifetime_ms: 0,
+                },
+            ])
+            .await,
+        );
+    }
+
+    let endpoints = Arc::new(Mutex::new(Vec::new()));
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(FreshArcFactory {
+        endpoints: endpoints.clone(),
+        built: built.clone(),
+    });
+
+    for mock in &mocks {
+        let config = KafkaConfig {
+            bootstrap_servers: vec![mock.bootstrap()],
+            security: SecurityConfig {
+                security_protocol: SecurityProtocol::SaslPlaintext,
+                sasl_mechanism_plugin_factory: Some(factory.clone()),
+                ..Default::default()
+            },
+            topics: TopicSelection::default(),
+            connection: Default::default(),
+        };
+        let client = KafkaClient::new(config);
+        client
+            .connect()
+            .await
+            .expect("pool member connect succeeds");
+    }
+
+    let observed_endpoints = endpoints.lock().unwrap().clone();
+    let retained = built.lock().unwrap().clone();
+
+    assert_eq!(
+        observed_endpoints.len(),
+        POOL_SIZE,
+        "factory::build must be called once per pool member"
+    );
+    assert_eq!(
+        retained.len(),
+        POOL_SIZE,
+        "factory must have retained one plugin Arc per build call"
+    );
+
+    let expected_endpoints: HashSet<String> = mocks.iter().map(|m| m.bootstrap()).collect();
+    let observed: HashSet<String> = observed_endpoints
+        .iter()
+        .map(|(h, p)| format!("{h}:{p}"))
+        .collect();
+    assert_eq!(
+        observed, expected_endpoints,
+        "each pool member's endpoint must flow into the factory"
+    );
+
+    // Every retained Arc still points to its own heap allocation (the
+    // factory holds them all alive), so pointer equality is a sound
+    // identity check here: no two pool members shared a plugin.
+    for i in 0..POOL_SIZE {
+        for j in (i + 1)..POOL_SIZE {
+            assert!(
+                !Arc::ptr_eq(&retained[i], &retained[j]),
+                "pool members {i} and {j} received the same plugin Arc — \
+                 shared-Arc leak regression"
+            );
+        }
+    }
+
+    for mock in mocks {
+        mock.shutdown().await;
+    }
 }

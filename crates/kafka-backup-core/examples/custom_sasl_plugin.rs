@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use kafka_backup_core::config::{KafkaConfig, SecurityConfig, SecurityProtocol, TopicSelection};
 use kafka_backup_core::kafka::{
     KafkaClient, SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError,
+    SharedPluginFactory,
 };
 
 /// A static-token OAUTHBEARER plugin.
@@ -89,12 +90,17 @@ fn main() {
     );
 
     let plugin = StaticTokenOauthBearer::new("test-user", unsecured_jwt).into_handle();
+    // OAUTHBEARER is stateless — the token is safe to share across every
+    // broker connection, so `SharedPluginFactory` hands the same Arc
+    // back from every `build` call. Mechanisms with per-connection state
+    // (GSSAPI) should implement `SaslMechanismPluginFactory` directly.
+    let factory = SharedPluginFactory::new(plugin).into_handle();
 
     let config = KafkaConfig {
         bootstrap_servers: vec!["localhost:9097".to_string()],
         security: SecurityConfig {
             security_protocol: SecurityProtocol::SaslPlaintext,
-            sasl_mechanism_plugin: Some(plugin),
+            sasl_mechanism_plugin_factory: Some(factory),
             ..Default::default()
         },
         topics: TopicSelection::default(),
