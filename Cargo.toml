@@ -86,7 +86,7 @@ regex = "1"
 
 # Cryptographic signing (evidence reports)
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 # PDF generation (evidence reports)
 printpdf = "0.7"
