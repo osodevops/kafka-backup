@@ -80,7 +80,7 @@ murmur2 = "0.1"
 
 # Utilities
 parking_lot = "0.12"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 crc32fast = "1.4"
 regex = "1"
 
