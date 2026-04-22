@@ -39,6 +39,12 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
+      # Required by the `gssapi` cargo feature (pulled in via `--all-features`).
+      # `libgssapi-sys`'s build.rs needs the krb5 development headers to
+      # generate bindings; only the runtime `.so` ships on default runners.
+      - name: Install krb5 development headers
+        run: sudo apt-get install -y libkrb5-dev
+
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
@@ -71,6 +77,9 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
           toolchain: stable
+
+      - name: Install krb5 development headers
+        run: sudo apt-get install -y libkrb5-dev
 
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
@@ -111,6 +120,9 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
           toolchain: stable
+
+      - name: Install krb5 development headers
+        run: sudo apt-get install -y libkrb5-dev
 
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
@@ -159,6 +171,9 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
           toolchain: stable
+
+      - name: Install krb5 development headers
+        run: sudo apt-get install -y libkrb5-dev
 
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5

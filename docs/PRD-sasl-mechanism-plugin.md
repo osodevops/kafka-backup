@@ -1,15 +1,16 @@
 # Product Requirements Document: Pluggable SASL Mechanism Extension Point
 
-**Document Version:** 2.1
-**Date:** 2026-04-21
-**Status:** Implemented (0.14.0)
+**Document Version:** 2.2
+**Date:** 2026-04-22
+**Status:** Implemented (0.15.0, unreleased)
 **Owners:** kafka-backup-core maintainers
-**Supersedes:** v2.0 (2026-04-20)
+**Supersedes:** v2.1 (2026-04-21)
 
 ---
 
 ## Changelog
 
+- **v2.2 (2026-04-22):** Reshaped the extension point from a shared `Arc<dyn SaslMechanismPlugin>` to a per-connection factory (`SaslMechanismPluginFactory`). `SecurityConfig.sasl_mechanism_plugin` is gone; the field is now `sasl_mechanism_plugin_factory: Option<SaslMechanismPluginFactoryHandle>`. The factory is invoked once per `KafkaClient` with the broker endpoint from `bootstrap_servers[0]` (which `PartitionLeaderRouter` has already rewritten to the advertised per-broker `host:port` from `MetadataResponse`). Stateless mechanisms (PLAIN, OAUTHBEARER) wrap a single `Arc` in `SharedPluginFactory`; stateful mechanisms (GSSAPI) build a fresh plugin per call. Fixes one correctness bug and removes one latent risk: (1) **fixed** — non-bootstrap brokers authenticating with the bootstrap SPN on multi-broker Kerberized clusters; (2) **removed as a latent risk** — sharing a single `GssapiPlugin` `ClientCtx` across a pooled `connections_per_broker` was a concurrency hazard even if it hadn't produced a visible failure. The GSSAPI integration roundtrip now runs at the default `connections_per_broker: 4` with each pooled connection owning its own `GssapiPlugin`. The pool-isolation guarantee is now tested end-to-end (`pool_produces_distinct_plugin_per_kafkaclient`). Also adds a `SaslMechanismPlugin::supports_reauth()` capability flag (default `true`; `GssapiPlugin` overrides to `false`) — Apache Kafka rejects live `SaslAuthenticate` for GSSAPI after the initial handshake because Kerberos contexts are connection-bound, so the client no longer schedules a reauth task for GSSAPI and the broker-advertised `session_lifetime_ms` becomes a drain-and-reconnect window (matches librdkafka / JVM client behaviour). New `SaslPluginError::FactoryFailed` variant. No version bump — folds into unreleased 0.15.0.
 - **v2.1 (2026-04-21):** Aligned spec with shipped 0.14.0 implementation. Mock SASL server is hand-rolled on top of `kafka-protocol = "0.17"` (`tests/integration_suite/sasl_mock_broker.rs`); `rsasl` dev-dep was NOT added — zero new dev-deps, strictly better than the v2.0 target. E2E fixture uses Confluent cp-kafka 7.7.0 with the bundled `OAuthBearerUnsecuredValidatorCallbackHandler` (`tests/sasl-oauth-test-infra/`), not Redpanda — Redpanda lacks a simple unsecured-JWS OAUTHBEARER path. All 14 unit + 4 integration tests ship. Known limitation: reauth task is not torn down on reconnect (follow-up #132).
 - **v2.0 (2026-04-20):** Protocol detail hardened against KIP-368 and RFC 7628 authoritative sources; verified OSS code-path anchors (file:line); resolved open questions Q1/Q2/Q3; expanded test plan from 10 → 14 units and 1 → 6 integrations; added a pre-refactor SCRAM/PLAIN regression baseline commit (OSS currently has zero SASL tests); corrected `interpret_server_error` default to handle Kafka 3.5+ free-form error_message (not just RFC 7628 JSON); added Redpanda-backed E2E; added two risks (R6 non-JSON error, R7 plugin re-entry deadlock). Budget raised from 3 → 5 engineer-days.
 - **v1.0 (2026-04-20):** Initial draft.
@@ -204,7 +205,7 @@ pub enum SaslPluginError {
 
 ### 2.2 Config wiring
 
-`SecurityConfig` gains one field:
+`SecurityConfig` gains one field. The field is a **factory handle**, not a plugin handle — see §2.2a for the factory trait shape and why.
 
 ```rust
 // crates/kafka-backup-core/src/config.rs  (modified)
@@ -215,17 +216,142 @@ pub struct SecurityConfig {
     // sasl_username, sasl_password, ssl_ca_location,
     // ssl_certificate_location, ssl_key_location)...
 
-    /// External SASL mechanism plugin. When set, overrides `sasl_mechanism`
-    /// dispatch. Programmatic-only (not YAML-addressable); downstream crates
-    /// inject plugins at client-build time.
+    /// External SASL mechanism plugin factory. When set, overrides
+    /// `sasl_mechanism` dispatch. Programmatic-only (not YAML-addressable);
+    /// downstream crates inject factories at client-build time.
     ///
-    /// See `SaslMechanismPlugin` for the extension contract.
+    /// Called once per `KafkaClient` with the broker endpoint from
+    /// `bootstrap_servers[0]`. `PartitionLeaderRouter` has already rewritten
+    /// that entry to the advertised per-broker `host:port` from the
+    /// `MetadataResponse`, so the factory receives the correct endpoint for
+    /// mechanism-specific per-broker state (e.g. GSSAPI SPN).
+    ///
+    /// See `SaslMechanismPluginFactory` for the extension contract.
     #[serde(skip)]
-    pub sasl_mechanism_plugin: Option<SaslMechanismPluginHandle>,
+    pub sasl_mechanism_plugin_factory: Option<SaslMechanismPluginFactoryHandle>,
 }
 ```
 
 `#[serde(skip)]` is a novel pattern in this file (verified: zero prior uses in `config.rs`). It keeps the YAML config surface unchanged and prevents users from attempting to deserialize something into a trait object. The `Default` derive produces `None`, preserving legacy behaviour for every existing config file.
+
+### 2.2a Factory trait
+
+```rust
+// crates/kafka-backup-core/src/kafka/sasl/plugin.rs  (added alongside SaslMechanismPlugin)
+
+/// Factory that produces a `SaslMechanismPlugin` bound to a specific broker
+/// endpoint. Called once per `KafkaClient::authenticate` with the endpoint
+/// from `bootstrap_servers[0]`.
+///
+/// # Why a factory, not a shared `Arc<dyn SaslMechanismPlugin>`
+///
+/// Stateful mechanisms (notably GSSAPI) hold per-connection state — a GSS
+/// context, a keytab-derived credential handle — that cannot be shared across
+/// concurrent connections to different brokers. Two concrete bugs the factory
+/// shape fixes:
+///
+/// 1. **Per-broker SPN (Kerberos).** `kafka/broker1.fqdn@REALM` differs from
+///    `kafka/broker2.fqdn@REALM`. A single plugin constructed from
+///    `bootstrap_servers[0]` authenticates every connection against the
+///    bootstrap's SPN — wrong for non-bootstrap brokers. The factory binds
+///    SPN at `.build()` time, after `PartitionLeaderRouter` has already
+///    rewritten `bootstrap_servers` to the advertised per-broker host.
+/// 2. **Per-connection context.** A shared GSSAPI plugin's KIP-368 reauth
+///    resets its internal state machine while a sibling connection has an
+///    in-flight handshake on the same plugin, corrupting the sibling.
+///
+/// Stateless mechanisms (PLAIN, OAUTHBEARER with static/cached tokens) can
+/// wrap a single `Arc` via `SharedPluginFactory` — the factory's `build` just
+/// clones the Arc.
+pub trait SaslMechanismPluginFactory: Send + Sync + Debug {
+    /// Advertised mechanism name. Must match the plugin returned by `build`.
+    fn mechanism_name(&self) -> &str;
+
+    /// Construct a plugin bound to this broker endpoint.
+    ///
+    /// `broker_host` / `broker_port` come from `KafkaConfig.bootstrap_servers[0]`
+    /// at the time `KafkaClient::authenticate` runs. For clients produced by
+    /// `PartitionLeaderRouter::get_broker_connection`, that entry is the
+    /// advertised per-broker endpoint from `MetadataResponse`.
+    fn build(
+        &self,
+        broker_host: &str,
+        broker_port: u16,
+    ) -> Result<SaslMechanismPluginHandle, SaslPluginError>;
+}
+
+pub type SaslMechanismPluginFactoryHandle = Arc<dyn SaslMechanismPluginFactory>;
+
+/// Stateless-mechanism convenience wrapper. Wraps one `Arc` and returns it
+/// unchanged from every `build` call. Used by OAUTHBEARER static-token,
+/// PLAIN, and any mechanism whose plugin holds no per-connection state.
+pub struct SharedPluginFactory { /* inner: SaslMechanismPluginHandle */ }
+
+impl SharedPluginFactory {
+    pub fn new(plugin: SaslMechanismPluginHandle) -> Self { /* ... */ }
+    pub fn into_handle(self) -> SaslMechanismPluginFactoryHandle { /* ... */ }
+}
+
+// New error variant for factory failure:
+pub enum SaslPluginError {
+    // ...existing variants...
+    #[error("factory failed to build {mechanism} plugin: {source}")]
+    FactoryFailed {
+        mechanism: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+```
+
+**Why `build` is sync, not async:** stateless factories return `Arc::clone` (trivial). `GssapiPluginFactory::build` does microseconds of work (clones `PathBuf`s + constructs an empty `GssapiPlugin::State`); no libgssapi calls happen until the handshake starts. Async plugins (token fetch, OIDC refresh) do their async work inside `initial_payload`, which is already async. An async `build` would force every caller to `.await` for no benefit.
+
+**Why `Debug` supertrait:** `SaslMechanismPlugin` already requires `Debug`, and `SecurityConfig` derives `Debug` — the factory handle must be `Debug` for the derive to compile.
+
+### 2.2b `supports_reauth()` capability flag
+
+```rust
+// crates/kafka-backup-core/src/kafka/sasl/plugin.rs  (added to SaslMechanismPlugin)
+
+#[async_trait]
+pub trait SaslMechanismPlugin: Send + Sync + Debug {
+    // ...existing methods...
+
+    /// Whether this mechanism supports KIP-368 live re-authentication on
+    /// the existing connection. Default: `true` (PLAIN, SCRAM,
+    /// OAUTHBEARER). Override to `false` when the broker cannot renew
+    /// the plugin's authentication state in-place — e.g. `GssapiPlugin`.
+    fn supports_reauth(&self) -> bool { true }
+}
+```
+
+**Why this flag exists.** Apache Kafka does **not** support live KIP-368 re-authentication for the GSSAPI mechanism. Kerberos GSS-API contexts are bound to the wire connection; the broker rejects any in-place `SaslAuthenticate` after the initial handshake with:
+
+```
+SaslAuthenticate request received after successful authentication
+```
+
+even when `connections.max.reauth.ms > 0` is advertised in the broker's `SaslAuthenticateResponse.session_lifetime_ms`. librdkafka's behaviour (verified via their issue #3304 and source) is to treat `session_lifetime_ms` as a **drain-and-reconnect** timer for GSSAPI rather than a reauth timer: let the session expire naturally, then reconnect on next RPC.
+
+**How the client uses it.** `KafkaClient::authenticate` (client.rs:~335) gates `spawn_reauth_task` on `plugin.supports_reauth()`:
+
+```rust
+SaslAuthOutcome::Done => {
+    if plugin.supports_reauth() {
+        super::sasl::reauth::spawn_reauth_task(
+            Arc::downgrade(&self.connection),
+            self.correlation_id.clone(),
+            plugin.clone(),
+            resp.session_lifetime_ms,
+        );
+    }
+    return Ok(());
+}
+```
+
+`GssapiPlugin` returns `false`. The client no longer schedules a reauth task for GSSAPI; the broker-advertised lifetime becomes a drain window, the session expires, and the next RPC reconnects through the normal auth path. This eliminates the `SaslAuthenticate request received after successful authentication` WARN storm that otherwise appeared every ~48 s per pooled connection.
+
+**Default-true rationale.** PLAIN, SCRAM, and OAUTHBEARER all support live re-authentication on Apache Kafka; keeping the default as `true` preserves the existing scheduler behaviour without requiring downstream plugin authors to opt in. The scheduler's existing "lifetime > 0" early-return still handles brokers that do not advertise reauth at all.
 
 ### 2.3 Dispatch integration in `client.rs`
 
@@ -264,8 +390,17 @@ async fn authenticate_on(
     stream: &mut ConnectionStream,
     security: &SecurityConfig,
 ) -> Result<AuthOutcome> {
-    // Plugin branch: takes priority if plugin is set.
-    if let Some(plugin) = &security.sasl_mechanism_plugin {
+    // Factory branch: takes priority if a factory is configured.
+    // Build a fresh plugin bound to this connection's broker endpoint.
+    if let Some(factory) = &security.sasl_mechanism_plugin_factory {
+        let entry = self.config.bootstrap_servers.first()
+            .ok_or_else(|| Error::Config("bootstrap_servers is empty".into()))?;
+        let (host, port) = parse_broker_endpoint(entry);
+        let plugin = factory.build(&host, port).map_err(|e| {
+            Error::Authentication(format!(
+                "SASL plugin factory failed for broker {host}:{port}: {e}"
+            ))
+        })?;
         return self.authenticate_with_plugin(stream, plugin.as_ref()).await;
     }
     // Legacy dispatch: PLAIN / SCRAM / no-auth.
@@ -380,8 +515,8 @@ crates/kafka-backup-core/examples/
 
 | File | Change | Est. LOC |
 |---|---|---|
-| `src/config.rs` | Add `sasl_mechanism_plugin` field with `#[serde(skip)]` | ~10 |
-| `src/kafka/client.rs` | Unify duplicate SASL dispatch; add plugin branch; spawn reauth scheduler | ~200 |
+| `src/config.rs` | Add `sasl_mechanism_plugin_factory` field with `#[serde(skip)]` | ~10 |
+| `src/kafka/client.rs` | Unify duplicate SASL dispatch; add factory branch (calls `factory.build(host, port)` with `bootstrap_servers[0]`); spawn reauth scheduler | ~200 |
 | `src/kafka/mod.rs` | `pub mod sasl;` | ~2 |
 | `src/lib.rs` | Re-export `SaslMechanismPlugin`, `SaslMechanismPluginHandle`, `SaslPluginError` at crate root | ~4 |
 | `tests/integration_suite_tests.rs` | Add 4 SCRAM/PLAIN baseline tests (commit 0) | ~250 |
@@ -419,12 +554,19 @@ crates/kafka-backup-core/examples/
 | U6 | `dispatch_single_round_success` | `client.rs` (test mod) | Mock stream: SaslHandshake + one SaslAuthenticate; `authenticate_with_plugin` returns `Ok(AuthOutcome::Plugin { .. })`. |
 | U7 | `dispatch_multi_round_success` | `client.rs` (test mod) | Mock plugin returns `Some(bytes)` on first `continue_payload` then `None`; two SaslAuthenticate exchanges occur. |
 | U8 | `dispatch_server_error_routes_to_interpret` | `client.rs` (test mod) | `error_code = SASL_AUTHENTICATION_FAILED (58)` → `interpret_server_error` called; returned error propagates. |
-| U9 | `dispatch_plugin_none_preserves_legacy_scram` | `client.rs` (test mod) | `sasl_mechanism_plugin = None`, SCRAM config → legacy `sasl_scram` path invoked (regression guard). |
+| U9 | `dispatch_plugin_none_preserves_legacy_scram` | `client.rs` (test mod) | `sasl_mechanism_plugin_factory = None`, SCRAM config → legacy `sasl_scram` path invoked (regression guard). |
 | U10 | `reauth_fires_at_80_percent` | `reauth.rs` | `session_lifetime_ms = 10_000`; with paused time, `reauth_payload` called between t=7.5s and t=8.5s (accounts for ±5s jitter with lower bound respected). |
 | U11 | `reauth_respects_min_interval_floor` | `reauth.rs` | `session_lifetime_ms = 1_000` (broker misconfigured) → scheduler waits 30s floor minimum, not 800 ms. |
 | U12 | `reauth_exits_on_connection_drop` | `reauth.rs` | Drop the `Arc<Mutex<Option<BrokerConnection>>>`; scheduler task observes `Weak::upgrade()` = None on wake; exits within 1 tick. |
 | U13 | `reauth_failure_marks_connection_unhealthy` | `reauth.rs` | Plugin `reauth_payload` returns `Err`; assert `BrokerConnection` flagged so next send triggers reconnect via existing path. |
-| U14 | `security_config_serde_skips_plugin_field` | `config.rs` (test mod) | `serde_yaml::to_string(&SecurityConfig { sasl_mechanism_plugin: Some(Arc::new(mock)), .. })` → output YAML has no `sasl_mechanism_plugin` key. Roundtrip back → field is `None`. |
+| U14 | `security_config_serde_skips_plugin_factory_field` | `config.rs` (test mod) | `serde_yaml::to_string(&SecurityConfig { sasl_mechanism_plugin_factory: Some(factory), .. })` → output YAML has no `sasl_mechanism_plugin_factory` key. Roundtrip back → field is `None`. |
+| U15 | `factory_receives_per_broker_endpoint` | `tests/integration_suite/sasl_plugin_mock_tests.rs` | A capturing factory asserts `build(host, port)` is invoked exactly once per `KafkaClient::authenticate` with the configured bootstrap endpoint. This is the regression gate for Bug 1 (per-broker SPN); when `PartitionLeaderRouter` rewrites `bootstrap_servers` to the advertised broker host, that host flows into the factory. |
+| U16 | `shared_plugin_factory_build_returns_same_arc` | `plugin.rs` | `SharedPluginFactory::build(...)` returns an `Arc` pointer-equal to the wrapped plugin on every call, regardless of host/port — proves the stateless convenience wrapper is just an `Arc::clone`. |
+| U17 | `gssapi_factory_builds_plugin_with_broker_specific_host` | `gssapi.rs` | `GssapiPluginFactory::build("broker-2.fqdn", 9094)` produces a `GssapiPlugin` whose internal hostname matches the argument — proves per-broker SPN binding at `.build()` time. |
+| U18 | `default_supports_reauth_is_true` | `plugin.rs` | Default trait impl returns `true` so PLAIN/SCRAM/OAUTHBEARER keep scheduling KIP-368 reauth without overriding. |
+| U19 | `gssapi_plugin_opts_out_of_reauth` | `gssapi.rs` | `GssapiPlugin::supports_reauth()` returns `false` — Apache Kafka rejects in-place reauth for GSSAPI, so the client must not schedule a reauth task. |
+| U20 | `reauth_scheduler_not_spawned_when_plugin_opts_out` | `tests/integration_suite/sasl_plugin_mock_tests.rs` | End-to-end over `MockKafkaBroker`: plugin with `supports_reauth() = false` + `session_lifetime_ms = 60_000`; virtual time advances past the 80 % deadline; asserts `reauth_payload` never called and the mock sees exactly one `SaslAuthenticate` frame. |
+| U21 | `pool_produces_distinct_plugin_per_kafkaclient` | `tests/integration_suite/sasl_plugin_mock_tests.rs` | N=3 separate `MockKafkaBroker`s + N `KafkaClient`s sharing one factory; asserts `build` is called once per client with the correct endpoint, and each returned plugin `Arc` is pointer-distinct. Regression gate for "pool-isolation latent risk removed". |
 
 **Coverage target: ≥ 90% line coverage** on `src/kafka/sasl/*.rs` (measured via `cargo llvm-cov`).
 
@@ -541,9 +683,11 @@ cargo check -p kafka-backup-enterprise-core
 
 ### 5.2 Versioning
 
-- `kafka-backup-core` minor version bump: `0.13.x → 0.14.0`.
-- CHANGELOG entry under `### Added`: "SASL mechanism plugin extension trait (`SaslMechanismPlugin`) for downstream SASL implementations. See `docs/PRD-sasl-mechanism-plugin.md`."
-- No breaking changes. Three new public items (trait, handle alias, error enum). `SaslMechanism` enum untouched.
+- `kafka-backup-core` 0.14.0 shipped the initial `SaslMechanismPlugin` extension trait.
+- `kafka-backup-core` 0.15.0 (unreleased, this PR) reshapes the extension point to `SaslMechanismPluginFactory` and adds in-tree GSSAPI under the `gssapi` Cargo feature. Because 0.15.0 is still in-flight on `feat/sasl-mechanism-plugin` and no external consumers exist, the factory revision folds into the same version — no 0.16.0 bump.
+- Public items added across 0.14.0 + 0.15.0: `SaslMechanismPlugin`, `SaslMechanismPluginHandle`, `SaslPluginError`, `SaslMechanismPluginFactory`, `SaslMechanismPluginFactoryHandle`, `SharedPluginFactory`, `GssapiPluginFactory` (feature-gated), `SaslAuthOutcome`.
+- Removed before first release: `SecurityConfig::sasl_mechanism_plugin` (replaced by `sasl_mechanism_plugin_factory`). Net zero breakage for consumers.
+- `SaslMechanism` enum untouched. No new YAML fields.
 
 ### 5.3 Downstream consumers
 
@@ -695,6 +839,115 @@ fn build_rfc7628_cir(token: &str, ext: &BTreeMap<String, String>) -> Vec<u8> {
 ```
 
 The OAUTHBEARER-specific logic (RFC 7628 framing, token provider trait, token cache, MSK IAM sigv4 presigning, OIDC flow) all lives in `kafka-backup-enterprise-core`. None of it is visible to this OSS crate.
+
+---
+
+## 10.a In-tree GSSAPI (Kerberos) plugin — feature-gated
+
+Unlike OAUTHBEARER/MSK IAM (which live in the enterprise crate), GSSAPI is
+in-tree under a `gssapi` Cargo feature. Rationale: Kerberos is a legitimate
+on-prem requirement, not cloud-vendor lock-in, and the reference impl proves
+the trait scales beyond OAUTH-style mechanisms without altering the core
+dispatch.
+
+**Crate surface** (default build is unchanged):
+
+```toml
+# workspace root Cargo.toml
+[workspace.dependencies]
+libgssapi = { version = "0.9", optional = true }
+
+# crates/kafka-backup-core/Cargo.toml
+[features]
+default = []
+gssapi = ["dep:libgssapi"]
+
+# crates/kafka-backup-cli/Cargo.toml
+[features]
+default = []
+gssapi = ["kafka-backup-core/gssapi"]
+```
+
+**Build requirements** — the feature links MIT krb5 at build time:
+
+- macOS: `brew install krb5` + export
+  `PKG_CONFIG_PATH="$(brew --prefix krb5)/lib/pkgconfig:…"` (Apple's bundled
+  Heimdal does not expose the symbols `libgssapi 0.9` links against).
+- Debian/Ubuntu: `apt-get install libkrb5-dev`.
+- Fedora/RHEL: `dnf install krb5-devel`.
+
+**Config shape** (always present in `SaslMechanism`; runtime error if the
+binary was compiled without `--features gssapi`):
+
+```yaml
+source:
+  bootstrap_servers: ["kafka.prod.example.com:9094"]
+  security_protocol: SASL_PLAINTEXT  # or SASL_SSL for over-TLS
+  sasl_mechanism: GSSAPI
+  sasl_kerberos_service_name: kafka
+  sasl_keytab_path: /etc/kafka-backup/client.keytab
+  sasl_krb5_config_path: /etc/kafka-backup/krb5.conf
+```
+
+**Handshake mapping** (`crates/kafka-backup-core/src/kafka/sasl/gssapi.rs`):
+
+- `initial_payload()` → first `gss_init_sec_context` token (no server input).
+- `continue_payload(server_bytes)` → steps the context machine. On
+  `gss_init_sec_context` returning `None` (established), it emits an empty
+  client token which prompts the broker's Phase 2 wrapped security-layer
+  proposal. The next call unwraps that proposal, verifies the `0x01` no-layer
+  bit, wraps a `{layer=0x01, max_size=0, authz_id=""}` reply, and returns it.
+  Subsequent calls with any server bytes transition to `Done`.
+- `interpret_server_error` → default (handles RFC 7628 JSON + free-form UTF-8;
+  GSS minor-status strings are surfaced unchanged).
+- `supports_reauth()` → **`false`** (§2.2b). Apache Kafka rejects in-place
+  `SaslAuthenticate` for GSSAPI after the initial handshake, so the client
+  does not schedule a KIP-368 reauth task; the broker-advertised
+  `session_lifetime_ms` is treated as a drain-and-reconnect window.
+- `reauth_payload()` → retained for symmetry and for brokers that might
+  reach the plugin via a different control path in future: rebuilds a
+  fresh `ClientCtx` (tickets expire — can't reuse stale context) and
+  returns the new Phase 1 initial token. In practice, this method is not
+  called because `supports_reauth()` is `false`.
+
+**Factory surface.** `GssapiPluginFactory` is the public entry point and what
+`kafka-backup-cli` installs. It eagerly validates the keytab at construction
+time (same behaviour as pre-factory `GssapiPlugin::new`), and its `build(host, port)`
+method creates a fresh `GssapiPlugin` bound to that broker's hostname each call.
+This is what fixes the multi-broker SPN and connection-pool reauth correctness
+bugs.
+
+**Env-var serialisation** — `libgssapi 0.9.1` does not expose a keytab-aware
+`Cred::acquire` API; paths are supplied via `KRB5_CLIENT_KTNAME` /
+`KRB5_CONFIG`. The plugin holds a process-wide
+`tokio::sync::Mutex<()>` across credential acquisition so parallel
+`KafkaClient` instances do not race each other's env mutation. Once the
+cred handle exists, it caches the paths internally — subsequent context
+steps do not re-read the env.
+
+**Operational caveats**:
+
+1. Multi-broker Kerberos is **supported by design** as of 0.15.0 via the
+   factory extension point (§2.2a). `GssapiPluginFactory::build` is invoked
+   once per `KafkaClient`, and `PartitionLeaderRouter` rewrites
+   `bootstrap_servers[0]` to the advertised per-broker `host:port` from
+   `MetadataResponse` before cloning the config, so each connection
+   authenticates against its own SPN (`kafka/brokerN.fqdn@REALM`).
+   End-to-end proof against a real multi-broker Kerberized cluster is
+   tracked as a follow-up (2-broker `docker-compose-gssapi.yml` fixture);
+   the factory-dispatch contract and pool-isolation guarantee are covered
+   today by the mock-broker `factory_receives_per_broker_endpoint` and
+   `pool_produces_distinct_plugin_per_kafkaclient` tests.
+2. **Live re-authentication is disabled for GSSAPI by design** (§2.2b).
+   Apache Kafka rejects in-place `SaslAuthenticate` for Kerberos
+   connections, so the client does not schedule a KIP-368 reauth task;
+   the broker-advertised `session_lifetime_ms` acts as a
+   drain-and-reconnect window, matching librdkafka / JVM-client
+   behaviour. The session expires naturally and the next RPC reconnects
+   through the normal auth path.
+3. Default release binaries and the default Docker image do not include
+   GSSAPI. Build your own with `--features gssapi` and matching runtime
+   `libkrb5-3` install, or wait for a `Dockerfile.gssapi` variant.
 
 ---
 

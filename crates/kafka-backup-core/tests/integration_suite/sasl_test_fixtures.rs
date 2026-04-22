@@ -9,8 +9,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kafka_backup_core::kafka::{
-    SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError,
+    SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginFactoryHandle,
+    SaslMechanismPluginHandle, SaslPluginError, SharedPluginFactory,
 };
+
+/// Wrap a plugin Arc in a [`SharedPluginFactory`] for direct assignment
+/// to `SecurityConfig::sasl_mechanism_plugin_factory`. Use this from
+/// the mock-broker and OAUTHBEARER tests — their plugins are either
+/// stateless or share state intentionally across connections.
+///
+/// GSSAPI tests do NOT use this helper — they want a fresh
+/// `GssapiPlugin` per connection via `GssapiPluginFactory`.
+pub fn factory_for(plugin: SaslMechanismPluginHandle) -> SaslMechanismPluginFactoryHandle {
+    SharedPluginFactory::new(plugin).into_handle()
+}
 
 /// Static-token OAUTHBEARER plugin for E2E against an unsecured-JWS
 /// Apache Kafka broker.
@@ -116,6 +128,55 @@ impl SaslMechanismPlugin for TwoRoundPlugin {
                 detail: format!("unexpected challenge: {:?}", other),
             }),
         }
+    }
+}
+
+/// Plugin that opts out of KIP-368 live re-authentication via
+/// `supports_reauth() = false`. Counts calls to `initial_payload` and
+/// `reauth_payload` so a test can prove the scheduler never fired.
+///
+/// Mirrors `GssapiPlugin`'s opt-out contract without needing the gssapi
+/// feature flag enabled.
+#[derive(Debug, Default)]
+pub struct NoReauthCountingPlugin {
+    pub initial_calls: Arc<AtomicUsize>,
+    pub reauth_calls: Arc<AtomicUsize>,
+}
+
+impl NoReauthCountingPlugin {
+    /// Construct a fresh plugin and return it wrapped as a handle
+    /// alongside shared counters for `initial_payload` and
+    /// `reauth_payload` invocations.
+    pub fn handle_with_counters() -> (
+        SaslMechanismPluginHandle,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let plugin = NoReauthCountingPlugin::default();
+        let initial = plugin.initial_calls.clone();
+        let reauth = plugin.reauth_calls.clone();
+        (Arc::new(plugin), initial, reauth)
+    }
+}
+
+#[async_trait]
+impl SaslMechanismPlugin for NoReauthCountingPlugin {
+    fn mechanism_name(&self) -> &str {
+        "TEST-NO-REAUTH"
+    }
+
+    async fn initial_payload(&self) -> Result<Vec<u8>, SaslPluginError> {
+        self.initial_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(b"initial".to_vec())
+    }
+
+    fn supports_reauth(&self) -> bool {
+        false
+    }
+
+    async fn reauth_payload(&self) -> Result<Vec<u8>, SaslPluginError> {
+        self.reauth_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(b"reauth".to_vec())
     }
 }
 

@@ -1,0 +1,45 @@
+# Example Kafka Backup Configuration — SASL/GSSAPI (Kerberos)
+#
+# Drives the release binary against the GSSAPI test fixture at
+# `tests/sasl-gssapi-test-infra/`. In production, replace the relative
+# keytab/krb5.conf paths with absolute paths to the real operator
+# credentials and point bootstrap_servers at your broker's FQDN that
+# matches the kafka service principal.
+#
+# Usage (requires --features gssapi and brew krb5 / libkrb5-dev):
+#   cargo build --release --features gssapi -p kafka-backup-cli
+#   ./target/release/kafka-backup backup --config config/gssapi-backup.yaml
+#
+# Paths below are resolved relative to the current working directory —
+# run from the repo root so they match the checked-in fixture files.
+
+mode: backup
+backup_id: "gssapi-smoke"
+
+source:
+  bootstrap_servers:
+    - kafka.test.local:9098
+
+  security:
+    security_protocol: SASL_PLAINTEXT
+    sasl_mechanism: GSSAPI
+    sasl_kerberos_service_name: kafka
+    sasl_keytab_path: tests/sasl-gssapi-test-infra/keytabs/client.keytab
+    sasl_krb5_config_path: tests/sasl-gssapi-test-infra/krb5.conf
+
+  topics:
+    include:
+      - smoke-topic
+    exclude:
+      - "__*"
+
+storage:
+  backend: filesystem
+  path: /tmp/gssapi-backup-smoke
+
+backup:
+  compression: zstd
+  segment_max_bytes: 65536
+  segment_max_interval_ms: 5000
+  continuous: false
+  start_offset: earliest

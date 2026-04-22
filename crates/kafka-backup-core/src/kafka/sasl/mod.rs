@@ -13,6 +13,14 @@
 pub mod plugin;
 pub(crate) mod reauth;
 
+#[cfg(feature = "gssapi")]
+pub mod gssapi;
+
+#[cfg(feature = "gssapi")]
+pub use gssapi::{GssapiPlugin, GssapiPluginError, GssapiPluginFactory};
+
 pub use plugin::{
-    SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginHandle, SaslPluginError,
+    SaslAuthOutcome, SaslMechanismPlugin, SaslMechanismPluginFactory,
+    SaslMechanismPluginFactoryHandle, SaslMechanismPluginHandle, SaslPluginError,
+    SharedPluginFactory,
 };

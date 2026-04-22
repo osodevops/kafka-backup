@@ -92,6 +92,18 @@ reqwest.workspace = true
 # UUID (validation run IDs)
 uuid.workspace = true
 
+# SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature.
+# Requires krb5 dev headers at build time (libkrb5-dev / krb5-devel /
+# `brew install krb5` on macOS).
+libgssapi = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables SASL/GSSAPI (Kerberos) authentication via the
+# `SaslMechanismPlugin` extension trait. Adds a build-time dependency
+# on the system krb5 development libraries.
+gssapi = ["dep:libgssapi"]
+
 [dev-dependencies]
 testcontainers.workspace = true
 testcontainers-modules.workspace = true

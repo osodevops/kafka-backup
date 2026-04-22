@@ -7,6 +7,8 @@ pub mod offset_reset;
 pub mod offset_reset_bulk;
 pub mod offset_rollback;
 pub mod restore;
+pub mod sasl_plugin;
+pub mod security_args;
 pub mod snapshot_groups;
 pub mod status;
 pub mod status_watch;

@@ -1,0 +1,119 @@
+# Docker Compose for SASL/GSSAPI (Kerberos) Kafka testing.
+#
+# Three services:
+#   - kdc          MIT Kerberos KDC (realm TEST.LOCAL)
+#   - zookeeper    cp-zookeeper 7.7.0 (broker metadata + elections)
+#   - kafka        cp-kafka 7.7.0 with SASL_PLAINTEXT://kafka.test.local:9098
+#                  enabling GSSAPI only on the external listener.
+#
+# Companion to `crates/kafka-backup-core/tests/integration_suite/sasl_gssapi_tests.rs`.
+# Host prerequisites + invocation details live in README.md.
+#
+# Why a separate listener per purpose?
+#   INTERNAL (PLAINTEXT://:9092) carries inter-broker traffic so the broker
+#   can bootstrap without authenticating to itself — Confluent's documented
+#   pattern for SASL single-broker dev fixtures.
+#
+# Why `hostname: kafka.test.local`?
+#   The GSSAPI service principal is `kafka/kafka.test.local@TEST.LOCAL`.
+#   If the client connects to any other hostname (e.g. `localhost`), the
+#   KDC returns `KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN`. See README.md for the
+#   host /etc/hosts entry required on the dev machine.
+
+services:
+  kdc:
+    build:
+      context: .
+      dockerfile: Dockerfile.kdc
+    container_name: kdc-gssapi-test
+    hostname: kdc.test.local
+    networks:
+      gssapi-net:
+        aliases:
+          - kdc.test.local
+    volumes:
+      - ./keytabs:/keytabs
+    ports:
+      # Publishing on port 88 (not 48088) keeps the single shared
+      # krb5.conf usable from both inside the compose network and the
+      # host test runner. Port 88 is the Kerberos default; macOS / most
+      # Linux dev boxes have nothing listening there.
+      - "88:88/udp"
+      - "88:88/tcp"
+    healthcheck:
+      # The KDC is ready when the kafka keytab has been written — that's
+      # the last step init-kdc.sh performs before it starts krb5kdc.
+      test: ["CMD", "test", "-f", "/keytabs/kafka.keytab"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    container_name: zookeeper-gssapi-test
+    networks:
+      - gssapi-net
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "22183:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    container_name: kafka-gssapi-test
+    hostname: kafka.test.local
+    networks:
+      gssapi-net:
+        aliases:
+          - kafka.test.local
+    depends_on:
+      kdc:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9098:9098"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,SASL:SASL_PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,SASL://0.0.0.0:9098
+      # Clients connect using the FQDN that matches the service principal.
+      # Host entry: `127.0.0.1 kafka.test.local` in /etc/hosts on the dev box.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka.test.local:9092,SASL://kafka.test.local:9098
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_SASL_ENABLED_MECHANISMS: GSSAPI
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: kafka
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # 60s reauth window: broker advertises at handshake time, client
+      # schedules reauth at ~80% (~48s). Gives the sasl_gssapi_reauth_fires
+      # E2E test headroom while staying short enough to test in <90s.
+      KAFKA_CONNECTIONS_MAX_REAUTH_MS: 60000
+      # Listener-scoped inline JAAS — avoids setting
+      # java.security.auth.login.config at the JVM level, which would
+      # make the cp-kafka preflight ZK client try SASL auth and hang.
+      KAFKA_LISTENER_NAME_SASL_GSSAPI_SASL_JAAS_CONFIG: 'com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="/etc/kafka/secrets/kafka.keytab" principal="kafka/kafka.test.local@TEST.LOCAL";'
+      KAFKA_OPTS: -Djava.security.krb5.conf=/etc/krb5.conf
+    volumes:
+      - ./krb5.conf:/etc/krb5.conf:ro
+      - ./keytabs:/etc/kafka/secrets:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9098"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+networks:
+  gssapi-net:
+    driver: bridge

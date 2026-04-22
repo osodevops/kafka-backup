@@ -380,6 +380,29 @@ cargo test
 RUST_LOG=debug cargo run -p kafka-backup-cli -- --help
 ```
 
+### Optional: SASL/GSSAPI (Kerberos) support
+
+GSSAPI authentication is gated behind the `gssapi` Cargo feature so the default
+build stays free of Kerberos system dependencies. Install MIT krb5 headers and
+rebuild:
+
+```bash
+# macOS (Heimdal won't do — libgssapi requires MIT krb5)
+brew install krb5
+export PKG_CONFIG_PATH="$(brew --prefix krb5)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# Debian/Ubuntu
+sudo apt-get install libkrb5-dev
+
+cargo build --release --features gssapi -p kafka-backup-cli
+```
+
+Then set `sasl_mechanism: GSSAPI` in your config plus
+`sasl_keytab_path` / `sasl_krb5_config_path` / `sasl_kerberos_service_name`,
+or pass the matching `--sasl-*` CLI flags on `offset-reset` commands. Local
+fixture for end-to-end testing lives at
+[`tests/sasl-gssapi-test-infra/`](tests/sasl-gssapi-test-infra/README.md).
+
 ## Running Tests
 
 ```bash

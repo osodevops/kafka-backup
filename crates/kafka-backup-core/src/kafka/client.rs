@@ -227,7 +227,28 @@ impl KafkaClient {
     async fn authenticate(&self) -> Result<()> {
         let security = &self.config.security;
 
-        if let Some(plugin) = security.sasl_mechanism_plugin.clone() {
+        if let Some(factory) = security.sasl_mechanism_plugin_factory.clone() {
+            // PartitionLeaderRouter rewrites `bootstrap_servers` to a
+            // single entry — the advertised broker `host:port` — before
+            // spawning a pooled client. For the bootstrap client, this
+            // is the user-configured endpoint. Either way, element 0 is
+            // the endpoint this client will dial.
+            let entry = self
+                .config
+                .bootstrap_servers
+                .first()
+                .ok_or_else(|| {
+                    crate::Error::Config(
+                        "bootstrap_servers is empty; cannot build SASL plugin".to_string(),
+                    )
+                })?
+                .as_str();
+            let (host, port) = parse_broker_endpoint(entry);
+            let plugin = factory.build(&host, port).map_err(|e| {
+                crate::Error::Authentication(format!(
+                    "SASL plugin factory failed for broker {host}:{port}: {e}"
+                ))
+            })?;
             return self.sasl_plugin_auth(plugin).await;
         }
 
@@ -247,6 +268,19 @@ impl KafkaClient {
                     mechanism,
                 )
                 .await
+            }
+            Some(SaslMechanism::Gssapi) => {
+                // GSSAPI is only supported through the plugin-factory
+                // path. If we reach here, the CLI layer did not install
+                // a factory — either the binary was built without
+                // `--features gssapi` or `populate_sasl_plugin` was not
+                // called on the config.
+                Err(crate::Error::Authentication(
+                    "sasl_mechanism: GSSAPI requires a \
+                     SaslMechanismPluginFactory (install via CLI built \
+                     with --features gssapi)"
+                        .to_string(),
+                ))
             }
             None => Ok(()), // No authentication needed
         }
@@ -298,12 +332,20 @@ impl KafkaClient {
                 SaslAuthOutcome::Continue(next) => payload = next,
                 SaslAuthOutcome::Done => {
                     debug!("SASL {} plugin authentication successful", mechanism_name);
-                    super::sasl::reauth::spawn_reauth_task(
-                        Arc::downgrade(&self.connection),
-                        self.correlation_id.clone(),
-                        plugin.clone(),
-                        resp.session_lifetime_ms,
-                    );
+                    if plugin.supports_reauth() {
+                        super::sasl::reauth::spawn_reauth_task(
+                            Arc::downgrade(&self.connection),
+                            self.correlation_id.clone(),
+                            plugin.clone(),
+                            resp.session_lifetime_ms,
+                        );
+                    } else {
+                        debug!(
+                            "SASL {} plugin opted out of live re-authentication; \
+                             connection will expire and reconnect on next RPC",
+                            mechanism_name
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -747,11 +789,79 @@ where
     Ok(response)
 }
 
+/// Split a bootstrap entry into `(host, port)`. Accepts `host:port`,
+/// bare `host` (defaults to 9092, the Kafka convention), and IPv6
+/// literals in the `[::1]:9092` form.
+///
+/// Used by [`KafkaClient::authenticate`] to feed the broker endpoint
+/// into a [`crate::kafka::SaslMechanismPluginFactory`].
+pub(super) fn parse_broker_endpoint(entry: &str) -> (String, u16) {
+    const DEFAULT_PORT: u16 = 9092;
+
+    // IPv6 literal: `[::1]:9092` or bare `[::1]`.
+    if let Some(rest) = entry.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = rest[..end].to_string();
+            let after = &rest[end + 1..];
+            let port = after
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(DEFAULT_PORT);
+            return (host, port);
+        }
+    }
+
+    match entry.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse::<u16>().unwrap_or(DEFAULT_PORT);
+            (host.to_string(), port)
+        }
+        None => (entry.to_string(), DEFAULT_PORT),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ConnectionConfig;
     use std::net::TcpListener;
+
+    #[test]
+    fn parse_broker_endpoint_host_port() {
+        let (host, port) = parse_broker_endpoint("kafka.example.com:9093");
+        assert_eq!(host, "kafka.example.com");
+        assert_eq!(port, 9093);
+    }
+
+    #[test]
+    fn parse_broker_endpoint_bare_host_defaults_port() {
+        let (host, port) = parse_broker_endpoint("kafka.example.com");
+        assert_eq!(host, "kafka.example.com");
+        assert_eq!(port, 9092);
+    }
+
+    #[test]
+    fn parse_broker_endpoint_ipv6_with_port() {
+        let (host, port) = parse_broker_endpoint("[::1]:9094");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9094);
+    }
+
+    #[test]
+    fn parse_broker_endpoint_ipv6_without_port() {
+        let (host, port) = parse_broker_endpoint("[::1]");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9092);
+    }
+
+    #[test]
+    fn parse_broker_endpoint_malformed_port_falls_back_to_default() {
+        // "host:not-a-port" — we recover rather than panic, and let the
+        // connect step surface the real failure if the entry is bad.
+        let (host, port) = parse_broker_endpoint("kafka.example.com:abc");
+        assert_eq!(host, "kafka.example.com");
+        assert_eq!(port, 9092);
+    }
 
     /// Test that TCP keepalive settings are actually applied to the socket.
     /// This creates a real TCP connection and verifies the socket options.
