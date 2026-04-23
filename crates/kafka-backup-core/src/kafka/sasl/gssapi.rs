@@ -36,7 +36,8 @@
 //! that lands in a future `libgssapi` release, switch to it and delete
 //! the mutex.
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -54,6 +55,60 @@ use super::plugin::{SaslAuthOutcome, SaslMechanismPlugin, SaslPluginError};
 /// Process-wide serialization point for the `KRB5_*` env-var mutation +
 /// `Cred::acquire` call. See module docs.
 static KRB5_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[derive(Debug)]
+struct EnvVarRestore {
+    name: &'static str,
+    original: Option<OsString>,
+}
+
+/// Restores process-global Kerberos environment overrides before the
+/// acquisition lock is released.
+#[derive(Debug, Default)]
+struct Krb5EnvGuard {
+    vars: Vec<EnvVarRestore>,
+}
+
+impl Krb5EnvGuard {
+    fn apply(
+        keytab_path: Option<&Path>,
+        krb5_config_path: Option<&Path>,
+        ccache: Option<&str>,
+    ) -> Self {
+        let mut guard = Self::default();
+        if let Some(path) = keytab_path {
+            guard.set("KRB5_CLIENT_KTNAME", path.as_os_str());
+        }
+        if let Some(ccache) = ccache {
+            guard.set("KRB5CCNAME", OsStr::new(ccache));
+        }
+        if let Some(path) = krb5_config_path {
+            guard.set("KRB5_CONFIG", path.as_os_str());
+        }
+        guard
+    }
+
+    fn set(&mut self, name: &'static str, value: &OsStr) {
+        let original = std::env::var_os(name);
+        self.vars.push(EnvVarRestore { name, original });
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+impl Drop for Krb5EnvGuard {
+    fn drop(&mut self) {
+        for var in self.vars.iter().rev() {
+            unsafe {
+                match &var.original {
+                    Some(value) => std::env::set_var(var.name, value),
+                    None => std::env::remove_var(var.name),
+                }
+            }
+        }
+    }
+}
 
 /// Errors specific to [`GssapiPlugin`]. Carried inside
 /// [`SaslPluginError::PayloadFailed`] when surfaced through the trait.
@@ -185,35 +240,27 @@ impl GssapiPlugin {
 
         let _guard = KRB5_ENV_LOCK.lock().await;
 
-        // SAFETY: `std::env::set_var` is unsafe in edition 2024 because
-        // it's not thread-safe w.r.t. other getenv callers. We
-        // serialize via KRB5_ENV_LOCK — only one GSSAPI acquisition
-        // mutates these variables at a time. Non-GSSAPI code does not
-        // read `KRB5_CLIENT_KTNAME`, `KRB5_CONFIG`, or `KRB5CCNAME`.
-        if let Some(path) = &keytab {
-            unsafe {
-                std::env::set_var("KRB5_CLIENT_KTNAME", path.as_os_str());
-            }
-            // Isolate from the OS credential cache. Without this, if the
-            // operator has stale tickets in the default ccache (common on
-            // macOS where API:<uuid> caches persist across logins), MIT
-            // Kerberos prefers them over a fresh TGT from the keytab.
-            // Stale tickets encrypted with an old service key cause the
-            // broker to reject the AP-REQ with "invalid credentials".
-            //
-            // `MEMORY:<addr>` gives this plugin a private in-process
-            // cache keyed by heap address — cheap, per-instance, and
-            // cleaned up with the plugin.
-            let ccache = format!("MEMORY:{:p}", self as *const Self);
-            unsafe {
-                std::env::set_var("KRB5CCNAME", ccache);
-            }
-        }
-        if let Some(path) = &krb5_config {
-            unsafe {
-                std::env::set_var("KRB5_CONFIG", path.as_os_str());
-            }
-        }
+        // Isolate from the OS credential cache when using a keytab.
+        // Without this, if the operator has stale tickets in the default
+        // ccache (common on macOS where API:<uuid> caches persist across
+        // logins), MIT Kerberos prefers them over a fresh TGT from the
+        // keytab. Stale tickets encrypted with an old service key cause
+        // the broker to reject the AP-REQ with "invalid credentials".
+        //
+        // `MEMORY:<addr>` gives this plugin a private in-process cache
+        // keyed by heap address — cheap, per-instance, and cleaned up
+        // with the plugin.
+        let ccache = keytab
+            .as_ref()
+            .map(|_| format!("MEMORY:{:p}", self as *const Self));
+
+        // SAFETY: `std::env::set_var`/`remove_var` are unsafe in edition
+        // 2024 because they are process-global. `Krb5EnvGuard::apply`
+        // snapshots and mutates the Kerberos variables while
+        // KRB5_ENV_LOCK is held, and its Drop restores them before this
+        // function releases the lock.
+        let _env_guard =
+            Krb5EnvGuard::apply(keytab.as_deref(), krb5_config.as_deref(), ccache.as_deref());
 
         // Pin the mechanism to Kerberos 5 rather than relying on the
         // library's implicit default. Matches librdkafka + the Java
@@ -638,5 +685,68 @@ mod tests {
         // Each build returns a fresh Arc — this is the whole point
         // (per-connection state).
         assert!(!Arc::ptr_eq(&handle_a, &handle_b));
+    }
+
+    #[tokio::test]
+    async fn acquire_cred_restores_krb5_environment_even_on_error() {
+        struct EnvSnapshot {
+            vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+
+        impl EnvSnapshot {
+            fn new(names: &[&'static str]) -> Self {
+                Self {
+                    vars: names
+                        .iter()
+                        .map(|name| (*name, std::env::var_os(name)))
+                        .collect(),
+                }
+            }
+        }
+
+        impl Drop for EnvSnapshot {
+            fn drop(&mut self) {
+                for (name, value) in &self.vars {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _snapshot = EnvSnapshot::new(&["KRB5_CLIENT_KTNAME", "KRB5CCNAME", "KRB5_CONFIG"]);
+        unsafe {
+            std::env::set_var("KRB5_CLIENT_KTNAME", "FILE:/tmp/original-client.keytab");
+            std::env::set_var("KRB5CCNAME", "FILE:/tmp/original-ccache");
+            std::env::set_var("KRB5_CONFIG", "/tmp/original-krb5.conf");
+        }
+
+        let keytab = tempfile::NamedTempFile::new().expect("temp keytab");
+        let krb5_config = tempfile::NamedTempFile::new().expect("temp krb5.conf");
+        let plugin = GssapiPlugin::new(
+            "kafka",
+            "kafka.test.local",
+            Some(keytab.path().to_path_buf()),
+            Some(krb5_config.path().to_path_buf()),
+        )
+        .expect("plugin construction");
+
+        let _ = plugin.acquire_cred().await;
+
+        assert_eq!(
+            std::env::var_os("KRB5_CLIENT_KTNAME").as_deref(),
+            Some(std::ffi::OsStr::new("FILE:/tmp/original-client.keytab"))
+        );
+        assert_eq!(
+            std::env::var_os("KRB5CCNAME").as_deref(),
+            Some(std::ffi::OsStr::new("FILE:/tmp/original-ccache"))
+        );
+        assert_eq!(
+            std::env::var_os("KRB5_CONFIG").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/original-krb5.conf"))
+        );
     }
 }

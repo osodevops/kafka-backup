@@ -232,7 +232,7 @@ async fn plugin_reauth_fires_at_80_percent_via_scheduler() {
 
 /// The factory contract: `KafkaClient::authenticate` must call
 /// `SaslMechanismPluginFactory::build` exactly once, passing the
-/// endpoint from `bootstrap_servers[0]`.
+/// configured endpoint that the client successfully dialed.
 ///
 /// This is the test that gates the multi-broker GSSAPI correctness:
 /// when `PartitionLeaderRouter` rewrites `bootstrap_servers` to the
@@ -313,13 +313,99 @@ async fn factory_receives_per_broker_endpoint() {
     );
     let (host, port) = &observed[0];
     // MockKafkaBroker binds 127.0.0.1:<ephemeral>. Assert the factory
-    // receives the exact host + port the client was configured with,
-    // proving the endpoint flows from `bootstrap_servers[0]` through
-    // `parse_broker_endpoint` to the factory.
+    // receives the exact host + port the client successfully dialed,
+    // proving the connected endpoint flows through `parse_broker_endpoint`
+    // to the factory.
     assert_eq!(
         format!("{host}:{port}"),
         bootstrap,
         "factory endpoint must match configured bootstrap exactly"
+    );
+
+    mock.shutdown().await;
+}
+
+/// Regression: if the first bootstrap entry is down and KafkaClient connects
+/// to a later entry, the plugin factory must receive the endpoint that was
+/// actually dialed. GSSAPI derives the broker SPN from this host, and MSK IAM
+/// signs this host/port into the OAuth payload.
+#[tokio::test]
+async fn factory_receives_successful_bootstrap_endpoint_not_first_configured() {
+    use async_trait::async_trait;
+    use kafka_backup_core::kafka::{
+        SaslMechanismPlugin, SaslMechanismPluginFactory, SaslMechanismPluginHandle, SaslPluginError,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct StubPlugin;
+    #[async_trait]
+    impl SaslMechanismPlugin for StubPlugin {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        async fn initial_payload(&self) -> Result<Vec<u8>, SaslPluginError> {
+            Ok(b"n,a=test-user,\x01auth=Bearer stub\x01\x01".to_vec())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingFactory {
+        calls: Arc<Mutex<Vec<(String, u16)>>>,
+    }
+
+    impl SaslMechanismPluginFactory for CapturingFactory {
+        fn mechanism_name(&self) -> &str {
+            "OAUTHBEARER"
+        }
+        fn build(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> Result<SaslMechanismPluginHandle, SaslPluginError> {
+            self.calls.lock().unwrap().push((host.to_string(), port));
+            Ok(Arc::new(StubPlugin))
+        }
+    }
+
+    let mock = MockKafkaBroker::start(vec![
+        Exchange::HandshakeSuccess,
+        Exchange::AuthenticateSuccess {
+            auth_bytes: vec![],
+            session_lifetime_ms: 0,
+        },
+    ])
+    .await;
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(CapturingFactory {
+        calls: calls.clone(),
+    });
+    let dead_first_bootstrap = "127.0.0.1:1".to_string();
+
+    let config = KafkaConfig {
+        bootstrap_servers: vec![dead_first_bootstrap.clone(), mock.bootstrap()],
+        security: SecurityConfig {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism_plugin_factory: Some(factory),
+            ..Default::default()
+        },
+        topics: TopicSelection::default(),
+        connection: Default::default(),
+    };
+    let client = KafkaClient::new(config);
+    client
+        .connect()
+        .await
+        .expect("connect should skip dead bootstrap and authenticate to mock");
+
+    let observed = calls.lock().unwrap().clone();
+    assert_eq!(observed.len(), 1);
+    let (host, port) = &observed[0];
+    assert_eq!(
+        format!("{host}:{port}"),
+        mock.bootstrap(),
+        "factory must receive the successfully connected bootstrap endpoint, not {dead_first_bootstrap}"
     );
 
     mock.shutdown().await;

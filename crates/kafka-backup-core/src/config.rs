@@ -235,12 +235,12 @@ pub struct SecurityConfig {
     /// config.
     ///
     /// The factory is invoked once per `KafkaClient` in
-    /// `KafkaClient::authenticate`, with the broker endpoint from
-    /// `bootstrap_servers[0]`. The `PartitionLeaderRouter` rewrites that
-    /// field to the advertised per-broker `host:port` before spawning
-    /// pooled clients, so stateful mechanisms (GSSAPI) receive the
-    /// correct SPN hostname and stateless mechanisms (PLAIN,
-    /// OAUTHBEARER) can ignore the argument via [`SharedPluginFactory`].
+    /// `KafkaClient::authenticate`, with the broker endpoint that was
+    /// successfully dialed. The `PartitionLeaderRouter` rewrites
+    /// `bootstrap_servers` to the advertised per-broker `host:port` before
+    /// spawning pooled clients, so stateful mechanisms (GSSAPI) receive the
+    /// correct SPN hostname and stateless mechanisms (PLAIN, OAUTHBEARER)
+    /// can ignore the argument via [`SharedPluginFactory`].
     ///
     /// [`SharedPluginFactory`]: crate::kafka::SharedPluginFactory
     #[serde(skip)]
