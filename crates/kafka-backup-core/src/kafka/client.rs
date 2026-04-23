@@ -118,7 +118,7 @@ impl KafkaClient {
                         || self.config.security.security_protocol == SecurityProtocol::SaslSsl
                     {
                         drop(conn);
-                        self.authenticate().await?;
+                        self.authenticate(server).await?;
                     }
 
                     debug!("Connected to Kafka broker: {}", server);
@@ -224,26 +224,15 @@ impl KafkaClient {
         Ok(())
     }
 
-    async fn authenticate(&self) -> Result<()> {
+    async fn authenticate(&self, broker_endpoint: &str) -> Result<()> {
         let security = &self.config.security;
 
         if let Some(factory) = security.sasl_mechanism_plugin_factory.clone() {
-            // PartitionLeaderRouter rewrites `bootstrap_servers` to a
-            // single entry — the advertised broker `host:port` — before
-            // spawning a pooled client. For the bootstrap client, this
-            // is the user-configured endpoint. Either way, element 0 is
-            // the endpoint this client will dial.
-            let entry = self
-                .config
-                .bootstrap_servers
-                .first()
-                .ok_or_else(|| {
-                    crate::Error::Config(
-                        "bootstrap_servers is empty; cannot build SASL plugin".to_string(),
-                    )
-                })?
-                .as_str();
-            let (host, port) = parse_broker_endpoint(entry);
+            // Use the endpoint that `try_connect` actually dialed. The
+            // bootstrap client may skip earlier configured entries if they
+            // are down; GSSAPI and MSK IAM both need the successful broker
+            // host/port when constructing mechanism-specific payloads.
+            let (host, port) = parse_broker_endpoint(broker_endpoint);
             let plugin = factory.build(&host, port).map_err(|e| {
                 crate::Error::Authentication(format!(
                     "SASL plugin factory failed for broker {host}:{port}: {e}"
@@ -547,7 +536,7 @@ impl KafkaClient {
                         || self.config.security.security_protocol == SecurityProtocol::SaslSsl
                     {
                         drop(conn);
-                        Box::pin(self.authenticate()).await?;
+                        Box::pin(self.authenticate(server)).await?;
                     }
 
                     debug!("Reconnected to Kafka broker: {}", server);

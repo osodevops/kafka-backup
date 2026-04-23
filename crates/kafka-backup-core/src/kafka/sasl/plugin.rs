@@ -201,10 +201,11 @@ struct Rfc7628Error {
 /// Builds a fresh [`SaslMechanismPluginHandle`] for a specific broker
 /// endpoint. The `KafkaClient::authenticate` path calls
 /// [`SaslMechanismPluginFactory::build`] exactly once per client — the
-/// bootstrap client with the user-configured endpoint, then one per
-/// pooled per-broker client with the advertised broker `host:port` that
-/// [`crate::kafka::partition_router::PartitionLeaderRouter`] rewrites
-/// into the cloned config.
+/// bootstrap client with the user-configured endpoint that successfully
+/// connected, then one per pooled per-broker client with the advertised
+/// broker `host:port` that
+/// [`crate::kafka::partition_router::PartitionLeaderRouter`] rewrites into
+/// the cloned config.
 ///
 /// This replaces the prior "single shared `Arc<dyn SaslMechanismPlugin>`
 /// cloned into every client" design, which had two defects:
