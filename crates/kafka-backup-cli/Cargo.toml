@@ -46,6 +46,9 @@ uuid.workspace = true
 # Crypto for SHA-256 verification
 sha2.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 # Enables SASL/GSSAPI (Kerberos) authentication. Propagates to

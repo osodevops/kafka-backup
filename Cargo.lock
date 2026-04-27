@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-cli"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1371,6 +1371,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1379,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "kafka-backup-core"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "anyhow",
  "async-trait",

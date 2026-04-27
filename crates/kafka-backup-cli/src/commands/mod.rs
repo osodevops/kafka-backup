@@ -12,6 +12,7 @@ pub mod security_args;
 pub mod snapshot_groups;
 pub mod status;
 pub mod status_watch;
+pub mod storage_path;
 pub mod three_phase;
 pub mod validate;
 pub mod validate_restore;

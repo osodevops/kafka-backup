@@ -1,10 +1,11 @@
 use anyhow::Result;
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::BackupManifest;
 use tracing::info;
 
+use super::storage_path::backend_from_path;
+
 pub async fn run(path: &str, backup_id: Option<&str>) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
+    let storage = backend_from_path(path)?;
 
     match backup_id {
         Some(id) => {

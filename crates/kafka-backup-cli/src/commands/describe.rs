@@ -1,7 +1,8 @@
 use anyhow::Result;
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::BackupManifest;
 use tracing::info;
+
+use super::storage_path::backend_from_path;
 
 /// Describe command output format
 pub enum OutputFormat {
@@ -21,7 +22,7 @@ impl OutputFormat {
 }
 
 pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
+    let storage = backend_from_path(path)?;
     let output_format = OutputFormat::from_str(format);
 
     info!("Loading backup manifest: {}", backup_id);
