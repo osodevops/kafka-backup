@@ -123,6 +123,12 @@ impl StorageBackendConfig {
         match parsed.scheme() {
             "s3" | "s3a" => {
                 let bucket = parsed.host_str().unwrap_or_default().to_string();
+                let prefix = parsed.path().trim_matches('/');
+                let prefix = if prefix.is_empty() {
+                    None
+                } else {
+                    Some(prefix.to_string())
+                };
                 let region = parsed
                     .query_pairs()
                     .find(|(k, _)| k == "region")
@@ -143,7 +149,7 @@ impl StorageBackendConfig {
                     endpoint,
                     access_key: std::env::var("AWS_ACCESS_KEY_ID").ok(),
                     secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
-                    prefix: None,
+                    prefix,
                     path_style,
                     allow_http: false,
                 })
@@ -218,6 +224,26 @@ mod tests {
             StorageBackendConfig::S3 { bucket, region, .. } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(region, Some("us-west-2".to_string()));
+            }
+            _ => panic!("Expected S3 config"),
+        }
+    }
+
+    #[test]
+    fn test_s3_url_parsing_preserves_path_prefix() {
+        let config =
+            StorageBackendConfig::from_url("s3://my-bucket/backups/prod/?region=us-west-2")
+                .unwrap();
+        match config {
+            StorageBackendConfig::S3 {
+                bucket,
+                region,
+                prefix,
+                ..
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(region, Some("us-west-2".to_string()));
+                assert_eq!(prefix.as_deref(), Some("backups/prod"));
             }
             _ => panic!("Expected S3 config"),
         }

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use kafka_backup_core::segment::SegmentReader;
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::BackupManifest;
-use std::path::PathBuf;
 use tracing::{error, info, warn};
+
+use super::storage_path::backend_from_path;
 
 #[derive(Debug, Default)]
 struct ValidationReport {
+    manifest_loaded: bool,
     segments_checked: usize,
     segments_valid: usize,
     segments_missing: usize,
@@ -17,7 +18,7 @@ struct ValidationReport {
 
 impl ValidationReport {
     fn is_valid(&self) -> bool {
-        self.segments_missing == 0 && self.segments_corrupted == 0
+        self.manifest_loaded && self.segments_missing == 0 && self.segments_corrupted == 0
     }
 
     fn print(&self) {
@@ -47,7 +48,7 @@ impl ValidationReport {
 pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
     info!("Validating backup: {} (deep={})", backup_id, deep);
 
-    let storage = FilesystemBackend::new(PathBuf::from(path));
+    let storage = backend_from_path(path)?;
     let mut report = ValidationReport::default();
 
     // Load manifest
@@ -60,7 +61,7 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
                 .issues
                 .push(format!("Manifest not found: {}", manifest_key));
             report.print();
-            return Ok(());
+            std::process::exit(1);
         }
     };
 
@@ -70,9 +71,10 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
             error!("Failed to parse manifest: {}", e);
             report.issues.push(format!("Manifest parse error: {}", e));
             report.print();
-            return Ok(());
+            std::process::exit(1);
         }
     };
+    report.manifest_loaded = true;
 
     println!("Validating backup: {}", manifest.backup_id);
     println!(
