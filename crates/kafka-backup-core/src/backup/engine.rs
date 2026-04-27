@@ -30,9 +30,109 @@ pub struct BackupEngine {
     prometheus_metrics: Option<Arc<PrometheusMetrics>>,
     health: Arc<HealthCheck>,
     offset_store: Option<Arc<SqliteOffsetStore>>,
+    manifest_persistence: Arc<ManifestPersistence>,
+    offset_persistence: Option<Arc<OffsetPersistence>>,
     kafka_circuit_breaker: Arc<CircuitBreaker>,
     storage_circuit_breaker: Arc<CircuitBreaker>,
     shutdown_tx: broadcast::Sender<()>,
+}
+
+struct ManifestPersistence {
+    backup_id: String,
+    storage: Arc<dyn StorageBackend>,
+    manifest: Arc<Mutex<BackupManifest>>,
+    save_lock: Mutex<()>,
+    progress_lock: Mutex<Option<Instant>>,
+    progress_interval: Duration,
+}
+
+impl ManifestPersistence {
+    fn new(
+        backup_id: String,
+        storage: Arc<dyn StorageBackend>,
+        manifest: Arc<Mutex<BackupManifest>>,
+        progress_interval: Duration,
+    ) -> Self {
+        Self {
+            backup_id,
+            storage,
+            manifest,
+            save_lock: Mutex::new(()),
+            progress_lock: Mutex::new(None),
+            progress_interval,
+        }
+    }
+
+    async fn save_now(&self) -> Result<()> {
+        let _guard = self.save_lock.lock().await;
+        let current = self.manifest.lock().await.clone();
+        save_manifest_snapshot(self.storage.as_ref(), &self.backup_id, current).await
+    }
+
+    async fn save_progress(&self) -> Result<()> {
+        let mut last_save = self.progress_lock.lock().await;
+        if last_save.is_some_and(|last| last.elapsed() < self.progress_interval) {
+            return Ok(());
+        }
+
+        self.save_now().await?;
+        *last_save = Some(Instant::now());
+        Ok(())
+    }
+}
+
+struct OffsetPersistence {
+    backup_id: String,
+    storage: Arc<dyn StorageBackend>,
+    offset_store: Arc<SqliteOffsetStore>,
+    sync_lock: Mutex<Option<Instant>>,
+    sync_interval: Duration,
+}
+
+impl OffsetPersistence {
+    fn new(
+        backup_id: String,
+        storage: Arc<dyn StorageBackend>,
+        offset_store: Arc<SqliteOffsetStore>,
+        sync_interval: Duration,
+    ) -> Self {
+        Self {
+            backup_id,
+            storage,
+            offset_store,
+            sync_lock: Mutex::new(None),
+            sync_interval,
+        }
+    }
+
+    async fn sync_now(&self) -> Result<()> {
+        let mut last_sync = self.sync_lock.lock().await;
+        self.offset_store
+            .sync_to_storage(
+                self.storage.as_ref(),
+                &format!("{}/offsets.db", self.backup_id),
+            )
+            .await?;
+
+        *last_sync = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn sync_if_due(&self) -> Result<()> {
+        let mut last_sync = self.sync_lock.lock().await;
+        if last_sync.is_some_and(|last| last.elapsed() < self.sync_interval) {
+            return Ok(());
+        }
+
+        self.offset_store
+            .sync_to_storage(
+                self.storage.as_ref(),
+                &format!("{}/offsets.db", self.backup_id),
+            )
+            .await?;
+        *last_sync = Some(Instant::now());
+        Ok(())
+    }
 }
 
 impl BackupEngine {
@@ -127,15 +227,33 @@ impl BackupEngine {
 
         let (shutdown_tx, _) = broadcast::channel(1);
 
+        let manifest = Arc::new(Mutex::new(manifest));
+        let manifest_persistence = Arc::new(ManifestPersistence::new(
+            config.backup_id.clone(),
+            storage.clone(),
+            manifest.clone(),
+            Duration::from_secs(backup_opts.sync_interval_secs),
+        ));
+        let offset_persistence = offset_store.as_ref().map(|offset_store| {
+            Arc::new(OffsetPersistence::new(
+                config.backup_id.clone(),
+                storage.clone(),
+                offset_store.clone(),
+                Duration::from_secs(backup_opts.sync_interval_secs),
+            ))
+        });
+
         Ok(Self {
             config,
             router,
             storage,
-            manifest: Arc::new(Mutex::new(manifest)),
+            manifest,
             metrics,
             prometheus_metrics,
             health,
             offset_store,
+            manifest_persistence,
+            offset_persistence,
             kafka_circuit_breaker,
             storage_circuit_breaker,
             shutdown_tx,
@@ -213,6 +331,9 @@ impl BackupEngine {
             offset_store
                 .get_or_create_job(&self.config.backup_id, None)
                 .await?;
+            if let Some(ref offset_persistence) = self.offset_persistence {
+                offset_persistence.sync_now().await?;
+            }
         }
 
         let source = self.config.source.as_ref().unwrap();
@@ -291,6 +412,11 @@ impl BackupEngine {
                     topic_entry.original_partition_count = Some(partitions.len() as i32);
                 }
 
+                // Publish metadata before any partition task for this topic can
+                // upload segments. A hard kill after a segment upload cannot run
+                // cleanup, so the manifest must already be discoverable.
+                self.save_manifest().await?;
+
                 // Spawn a task for each partition (limited by semaphore)
                 // NOTE: The semaphore is acquired INSIDE the spawned task, not before
                 // spawning. This allows all tasks to be spawned immediately and queued,
@@ -319,6 +445,8 @@ impl BackupEngine {
                         prometheus_metrics: self.prometheus_metrics.clone(),
                         health: Arc::clone(&self.health),
                         offset_store: self.offset_store.clone(),
+                        manifest_persistence: Arc::clone(&self.manifest_persistence),
+                        offset_persistence: self.offset_persistence.clone(),
                         kafka_cb: Arc::clone(&self.kafka_circuit_breaker),
                         storage_cb: Arc::clone(&self.storage_circuit_breaker),
                         earliest_offset,
@@ -342,6 +470,10 @@ impl BackupEngine {
                 all_handles.len(),
                 backup_opts.max_concurrent_partitions
             );
+
+            // Publish a manifest before long-running partition tasks complete so
+            // interrupted continuous backups still have discoverable metadata.
+            self.save_manifest().await?;
 
             // Wait for ALL partitions across ALL topics to complete,
             // but allow interruption by shutdown signal for graceful exit
@@ -383,6 +515,7 @@ impl BackupEngine {
                             "{} of {} partition backup tasks failed",
                             error_count, total_tasks
                         );
+                        self.persist_progress_best_effort("partition task failure").await;
                         return Err(Error::Io(std::io::Error::other(format!(
                             "{} of {} partitions failed to backup",
                             error_count, total_tasks
@@ -400,6 +533,9 @@ impl BackupEngine {
             if let Some(ref offset_store) = self.offset_store {
                 let start = Instant::now();
                 offset_store.checkpoint().await?;
+                if let Some(ref offset_persistence) = self.offset_persistence {
+                    offset_persistence.sync_now().await?;
+                }
                 self.metrics.record_checkpoint_latency(start.elapsed());
                 self.health.mark_healthy("checkpointing");
             }
@@ -446,12 +582,9 @@ impl BackupEngine {
         // Final checkpoint
         if let Some(ref offset_store) = self.offset_store {
             offset_store.checkpoint().await?;
-            offset_store
-                .sync_to_storage(
-                    self.storage.as_ref(),
-                    &format!("{}/offsets.db", self.config.backup_id),
-                )
-                .await?;
+            if let Some(ref offset_persistence) = self.offset_persistence {
+                offset_persistence.sync_now().await?;
+            }
             offset_store
                 .update_job_status(&self.config.backup_id, "completed")
                 .await?;
@@ -537,26 +670,18 @@ impl BackupEngine {
     /// segments (same key or same start_offset) are deduplicated — the stored entry
     /// wins on conflict.
     async fn save_manifest(&self) -> Result<()> {
-        let current = self.manifest.lock().await.clone();
-        let key = format!("{}/manifest.json", self.config.backup_id);
+        self.manifest_persistence.save_now().await
+    }
 
-        // Load existing manifest and merge; fall back to current-only on any error
-        let merged = match self.storage.get(&key).await {
-            Ok(data) => match serde_json::from_slice::<BackupManifest>(&data) {
-                Ok(existing) => merge_manifests(existing, current),
-                Err(e) => {
-                    warn!("Existing manifest is unparseable, overwriting: {}", e);
-                    current
-                }
-            },
-            Err(_) => current, // First run — no manifest yet
-        };
-
-        let manifest_json = serde_json::to_string_pretty(&merged)?;
-        self.storage.put(&key, Bytes::from(manifest_json)).await?;
-        debug!("Saved manifest to {} ({} topics)", key, merged.topics.len());
-
-        Ok(())
+    async fn persist_progress_best_effort(&self, reason: &str) {
+        if let Err(e) = self.manifest_persistence.save_now().await {
+            warn!("Best-effort manifest save failed after {}: {}", reason, e);
+        }
+        if let Some(ref offset_persistence) = self.offset_persistence {
+            if let Err(e) = offset_persistence.sync_now().await {
+                warn!("Best-effort offset sync failed after {}: {}", reason, e);
+            }
+        }
     }
 
     /// Snapshot consumer group committed offsets to storage.
@@ -718,6 +843,8 @@ struct BackupPartitionContext {
     prometheus_metrics: Option<Arc<PrometheusMetrics>>,
     health: Arc<HealthCheck>,
     offset_store: Option<Arc<SqliteOffsetStore>>,
+    manifest_persistence: Arc<ManifestPersistence>,
+    offset_persistence: Option<Arc<OffsetPersistence>>,
     kafka_cb: Arc<CircuitBreaker>,
     #[allow(dead_code)] // Reserved for future storage circuit breaker integration
     storage_cb: Arc<CircuitBreaker>,
@@ -824,6 +951,7 @@ impl BackupPartitionContext {
                         let error_type = ErrorType::from_error(&e);
                         prom.record_error(&self.backup_id, error_type);
                     }
+                    self.persist_progress_best_effort("fetch error").await;
                     return Err(e);
                 }
             };
@@ -880,6 +1008,7 @@ impl BackupPartitionContext {
                     let key = self.segment_key(seg_start);
                     if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                         self.add_segment_to_manifest(segment_metadata).await;
+                        self.manifest_persistence.save_progress().await?;
                         segments_written += 1;
                     }
                 }
@@ -891,6 +1020,9 @@ impl BackupPartitionContext {
                 offset_store
                     .set_offset(&self.backup_id, &self.topic, self.partition, last_offset)
                     .await?;
+                if let Some(ref offset_persistence) = self.offset_persistence {
+                    offset_persistence.sync_if_due().await?;
+                }
             }
 
             // Track progress
@@ -930,6 +1062,7 @@ impl BackupPartitionContext {
             let key = self.segment_key(seg_start);
             if let Some(segment_metadata) = segment_writer.flush(&key).await? {
                 self.add_segment_to_manifest(segment_metadata).await;
+                self.manifest_persistence.save_progress().await?;
                 segments_written += 1;
             }
         }
@@ -976,6 +1109,23 @@ impl BackupPartitionContext {
         partition_backup.add_segment(segment_metadata);
     }
 
+    async fn persist_progress_best_effort(&self, reason: &str) {
+        if let Err(e) = self.manifest_persistence.save_now().await {
+            warn!(
+                "Best-effort manifest save failed for {}:{} after {}: {}",
+                self.topic, self.partition, reason, e
+            );
+        }
+        if let Some(ref offset_persistence) = self.offset_persistence {
+            if let Err(e) = offset_persistence.sync_now().await {
+                warn!(
+                    "Best-effort offset sync failed for {}:{} after {}: {}",
+                    self.topic, self.partition, reason, e
+                );
+            }
+        }
+    }
+
     async fn fetch_records(
         &self,
         start_offset: i64,
@@ -991,6 +1141,32 @@ impl BackupPartitionContext {
 
         Ok((fetch_response.records, fetch_response.next_offset))
     }
+}
+
+async fn save_manifest_snapshot(
+    storage: &dyn StorageBackend,
+    backup_id: &str,
+    current: BackupManifest,
+) -> Result<()> {
+    let key = format!("{}/manifest.json", backup_id);
+
+    // Load existing manifest and merge; fall back to current-only on any error.
+    let merged = match storage.get(&key).await {
+        Ok(data) => match serde_json::from_slice::<BackupManifest>(&data) {
+            Ok(existing) => merge_manifests(existing, current),
+            Err(e) => {
+                warn!("Existing manifest is unparseable, overwriting: {}", e);
+                current
+            }
+        },
+        Err(_) => current, // First write — no manifest yet.
+    };
+
+    let manifest_json = serde_json::to_string_pretty(&merged)?;
+    storage.put(&key, Bytes::from(manifest_json)).await?;
+    debug!("Saved manifest to {} ({} topics)", key, merged.topics.len());
+
+    Ok(())
 }
 
 /// Merge two backup manifests, performing a union of topics/partitions/segments.
@@ -1179,6 +1355,121 @@ mod tests {
             original_partition_count: partition_count,
             partitions,
         }
+    }
+
+    fn count_segments(manifest: &BackupManifest) -> usize {
+        manifest
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.partitions)
+            .map(|partition| partition.segments.len())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn test_manifest_persistence_writes_initial_manifest() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(crate::storage::MemoryBackend::new());
+        let manifest = Arc::new(Mutex::new(BackupManifest::new("backup-1".to_string())));
+        {
+            let mut manifest_guard = manifest.lock().await;
+            manifest_guard
+                .topics
+                .push(make_topic("orders", Some(3), Vec::new()));
+        }
+
+        let persistence = ManifestPersistence::new(
+            "backup-1".to_string(),
+            storage.clone(),
+            manifest,
+            Duration::from_secs(30),
+        );
+
+        persistence.save_now().await.unwrap();
+
+        let data = storage.get("backup-1/manifest.json").await.unwrap();
+        let stored: BackupManifest = serde_json::from_slice(&data).unwrap();
+        assert_eq!(stored.backup_id, "backup-1");
+        assert_eq!(stored.topics[0].name, "orders");
+        assert_eq!(stored.topics[0].original_partition_count, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_progress_save_persists_first_segment_and_throttles() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(crate::storage::MemoryBackend::new());
+        let manifest = Arc::new(Mutex::new(BackupManifest::new("backup-1".to_string())));
+        let persistence = ManifestPersistence::new(
+            "backup-1".to_string(),
+            storage.clone(),
+            manifest.clone(),
+            Duration::from_secs(3600),
+        );
+
+        {
+            let mut manifest_guard = manifest.lock().await;
+            manifest_guard.topics.push(make_topic(
+                "orders",
+                Some(1),
+                vec![make_partition(0, vec![make_segment("seg-a", 0, 9)])],
+            ));
+        }
+        persistence.save_progress().await.unwrap();
+
+        let data = storage.get("backup-1/manifest.json").await.unwrap();
+        let stored: BackupManifest = serde_json::from_slice(&data).unwrap();
+        assert_eq!(count_segments(&stored), 1);
+
+        {
+            let mut manifest_guard = manifest.lock().await;
+            manifest_guard.topics[0].partitions[0]
+                .segments
+                .push(make_segment("seg-b", 10, 19));
+        }
+        persistence.save_progress().await.unwrap();
+
+        let data = storage.get("backup-1/manifest.json").await.unwrap();
+        let stored: BackupManifest = serde_json::from_slice(&data).unwrap();
+        assert_eq!(count_segments(&stored), 1);
+
+        persistence.save_now().await.unwrap();
+
+        let data = storage.get("backup-1/manifest.json").await.unwrap();
+        let stored: BackupManifest = serde_json::from_slice(&data).unwrap();
+        assert_eq!(count_segments(&stored), 2);
+    }
+
+    #[tokio::test]
+    async fn test_offset_persistence_syncs_remote_offset_database() {
+        use crate::offset_store::{OffsetStore, OffsetStoreConfig};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(crate::storage::MemoryBackend::new());
+        let offset_store = Arc::new(
+            SqliteOffsetStore::new(OffsetStoreConfig {
+                db_path: temp_dir.path().join("offsets.db"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+
+        offset_store
+            .get_or_create_job("backup-1", None)
+            .await
+            .unwrap();
+        offset_store
+            .set_offset("backup-1", "orders", 0, 42)
+            .await
+            .unwrap();
+
+        let persistence = OffsetPersistence::new(
+            "backup-1".to_string(),
+            storage.clone(),
+            offset_store,
+            Duration::from_secs(30),
+        );
+
+        persistence.sync_now().await.unwrap();
+        assert!(storage.exists("backup-1/offsets.db").await.unwrap());
     }
 
     #[test]
