@@ -8,9 +8,10 @@
 //! - ListOffsetsForTimes: Find offsets by timestamp
 
 use kafka_protocol::messages::{
-    ApiKey, DescribeGroupsRequest, DescribeGroupsResponse, GroupId, ListGroupsRequest,
-    ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse, TopicName,
+    ApiKey, DescribeGroupsRequest, DescribeGroupsResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, GroupId, ListGroupsRequest, ListGroupsResponse, ListOffsetsRequest,
+    ListOffsetsResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
+    OffsetFetchResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use std::collections::HashMap;
@@ -89,6 +90,17 @@ pub struct TimestampOffset {
     pub timestamp: i64,
     /// Error code (0 = success)
     pub error_code: i16,
+}
+
+/// Broker that coordinates a consumer group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCoordinator {
+    /// Coordinator broker node ID
+    pub node_id: i32,
+    /// Coordinator broker host
+    pub host: String,
+    /// Coordinator broker port
+    pub port: i32,
 }
 
 /// List all consumer groups on the cluster
@@ -230,6 +242,107 @@ pub async fn fetch_offsets(
     Ok(offsets)
 }
 
+/// Find the broker coordinating a consumer group.
+pub async fn find_group_coordinator(
+    client: &KafkaClient,
+    group_id: &str,
+) -> Result<GroupCoordinator> {
+    let request = FindCoordinatorRequest::default()
+        .with_key(StrBytes::from_string(group_id.to_string()))
+        .with_key_type(0);
+
+    let response: FindCoordinatorResponse = client
+        .send_request(ApiKey::FindCoordinator, request)
+        .await?;
+
+    group_coordinator_from_response(group_id, response)
+}
+
+fn group_coordinator_from_response(
+    group_id: &str,
+    response: FindCoordinatorResponse,
+) -> Result<GroupCoordinator> {
+    if response.coordinators.is_empty() {
+        if response.error_code != 0 {
+            return Err(KafkaError::BrokerError {
+                code: response.error_code,
+                message: response
+                    .error_message
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "FindCoordinator failed for group {group_id} with error code {}",
+                            response.error_code
+                        )
+                    }),
+            }
+            .into());
+        }
+        return Ok(GroupCoordinator {
+            node_id: response.node_id.0,
+            host: response.host.to_string(),
+            port: response.port,
+        });
+    }
+
+    let mut fallback = None;
+    for coordinator in response.coordinators {
+        let is_match = coordinator.key.as_str() == group_id;
+        if fallback.is_none() {
+            fallback = Some(coordinator.clone());
+        }
+        if !is_match {
+            continue;
+        }
+        if coordinator.error_code != 0 {
+            return Err(KafkaError::BrokerError {
+                code: coordinator.error_code,
+                message: coordinator
+                    .error_message
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "FindCoordinator failed for group {group_id} with error code {}",
+                            coordinator.error_code
+                        )
+                    }),
+            }
+            .into());
+        }
+        return Ok(GroupCoordinator {
+            node_id: coordinator.node_id.0,
+            host: coordinator.host.to_string(),
+            port: coordinator.port,
+        });
+    }
+
+    let coordinator = fallback.ok_or_else(|| {
+        KafkaError::Protocol(format!(
+            "FindCoordinator returned no coordinator for group {group_id}"
+        ))
+    })?;
+    if coordinator.error_code != 0 {
+        return Err(KafkaError::BrokerError {
+            code: coordinator.error_code,
+            message: coordinator
+                .error_message
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| {
+                    format!(
+                        "FindCoordinator failed for group {group_id} with error code {}",
+                        coordinator.error_code
+                    )
+                }),
+        }
+        .into());
+    }
+    Ok(GroupCoordinator {
+        node_id: coordinator.node_id.0,
+        host: coordinator.host.to_string(),
+        port: coordinator.port,
+    })
+}
+
 /// Commit offsets for a consumer group
 pub async fn commit_offsets(
     client: &KafkaClient,
@@ -368,10 +481,35 @@ fn parse_member_assignment(bytes: &[u8]) -> HashMap<String, Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kafka_protocol::messages::find_coordinator_response::Coordinator;
+    use kafka_protocol::messages::{BrokerId, FindCoordinatorResponse};
+    use kafka_protocol::protocol::StrBytes;
 
     #[test]
     fn test_parse_empty_member_assignment() {
         let result = parse_member_assignment(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn group_coordinator_from_response_picks_matching_modern_response() {
+        let response = FindCoordinatorResponse::default().with_coordinators(vec![
+            Coordinator::default()
+                .with_key(StrBytes::from_static_str("other"))
+                .with_node_id(BrokerId(1))
+                .with_host(StrBytes::from_static_str("broker-1"))
+                .with_port(9092),
+            Coordinator::default()
+                .with_key(StrBytes::from_static_str("analytics"))
+                .with_node_id(BrokerId(2))
+                .with_host(StrBytes::from_static_str("broker-2"))
+                .with_port(9093),
+        ]);
+
+        let coordinator = group_coordinator_from_response("analytics", response).unwrap();
+
+        assert_eq!(coordinator.node_id, 2);
+        assert_eq!(coordinator.host, "broker-2");
+        assert_eq!(coordinator.port, 9093);
     }
 }

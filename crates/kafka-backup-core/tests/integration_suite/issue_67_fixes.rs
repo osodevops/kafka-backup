@@ -742,15 +742,15 @@ async fn test_bug7_socket_timeout_constants_all_io_paths_protected() {
     );
     assert_eq!(
         kafka_backup_core::kafka::RESPONSE_TIMEOUT_SECS,
-        10,
-        "RESPONSE_TIMEOUT_SECS should be 10"
+        60,
+        "RESPONSE_TIMEOUT_SECS should stay above the default 30s produce timeout"
     );
 
     // The timeout error message must be classified as a connection error so it
     // triggers the existing reconnect-and-retry path in send_request().
     let timeout_err =
         kafka_backup_core::Error::Kafka(kafka_backup_core::error::KafkaError::Protocol(
-            "Request timed out after 10s waiting for broker response".to_string(),
+            "Request timed out after 60s waiting for broker response".to_string(),
         ));
     assert!(
         kafka_backup_core::kafka::is_connection_error_public(&timeout_err),
@@ -759,7 +759,7 @@ async fn test_bug7_socket_timeout_constants_all_io_paths_protected() {
 
     // Verify the body-read timeout message is distinct (the PR #68 gap we fixed)
     let body_err = kafka_backup_core::Error::Kafka(kafka_backup_core::error::KafkaError::Protocol(
-        "Response body read timed out after 10s".to_string(),
+        "Response body read timed out after 60s".to_string(),
     ));
     assert!(
         kafka_backup_core::kafka::is_connection_error_public(&body_err),

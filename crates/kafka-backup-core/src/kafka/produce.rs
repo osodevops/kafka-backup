@@ -145,7 +145,7 @@ pub async fn produce(
 
         let options = RecordEncodeOptions {
             version: 2,
-            compression: Compression::None,
+            compression: Compression::Zstd,
         };
 
         let mut records_buf = BytesMut::new();

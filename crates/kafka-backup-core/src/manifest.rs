@@ -600,15 +600,19 @@ impl OffsetMapping {
     ) {
         let key = format!("{}/{}", topic, partition);
         if let Some(entry) = self.entries.get_mut(&key) {
-            if source_offset < entry.source_first_offset {
+            if source_offset <= entry.source_first_offset {
                 entry.source_first_offset = source_offset;
-                entry.target_first_offset = target_offset;
-                entry.first_timestamp = timestamp;
+                if target_offset.is_some() || entry.target_first_offset.is_none() {
+                    entry.target_first_offset = target_offset;
+                }
+                entry.first_timestamp = timestamp.min(entry.first_timestamp);
             }
-            if source_offset > entry.source_last_offset {
+            if source_offset >= entry.source_last_offset {
                 entry.source_last_offset = source_offset;
-                entry.target_last_offset = target_offset;
-                entry.last_timestamp = timestamp;
+                if target_offset.is_some() || entry.target_last_offset.is_none() {
+                    entry.target_last_offset = target_offset;
+                }
+                entry.last_timestamp = timestamp.max(entry.last_timestamp);
             }
         } else {
             self.add(topic, partition, source_offset, target_offset, timestamp);
@@ -1072,5 +1076,98 @@ mod tests {
         assert_eq!(pair.source_offset, 100);
         assert_eq!(pair.target_offset, 5100);
         assert_eq!(pair.timestamp, 1700000000000);
+    }
+
+    #[test]
+    fn update_range_none_then_some_preserves_targets() {
+        // Reproduces the RestoreEngine pattern: a pre-produce loop calls
+        // update_range with None targets for all records in a segment, then
+        // the post-produce add_detailed calls update_range with Some targets.
+        // Before the fix, the pre-produce loop advanced source_last_offset so
+        // that post-produce calls never matched the > boundary, leaving
+        // target_first_offset and target_last_offset as None.
+        let mut m = OffsetMapping::new();
+
+        // Pre-produce: register source range without target offsets
+        for src in 0..1000i64 {
+            m.update_range("t", 0, src, None, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(e.source_first_offset, 0);
+        assert_eq!(e.source_last_offset, 999);
+        assert_eq!(e.target_first_offset, None, "no target yet");
+        assert_eq!(e.target_last_offset, None, "no target yet");
+
+        // Post-produce: add_detailed fills in actual target offsets
+        for src in 0..1000i64 {
+            m.add_detailed("t", 0, src, src, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(e.target_first_offset, Some(0), "seed first target");
+        assert_eq!(e.target_last_offset, Some(999), "seed last target");
+    }
+
+    #[test]
+    fn update_range_some_not_overwritten_by_none() {
+        // When a second segment's pre-produce loop calls update_range(None)
+        // for offsets beyond the first segment, it must not overwrite the
+        // Some(target_last) that the first segment's post-produce set.
+        let mut m = OffsetMapping::new();
+
+        // Segment 1 (offsets 0-999): pre-produce then post-produce
+        for src in 0..1000i64 {
+            m.update_range("t", 0, src, None, 1000 + src);
+        }
+        for src in 0..1000i64 {
+            m.add_detailed("t", 0, src, src, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(e.target_first_offset, Some(0));
+        assert_eq!(e.target_last_offset, Some(999));
+
+        // Segment 2 (offsets 1000-1999): pre-produce with None
+        for src in 1000..2000i64 {
+            m.update_range("t", 0, src, None, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(
+            e.target_last_offset,
+            Some(999),
+            "None must not overwrite Some"
+        );
+
+        // Segment 2: post-produce with Some
+        for src in 1000..2000i64 {
+            m.add_detailed("t", 0, src, src, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(e.source_first_offset, 0);
+        assert_eq!(e.source_last_offset, 1999);
+        assert_eq!(e.target_first_offset, Some(0));
+        assert_eq!(e.target_last_offset, Some(1999));
+    }
+
+    #[test]
+    fn update_range_shifted_target_offsets() {
+        // Target offsets can differ from source (e.g. target partition not
+        // empty). Verify the range tracks correctly.
+        let mut m = OffsetMapping::new();
+        let base = 5000i64;
+
+        for src in 0..100i64 {
+            m.update_range("t", 0, src, None, 1000 + src);
+        }
+        for src in 0..100i64 {
+            m.add_detailed("t", 0, src, base + src, 1000 + src);
+        }
+
+        let e = m.entries.get("t/0").unwrap();
+        assert_eq!(e.target_first_offset, Some(5000));
+        assert_eq!(e.target_last_offset, Some(5099));
     }
 }

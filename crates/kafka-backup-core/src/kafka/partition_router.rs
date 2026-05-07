@@ -20,6 +20,11 @@ use super::metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
 use super::{FetchResponse, KafkaClient, ProduceResponse};
 use crate::manifest::BackupRecord;
 
+const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+const NOT_COORDINATOR: i16 = 16;
+const MAX_COORDINATOR_RETRIES: u32 = 12;
+
 /// Routes Kafka requests to the correct partition leader broker.
 ///
 /// This router maintains:
@@ -477,74 +482,48 @@ impl PartitionLeaderRouter {
         timeout_ms: i32,
     ) -> Result<ProduceResponse> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
+        const MAX_LEADER_RETRIES: u32 = 20;
 
-        // First attempt — no clone yet
-        let err = match self
-            .produce_internal(topic, partition, &records, acks, timeout_ms)
-            .await
-        {
-            Ok(response) => return Ok(response),
-            Err(e) if is_not_leader_error(&e) => {
-                warn!(
-                    "NOT_LEADER_FOR_PARTITION for {}/{}, refreshing metadata and retrying",
-                    topic, partition
-                );
-                self.refresh_partition_leader(topic, partition).await?;
-                self.clear_connection_cache().await;
-                match self
-                    .produce_internal(topic, partition, &records, acks, timeout_ms)
-                    .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err(e) if !is_connection_error(&e) => return Err(e),
-                    Err(e) => {
-                        warn!(
-                            "Connection error after leader refresh for {}/{}: {}",
-                            topic, partition, e
-                        );
-                        self.clear_connection_cache().await;
-                        e
-                    }
-                }
-            }
-            Err(e) if !is_connection_error(&e) => return Err(e),
-            Err(e) => {
-                warn!(
-                    "Connection error for {}/{} (attempt 0), will retry: {}",
-                    topic, partition, e
-                );
-                self.clear_connection_cache().await;
-                e
-            }
-        };
+        let mut connection_attempts = 0;
+        let mut leader_attempts = 0;
 
-        // Connection-error retry loop with linear back-off (500ms, 1s, 1.5s, 2s, 2.5s)
-        let mut last_err = err;
-        for attempt in 1..=MAX_CONNECTION_RETRIES {
-            let backoff = Duration::from_millis(500 * attempt as u64);
-            warn!(
-                "Retrying produce for {}/{} (attempt {}/{}) after {:?}: {}",
-                topic, partition, attempt, MAX_CONNECTION_RETRIES, backoff, last_err
-            );
-            tokio::time::sleep(backoff).await;
-
+        loop {
             match self
                 .produce_internal(topic, partition, &records, acks, timeout_ms)
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(e) if is_connection_error(&e) => {
+                Err(e) if is_not_leader_error(&e) && leader_attempts < MAX_LEADER_RETRIES => {
+                    leader_attempts += 1;
+                    let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
+                    warn!(
+                        "NOT_LEADER_FOR_PARTITION for {}/{} (attempt {}/{}), refreshing metadata after {:?}: {}",
+                        topic,
+                        partition,
+                        leader_attempts,
+                        MAX_LEADER_RETRIES,
+                        backoff,
+                        e
+                    );
+                    self.refresh_partition_leader(topic, partition).await?;
                     self.clear_connection_cache().await;
-                    last_err = e;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e)
+                    if is_connection_error(&e) && connection_attempts < MAX_CONNECTION_RETRIES =>
+                {
+                    connection_attempts += 1;
+                    let backoff = Duration::from_millis(500 * connection_attempts as u64);
+                    warn!(
+                        "Connection error for {}/{} (attempt {}/{}), retrying after {:?}: {}",
+                        topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
+                    );
+                    self.clear_connection_cache().await;
+                    tokio::time::sleep(backoff).await;
                 }
                 Err(e) => return Err(e),
             }
         }
-
-        Err(crate::Error::Kafka(KafkaError::Protocol(format!(
-            "Produce failed for {}/{} after {} connection retries: {}",
-            topic, partition, MAX_CONNECTION_RETRIES, last_err
-        ))))
     }
 
     /// Internal produce implementation — borrows records to avoid unnecessary cloning.
@@ -728,6 +707,84 @@ impl PartitionLeaderRouter {
         Ok(all_offsets)
     }
 
+    /// Commit offsets for a consumer group through that group's coordinator.
+    ///
+    /// `OffsetCommit` must be sent to the broker that coordinates the group. A
+    /// bootstrap broker may not coordinate the group, and committing there can
+    /// return coordinator errors in multi-broker KRaft clusters.
+    pub async fn commit_group_offsets(
+        &self,
+        group_id: &str,
+        offsets: &[(String, i32, i64, Option<String>)],
+    ) -> Result<Vec<(String, i32, i16)>> {
+        for attempt in 1..=MAX_COORDINATOR_RETRIES {
+            let coordinator = match super::consumer_groups::find_group_coordinator(
+                &self.bootstrap_client,
+                group_id,
+            )
+            .await
+            {
+                Ok(coordinator) => coordinator,
+                Err(e)
+                    if is_transient_coordinator_error(&e) && attempt < MAX_COORDINATOR_RETRIES =>
+                {
+                    let backoff = coordinator_backoff(attempt);
+                    warn!(
+                            "FindCoordinator for group {} returned transient error on attempt {}/{}; retrying after {:?}: {}",
+                            group_id, attempt, MAX_COORDINATOR_RETRIES, backoff, e
+                        );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            {
+                let mut brokers = self.broker_metadata.write().await;
+                brokers
+                    .entry(coordinator.node_id)
+                    .or_insert_with(|| BrokerMetadata {
+                        node_id: coordinator.node_id,
+                        host: coordinator.host.clone(),
+                        port: coordinator.port,
+                        rack: None,
+                    });
+            }
+
+            let client = match self.get_broker_connection(coordinator.node_id).await {
+                Ok(client) => client,
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to coordinator broker {} for group {}: {}; refreshing metadata",
+                        coordinator.node_id, group_id, e
+                    );
+                    self.refresh_metadata().await?;
+                    self.get_broker_connection(coordinator.node_id).await?
+                }
+            };
+
+            let results =
+                super::consumer_groups::commit_offsets(&client, group_id, offsets).await?;
+            if has_transient_coordinator_commit_error(&results) && attempt < MAX_COORDINATOR_RETRIES
+            {
+                let backoff = coordinator_backoff(attempt);
+                warn!(
+                    "OffsetCommit for group {} returned transient coordinator error on attempt {}/{}; retrying after {:?}",
+                    group_id, attempt, MAX_COORDINATOR_RETRIES, backoff
+                );
+                self.refresh_metadata().await?;
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+
+            return Ok(results);
+        }
+
+        Err(KafkaError::Timeout(format!(
+            "coordinator for group {group_id} was not ready after {MAX_COORDINATOR_RETRIES} attempts"
+        ))
+        .into())
+    }
+
     /// Delete records from a topic by advancing the log-start-offset to `before_offset`.
     ///
     /// Records with offset < `before_offset` become inaccessible. This empties a topic
@@ -771,6 +828,29 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
     }
 }
 
+fn is_transient_coordinator_error(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Kafka(KafkaError::BrokerError {
+            code: COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR,
+            ..
+        })
+    )
+}
+
+fn has_transient_coordinator_commit_error(results: &[(String, i32, i16)]) -> bool {
+    results.iter().any(|(_, _, code)| {
+        matches!(
+            *code,
+            COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR
+        )
+    })
+}
+
+fn coordinator_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((250 * attempt as u64).min(2_000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +868,38 @@ mod tests {
             message: "Some other error".to_string(),
         });
         assert!(!is_not_leader_error(&other_error));
+    }
+
+    #[test]
+    fn transient_coordinator_errors_are_retryable() {
+        for code in [
+            COORDINATOR_LOAD_IN_PROGRESS,
+            COORDINATOR_NOT_AVAILABLE,
+            NOT_COORDINATOR,
+        ] {
+            let error = crate::Error::Kafka(KafkaError::BrokerError {
+                code,
+                message: "coordinator transient".to_string(),
+            });
+            assert!(is_transient_coordinator_error(&error));
+        }
+
+        let fatal = crate::Error::Kafka(KafkaError::BrokerError {
+            code: 30,
+            message: "group authorization failed".to_string(),
+        });
+        assert!(!is_transient_coordinator_error(&fatal));
+    }
+
+    #[test]
+    fn transient_commit_partition_errors_are_retryable() {
+        let results = vec![
+            ("orders".to_string(), 0, 0),
+            ("orders".to_string(), 1, COORDINATOR_NOT_AVAILABLE),
+        ];
+        assert!(has_transient_coordinator_commit_error(&results));
+
+        let fatal = vec![("orders".to_string(), 0, 30)];
+        assert!(!has_transient_coordinator_commit_error(&fatal));
     }
 }
