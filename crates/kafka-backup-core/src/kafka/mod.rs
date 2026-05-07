@@ -11,14 +11,18 @@ pub mod sasl;
 mod scram;
 pub mod tls;
 
-pub use admin::{create_topics, delete_records, CreateTopicResult, TopicToCreate};
+pub use admin::{
+    create_topics, delete_records, describe_configs, incremental_alter_configs, ConfigChange,
+    ConfigEntry, ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
+};
 pub use client::{KafkaClient, RESPONSE_TIMEOUT_SECS, WRITE_TIMEOUT_SECS};
 pub use consumer_groups::{
-    commit_offsets, describe_groups, fetch_offsets, list_groups, offsets_for_times,
-    CommittedOffset, ConsumerGroup, ConsumerGroupDescription, ConsumerGroupMember, TimestampOffset,
+    commit_offsets, describe_groups, fetch_offsets, find_group_coordinator, list_groups,
+    offsets_for_times, CommittedOffset, ConsumerGroup, ConsumerGroupDescription,
+    ConsumerGroupMember, GroupCoordinator, TimestampOffset,
 };
 pub use fetch::FetchResponse;
-pub use metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
+pub use metadata::{fetch_metadata, BrokerMetadata, PartitionMetadata, TopicMetadata};
 pub use partition_router::PartitionLeaderRouter;
 pub use produce::ProduceResponse;
 pub use sasl::{

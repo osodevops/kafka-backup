@@ -679,8 +679,9 @@ pub struct RestoreOptions {
     /// Broker-side produce timeout in milliseconds (default: 30 000).
     ///
     /// The broker waits up to this duration for the required acks before
-    /// returning REQUEST_TIMED_OUT. The client-side socket timeout
-    /// (RESPONSE_TIMEOUT_SECS = 10 s) is a hard ceiling regardless.
+    /// returning REQUEST_TIMED_OUT. The client-side socket timeout must stay
+    /// above this value so slow replicated writes can return broker errors
+    /// instead of being misclassified as transport failures.
     #[serde(default = "default_produce_timeout_ms")]
     pub produce_timeout_ms: i32,
 

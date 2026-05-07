@@ -611,9 +611,7 @@ impl RestoreEngine {
 
         let offset_mapping = self.offset_mapping.lock().await.clone();
 
-        info!("Restore completed successfully");
-
-        Ok(RestoreReport {
+        let report = RestoreReport {
             backup_id: self.config.backup_id.clone(),
             dry_run: false,
             start_time: 0,
@@ -628,7 +626,9 @@ impl RestoreEngine {
             errors,
             offset_mapping,
             resolved_consumer_groups: restore_options.consumer_groups.clone(),
-        })
+        };
+
+        finalize_restore_report(report)
     }
 
     /// Load consumer group IDs from the snapshot written by `snapshot_consumer_groups()`.
@@ -1504,6 +1504,19 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
+    if !report.errors.is_empty() {
+        let error_count = report.errors.len();
+        let joined = report.errors.join("; ");
+        return Err(Error::Config(format!(
+            "Restore completed with {error_count} error(s): {joined}"
+        )));
+    }
+
+    info!("Restore completed successfully");
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,5 +1570,33 @@ mod tests {
         assert!(!pattern_match("orders", "orders-v1"));
         assert!(pattern_match("~^orders$", "orders"));
         assert!(!pattern_match("~^orders$", "orders-v1"));
+    }
+
+    #[test]
+    fn restore_report_with_errors_is_failure() {
+        let report = RestoreReport {
+            backup_id: "restore-error-regression".to_string(),
+            dry_run: false,
+            start_time: 0,
+            end_time: 0,
+            duration_ms: 0,
+            topics_restored: Vec::new(),
+            segments_processed: 0,
+            records_restored: 0,
+            bytes_restored: 0,
+            throughput_records_per_sec: 0.0,
+            throughput_bytes_per_sec: 0.0,
+            errors: vec!["Topic orders: Produce error for orders:5: code 6".to_string()],
+            offset_mapping: OffsetMapping::new(),
+            resolved_consumer_groups: Vec::new(),
+        };
+
+        let err = finalize_restore_report(report).expect_err(
+            "restore reports containing partition/topic errors must fail the restore run",
+        );
+        assert!(
+            err.to_string().contains("Restore completed with 1 error"),
+            "unexpected error: {err}"
+        );
     }
 }

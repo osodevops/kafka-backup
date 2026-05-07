@@ -13,10 +13,27 @@ use kafka_protocol::records::{
     NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
 };
 
-use kafka_backup_core::config::{ConnectionConfig, KafkaConfig, SecurityConfig, TopicSelection};
+use kafka_backup_core::config::{
+    ConnectionConfig, KafkaConfig, SaslMechanism, SecurityConfig, SecurityProtocol, TopicSelection,
+};
 use kafka_backup_core::kafka::KafkaClient;
 
 fn test_config() -> KafkaConfig {
+    if let Ok(bootstrap) = std::env::var("KAFKA_BOOTSTRAP") {
+        return KafkaConfig {
+            bootstrap_servers: bootstrap.split(',').map(str::to_string).collect(),
+            security: SecurityConfig {
+                security_protocol: SecurityProtocol::SaslSsl,
+                sasl_mechanism: Some(SaslMechanism::ScramSha512),
+                sasl_username: std::env::var("KAFKA_SASL_USERNAME").ok(),
+                sasl_password: std::env::var("KAFKA_SASL_PASSWORD").ok(),
+                ..SecurityConfig::default()
+            },
+            topics: TopicSelection::default(),
+            connection: ConnectionConfig::default(),
+        };
+    }
+
     KafkaConfig {
         bootstrap_servers: vec!["localhost:9092".to_string()],
         security: SecurityConfig::default(),
@@ -149,6 +166,57 @@ async fn test_produce_via_client_method() {
 
     let result = client.produce("orders", 0, records, -1, 30_000).await;
     println!("Produce via client.produce(): {:?}", result);
+}
+
+/// Test 3b: Large BackupRecord through the production client path against an
+/// externally configured cluster. Intended for MSK diagnosis:
+///
+/// KAFKA_BOOTSTRAP=host:9096 \
+/// KAFKA_SASL_USERNAME=migrator \
+/// KAFKA_SASL_PASSWORD=... \
+/// KAFKA_TEST_TOPIC=e2e.large \
+/// KAFKA_TEST_ACKS=1 \
+/// cargo test -p kafka-backup-core --test produce_debug \
+///   test_large_produce_via_client_method -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "requires external Kafka configured via KAFKA_* env vars"]
+async fn test_large_produce_via_client_method() {
+    let client = KafkaClient::new(test_config());
+    client.connect().await.expect("Failed to connect");
+
+    let topic = std::env::var("KAFKA_TEST_TOPIC").unwrap_or_else(|_| "orders".to_string());
+    let partition = std::env::var("KAFKA_TEST_PARTITION")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    let acks = std::env::var("KAFKA_TEST_ACKS")
+        .ok()
+        .and_then(|s| s.parse::<i16>().ok())
+        .unwrap_or(-1);
+    let timeout_ms = std::env::var("KAFKA_TEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(30_000);
+    let value_len = std::env::var("KAFKA_TEST_VALUE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(131_072);
+
+    let records = vec![kafka_backup_core::manifest::BackupRecord {
+        key: Some(b"rust-large-diag".to_vec()),
+        value: Some(vec![b'x'; value_len]),
+        headers: vec![],
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        offset: 0,
+    }];
+
+    let result = client
+        .produce(&topic, partition, records, acks, timeout_ms)
+        .await;
+    println!(
+        "Large produce via client.produce(topic={topic}, partition={partition}, acks={acks}, timeout_ms={timeout_ms}, value_len={value_len}): {result:?}"
+    );
+    result.expect("large produce failed");
 }
 
 /// Test 4: Batch produce - isolate whether separate batches per record causes error 87
