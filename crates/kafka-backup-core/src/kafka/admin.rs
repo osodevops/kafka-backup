@@ -277,6 +277,12 @@ pub async fn delete_records(
     let response: DeleteRecordsResponse =
         client.send_request(ApiKey::DeleteRecords, request).await?;
 
+    handle_delete_records_response(&response)
+}
+
+fn handle_delete_records_response(response: &DeleteRecordsResponse) -> Result<()> {
+    let mut failures = Vec::new();
+
     for topic_result in &response.topics {
         for part in &topic_result.partitions {
             if part.error_code != 0 {
@@ -284,6 +290,10 @@ pub async fn delete_records(
                     "DeleteRecords failed for {}[{}]: error_code={}",
                     topic_result.name.0, part.partition_index, part.error_code
                 );
+                failures.push(format!(
+                    "{}[{}]: error_code={} low_watermark={}",
+                    topic_result.name.0, part.partition_index, part.error_code, part.low_watermark
+                ));
             } else {
                 debug!(
                     "Purged {}[{}] new log-start-offset={}",
@@ -291,6 +301,12 @@ pub async fn delete_records(
                 );
             }
         }
+    }
+
+    if !failures.is_empty() {
+        return Err(
+            KafkaError::Protocol(format!("DeleteRecords failed: {}", failures.join("; "))).into(),
+        );
     }
 
     Ok(())
@@ -430,6 +446,9 @@ pub async fn incremental_alter_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kafka_protocol::messages::delete_records_response::{
+        DeleteRecordsPartitionResult, DeleteRecordsTopicResult,
+    };
 
     #[test]
     fn test_create_topic_result_success() {
@@ -465,5 +484,31 @@ mod tests {
         assert!(!result.is_success());
         assert!(!result.is_success_or_exists());
         assert!(!result.already_exists());
+    }
+
+    #[test]
+    fn delete_records_partition_errors_should_fail_request() {
+        let response =
+            DeleteRecordsResponse::default().with_topics(vec![DeleteRecordsTopicResult::default()
+                .with_name(TopicName(StrBytes::from_static_str("issue51-topic")))
+                .with_partitions(vec![
+                    DeleteRecordsPartitionResult::default()
+                        .with_partition_index(0)
+                        .with_low_watermark(10)
+                        .with_error_code(0),
+                    DeleteRecordsPartitionResult::default()
+                        .with_partition_index(1)
+                        .with_low_watermark(-1)
+                        .with_error_code(6),
+                ])]);
+
+        let err = handle_delete_records_response(&response)
+            .expect_err("DeleteRecords partition errors must fail the purge request");
+
+        assert!(
+            err.to_string().contains("issue51-topic[1]")
+                && err.to_string().contains("error_code=6"),
+            "unexpected error: {err}"
+        );
     }
 }

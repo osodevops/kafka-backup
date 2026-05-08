@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::kafka::KafkaClient;
+use crate::kafka::{KafkaClient, PartitionLeaderRouter};
 use crate::manifest::{OffsetMapping, RestoreReport};
 use crate::Result;
 
@@ -257,10 +257,11 @@ impl ThreePhaseRestore {
             )
         })?;
 
-        let client = KafkaClient::new(target.clone());
-        client.connect().await?;
-
-        let executor = OffsetResetExecutor::new(client, target.bootstrap_servers.clone());
+        let router = PartitionLeaderRouter::new(target.clone()).await?;
+        let executor = OffsetResetExecutor::new_with_router(
+            std::sync::Arc::new(router),
+            target.bootstrap_servers.clone(),
+        );
         executor.execute_plan(plan).await
     }
 
