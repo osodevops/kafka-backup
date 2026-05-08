@@ -797,8 +797,104 @@ impl PartitionLeaderRouter {
         partitions: &[(i32, i64)],
         timeout_ms: i32,
     ) -> Result<()> {
-        super::admin::delete_records(&self.bootstrap_client, topic, partitions, timeout_ms).await
+        const MAX_CONNECTION_RETRIES: u32 = 5;
+        const MAX_LEADER_RETRIES: u32 = 20;
+
+        if partitions.is_empty() {
+            return Ok(());
+        }
+
+        let mut connection_attempts = 0;
+        let mut leader_attempts = 0;
+
+        loop {
+            match self
+                .delete_records_internal(topic, partitions, timeout_ms)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if is_not_leader_error(&e) && leader_attempts < MAX_LEADER_RETRIES => {
+                    leader_attempts += 1;
+                    let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
+                    warn!(
+                        "NOT_LEADER_FOR_PARTITION during DeleteRecords for topic {} (attempt {}/{}), refreshing metadata after {:?}: {}",
+                        topic, leader_attempts, MAX_LEADER_RETRIES, backoff, e
+                    );
+                    self.refresh_metadata().await?;
+                    self.clear_connection_cache().await;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e)
+                    if is_connection_error(&e) && connection_attempts < MAX_CONNECTION_RETRIES =>
+                {
+                    connection_attempts += 1;
+                    let backoff = Duration::from_millis(500 * connection_attempts as u64);
+                    warn!(
+                        "Connection error during DeleteRecords for topic {} (attempt {}/{}), retrying after {:?}: {}",
+                        topic, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
+                    );
+                    self.clear_connection_cache().await;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
+
+    async fn delete_records_internal(
+        &self,
+        topic: &str,
+        partitions: &[(i32, i64)],
+        timeout_ms: i32,
+    ) -> Result<()> {
+        let mut partition_leaders = HashMap::new();
+        for (partition, _) in partitions {
+            let leader_id = self.get_leader(topic, *partition).await?;
+            partition_leaders.insert((topic.to_string(), *partition), leader_id);
+        }
+
+        let broker_partitions =
+            group_partition_offsets_by_leader(topic, partitions, &partition_leaders)?;
+
+        debug!(
+            "delete_records: {} partitions for topic {} across {} brokers",
+            partitions.len(),
+            topic,
+            broker_partitions.len()
+        );
+
+        for (broker_id, broker_parts) in &broker_partitions {
+            let client = self.get_broker_connection(*broker_id).await?;
+            super::admin::delete_records(&client, topic, broker_parts, timeout_ms).await?;
+        }
+
+        Ok(())
+    }
+}
+
+fn group_partition_offsets_by_leader(
+    topic: &str,
+    partitions: &[(i32, i64)],
+    partition_leaders: &HashMap<(String, i32), i32>,
+) -> Result<HashMap<i32, Vec<(i32, i64)>>> {
+    let mut broker_partitions: HashMap<i32, Vec<(i32, i64)>> = HashMap::new();
+
+    for (partition, offset) in partitions {
+        let leader_id = partition_leaders
+            .get(&(topic.to_string(), *partition))
+            .copied()
+            .ok_or_else(|| KafkaError::PartitionNotAvailable {
+                topic: topic.to_string(),
+                partition: *partition,
+            })?;
+
+        broker_partitions
+            .entry(leader_id)
+            .or_default()
+            .push((*partition, *offset));
+    }
+
+    Ok(broker_partitions)
 }
 
 /// Check if an error is a connection-level error that warrants a retry.
@@ -823,7 +919,7 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
         _ => {
             // Also check error message as fallback
             let msg = error.to_string();
-            msg.contains("NOT_LEADER") || msg.contains("code 6")
+            msg.contains("NOT_LEADER") || msg.contains("code 6") || msg.contains("error_code=6")
         }
     }
 }
@@ -863,11 +959,32 @@ mod tests {
         });
         assert!(is_not_leader_error(&error));
 
+        let protocol_error = crate::Error::Kafka(KafkaError::Protocol(
+            "DeleteRecords failed: orders[1]: error_code=6 low_watermark=-1".to_string(),
+        ));
+        assert!(is_not_leader_error(&protocol_error));
+
         let other_error = crate::Error::Kafka(KafkaError::BrokerError {
             code: 1,
             message: "Some other error".to_string(),
         });
         assert!(!is_not_leader_error(&other_error));
+    }
+
+    #[test]
+    fn delete_records_partitions_are_grouped_by_leader() {
+        let mut leaders = HashMap::new();
+        leaders.insert(("orders".to_string(), 0), 1);
+        leaders.insert(("orders".to_string(), 1), 2);
+        leaders.insert(("orders".to_string(), 2), 1);
+
+        let grouped =
+            group_partition_offsets_by_leader("orders", &[(0, 10), (1, 20), (2, 30)], &leaders)
+                .expect("partitions should group by leader");
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped.get(&1), Some(&vec![(0, 10), (2, 30)]));
+        assert_eq!(grouped.get(&2), Some(&vec![(1, 20)]));
     }
 
     #[test]

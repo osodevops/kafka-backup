@@ -1,6 +1,6 @@
 //! Restore engine orchestration.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
@@ -119,6 +119,119 @@ pub struct RestoreEngine {
     offset_mapping: Arc<Mutex<OffsetMapping>>,
     progress_tx: broadcast::Sender<RestoreProgress>,
     target_config: Option<crate::config::KafkaConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AutoConsumerGroupSnapshot {
+    #[serde(default)]
+    snapshot_time: Option<i64>,
+    #[serde(default)]
+    groups: Vec<AutoConsumerGroupSnapshotGroup>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AutoConsumerGroupSnapshotGroup {
+    group_id: String,
+    #[serde(default)]
+    offsets: HashMap<String, HashMap<String, i64>>,
+}
+
+impl AutoConsumerGroupSnapshot {
+    fn group_ids(&self) -> Vec<String> {
+        self.groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect()
+    }
+}
+
+fn parse_auto_consumer_group_snapshot(data: &[u8]) -> Result<AutoConsumerGroupSnapshot> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+fn import_auto_consumer_group_snapshot_offsets(
+    offset_mapping: &mut OffsetMapping,
+    snapshot: &AutoConsumerGroupSnapshot,
+    restore_options: &RestoreOptions,
+) -> Vec<String> {
+    let group_ids = snapshot.group_ids();
+    let timestamp = snapshot
+        .snapshot_time
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let mut imported_offsets = 0usize;
+    let mut skipped_offsets = 0usize;
+
+    for group in &snapshot.groups {
+        for (source_topic, topic_offsets) in &group.offsets {
+            let target_topic = restore_options
+                .topic_mapping
+                .get(source_topic)
+                .map(String::as_str)
+                .unwrap_or(source_topic.as_str());
+
+            for (source_partition, source_offset) in topic_offsets {
+                if *source_offset < 0 {
+                    skipped_offsets += 1;
+                    warn!(
+                        "auto_consumer_groups: skipping negative offset for group {} topic {} partition {}",
+                        group.group_id, source_topic, source_partition
+                    );
+                    continue;
+                }
+
+                let source_partition = match source_partition.parse::<i32>() {
+                    Ok(partition) => partition,
+                    Err(e) => {
+                        skipped_offsets += 1;
+                        warn!(
+                            "auto_consumer_groups: skipping invalid partition '{}' for group {} topic {}: {}",
+                            source_partition, group.group_id, source_topic, e
+                        );
+                        continue;
+                    }
+                };
+
+                let target_partition = restore_options
+                    .partition_mapping
+                    .get(&source_partition)
+                    .copied()
+                    .unwrap_or(source_partition);
+
+                offset_mapping.add_consumer_group_offset(
+                    &group.group_id,
+                    target_topic,
+                    target_partition,
+                    *source_offset,
+                    timestamp,
+                    None,
+                );
+                imported_offsets += 1;
+            }
+        }
+    }
+
+    offset_mapping.recalculate_consumer_group_offsets();
+
+    if imported_offsets == 0 && !group_ids.is_empty() {
+        warn!(
+            "auto_consumer_groups: snapshot listed {} groups but contained no usable offsets",
+            group_ids.len()
+        );
+    } else {
+        info!(
+            "auto_consumer_groups: imported {} consumer group offsets from snapshot",
+            imported_offsets
+        );
+    }
+
+    if skipped_offsets > 0 {
+        warn!(
+            "auto_consumer_groups: skipped {} malformed snapshot offsets",
+            skipped_offsets
+        );
+    }
+
+    group_ids
 }
 
 impl RestoreEngine {
@@ -538,25 +651,38 @@ impl RestoreEngine {
                 .await?;
         }
 
-        // Auto-load consumer groups from snapshot if requested (Issue #67 bug 5)
-        if restore_options.auto_consumer_groups && restore_options.consumer_groups.is_empty() {
-            match self.load_auto_consumer_groups().await {
-                Ok(groups) => {
+        // Auto-load consumer groups from snapshot if requested (Issue #51 / #67 bug 5)
+        let auto_consumer_group_snapshot = if restore_options.auto_consumer_groups
+            && restore_options.consumer_groups.is_empty()
+        {
+            match self.load_auto_consumer_group_snapshot().await {
+                Ok(snapshot) => {
+                    let groups = snapshot.group_ids();
+                    let offset_count = snapshot
+                        .groups
+                        .iter()
+                        .map(|group| group.offsets.values().map(HashMap::len).sum::<usize>())
+                        .sum::<usize>();
+
                     info!(
-                        "auto_consumer_groups: loaded {} groups from snapshot",
-                        groups.len()
+                        "auto_consumer_groups: loaded {} groups and {} offsets from snapshot",
+                        groups.len(),
+                        offset_count
                     );
                     restore_options.consumer_groups = groups;
                     restore_options.reset_consumer_offsets = true;
+                    Some(snapshot)
                 }
                 Err(e) => {
                     warn!(
-                        "auto_consumer_groups: failed to load snapshot ({}); continuing without group reset",
-                        e
+                        "auto_consumer_groups: failed to load snapshot ({e}); continuing without group reset"
                     );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         // Purge target topics before restore if requested (Issue #67 bug 10)
         if restore_options.purge_topics {
@@ -609,6 +735,11 @@ impl RestoreEngine {
             }
         }
 
+        if let Some(snapshot) = &auto_consumer_group_snapshot {
+            let mut mapping = self.offset_mapping.lock().await;
+            import_auto_consumer_group_snapshot_offsets(&mut mapping, snapshot, &restore_options);
+        }
+
         let offset_mapping = self.offset_mapping.lock().await.clone();
 
         let report = RestoreReport {
@@ -631,11 +762,11 @@ impl RestoreEngine {
         finalize_restore_report(report)
     }
 
-    /// Load consumer group IDs from the snapshot written by `snapshot_consumer_groups()`.
+    /// Load the consumer group snapshot written by `snapshot_consumer_groups()`.
     ///
     /// Reads `{backup_id}/consumer-groups-snapshot.json`. Returns an error when the
     /// file is absent so the caller can treat it as a non-fatal warning.
-    async fn load_auto_consumer_groups(&self) -> Result<Vec<String>> {
+    async fn load_auto_consumer_group_snapshot(&self) -> Result<AutoConsumerGroupSnapshot> {
         let key = format!("{}/consumer-groups-snapshot.json", self.config.backup_id);
         let data = self.storage.get(&key).await.map_err(|e| {
             Error::BackupNotFound(format!(
@@ -644,17 +775,7 @@ impl RestoreEngine {
             ))
         })?;
 
-        #[derive(serde::Deserialize)]
-        struct Snapshot {
-            groups: Vec<GroupEntry>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GroupEntry {
-            group_id: String,
-        }
-
-        let snapshot: Snapshot = serde_json::from_slice(&data)?;
-        Ok(snapshot.groups.into_iter().map(|g| g.group_id).collect())
+        parse_auto_consumer_group_snapshot(&data)
     }
 
     /// Purge target topics before restore by advancing log-start-offset to the current end.
@@ -1520,6 +1641,8 @@ fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetStrategy};
+    use std::collections::HashMap;
 
     #[test]
     fn test_glob_match() {
@@ -1598,5 +1721,85 @@ mod tests {
             err.to_string().contains("Restore completed with 1 error"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_consumer_group_snapshot_offsets_feed_reset_plan() {
+        let snapshot = parse_auto_consumer_group_snapshot(
+            br#"{
+                "snapshot_time": 1778044734905,
+                "groups": [
+                    {
+                        "group_id": "issue51-group",
+                        "offsets": {
+                            "issue51-topic": {
+                                "0": 10,
+                                "2": 10,
+                                "1": 10
+                            }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("snapshot should parse");
+
+        let mut restore_options = RestoreOptions::default();
+        restore_options.topic_mapping.insert(
+            "issue51-topic".to_string(),
+            "issue51-restored-topic".to_string(),
+        );
+        restore_options.partition_mapping.insert(2, 5);
+
+        let mut mapping = OffsetMapping::new();
+        for source_offset in 0..10 {
+            mapping.add_detailed(
+                "issue51-restored-topic",
+                0,
+                source_offset,
+                100 + source_offset,
+                1778044700000 + source_offset,
+            );
+            mapping.add_detailed(
+                "issue51-restored-topic",
+                1,
+                source_offset,
+                200 + source_offset,
+                1778044700000 + source_offset,
+            );
+            mapping.add_detailed(
+                "issue51-restored-topic",
+                5,
+                source_offset,
+                500 + source_offset,
+                1778044700000 + source_offset,
+            );
+        }
+
+        let group_ids =
+            import_auto_consumer_group_snapshot_offsets(&mut mapping, &snapshot, &restore_options);
+
+        assert_eq!(group_ids, vec!["issue51-group".to_string()]);
+
+        let executor = OffsetResetExecutor::new_offline(vec!["target:9092".to_string()]);
+        let plan = executor
+            .generate_plan(&mapping, &group_ids, OffsetResetStrategy::Auto)
+            .await
+            .expect("reset plan should be generated from snapshot offsets");
+
+        assert_eq!(plan.groups.len(), 1);
+        let group_plan = &plan.groups[0];
+        assert!(group_plan.complete);
+        assert_eq!(group_plan.partition_count, 3);
+
+        let planned_offsets: HashMap<i32, i64> = group_plan
+            .partitions
+            .iter()
+            .map(|partition| (partition.partition, partition.target_offset))
+            .collect();
+
+        assert_eq!(planned_offsets.get(&0), Some(&110));
+        assert_eq!(planned_offsets.get(&1), Some(&210));
+        assert_eq!(planned_offsets.get(&5), Some(&510));
     }
 }

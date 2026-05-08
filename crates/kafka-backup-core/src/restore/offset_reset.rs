@@ -8,9 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::kafka::{commit_offsets, fetch_offsets, KafkaClient};
+use crate::kafka::{commit_offsets, fetch_offsets, KafkaClient, PartitionLeaderRouter};
 #[cfg(test)]
 use crate::manifest::ConsumerGroupOffset;
 use crate::manifest::{ConsumerGroupOffsets, OffsetMapping};
@@ -133,17 +134,73 @@ pub enum OffsetResetStrategy {
 /// Offset reset executor
 pub struct OffsetResetExecutor {
     /// Target Kafka client
-    client: Option<KafkaClient>,
+    client: Option<Arc<KafkaClient>>,
+
+    /// Commit backend used when applying a reset plan
+    committer: Option<Arc<dyn OffsetCommitter>>,
 
     /// Bootstrap servers for shell script generation
     bootstrap_servers: Vec<String>,
 }
 
+#[async_trait::async_trait]
+trait OffsetCommitter: Send + Sync {
+    async fn commit_offsets(
+        &self,
+        group_id: &str,
+        offsets: &[(String, i32, i64, Option<String>)],
+    ) -> Result<Vec<(String, i32, i16)>>;
+}
+
+struct ClientOffsetCommitter {
+    client: Arc<KafkaClient>,
+}
+
+#[async_trait::async_trait]
+impl OffsetCommitter for ClientOffsetCommitter {
+    async fn commit_offsets(
+        &self,
+        group_id: &str,
+        offsets: &[(String, i32, i64, Option<String>)],
+    ) -> Result<Vec<(String, i32, i16)>> {
+        commit_offsets(&self.client, group_id, offsets).await
+    }
+}
+
+struct RouterOffsetCommitter {
+    router: Arc<PartitionLeaderRouter>,
+}
+
+#[async_trait::async_trait]
+impl OffsetCommitter for RouterOffsetCommitter {
+    async fn commit_offsets(
+        &self,
+        group_id: &str,
+        offsets: &[(String, i32, i64, Option<String>)],
+    ) -> Result<Vec<(String, i32, i16)>> {
+        self.router.commit_group_offsets(group_id, offsets).await
+    }
+}
+
 impl OffsetResetExecutor {
     /// Create a new executor with a Kafka client
     pub fn new(client: KafkaClient, bootstrap_servers: Vec<String>) -> Self {
+        let client = Arc::new(client);
         Self {
-            client: Some(client),
+            client: Some(Arc::clone(&client)),
+            committer: Some(Arc::new(ClientOffsetCommitter { client })),
+            bootstrap_servers,
+        }
+    }
+
+    /// Create a new executor that commits offsets through group coordinators.
+    pub fn new_with_router(
+        router: Arc<PartitionLeaderRouter>,
+        bootstrap_servers: Vec<String>,
+    ) -> Self {
+        Self {
+            client: None,
+            committer: Some(Arc::new(RouterOffsetCommitter { router })),
             bootstrap_servers,
         }
     }
@@ -152,6 +209,7 @@ impl OffsetResetExecutor {
     pub fn new_offline(bootstrap_servers: Vec<String>) -> Self {
         Self {
             client: None,
+            committer: None,
             bootstrap_servers,
         }
     }
@@ -279,16 +337,18 @@ impl OffsetResetExecutor {
     /// Execute an offset reset plan
     pub async fn execute_plan(&self, plan: &OffsetResetPlan) -> Result<OffsetResetReport> {
         let start_time = std::time::Instant::now();
-        let client = self.client.as_ref().ok_or_else(|| {
-            crate::Error::Config("Kafka client required to execute offset reset".to_string())
-        })?;
+        if self.committer.is_none() {
+            return Err(crate::Error::Config(
+                "Kafka client required to execute offset reset".to_string(),
+            ));
+        }
 
         let mut groups_reset = Vec::new();
         let mut total_errors = Vec::new();
         let mut total_partitions_reset = 0u64;
 
         for group_plan in &plan.groups {
-            let result = self.execute_group_reset(client, group_plan).await;
+            let result = self.execute_group_reset(group_plan).await;
 
             match result {
                 Ok(group_result) => {
@@ -340,11 +400,7 @@ impl OffsetResetExecutor {
     }
 
     /// Execute offset reset for a single group
-    async fn execute_group_reset(
-        &self,
-        client: &KafkaClient,
-        plan: &GroupResetPlan,
-    ) -> Result<GroupResetResult> {
+    async fn execute_group_reset(&self, plan: &GroupResetPlan) -> Result<GroupResetResult> {
         let offsets: Vec<_> = plan
             .partitions
             .iter()
@@ -358,7 +414,10 @@ impl OffsetResetExecutor {
             })
             .collect();
 
-        let results = commit_offsets(client, &plan.group_id, &offsets).await?;
+        let committer = self.committer.as_ref().ok_or_else(|| {
+            crate::Error::Config("Kafka client required to execute offset reset".to_string())
+        })?;
+        let results = committer.commit_offsets(&plan.group_id, &offsets).await?;
 
         let mut partitions_reset = 0u64;
         let mut partitions_failed = 0u64;
@@ -759,5 +818,89 @@ mod tests {
     fn test_offset_reset_strategy_default() {
         let strategy: OffsetResetStrategy = Default::default();
         assert_eq!(strategy, OffsetResetStrategy::Manual);
+    }
+
+    type RecordedCommitCall = (String, Vec<(String, i32, i64, Option<String>)>);
+
+    #[derive(Default)]
+    struct RecordingCommitter {
+        calls: std::sync::Mutex<Vec<RecordedCommitCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OffsetCommitter for RecordingCommitter {
+        async fn commit_offsets(
+            &self,
+            group_id: &str,
+            offsets: &[(String, i32, i64, Option<String>)],
+        ) -> Result<Vec<(String, i32, i16)>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((group_id.to_string(), offsets.to_vec()));
+
+            Ok(offsets
+                .iter()
+                .map(|(topic, partition, _, _)| (topic.clone(), *partition, 0))
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_plan_uses_configured_offset_committer() {
+        let committer = std::sync::Arc::new(RecordingCommitter::default());
+        let executor = OffsetResetExecutor {
+            client: None,
+            committer: Some(committer.clone()),
+            bootstrap_servers: vec!["kafka:9092".to_string()],
+        };
+
+        let plan = OffsetResetPlan {
+            groups: vec![GroupResetPlan {
+                group_id: "issue51-group".to_string(),
+                partitions: vec![
+                    PartitionResetPlan {
+                        topic: "orders".to_string(),
+                        partition: 0,
+                        source_offset: 10,
+                        target_offset: 30,
+                        timestamp: 1000,
+                        metadata: None,
+                    },
+                    PartitionResetPlan {
+                        topic: "orders".to_string(),
+                        partition: 1,
+                        source_offset: 12,
+                        target_offset: 42,
+                        timestamp: 1000,
+                        metadata: Some("snapshot".to_string()),
+                    },
+                ],
+                partition_count: 2,
+                complete: true,
+            }],
+            generated_at: 0,
+            strategy: "Auto".to_string(),
+            dry_run: false,
+            backup_id: None,
+            source_cluster_id: None,
+            target_bootstrap_servers: vec![],
+        };
+
+        let report = executor.execute_plan(&plan).await.unwrap();
+
+        assert!(report.success);
+        assert_eq!(report.partitions_reset, 2);
+
+        let calls = committer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "issue51-group");
+        assert_eq!(
+            calls[0].1,
+            vec![
+                ("orders".to_string(), 0, 30, None),
+                ("orders".to_string(), 1, 42, Some("snapshot".to_string())),
+            ]
+        );
     }
 }
