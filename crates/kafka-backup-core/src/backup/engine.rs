@@ -1,7 +1,7 @@
 //! Backup engine orchestration.
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
-use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset};
+use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset, TopicSelection};
 use crate::health::HealthCheck;
 use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
@@ -529,6 +529,13 @@ impl BackupEngine {
                 }
             }
 
+            // A literal topic selected at backup start must still exist after
+            // the cycle. This catches topics deleted while a backup is running
+            // before a zero-record/empty-artifact result can be reported as
+            // successful.
+            self.ensure_literal_topic_includes_exist(&source.topics)
+                .await?;
+
             // Checkpoint offsets
             if let Some(ref offset_store) = self.offset_store {
                 let start = Instant::now();
@@ -614,6 +621,8 @@ impl BackupEngine {
         // Fetch ALL topic metadata in a single bulk call
         let all_topics = self.router.fetch_metadata(None).await?;
 
+        fail_if_literal_topic_includes_missing(selection, &all_topics)?;
+
         let mut selected = Vec::new();
         for topic in all_topics {
             let name = &topic.name;
@@ -656,6 +665,11 @@ impl BackupEngine {
         // Sort by topic name for consistent ordering
         selected.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(selected)
+    }
+
+    async fn ensure_literal_topic_includes_exist(&self, selection: &TopicSelection) -> Result<()> {
+        let all_topics = self.router.fetch_metadata(None).await?;
+        fail_if_literal_topic_includes_missing(selection, &all_topics)
     }
 
     /// Save the manifest to storage, merging with any existing manifest.
@@ -1240,6 +1254,47 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_impl(&pattern_chars, &text_chars)
 }
 
+fn fail_if_literal_topic_includes_missing(
+    selection: &TopicSelection,
+    existing_topics: &[TopicMetadata],
+) -> Result<()> {
+    let missing = missing_literal_topic_includes(selection, existing_topics);
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::TopicNotFound(format!(
+        "configured backup topic(s) not found in Kafka cluster: {}",
+        missing.join(", ")
+    )))
+}
+
+fn missing_literal_topic_includes(
+    selection: &TopicSelection,
+    existing_topics: &[TopicMetadata],
+) -> Vec<String> {
+    let existing_names: HashSet<&str> = existing_topics
+        .iter()
+        .map(|topic| topic.name.as_str())
+        .collect();
+
+    let mut missing: Vec<String> = selection
+        .include
+        .iter()
+        .filter(|topic| is_literal_topic_pattern(topic))
+        .filter(|topic| !existing_names.contains(topic.as_str()))
+        .cloned()
+        .collect();
+
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+fn is_literal_topic_pattern(pattern: &str) -> bool {
+    !pattern.contains('*') && !pattern.contains('?')
+}
+
 fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
     if pattern.is_empty() {
         return text.is_empty();
@@ -1299,6 +1354,49 @@ mod tests {
         assert!(glob_match("order?", "orders"));
         assert!(!glob_match("order?", "order"));
         assert!(!glob_match("orders", "payments"));
+    }
+
+    fn topic_metadata(name: &str) -> TopicMetadata {
+        TopicMetadata {
+            name: name.to_string(),
+            is_internal: false,
+            partitions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn missing_literal_topic_includes_reports_absent_exact_topics() {
+        let selection = TopicSelection {
+            include: vec![
+                "orders".to_string(),
+                "payments".to_string(),
+                "orders".to_string(),
+            ],
+            exclude: vec![],
+        };
+        let existing = vec![topic_metadata("orders")];
+
+        assert_eq!(
+            missing_literal_topic_includes(&selection, &existing),
+            vec!["payments".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_literal_topic_includes_ignores_globs_and_empty_include() {
+        let existing = vec![topic_metadata("orders")];
+
+        let glob_selection = TopicSelection {
+            include: vec!["missing-*".to_string(), "order?".to_string()],
+            exclude: vec![],
+        };
+        assert!(missing_literal_topic_includes(&glob_selection, &existing).is_empty());
+
+        let all_topics_selection = TopicSelection {
+            include: vec![],
+            exclude: vec![],
+        };
+        assert!(missing_literal_topic_includes(&all_topics_selection, &existing).is_empty());
     }
 
     // -- should_create_offset_store tests --

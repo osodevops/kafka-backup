@@ -11,6 +11,7 @@
 //! - Performance Issues: Issue #29 constant lag and throughput tests
 
 pub mod common;
+pub mod issue_56_missing_topic;
 pub mod issue_67_fixes;
 pub mod offset_semantics;
 pub mod performance_issues;
