@@ -210,7 +210,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@0ac54ad8ce590a3e513ab91d888e532ee8f60833 # cargo-tarpaulin
+        uses: taiki-e/install-action@b22dd82fe1ad4419f5be5ea5e741291929a74bbe # cargo-tarpaulin
 
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
