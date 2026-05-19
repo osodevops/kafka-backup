@@ -102,6 +102,10 @@ impl KafkaClient {
         }
     }
 
+    pub(super) fn config_clone(&self) -> KafkaConfig {
+        self.config.clone()
+    }
+
     /// Connect to the Kafka cluster
     pub async fn connect(&self) -> Result<()> {
         // Try each bootstrap server until one connects
