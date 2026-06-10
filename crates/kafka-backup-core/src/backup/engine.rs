@@ -950,6 +950,12 @@ impl BackupPartitionContext {
         let mut current_offset = start_offset;
         let mut segments_written = 0u64;
 
+        // At most one segment is compressed/uploaded in the background while
+        // we keep fetching; this overlaps compression with fetch wait time
+        // without unbounded memory growth.
+        let segment_flusher = segment_writer.flusher();
+        let mut pending_flush: Option<tokio::task::JoinHandle<Result<SegmentMetadata>>> = None;
+
         // Fetch and store records in segments
         while current_offset < end_offset {
             let fetch_result = self.fetch_records(current_offset, end_offset).await;
@@ -1018,12 +1024,22 @@ impl BackupPartitionContext {
 
                 // Check if we should rotate
                 if segment_writer.should_rotate() {
-                    let seg_start = segment_writer.start_offset().unwrap();
-                    let key = self.segment_key(seg_start);
-                    if let Some(segment_metadata) = segment_writer.flush(&key).await? {
+                    // Wait for the previous in-flight segment first, so
+                    // manifest entries stay ordered and at most one sealed
+                    // segment is held in memory per partition.
+                    if let Some(handle) = pending_flush.take() {
+                        let segment_metadata = join_segment_flush(handle).await?;
                         self.add_segment_to_manifest(segment_metadata).await;
                         self.manifest_persistence.save_progress().await?;
                         segments_written += 1;
+                    }
+
+                    let seg_start = segment_writer.start_offset().unwrap();
+                    let key = self.segment_key(seg_start);
+                    if let Some(sealed) = segment_writer.seal(&key) {
+                        let flusher = segment_flusher.clone();
+                        pending_flush =
+                            Some(tokio::spawn(async move { flusher.write(sealed).await }));
                     }
                 }
             }
@@ -1068,6 +1084,14 @@ impl BackupPartitionContext {
             }
 
             current_offset = next_offset;
+        }
+
+        // Wait for any in-flight segment flush
+        if let Some(handle) = pending_flush.take() {
+            let segment_metadata = join_segment_flush(handle).await?;
+            self.add_segment_to_manifest(segment_metadata).await;
+            self.manifest_persistence.save_progress().await?;
+            segments_written += 1;
         }
 
         // Flush any remaining records
@@ -1155,6 +1179,15 @@ impl BackupPartitionContext {
 
         Ok((fetch_response.records, fetch_response.next_offset))
     }
+}
+
+/// Await a background segment flush task, surfacing panics as errors.
+async fn join_segment_flush(
+    handle: tokio::task::JoinHandle<Result<SegmentMetadata>>,
+) -> Result<SegmentMetadata> {
+    handle
+        .await
+        .map_err(|e| Error::Compression(format!("segment flush task failed: {e}")))?
 }
 
 async fn save_manifest_snapshot(
