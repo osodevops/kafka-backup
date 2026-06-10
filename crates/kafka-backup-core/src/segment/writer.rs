@@ -36,6 +36,121 @@ impl Default for SegmentWriterConfig {
     }
 }
 
+/// A full segment taken out of a [`SegmentWriter`], ready to be compressed
+/// and uploaded independently of the writer (e.g. from a spawned task).
+pub struct SealedSegment {
+    key: String,
+    buffer: BytesMut,
+    record_count: u64,
+    start_offset: i64,
+    end_offset: i64,
+    start_timestamp: i64,
+    end_timestamp: i64,
+}
+
+/// Compresses and uploads [`SealedSegment`]s. Cheap to clone; holds only
+/// shared handles, so it can be moved into spawned tasks while the
+/// originating [`SegmentWriter`] keeps accumulating records.
+#[derive(Clone)]
+pub struct SegmentFlusher {
+    config: SegmentWriterConfig,
+    storage: Arc<dyn StorageBackend>,
+    metrics: Arc<PerformanceMetrics>,
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
+    backup_id: String,
+}
+
+impl SegmentFlusher {
+    /// Compress a sealed segment and write it to storage.
+    pub async fn write(&self, sealed: SealedSegment) -> Result<SegmentMetadata> {
+        let start = std::time::Instant::now();
+
+        // Build header
+        let header = SegmentHeader {
+            version: super::format::VERSION,
+            compression: self.config.compression,
+            record_count: sealed.record_count,
+            start_offset: sealed.start_offset,
+            end_offset: sealed.end_offset,
+        };
+
+        // Compress record data off the async runtime (zstd on a 128MB
+        // segment takes hundreds of milliseconds of pure CPU)
+        let uncompressed_size = sealed.buffer.len();
+        let compression = self.config.compression;
+        let compression_level = self.config.compression_level;
+        let buffer = sealed.buffer;
+        let compressed_data = tokio::task::spawn_blocking(move || {
+            compression::compress_with_level(&buffer, compression, compression_level)
+        })
+        .await
+        .map_err(|e| crate::Error::Compression(format!("compression task failed: {e}")))??;
+
+        // Build final segment
+        let mut segment =
+            BytesMut::with_capacity(HEADER_SIZE + compressed_data.len() + FOOTER_SIZE);
+        segment.extend_from_slice(&header.to_bytes());
+        segment.extend_from_slice(&compressed_data);
+
+        // Calculate CRC and add footer
+        let crc = super::format::crc32(&segment);
+        segment.put_u32_le(crc);
+        segment.extend_from_slice(&MAGIC_END);
+
+        let compressed_size = segment.len();
+
+        // Write to storage
+        self.storage.put(&sealed.key, Bytes::from(segment)).await?;
+
+        // Update legacy metrics
+        self.metrics
+            .record_bytes(compressed_size as u64, uncompressed_size as u64);
+        self.metrics.record_records(sealed.record_count);
+        self.metrics.record_segment();
+        self.metrics.record_segment_write_latency(start.elapsed());
+
+        // Update Prometheus metrics
+        if let Some(ref prom) = self.prometheus_metrics {
+            let algorithm = format!("{:?}", self.config.compression).to_lowercase();
+            prom.record_compression(
+                &algorithm,
+                &self.backup_id,
+                compressed_size as u64,
+                uncompressed_size as u64,
+            );
+            prom.record_storage_write_latency(
+                "filesystem",
+                StorageOperation::Segment,
+                start.elapsed().as_secs_f64(),
+            );
+            prom.inc_storage_write_bytes("filesystem", &self.backup_id, compressed_size as u64);
+        }
+
+        // Build metadata
+        let metadata = SegmentMetadata {
+            key: sealed.key.clone(),
+            start_offset: sealed.start_offset,
+            end_offset: sealed.end_offset,
+            start_timestamp: sealed.start_timestamp,
+            end_timestamp: sealed.end_timestamp,
+            record_count: sealed.record_count as i64,
+            uncompressed_size: uncompressed_size as u64,
+            compressed_size: compressed_size as u64,
+        };
+
+        info!(
+            "Wrote segment {} with {} records ({} -> {} bytes, {:.1}x compression)",
+            sealed.key,
+            sealed.record_count,
+            uncompressed_size,
+            compressed_size,
+            uncompressed_size as f64 / compressed_size as f64
+        );
+
+        Ok(metadata)
+    }
+}
+
 /// Segment writer that accumulates records and writes segments to storage
 pub struct SegmentWriter {
     config: SegmentWriterConfig,
@@ -155,103 +270,48 @@ impl SegmentWriter {
         self.start_offset
     }
 
-    /// Flush the current segment to storage
-    pub async fn flush(&mut self, key: &str) -> Result<Option<SegmentMetadata>> {
+    /// Get a flusher that can compress/upload sealed segments independently
+    /// of this writer (e.g. from a spawned task).
+    pub fn flusher(&self) -> SegmentFlusher {
+        SegmentFlusher {
+            config: self.config.clone(),
+            storage: self.storage.clone(),
+            metrics: self.metrics.clone(),
+            prometheus_metrics: self.prometheus_metrics.clone(),
+            backup_id: self.backup_id.clone(),
+        }
+    }
+
+    /// Take the current segment out of the writer and reset it, so the
+    /// segment can be compressed/uploaded while new records accumulate.
+    /// Returns `None` if no records are buffered.
+    pub fn seal(&mut self, key: &str) -> Option<SealedSegment> {
         if self.record_count == 0 {
-            return Ok(None);
+            return None;
         }
 
-        let start = std::time::Instant::now();
-
-        // Build header
-        let header = SegmentHeader {
-            version: super::format::VERSION,
-            compression: self.config.compression,
+        let sealed = SealedSegment {
+            key: key.to_string(),
+            buffer: std::mem::replace(&mut self.buffer, BytesMut::with_capacity(1024 * 1024)),
             record_count: self.record_count,
             start_offset: self.start_offset.unwrap_or(-1),
             end_offset: self.end_offset.unwrap_or(-1),
-        };
-
-        // Compress record data
-        let uncompressed_size = self.buffer.len();
-        let compressed_data = compression::compress_with_level(
-            &self.buffer,
-            self.config.compression,
-            self.config.compression_level,
-        )?;
-
-        // Build final segment
-        let mut segment =
-            BytesMut::with_capacity(HEADER_SIZE + compressed_data.len() + FOOTER_SIZE);
-        segment.extend_from_slice(&header.to_bytes());
-        segment.extend_from_slice(&compressed_data);
-
-        // Calculate CRC and add footer
-        let crc = super::format::crc32(&segment);
-        segment.put_u32_le(crc);
-        segment.extend_from_slice(&MAGIC_END);
-
-        let compressed_size = segment.len();
-
-        // Write to storage
-        self.storage.put(key, Bytes::from(segment)).await?;
-
-        // Update legacy metrics
-        self.metrics
-            .record_bytes(compressed_size as u64, uncompressed_size as u64);
-        self.metrics.record_records(self.record_count);
-        self.metrics.record_segment();
-        self.metrics.record_segment_write_latency(start.elapsed());
-
-        // Update Prometheus metrics
-        if let Some(ref prom) = self.prometheus_metrics {
-            let algorithm = format!("{:?}", self.config.compression).to_lowercase();
-            prom.record_compression(
-                &algorithm,
-                &self.backup_id,
-                compressed_size as u64,
-                uncompressed_size as u64,
-            );
-            prom.record_storage_write_latency(
-                "filesystem",
-                StorageOperation::Segment,
-                start.elapsed().as_secs_f64(),
-            );
-            prom.inc_storage_write_bytes("filesystem", &self.backup_id, compressed_size as u64);
-        }
-
-        // Build metadata
-        let metadata = SegmentMetadata {
-            key: key.to_string(),
-            start_offset: self.start_offset.unwrap_or(0),
-            end_offset: self.end_offset.unwrap_or(0),
             start_timestamp: self.start_timestamp.unwrap_or(0),
             end_timestamp: self.end_timestamp.unwrap_or(0),
-            record_count: self.record_count as i64,
-            uncompressed_size: uncompressed_size as u64,
-            compressed_size: compressed_size as u64,
         };
+        self.reset();
+        Some(sealed)
+    }
 
-        info!(
-            "Wrote segment {} with {} records ({} -> {} bytes, {:.1}x compression)",
-            key,
-            self.record_count,
-            uncompressed_size,
-            compressed_size,
-            uncompressed_size as f64 / compressed_size as f64
-        );
-
-        // Reset state
-        self.buffer.clear();
-        self.record_count = 0;
-        self.start_offset = None;
-        self.end_offset = None;
-        self.start_timestamp = None;
-        self.end_timestamp = None;
-        self.segment_start_time = None;
-        self.uncompressed_bytes = 0;
-
-        Ok(Some(metadata))
+    /// Flush the current segment to storage
+    pub async fn flush(&mut self, key: &str) -> Result<Option<SegmentMetadata>> {
+        match self.seal(key) {
+            Some(sealed) => {
+                let metadata = self.flusher().write(sealed).await?;
+                Ok(Some(metadata))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Reset writer state without writing
