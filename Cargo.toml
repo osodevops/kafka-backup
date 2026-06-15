@@ -31,7 +31,7 @@ bytes = "1"
 
 # Compression
 zstd = "0.13"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
