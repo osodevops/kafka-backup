@@ -64,6 +64,11 @@ pub struct MetricsConfig {
     #[serde(default = "default_metrics_update_interval_ms")]
     pub update_interval_ms: u64,
 
+    /// Keep serving metrics for this many seconds after a one-shot operation
+    /// completes (default: 0).
+    #[serde(default = "default_metrics_keep_alive_seconds")]
+    pub keep_alive_seconds: u64,
+
     /// Maximum partition labels to prevent cardinality explosion (default: 100)
     #[serde(default = "default_max_partition_labels")]
     pub max_partition_labels: usize,
@@ -77,6 +82,7 @@ impl Default for MetricsConfig {
             bind_address: default_metrics_bind_address(),
             path: default_metrics_path(),
             update_interval_ms: default_metrics_update_interval_ms(),
+            keep_alive_seconds: default_metrics_keep_alive_seconds(),
             max_partition_labels: default_max_partition_labels(),
         }
     }
@@ -100,6 +106,10 @@ fn default_metrics_path() -> String {
 
 fn default_metrics_update_interval_ms() -> u64 {
     500
+}
+
+fn default_metrics_keep_alive_seconds() -> u64 {
+    0
 }
 
 fn default_max_partition_labels() -> usize {
@@ -1003,6 +1013,25 @@ bootstrap_servers:
         assert_eq!(config.connection.keepalive_time_secs, 60);
         assert_eq!(config.connection.keepalive_interval_secs, 20);
         assert!(config.connection.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_metrics_config_defaults() {
+        let config = MetricsConfig::default();
+        assert_eq!(config.keep_alive_seconds, 0);
+    }
+
+    #[test]
+    fn test_metrics_config_keep_alive_yaml() {
+        let yaml = r#"
+enabled: true
+port: 8080
+bind_address: "0.0.0.0"
+path: "/metrics"
+keep_alive_seconds: 90
+"#;
+        let config: MetricsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.keep_alive_seconds, 90);
     }
 
     #[test]

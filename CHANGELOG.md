@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.9] - 2026-07-07
+
+### Added
+- Add `metrics.keep_alive_seconds` for one-shot backup and restore jobs, keeping
+  the Prometheus metrics server alive after operation completion so short-lived
+  Kubernetes CronJobs can be scraped before the pod exits.
+
+### Fixed
+- Preserve immediate shutdown on SIGINT/SIGTERM during the post-completion
+  metrics keep-alive window, so Kubernetes termination signals are not delayed.
+
 ## [0.15.7] - 2026-05-19
 
 ### Fixed

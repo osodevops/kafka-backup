@@ -481,14 +481,22 @@ Configuration for the Prometheus metrics and health check HTTP server.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `metrics.enabled` | bool | No | `false` | Enable the metrics HTTP server |
+| `metrics.enabled` | bool | No | `true` | Enable the metrics HTTP server |
 | `metrics.port` | int | No | `8080` | Port for the metrics server |
-| `metrics.bind_address` | string | No | `127.0.0.1` | Bind address (use `0.0.0.0` for Kubernetes) |
+| `metrics.bind_address` | string | No | `0.0.0.0` | Bind address (use `0.0.0.0` for Kubernetes Service routing) |
 | `metrics.path` | string | No | `/metrics` | Path for the Prometheus metrics endpoint |
+| `metrics.keep_alive_seconds` | int | No | `0` | Keep serving metrics for N seconds after one-shot backup or restore completion |
 
 When enabled, the server exposes:
 - `GET /metrics` — Prometheus/OpenMetrics scrape endpoint
 - `GET /health` — Liveness check (returns 200 OK)
+
+For short-lived CronJob backups or restores, set `keep_alive_seconds` to at
+least 2x your Prometheus scrape interval so Prometheus has more than one chance
+to scrape the final metrics snapshot. For example, use `60` to `90` seconds
+with a 30 second scrape interval. In Kubernetes, ensure
+`terminationGracePeriodSeconds` and any Job `activeDeadlineSeconds` account for
+this extra serving window.
 
 ### Example
 
@@ -498,9 +506,12 @@ metrics:
   port: 8080
   bind_address: "0.0.0.0"   # Required for Kubernetes Service routing
   path: "/metrics"
+  keep_alive_seconds: 90     # Optional: useful for short-lived CronJobs
 ```
 
-> **Kubernetes note:** Set `bind_address: "0.0.0.0"` when running in Kubernetes. The default `127.0.0.1` only accepts localhost connections and will not be reachable via a Service.
+> **Kubernetes note:** `bind_address: "0.0.0.0"` is required for Kubernetes
+> Service routing. `keep_alive_seconds` extends the pod lifetime after work
+> completes; keep it within the pod termination grace period.
 
 ### Key Metrics
 
