@@ -61,7 +61,7 @@ webpki-roots = "1.0"
 ring = "0.17"
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # Object storage
 object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
