@@ -211,6 +211,8 @@ jobs:
 
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@b22dd82fe1ad4419f5be5ea5e741291929a74bbe # cargo-tarpaulin
+        with:
+          tool: cargo-tarpaulin
 
       - name: Cache cargo registry
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
