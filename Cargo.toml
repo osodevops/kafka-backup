@@ -98,7 +98,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 uuid = { version = "1", features = ["v4"] }
 
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature in core/cli
-libgssapi = "0.9"
+libgssapi = "0.11"
 
 # Testing
 testcontainers = "0.24"
