@@ -610,9 +610,13 @@ data:
       port: 8080
       bind_address: "0.0.0.0"  # Required for K8s - allows Service routing
       path: "/metrics"
+      keep_alive_seconds: 90   # Optional for short-lived CronJobs
 ```
 
-> **Important:** When running in Kubernetes, set `bind_address: "0.0.0.0"` to allow the Service to route traffic to the metrics endpoint. The default `127.0.0.1` only accepts localhost connections.
+> **Important:** When running in Kubernetes, bind to `0.0.0.0` to allow the
+> Service to route traffic to the metrics endpoint. For short-lived CronJobs,
+> set `keep_alive_seconds` to at least 2x your Prometheus scrape interval and
+> keep it within the pod termination grace period.
 
 #### Secret (AWS Credentials)
 
@@ -743,11 +747,12 @@ spec:
   schedule: "0 */6 * * *"  # Every 6 hours
   jobTemplate:
     spec:
-      template:
-        spec:
-          containers:
-            - name: kafka-backup
-              image: kafka-backup:latest
+          template:
+            spec:
+              terminationGracePeriodSeconds: 120
+              containers:
+                - name: kafka-backup
+                  image: kafka-backup:latest
               args:
                 - backup
                 - --config

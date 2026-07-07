@@ -330,7 +330,12 @@ kafka-backup exposes Prometheus metrics at `/metrics` for monitoring backup oper
 metrics:
   enabled: true
   port: 8080
+  keep_alive_seconds: 90  # Optional: final scrape window for short-lived CronJobs
 ```
+
+For one-shot Kubernetes CronJobs, set `keep_alive_seconds` to at least 2x your
+Prometheus scrape interval so the final metrics snapshot can be scraped before
+the pod exits. Keep the value within the pod termination grace period.
 
 **Key metrics:**
 - `kafka_backup_lag_records` — Consumer lag per partition
