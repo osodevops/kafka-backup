@@ -69,7 +69,8 @@ pub struct MetricsConfig {
     #[serde(default = "default_metrics_keep_alive_seconds")]
     pub keep_alive_seconds: u64,
 
-    /// Maximum partition labels to prevent cardinality explosion (default: 100)
+    /// Maximum unique topic/partition label sets to expose (default: 100).
+    /// Set to 0 to disable the limit; this can create high-cardinality metrics.
     #[serde(default = "default_max_partition_labels")]
     pub max_partition_labels: usize,
 }

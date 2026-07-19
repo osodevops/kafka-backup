@@ -840,6 +840,10 @@ impl BackupEngine {
             total_records
         );
 
+        if let Some(ref prom) = self.prometheus_metrics {
+            prom.initialize_snapshot_progress(&self.config.backup_id, total_records);
+        }
+
         Ok(offsets)
     }
 }
@@ -910,6 +914,16 @@ impl BackupPartitionContext {
         } else {
             self.get_configured_start_offset(earliest)
         };
+
+        // The snapshot target spans earliest..latest. Account immediately for
+        // offsets skipped by the configured start position or an existing
+        // checkpoint, then decrement the remainder as fetches advance.
+        if self.target_offset.is_some() {
+            if let Some(ref prom) = self.prometheus_metrics {
+                let skipped_offsets = start_offset.min(end_offset) - earliest;
+                prom.advance_snapshot_progress(&self.backup_id, skipped_offsets.max(0));
+            }
+        }
 
         // Record consumer lag (how many records we need to catch up)
         let lag = end_offset - start_offset;
@@ -1071,6 +1085,13 @@ impl BackupPartitionContext {
             if let Some(ref prom) = self.prometheus_metrics {
                 prom.inc_records(&self.backup_id, record_count);
                 prom.inc_bytes(&self.backup_id, bytes_processed);
+
+                if self.target_offset.is_some() {
+                    prom.advance_snapshot_progress(
+                        &self.backup_id,
+                        (next_offset - current_offset).max(0),
+                    );
+                }
 
                 // Update lag (records remaining to process towards our target)
                 let remaining_lag = end_offset - next_offset;

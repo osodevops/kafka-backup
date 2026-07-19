@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.11] - 2026-07-19
+
+### Added
+- Add low-cardinality `kafka_backup_snapshot_records_target` and
+  `kafka_backup_snapshot_records_remaining` gauges for snapshot progress.
+- Add a low-cardinality `kafka_backup_lag_records_sum` gauge for continuous
+  backup lag, including partitions hidden by the detailed-series limit.
+- Treat `metrics.max_partition_labels: 0` as an explicit unlimited mode.
+
+### Fixed
+- Count unique topic/partition label sets toward `max_partition_labels` instead
+  of counting every update, which exhausted the default budget while fewer than
+  100 partition series were visible. Addresses
+  [strimzi-backup-operator#45](https://github.com/osodevops/strimzi-backup-operator/issues/45).
+
 ## [0.15.9] - 2026-07-07
 
 ### Added

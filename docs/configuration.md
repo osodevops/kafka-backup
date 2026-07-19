@@ -486,6 +486,7 @@ Configuration for the Prometheus metrics and health check HTTP server.
 | `metrics.bind_address` | string | No | `0.0.0.0` | Bind address (use `0.0.0.0` for Kubernetes Service routing) |
 | `metrics.path` | string | No | `/metrics` | Path for the Prometheus metrics endpoint |
 | `metrics.keep_alive_seconds` | int | No | `0` | Keep serving metrics for N seconds after one-shot backup or restore completion |
+| `metrics.max_partition_labels` | int | No | `100` | Maximum unique topic/partition label sets; `0` disables the limit |
 
 When enabled, the server exposes:
 - `GET /metrics` — Prometheus/OpenMetrics scrape endpoint
@@ -507,6 +508,7 @@ metrics:
   bind_address: "0.0.0.0"   # Required for Kubernetes Service routing
   path: "/metrics"
   keep_alive_seconds: 90     # Optional: useful for short-lived CronJobs
+  max_partition_labels: 100  # Use 0 only when unbounded cardinality is acceptable
 ```
 
 > **Kubernetes note:** `bind_address: "0.0.0.0"` is required for Kubernetes
@@ -518,6 +520,9 @@ metrics:
 | Metric | Type | Description |
 |--------|------|-------------|
 | `kafka_backup_lag_records` | Gauge | Consumer lag per topic/partition |
+| `kafka_backup_lag_records_sum` | Gauge | Current lag summed across all partitions |
+| `kafka_backup_snapshot_records_target` | Gauge | Total captured snapshot offset span |
+| `kafka_backup_snapshot_records_remaining` | Gauge | Captured snapshot offset span still to process |
 | `kafka_backup_records_total` | Counter | Total records backed up |
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_compression_ratio` | Gauge | Compression efficiency |
