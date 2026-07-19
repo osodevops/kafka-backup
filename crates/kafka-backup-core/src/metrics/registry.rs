@@ -10,6 +10,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
@@ -52,6 +53,15 @@ pub struct PrometheusMetrics {
 
     /// Maximum lag across all partitions.
     pub lag_records_max: Family<BackupLabels, Gauge>,
+
+    /// Current lag summed across all partitions.
+    pub lag_records_sum: Family<BackupLabels, Gauge>,
+
+    /// Total records in the captured snapshot offset range.
+    pub snapshot_records_target: Family<BackupLabels, Gauge>,
+
+    /// Records remaining before the captured snapshot target is reached.
+    pub snapshot_records_remaining: Family<BackupLabels, Gauge>,
 
     // ========================================
     // Throughput Metrics
@@ -146,8 +156,17 @@ pub struct PrometheusMetrics {
     /// Maximum partition labels to prevent cardinality explosion.
     max_partition_labels: usize,
 
-    /// Current partition label count.
-    partition_label_count: RwLock<usize>,
+    /// Unique topic/partition label sets admitted to per-partition metrics.
+    partition_labels: RwLock<HashSet<LagLabels>>,
+
+    /// Last observed lag for each partition, used to maintain the aggregate.
+    partition_lag: RwLock<HashMap<LagLabels, i64>>,
+
+    /// Current aggregate lag keyed by backup.
+    aggregate_lag: RwLock<HashMap<BackupLabels, i64>>,
+
+    /// Snapshot remainder used to make concurrent progress updates saturating.
+    snapshot_remaining: RwLock<HashMap<BackupLabels, i64>>,
 }
 
 impl Default for PrometheusMetrics {
@@ -173,6 +192,9 @@ impl PrometheusMetrics {
         let lag_bytes = Family::<LagLabels, Gauge>::default();
         let lag_seconds = Family::<LagLabels, Gauge<f64, AtomicU64>>::default();
         let lag_records_max = Family::<BackupLabels, Gauge>::default();
+        let lag_records_sum = Family::<BackupLabels, Gauge>::default();
+        let snapshot_records_target = Family::<BackupLabels, Gauge>::default();
+        let snapshot_records_remaining = Family::<BackupLabels, Gauge>::default();
 
         // Throughput Metrics
         let throughput_records_per_sec =
@@ -244,6 +266,21 @@ impl PrometheusMetrics {
             "kafka_backup_lag_records_max",
             "Maximum lag across all partitions",
             lag_records_max.clone(),
+        );
+        registry.register(
+            "kafka_backup_lag_records_sum",
+            "Current lag summed across all partitions",
+            lag_records_sum.clone(),
+        );
+        registry.register(
+            "kafka_backup_snapshot_records_target",
+            "Total records in the captured snapshot offset range",
+            snapshot_records_target.clone(),
+        );
+        registry.register(
+            "kafka_backup_snapshot_records_remaining",
+            "Records remaining before the captured snapshot target is reached",
+            snapshot_records_remaining.clone(),
         );
 
         // Throughput Metrics
@@ -374,6 +411,9 @@ impl PrometheusMetrics {
             lag_bytes,
             lag_seconds,
             lag_records_max,
+            lag_records_sum,
+            snapshot_records_target,
+            snapshot_records_remaining,
             throughput_records_per_sec,
             throughput_bytes_per_sec,
             records_total,
@@ -398,7 +438,10 @@ impl PrometheusMetrics {
             restore_records_total,
             start_time: Instant::now(),
             max_partition_labels,
-            partition_label_count: RwLock::new(0),
+            partition_labels: RwLock::new(HashSet::new()),
+            partition_lag: RwLock::new(HashMap::new()),
+            aggregate_lag: RwLock::new(HashMap::new()),
+            snapshot_remaining: RwLock::new(HashMap::new()),
         }
     }
 
@@ -422,12 +465,27 @@ impl PrometheusMetrics {
         lag_records: i64,
         avg_record_size: Option<u64>,
     ) {
-        // Check cardinality limit
-        if !self.check_partition_cardinality() {
-            return;
+        let labels = LagLabels::new(topic, partition, backup_id);
+        let lag_records = lag_records.max(0);
+        let previous_lag = {
+            let mut partition_lag = self.partition_lag.write();
+            partition_lag
+                .insert(labels.clone(), lag_records)
+                .unwrap_or(0)
+        };
+        let backup_labels = BackupLabels::new(backup_id);
+        {
+            let mut aggregate_lag = self.aggregate_lag.write();
+            let total = aggregate_lag.entry(backup_labels.clone()).or_insert(0);
+            *total = (*total + lag_records - previous_lag).max(0);
+            self.lag_records_sum
+                .get_or_create(&backup_labels)
+                .set(*total);
         }
 
-        let labels = LagLabels::new(topic, partition, backup_id);
+        if !self.check_partition_cardinality(&labels) {
+            return;
+        }
 
         self.lag_records.get_or_create(&labels).set(lag_records);
 
@@ -447,11 +505,10 @@ impl PrometheusMetrics {
         backup_id: &str,
         lag_seconds: f64,
     ) {
-        if !self.check_partition_cardinality() {
+        let labels = LagLabels::new(topic, partition, backup_id);
+        if !self.check_partition_cardinality(&labels) {
             return;
         }
-
-        let labels = LagLabels::new(topic, partition, backup_id);
         self.lag_seconds.get_or_create(&labels).set(lag_seconds);
     }
 
@@ -459,6 +516,39 @@ impl PrometheusMetrics {
     pub fn record_max_lag(&self, backup_id: &str, max_lag: i64) {
         let labels = BackupLabels::new(backup_id);
         self.lag_records_max.get_or_create(&labels).set(max_lag);
+    }
+
+    /// Initialize low-cardinality progress gauges for a captured snapshot.
+    pub fn initialize_snapshot_progress(&self, backup_id: &str, target_records: i64) {
+        let labels = BackupLabels::new(backup_id);
+        let target_records = target_records.max(0);
+        self.snapshot_records_target
+            .get_or_create(&labels)
+            .set(target_records);
+        self.snapshot_records_remaining
+            .get_or_create(&labels)
+            .set(target_records);
+        self.snapshot_remaining
+            .write()
+            .insert(labels, target_records);
+    }
+
+    /// Decrease the snapshot's remaining offset span as partitions advance.
+    pub fn advance_snapshot_progress(&self, backup_id: &str, offsets_advanced: i64) {
+        if offsets_advanced <= 0 {
+            return;
+        }
+
+        let labels = BackupLabels::new(backup_id);
+        let remaining = {
+            let mut snapshots = self.snapshot_remaining.write();
+            let remaining = snapshots.entry(labels.clone()).or_insert(0);
+            *remaining = (*remaining - offsets_advanced).max(0);
+            *remaining
+        };
+        self.snapshot_records_remaining
+            .get_or_create(&labels)
+            .set(remaining);
     }
 
     // ========================================
@@ -698,21 +788,28 @@ impl PrometheusMetrics {
         buffer
     }
 
-    /// Check if we've exceeded the partition cardinality limit.
-    fn check_partition_cardinality(&self) -> bool {
-        let count = *self.partition_label_count.read();
-        if count >= self.max_partition_labels {
+    /// Admit existing label sets, or one new label set while under the limit.
+    /// A configured limit of zero explicitly disables the cardinality cap.
+    fn check_partition_cardinality(&self, labels: &LagLabels) -> bool {
+        if self.max_partition_labels == 0 {
+            return true;
+        }
+
+        let mut partition_labels = self.partition_labels.write();
+        if partition_labels.contains(labels) {
+            return true;
+        }
+        if partition_labels.len() >= self.max_partition_labels {
             return false;
         }
 
-        // Increment count (racy but acceptable for cardinality limiting)
-        *self.partition_label_count.write() += 1;
+        partition_labels.insert(labels.clone());
         true
     }
 
     /// Reset partition cardinality counter (for testing or job restarts).
     pub fn reset_partition_cardinality(&self) {
-        *self.partition_label_count.write() = 0;
+        self.partition_labels.write().clear();
     }
 }
 
@@ -849,19 +946,66 @@ mod tests {
     fn test_cardinality_limiting() {
         let metrics = PrometheusMetrics::with_max_labels(3);
 
-        // These should succeed
-        metrics.record_lag("topic1", 0, "backup", 100, None);
+        // Repeated updates to one partition consume one slot, not the whole
+        // budget. This was the cause of fewer than 100 visible partitions.
+        for lag in (1..=100).rev() {
+            metrics.record_lag("topic1", 0, "backup", lag, None);
+        }
         metrics.record_lag("topic2", 0, "backup", 100, None);
         metrics.record_lag("topic3", 0, "backup", 100, None);
 
-        // This should be silently dropped
+        // A fourth unique label set is dropped, but admitted labels continue
+        // to update after the limit is reached.
         metrics.record_lag("topic4", 0, "backup", 100, None);
+        metrics.record_lag("topic1", 0, "backup", 0, None);
 
         let encoded = metrics.encode();
         assert!(encoded.contains("topic1"));
         assert!(encoded.contains("topic2"));
         assert!(encoded.contains("topic3"));
-        // topic4 might or might not appear depending on timing, but cardinality should be limited
+        assert!(!encoded.contains("topic4"));
+        assert!(encoded.contains("topic=\"topic1\",partition=\"0\",backup_id=\"backup\"} 0"));
+    }
+
+    #[test]
+    fn zero_cardinality_limit_exposes_all_partitions() {
+        let metrics = PrometheusMetrics::with_max_labels(0);
+        for partition in 0..150 {
+            metrics.record_lag("orders", partition, "backup", 100, None);
+        }
+
+        let encoded = metrics.encode();
+        assert_eq!(encoded.matches("kafka_backup_lag_records{").count(), 150);
+    }
+
+    #[test]
+    fn aggregate_lag_includes_partitions_hidden_by_cardinality_limit() {
+        let metrics = PrometheusMetrics::with_max_labels(1);
+        metrics.record_lag("orders", 0, "continuous", 10, None);
+        metrics.record_lag("orders", 1, "continuous", 20, None);
+        metrics.record_lag("orders", 0, "continuous", 5, None);
+
+        let encoded = metrics.encode();
+        assert_eq!(encoded.matches("kafka_backup_lag_records{").count(), 1);
+        assert!(encoded.contains("kafka_backup_lag_records_sum{backup_id=\"continuous\"} 25"));
+    }
+
+    #[test]
+    fn snapshot_progress_reports_target_and_remaining_without_partition_labels() {
+        let metrics = PrometheusMetrics::with_max_labels(1);
+        metrics.initialize_snapshot_progress("snapshot-001", 12_000);
+        metrics.advance_snapshot_progress("snapshot-001", 2_500);
+
+        let encoded = metrics.encode();
+        assert!(encoded
+            .contains("kafka_backup_snapshot_records_target{backup_id=\"snapshot-001\"} 12000"));
+        assert!(encoded
+            .contains("kafka_backup_snapshot_records_remaining{backup_id=\"snapshot-001\"} 9500"));
+
+        metrics.advance_snapshot_progress("snapshot-001", 20_000);
+        let encoded = metrics.encode();
+        assert!(encoded
+            .contains("kafka_backup_snapshot_records_remaining{backup_id=\"snapshot-001\"} 0"));
     }
 
     #[test]

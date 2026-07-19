@@ -331,6 +331,7 @@ metrics:
   enabled: true
   port: 8080
   keep_alive_seconds: 90  # Optional: final scrape window for short-lived CronJobs
+  max_partition_labels: 100  # Set to 0 only when unbounded cardinality is acceptable
 ```
 
 For one-shot Kubernetes CronJobs, set `keep_alive_seconds` to at least 2x your
@@ -339,6 +340,9 @@ the pod exits. Keep the value within the pod termination grace period.
 
 **Key metrics:**
 - `kafka_backup_lag_records` — Consumer lag per partition
+- `kafka_backup_lag_records_sum` — Current lag across all partitions
+- `kafka_backup_snapshot_records_target` — Captured snapshot offset span
+- `kafka_backup_snapshot_records_remaining` — Snapshot offset span still to process
 - `kafka_backup_records_total` — Total records backed up
 - `kafka_backup_compression_ratio` — Compression efficiency
 - `kafka_backup_storage_write_latency_seconds` — Storage I/O latency
