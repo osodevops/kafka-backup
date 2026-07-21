@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.12] - 2026-07-21
+
+### Fixed
+- Label segment storage write metrics (`kafka_backup_storage_write_bytes_total`,
+  `kafka_backup_storage_write_latency_seconds`) with the storage backend that
+  was actually written to (`s3`, `azure`, `gcs`, `filesystem`, `memory`)
+  instead of a hardcoded `filesystem`. Addresses
+  [strimzi-backup-operator#50](https://github.com/osodevops/strimzi-backup-operator/issues/50).
+- Register counters without an explicit `_total` suffix so exposed series match
+  the documented names (e.g. `kafka_backup_records_total`) instead of carrying
+  a doubled suffix (`kafka_backup_records_total_total`); `prometheus-client`
+  appends `_total` to counters at encode time. Dashboards or alerts built on
+  the doubled names must move to the documented single-`_total` names.
+
 ## [0.15.11] - 2026-07-19
 
 ### Added
