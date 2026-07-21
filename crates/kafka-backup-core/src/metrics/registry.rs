@@ -295,12 +295,12 @@ impl PrometheusMetrics {
             throughput_bytes_per_sec.clone(),
         );
         registry.register(
-            "kafka_backup_records_total",
+            "kafka_backup_records",
             "Cumulative records backed up",
             records_total.clone(),
         );
         registry.register(
-            "kafka_backup_bytes_total",
+            "kafka_backup_bytes",
             "Cumulative bytes backed up",
             bytes_total.clone(),
         );
@@ -329,17 +329,17 @@ impl PrometheusMetrics {
             storage_read_latency_seconds.clone(),
         );
         registry.register(
-            "kafka_backup_storage_write_bytes_total",
+            "kafka_backup_storage_write_bytes",
             "Cumulative bytes written to storage",
             storage_write_bytes_total.clone(),
         );
         registry.register(
-            "kafka_backup_storage_read_bytes_total",
+            "kafka_backup_storage_read_bytes",
             "Cumulative bytes read from storage",
             storage_read_bytes_total.clone(),
         );
         registry.register(
-            "kafka_backup_storage_errors_total",
+            "kafka_backup_storage_errors",
             "Storage operation errors by type",
             storage_errors_total.clone(),
         );
@@ -351,24 +351,24 @@ impl PrometheusMetrics {
             compression_ratio.clone(),
         );
         registry.register(
-            "kafka_backup_compressed_bytes_total",
+            "kafka_backup_compressed_bytes",
             "Cumulative bytes after compression",
             compressed_bytes_total.clone(),
         );
         registry.register(
-            "kafka_backup_uncompressed_bytes_total",
+            "kafka_backup_uncompressed_bytes",
             "Cumulative bytes before compression",
             uncompressed_bytes_total.clone(),
         );
 
         // Error & Health Metrics
         registry.register(
-            "kafka_backup_errors_total",
+            "kafka_backup_errors",
             "Cumulative errors by category",
             errors_total.clone(),
         );
         registry.register(
-            "kafka_backup_retries_total",
+            "kafka_backup_retries",
             "Cumulative retries by operation",
             retries_total.clone(),
         );
@@ -378,7 +378,7 @@ impl PrometheusMetrics {
             last_successful_commit.clone(),
         );
         registry.register(
-            "kafka_backup_consumer_rebalance_total",
+            "kafka_backup_consumer_rebalance",
             "Number of consumer group rebalances",
             consumer_rebalance_total.clone(),
         );
@@ -400,7 +400,7 @@ impl PrometheusMetrics {
             restore_throughput_records_per_sec.clone(),
         );
         registry.register(
-            "kafka_restore_records_total",
+            "kafka_restore_records",
             "Cumulative records restored",
             restore_records_total.clone(),
         );
@@ -912,7 +912,7 @@ mod tests {
         metrics.record_error("backup-001", ErrorType::BrokerConnection);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("kafka_backup_errors_total"));
+        assert!(encoded.contains("kafka_backup_errors"));
         assert!(encoded.contains("broker_connection"));
     }
 
@@ -923,7 +923,7 @@ mod tests {
 
         let encoded = metrics.encode();
         assert!(encoded.contains("kafka_backup_compression_ratio"));
-        assert!(encoded.contains("kafka_backup_compressed_bytes_total"));
+        assert!(encoded.contains("kafka_backup_compressed_bytes"));
     }
 
     #[test]
@@ -1031,6 +1031,42 @@ mod tests {
         // Check for Prometheus text format markers
         assert!(encoded.contains("# HELP"));
         assert!(encoded.contains("# TYPE"));
-        assert!(encoded.contains("kafka_backup_records_total"));
+        assert!(encoded.contains("kafka_backup_records_total{"));
+    }
+
+    #[test]
+    fn counters_expose_single_total_suffix() {
+        // prometheus-client appends `_total` to counters at encode time, so
+        // registering counters with an explicit `_total` produced names like
+        // `kafka_backup_records_total_total` (operator issue #50).
+        let metrics = PrometheusMetrics::new();
+        metrics.inc_records("backup-001", 100);
+        metrics.inc_bytes("backup-001", 1024);
+        metrics.inc_storage_write_bytes("s3", "backup-001", 2048);
+        metrics.inc_storage_read_bytes("s3", "backup-001", 512);
+        metrics.inc_storage_error("s3", ErrorType::StorageIo);
+        metrics.record_compression("zstd", "backup-001", 100, 400);
+        metrics.record_error("backup-001", ErrorType::BrokerConnection);
+        metrics.record_retry("backup-001", "fetch");
+        metrics.record_rebalance("backup-001");
+        metrics.inc_restore_records("restore-001", 10);
+
+        let encoded = metrics.encode();
+        assert!(!encoded.contains("_total_total"));
+        for name in [
+            "kafka_backup_records_total{",
+            "kafka_backup_bytes_total{",
+            "kafka_backup_storage_write_bytes_total{",
+            "kafka_backup_storage_read_bytes_total{",
+            "kafka_backup_storage_errors_total{",
+            "kafka_backup_compressed_bytes_total{",
+            "kafka_backup_uncompressed_bytes_total{",
+            "kafka_backup_errors_total{",
+            "kafka_backup_retries_total{",
+            "kafka_backup_consumer_rebalance_total{",
+            "kafka_restore_records_total{",
+        ] {
+            assert!(encoded.contains(name), "missing counter series: {name}");
+        }
     }
 }

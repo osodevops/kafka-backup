@@ -107,6 +107,10 @@ impl S3Backend {
 
 #[async_trait]
 impl StorageBackend for S3Backend {
+    fn backend_name(&self) -> &str {
+        "s3"
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.full_path(key);
         debug!("S3 PUT: {}", path);

@@ -70,11 +70,6 @@ impl InstrumentedStorageBackend {
         }
     }
 
-    /// Get the backend name.
-    pub fn backend_name(&self) -> &str {
-        &self.backend_name
-    }
-
     /// Get the inner storage backend.
     pub fn inner(&self) -> &Arc<dyn StorageBackend> {
         &self.inner
@@ -95,6 +90,10 @@ impl InstrumentedStorageBackend {
 
 #[async_trait]
 impl StorageBackend for InstrumentedStorageBackend {
+    fn backend_name(&self) -> &str {
+        &self.backend_name
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let operation = self.classify_operation(key);
         let bytes_len = data.len() as u64;

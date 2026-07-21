@@ -84,6 +84,10 @@ impl GcsBackend {
 
 #[async_trait]
 impl StorageBackend for GcsBackend {
+    fn backend_name(&self) -> &str {
+        "gcs"
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.full_path(key);
         debug!("GCS PUT: {}", path);
