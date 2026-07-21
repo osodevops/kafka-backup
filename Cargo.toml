@@ -85,7 +85,7 @@ crc32fast = "1.4"
 regex = "1"
 
 # Cryptographic signing (evidence reports)
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 sha2 = "0.10"
 
 # PDF generation (evidence reports)
