@@ -118,12 +118,13 @@ impl SegmentFlusher {
                 compressed_size as u64,
                 uncompressed_size as u64,
             );
+            let backend = self.storage.backend_name();
             prom.record_storage_write_latency(
-                "filesystem",
+                backend,
                 StorageOperation::Segment,
                 start.elapsed().as_secs_f64(),
             );
-            prom.inc_storage_write_bytes("filesystem", &self.backup_id, compressed_size as u64);
+            prom.inc_storage_write_bytes(backend, &self.backup_id, compressed_size as u64);
         }
 
         // Build metadata
@@ -365,6 +366,42 @@ mod tests {
 
         // Verify file exists
         assert!(storage.exists("test-segment.bin").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_segment_flush_labels_actual_backend() {
+        use crate::metrics::PrometheusMetrics;
+        use crate::storage::MemoryBackend;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let prometheus = Arc::new(PrometheusMetrics::new());
+        let config = SegmentWriterConfig::default();
+
+        let mut writer = SegmentWriter::with_prometheus(
+            config,
+            storage,
+            metrics,
+            Some(prometheus.clone()),
+            "backend-label-test".to_string(),
+        );
+
+        writer
+            .add_record(BinaryRecord {
+                timestamp: 1000,
+                offset: 0,
+                key: None,
+                value: Some(Bytes::from("value")),
+                headers: vec![],
+            })
+            .unwrap();
+        writer.flush("test-segment.bin").await.unwrap().unwrap();
+
+        // The storage metrics must be labelled with the backend that was
+        // actually written to, not a hardcoded "filesystem" (operator issue #50).
+        let encoded = prometheus.encode();
+        assert!(encoded.contains("kafka_backup_storage_write_bytes_total{backend=\"memory\",backup_id=\"backend-label-test\"}"));
+        assert!(!encoded.contains("backend=\"filesystem\""));
     }
 
     #[tokio::test]

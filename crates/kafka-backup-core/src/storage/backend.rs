@@ -19,6 +19,12 @@ pub struct ObjectMetadata {
 /// Trait for storage backends
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Short backend identifier used as the `backend` label on storage
+    /// metrics (e.g. "s3", "azure", "gcs", "filesystem", "memory").
+    fn backend_name(&self) -> &str {
+        "unknown"
+    }
+
     /// Write data to a key
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
 

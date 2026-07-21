@@ -165,6 +165,10 @@ impl AzureBackend {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    fn backend_name(&self) -> &str {
+        "azure"
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.full_path(key);
         debug!("Azure PUT: {}", path);

@@ -39,6 +39,10 @@ impl FilesystemBackend {
 
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
+    fn backend_name(&self) -> &str {
+        "filesystem"
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.key_to_path(key);
 

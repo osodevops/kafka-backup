@@ -36,6 +36,10 @@ impl Default for MemoryBackend {
 
 #[async_trait]
 impl StorageBackend for MemoryBackend {
+    fn backend_name(&self) -> &str {
+        "memory"
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = Path::from(key);
         self.store

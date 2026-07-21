@@ -232,7 +232,10 @@ fn parse_prometheus_metrics(text: &str) -> ParsedMetrics {
                 | "kafka_backup_segments_written_total" => {
                     metrics.segments_written = value as u64;
                 }
-                "kafka_backup_storage_write_bytes_total_total" if metrics.bytes_total == 0 => {
+                "kafka_backup_storage_write_bytes_total"
+                | "kafka_backup_storage_write_bytes_total_total"
+                    if metrics.bytes_total == 0 =>
+                {
                     metrics.bytes_total = value as u64;
                 }
                 "kafka_backup_throughput_records_per_second" => {
