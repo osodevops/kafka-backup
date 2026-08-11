@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-08-11
+
+### Added
+- `backup.fetch_max_bytes` — maximum bytes requested per Kafka Fetch request,
+  decoupled from the segment size (previously always
+  `min(segment_max_bytes, 16MB)`).
+- `backup.segment_max_records` — rotate segments once they hold this many
+  records, in addition to the existing size/interval thresholds.
+- Warn on unknown config keys at load time instead of silently ignoring them.
+  Requested in
+  [strimzi-backup-operator#53](https://github.com/osodevops/strimzi-backup-operator/issues/53).
+
+### Changed
+- `kafka-backup-core`: `BackupOptions` and `SegmentWriterConfig` gained new
+  public fields (breaking for struct-literal construction; use
+  `..Default::default()`).
+
+## [0.15.13] - 2026-08-11
+
+### Fixed
+- Advance fetches past record batches whose tail records were removed by log
+  compaction instead of re-requesting the same batch forever (stalled backup,
+  duplicate segments written to storage), and continue past fully-compacted
+  batches instead of ending the partition backup early. Fixes
+  [strimzi-backup-operator#54](https://github.com/osodevops/strimzi-backup-operator/issues/54).
+
 ## [0.15.12] - 2026-07-21
 
 ### Fixed
