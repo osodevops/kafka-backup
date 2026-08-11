@@ -105,6 +105,7 @@ default = []
 gssapi = ["dep:libgssapi"]
 
 [dev-dependencies]
+crc32c = "0.6"
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
 tempfile.workspace = true

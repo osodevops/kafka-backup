@@ -993,7 +993,11 @@ impl BackupPartitionContext {
             self.kafka_cb.record_success();
             self.health.mark_healthy("kafka");
 
-            if records.is_empty() {
+            // A fetch can return zero records yet still advance the offset:
+            // on compacted topics the log cleaner may have removed every
+            // record in the fetched batches. Only "no records and no
+            // progress" means we have reached the end of available data.
+            if records.is_empty() && next_offset <= current_offset {
                 break;
             }
 
@@ -1058,9 +1062,12 @@ impl BackupPartitionContext {
                 }
             }
 
-            // Update offset tracking
+            // Update offset tracking. Checkpoint the end of the fetched
+            // batches rather than the last record: on compacted topics the
+            // trailing records of a batch may no longer exist, and resuming
+            // there would re-read the whole batch.
             if let Some(ref offset_store) = self.offset_store {
-                let last_offset = records.last().map(|r| r.offset).unwrap_or(current_offset);
+                let last_offset = next_offset - 1;
                 offset_store
                     .set_offset(&self.backup_id, &self.topic, self.partition, last_offset)
                     .await?;
