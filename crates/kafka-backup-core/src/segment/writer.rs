@@ -345,6 +345,36 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn no_record_rotation_when_limit_unset() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
+        let metrics = Arc::new(PerformanceMetrics::new());
+        // Defaults: max_segment_records is None — record count must never
+        // trigger rotation on its own (pre-v0.16.0 behavior preserved).
+        let config = SegmentWriterConfig {
+            max_segment_bytes: u64::MAX,
+            max_segment_interval_ms: u64::MAX,
+            ..SegmentWriterConfig::default()
+        };
+        let mut writer = SegmentWriter::new(config, storage, metrics);
+        for i in 0..1000 {
+            writer
+                .add_record(BinaryRecord {
+                    timestamp: 1000 + i,
+                    offset: i,
+                    key: None,
+                    value: Some(Bytes::from("v")),
+                    headers: vec![],
+                })
+                .unwrap();
+        }
+        assert!(
+            !writer.should_rotate(),
+            "record count must not trigger rotation when the limit is unset"
+        );
+    }
+
+    #[tokio::test]
     async fn rotates_at_max_segment_records() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));

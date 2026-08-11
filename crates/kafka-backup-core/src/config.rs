@@ -1054,6 +1054,36 @@ mod tests {
     }
 
     #[test]
+    fn pre_v0_16_config_parses_unchanged_with_no_warnings() {
+        // A config written for older versions (no v0.16.0 keys) must parse
+        // with identical semantics and produce zero warnings.
+        let yaml = r#"
+mode: backup
+backup_id: compat-test
+source:
+  bootstrap_servers:
+    - localhost:9092
+storage:
+  backend: filesystem
+  path: /tmp/compat-test
+backup:
+  compression: zstd
+  segment_max_bytes: 134217728
+  stop_at_current_offsets: true
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+        let opts = config.backup.unwrap();
+        assert_eq!(opts.fetch_max_bytes, None);
+        assert_eq!(opts.segment_max_records, None);
+        assert_eq!(opts.segment_max_bytes, 134217728);
+        assert!(opts.stop_at_current_offsets);
+    }
+
+    #[test]
     fn config_from_yaml_with_warnings_reports_unknown_keys() {
         let yaml = r#"
 mode: backup
