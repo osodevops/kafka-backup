@@ -854,6 +854,22 @@ impl Config {
         let config: Config =
             serde_ignored::deserialize(deserializer, |path| ignored.push(path.to_string()))
                 .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+
+        let ignored = ignored
+            .into_iter()
+            // serde_ignored renders Option/enum layers as `?` segments
+            // (e.g. `backup.?.key`); drop them for readable key paths.
+            .map(|path| {
+                path.split('.')
+                    .filter(|segment| *segment != "?")
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            // The documented `logging` section is applied by the CLI layer
+            // (RUST_LOG / -v), not deserialized into this struct — not a typo.
+            .filter(|path| path != "logging" && !path.starts_with("logging."))
+            .collect();
+
         Ok((config, ignored))
     }
 
@@ -1057,8 +1073,8 @@ not_a_real_section:
         let (config, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
         assert_eq!(config.backup_id, "warn-test");
         assert!(
-            warnings.iter().any(|w| w.contains("fetch_max_bytez")),
-            "expected a warning for backup.fetch_max_bytez, got {warnings:?}"
+            warnings.iter().any(|w| w == "backup.fetch_max_bytez"),
+            "expected a clean `backup.fetch_max_bytez` path (no `?` segments), got {warnings:?}"
         );
         assert!(
             warnings.iter().any(|w| w.contains("not_a_real_section")),
@@ -1081,6 +1097,9 @@ backup:
   segment_max_bytes: 1048576
   fetch_max_bytes: 16777216
   segment_max_records: 2000000
+logging:
+  level: debug
+  format: text
 "#;
         let (_, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
         assert!(
