@@ -6,7 +6,7 @@ pub async fn run(config_path: &str, format: &str) -> Result<()> {
     // Load configuration
     let config_content = std::fs::read_to_string(config_path)?;
     let config_content = super::config::expand_env_vars(&config_content);
-    let mut config: Config = serde_yaml::from_str(&config_content)?;
+    let mut config: Config = super::config::parse_config(&config_content)?;
 
     // Force dry-run mode
     if let Some(ref mut restore) = config.restore {

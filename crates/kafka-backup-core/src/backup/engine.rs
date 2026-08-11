@@ -952,6 +952,7 @@ impl BackupPartitionContext {
             max_segment_interval_ms: self.options.segment_max_interval_ms,
             compression: self.options.compression,
             compression_level: self.options.compression_level,
+            max_segment_records: self.options.segment_max_records,
         };
         let mut segment_writer = SegmentWriter::with_prometheus(
             writer_config,
@@ -1197,7 +1198,7 @@ impl BackupPartitionContext {
         start_offset: i64,
         _end_offset: i64,
     ) -> Result<(Vec<BackupRecord>, i64)> {
-        let max_bytes = self.options.segment_max_bytes.min(16 * 1024 * 1024) as i32;
+        let max_bytes = effective_fetch_max_bytes(&self.options);
 
         // Fetch records using router (automatically routes to partition leader)
         let fetch_response = self
@@ -1207,6 +1208,17 @@ impl BackupPartitionContext {
 
         Ok((fetch_response.records, fetch_response.next_offset))
     }
+}
+
+/// Maximum bytes to request per Fetch call: an explicit `fetch_max_bytes`
+/// wins; otherwise fall back to the segment size capped at 16MB. Clamped to
+/// the Kafka protocol's i32 range.
+fn effective_fetch_max_bytes(options: &BackupOptions) -> i32 {
+    const DEFAULT_FETCH_CAP: u64 = 16 * 1024 * 1024;
+    options
+        .fetch_max_bytes
+        .unwrap_or_else(|| options.segment_max_bytes.min(DEFAULT_FETCH_CAP))
+        .clamp(1, i32::MAX as u64) as i32
 }
 
 /// Await a background segment flush task, surfacing panics as errors.
@@ -1404,6 +1416,43 @@ fn should_create_offset_store(continuous: bool, offset_storage_configured: bool)
 mod tests {
     use super::*;
     use crate::manifest::{PartitionBackup, TopicBackup};
+
+    #[test]
+    fn fetch_max_bytes_defaults_to_capped_segment_size() {
+        let mut opts = BackupOptions {
+            segment_max_bytes: 512 * 1024,
+            ..BackupOptions::default()
+        };
+        assert_eq!(effective_fetch_max_bytes(&opts), 512 * 1024);
+
+        opts.segment_max_bytes = 256 * 1024 * 1024;
+        assert_eq!(effective_fetch_max_bytes(&opts), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn explicit_fetch_max_bytes_wins_over_segment_size() {
+        let opts = BackupOptions {
+            segment_max_bytes: 256 * 1024 * 1024,
+            fetch_max_bytes: Some(64 * 1024 * 1024),
+            ..BackupOptions::default()
+        };
+        assert_eq!(effective_fetch_max_bytes(&opts), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fetch_max_bytes_is_clamped_to_protocol_range() {
+        let opts = BackupOptions {
+            fetch_max_bytes: Some(u64::MAX),
+            ..BackupOptions::default()
+        };
+        assert_eq!(effective_fetch_max_bytes(&opts), i32::MAX);
+
+        let opts = BackupOptions {
+            fetch_max_bytes: Some(0),
+            ..BackupOptions::default()
+        };
+        assert_eq!(effective_fetch_max_bytes(&opts), 1);
+    }
 
     #[test]
     fn test_glob_match() {

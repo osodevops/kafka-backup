@@ -34,6 +34,20 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
+/// Parse a config YAML string, logging a warning for every key that the
+/// config schema does not recognize (they would otherwise be silently
+/// ignored — e.g. a typo like `fetch_max_bytez` doing nothing).
+pub fn parse_config(
+    config_content: &str,
+) -> kafka_backup_core::Result<kafka_backup_core::config::Config> {
+    let (config, ignored) =
+        kafka_backup_core::config::Config::from_yaml_with_warnings(config_content)?;
+    for path in &ignored {
+        tracing::warn!("Ignoring unknown config key `{path}` — check for typos; see https://kafkabackup.com/reference/config-yaml");
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

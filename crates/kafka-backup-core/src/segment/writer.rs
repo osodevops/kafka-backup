@@ -23,6 +23,8 @@ pub struct SegmentWriterConfig {
     pub compression: CompressionType,
     /// Compression level (for zstd: 1-22, default 3)
     pub compression_level: i32,
+    /// Maximum records per segment before rotation (default: unlimited)
+    pub max_segment_records: Option<u64>,
 }
 
 impl Default for SegmentWriterConfig {
@@ -32,6 +34,7 @@ impl Default for SegmentWriterConfig {
             max_segment_interval_ms: 60_000,      // 60 seconds
             compression: CompressionType::Zstd,
             compression_level: 3,
+            max_segment_records: None,
         }
     }
 }
@@ -240,6 +243,13 @@ impl SegmentWriter {
             return true;
         }
 
+        // Check record-count threshold
+        if let Some(max_records) = self.config.max_segment_records {
+            if self.record_count >= max_records {
+                return true;
+            }
+        }
+
         // Check time threshold
         if let Some(start_time) = self.segment_start_time {
             if start_time.elapsed().as_millis() as u64 >= self.config.max_segment_interval_ms {
@@ -333,6 +343,46 @@ mod tests {
     use super::*;
     use crate::storage::FilesystemBackend;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn rotates_at_max_segment_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let config = SegmentWriterConfig {
+            max_segment_bytes: u64::MAX,
+            max_segment_interval_ms: u64::MAX,
+            max_segment_records: Some(10),
+            ..SegmentWriterConfig::default()
+        };
+
+        let mut writer = SegmentWriter::new(config, storage, metrics);
+        for i in 0..9 {
+            writer
+                .add_record(BinaryRecord {
+                    timestamp: 1000 + i,
+                    offset: i,
+                    key: None,
+                    value: Some(Bytes::from("v")),
+                    headers: vec![],
+                })
+                .unwrap();
+        }
+        assert!(
+            !writer.should_rotate(),
+            "must not rotate below the record limit"
+        );
+        writer
+            .add_record(BinaryRecord {
+                timestamp: 2000,
+                offset: 9,
+                key: None,
+                value: Some(Bytes::from("v")),
+                headers: vec![],
+            })
+            .unwrap();
+        assert!(writer.should_rotate(), "must rotate at the record limit");
+    }
 
     #[tokio::test]
     async fn test_segment_writer_basic() {

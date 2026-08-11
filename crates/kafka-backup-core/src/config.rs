@@ -497,6 +497,20 @@ pub struct BackupOptions {
     /// Default: `false` — opt in explicitly to avoid unexpected overhead.
     #[serde(default)]
     pub consumer_group_snapshot: bool,
+
+    /// Maximum bytes requested per Kafka Fetch request.
+    ///
+    /// When unset, fetches request `min(segment_max_bytes, 16MB)`.
+    /// Values are clamped to the Kafka protocol's i32 range.
+    #[serde(default)]
+    pub fetch_max_bytes: Option<u64>,
+
+    /// Maximum records per segment before rotation.
+    ///
+    /// When unset, segments rotate on `segment_max_bytes` /
+    /// `segment_max_interval_ms` only.
+    #[serde(default)]
+    pub segment_max_records: Option<u64>,
 }
 
 fn default_include_offset_headers() -> bool {
@@ -530,6 +544,8 @@ impl Default for BackupOptions {
             max_concurrent_partitions: default_backup_max_concurrent_partitions(),
             poll_interval_ms: default_poll_interval_ms(),
             consumer_group_snapshot: false,
+            fetch_max_bytes: None,
+            segment_max_records: None,
         }
     }
 }
@@ -825,6 +841,22 @@ fn default_restore_checkpoint_interval_secs() -> u64 {
 }
 
 impl Config {
+    /// Parse a YAML config, collecting the paths of any keys that were
+    /// ignored during deserialization.
+    ///
+    /// The config structs do not reject unknown fields, so a typo like
+    /// `fetch_max_bytez` would otherwise be silently dropped and the
+    /// operator-provided or hand-written option would simply not apply.
+    /// Callers should surface the returned paths as warnings.
+    pub fn from_yaml_with_warnings(yaml: &str) -> crate::Result<(Self, Vec<String>)> {
+        let mut ignored = Vec::new();
+        let deserializer = serde_yaml::Deserializer::from_str(yaml);
+        let config: Config =
+            serde_ignored::deserialize(deserializer, |path| ignored.push(path.to_string()))
+                .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+        Ok((config, ignored))
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> crate::Result<()> {
         match self.mode {
@@ -992,6 +1024,70 @@ impl RestoreOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_options_parse_fetch_max_bytes_and_segment_max_records() {
+        let yaml = "fetch_max_bytes: 16777216\nsegment_max_records: 2000000\n";
+        let opts: BackupOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(opts.fetch_max_bytes, Some(16777216));
+        assert_eq!(opts.segment_max_records, Some(2_000_000));
+
+        let defaults = BackupOptions::default();
+        assert_eq!(defaults.fetch_max_bytes, None);
+        assert_eq!(defaults.segment_max_records, None);
+    }
+
+    #[test]
+    fn config_from_yaml_with_warnings_reports_unknown_keys() {
+        let yaml = r#"
+mode: backup
+backup_id: warn-test
+source:
+  bootstrap_servers:
+    - localhost:9092
+storage:
+  backend: filesystem
+  path: /tmp/warn-test
+backup:
+  segment_max_bytes: 1048576
+  fetch_max_bytez: 123
+not_a_real_section:
+  foo: 1
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert_eq!(config.backup_id, "warn-test");
+        assert!(
+            warnings.iter().any(|w| w.contains("fetch_max_bytez")),
+            "expected a warning for backup.fetch_max_bytez, got {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("not_a_real_section")),
+            "expected a warning for not_a_real_section, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_from_yaml_with_warnings_is_quiet_for_known_keys() {
+        let yaml = r#"
+mode: backup
+backup_id: quiet-test
+source:
+  bootstrap_servers:
+    - localhost:9092
+storage:
+  backend: filesystem
+  path: /tmp/quiet-test
+backup:
+  segment_max_bytes: 1048576
+  fetch_max_bytes: 16777216
+  segment_max_records: 2000000
+"#;
+        let (_, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+    }
 
     #[test]
     fn test_connection_config_defaults() {
