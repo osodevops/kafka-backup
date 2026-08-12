@@ -606,6 +606,7 @@ impl KafkaClient {
             ApiKey::IncrementalAlterConfigs => 1,
             ApiKey::DescribeAcls => 1,
             ApiKey::CreateAcls => 1,
+            ApiKey::DeleteAcls => 1,
             _ => 0,
         }
     }

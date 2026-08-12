@@ -1,6 +1,7 @@
 //! Backup manifest and record structures.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Top-level backup manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ impl BackupManifest {
             self.topics.push(TopicBackup {
                 name: name.to_string(),
                 original_partition_count: None,
+                source_replication_factor: None,
+                configurations: BTreeMap::new(),
                 partitions: Vec::new(),
             });
         }
@@ -87,6 +90,16 @@ pub struct TopicBackup {
     /// restore engine falls back to `max(partition_id) + 1`.
     #[serde(default)]
     pub original_partition_count: Option<i32>,
+
+    /// Source replication factor, retained as advisory recovery metadata. The
+    /// target restore policy still controls the actual replication factor.
+    #[serde(default)]
+    pub source_replication_factor: Option<i16>,
+
+    /// Explicit, mutable source topic configuration overrides. Broker-default,
+    /// sensitive, and read-only entries are intentionally excluded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub configurations: BTreeMap<String, String>,
 
     /// Partitions in this topic
     pub partitions: Vec<PartitionBackup>,
@@ -854,6 +867,11 @@ pub struct DryRunReport {
 
     /// Consumer offsets that would need to be reset
     pub consumer_offset_actions: Vec<String>,
+
+    /// Phase 1 header preflight result (present when the restore
+    /// configuration required a tracking-metadata scan; see issue #137).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_preflight: Option<crate::restore::preflight::HeaderPreflightReport>,
 }
 
 /// Per-topic dry-run report

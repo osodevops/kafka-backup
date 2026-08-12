@@ -5,6 +5,7 @@ pub(crate) mod helpers;
 pub mod offset_automation;
 pub mod offset_reset;
 pub mod offset_rollback;
+pub mod preflight;
 pub mod repartition;
 pub mod three_phase;
 
@@ -25,4 +26,7 @@ pub use offset_rollback::{
     RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
     VerificationResult,
 };
-pub use three_phase::{Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore};
+pub use preflight::{
+    HeaderPreflightReport, PartitionCoverageState, PartitionHeaderCoverage, SnapshotCheck,
+};
+pub use three_phase::{ThreePhaseReport, ThreePhaseRestore};

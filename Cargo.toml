@@ -64,7 +64,7 @@ ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # Object storage
-object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
+object_store = { version = "0.14", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 
 # Metrics
@@ -89,7 +89,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 sha2 = "0.10"
 
 # PDF generation (evidence reports)
-printpdf = "0.7"
+printpdf = { version = "0.12", default-features = false }
 
 # HTTP client (webhooks, notifications)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
@@ -101,8 +101,8 @@ uuid = { version = "1", features = ["v4"] }
 libgssapi = "0.9"
 
 # Testing
-testcontainers = "0.24"
-testcontainers-modules = { version = "0.12", features = ["kafka"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["kafka"] }
 tempfile = "3"
 tokio-test = "0.4"
 

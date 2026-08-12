@@ -56,6 +56,10 @@ pub enum Error {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Restore preflight failed before any target mutation
+    #[error("Preflight failed: {0}")]
+    Preflight(String),
+
     /// Evidence generation or signing error
     #[error("Evidence error: {0}")]
     Evidence(String),

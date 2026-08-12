@@ -1,23 +1,23 @@
 //! CLI commands for backup validation and evidence management.
+//!
+//! Evidence artifact creation and verification are centralized in
+//! `kafka_backup_core::evidence` (issue #138): this module only loads
+//! configuration, runs the checks, and prints results.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use tracing::info;
 use uuid::Uuid;
 
-use kafka_backup_core::evidence::report::{
-    hex_encode, BackupInfo, EvidenceReport, IntegrityInfo, RestoreInfo, ToolInfo,
-};
-use kafka_backup_core::evidence::{pdf, signing, storage as evidence_storage};
+use kafka_backup_core::evidence::{self, EvidenceReportParams};
 use kafka_backup_core::kafka::PartitionLeaderRouter;
 use kafka_backup_core::manifest::BackupManifest;
 use kafka_backup_core::notification::pagerduty::PagerDutyNotifier;
 use kafka_backup_core::notification::slack::SlackNotifier;
 use kafka_backup_core::notification::NotificationSender;
 use kafka_backup_core::storage::create_backend;
-use kafka_backup_core::validation::config::{EvidenceFormat, ValidationConfig};
+use kafka_backup_core::validation::config::ValidationConfig;
 use kafka_backup_core::validation::context::ValidationContext;
 use kafka_backup_core::validation::{CheckOutcome, ValidationRunner};
 
@@ -50,14 +50,7 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
         .with_context(|| format!("Failed to load manifest from {manifest_key}"))?;
     let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| "Failed to parse backup manifest")?;
-
-    // Compute manifest SHA-256
-    let manifest_sha256 = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&manifest_bytes);
-        hex_encode(&hasher.finalize())
-    };
+    let manifest_sha256 = evidence::sha256_hex(&manifest_bytes);
 
     info!(
         topics = manifest.topics.len(),
@@ -101,133 +94,43 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
         );
     }
 
-    // Build evidence report
-    let check_names: Vec<String> = summary
-        .results
-        .iter()
-        .map(|r| r.check_name.clone())
-        .collect();
-    let total_partitions: usize = manifest.topics.iter().map(|t| t.partitions.len()).sum();
-
-    let compliance = EvidenceReport::build_compliance_mappings(
-        &check_names,
-        config.evidence.storage.retention_days,
-        None,
-    );
-
-    let mut report = EvidenceReport {
-        schema_version: "1.0".to_string(),
-        report_id: run_id.clone(),
-        generated_at: Utc::now().to_rfc3339(),
-        tool: ToolInfo {
-            name: "kafka-backup".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-        backup: BackupInfo {
-            id: config.backup_id.clone(),
-            source_cluster_id: manifest.source_cluster_id.clone(),
-            source_brokers: manifest.source_brokers.clone(),
-            storage_backend: format!("{:?}", config.storage),
-            pitr_timestamp: config.pitr_timestamp,
-            created_at: manifest.created_at,
-            total_topics: manifest.topics.len(),
-            total_partitions,
-            total_segments: manifest.total_segments(),
-            total_records: manifest.total_records(),
-        },
-        restore: Some(RestoreInfo {
-            target_bootstrap_servers: config.target.bootstrap_servers.clone(),
-            start_time: None,
-            end_time: None,
-            duration_seconds: None,
-        }),
-        validation: summary.clone(),
-        integrity: IntegrityInfo {
-            backup_manifest_sha256: manifest_sha256,
-            report_sha256: String::new(), // Populated below
-            checksums_valid: true,
-            signature_algorithm: if config.evidence.signing.enabled {
-                "ECDSA-P256-SHA256".to_string()
-            } else {
-                "none".to_string()
-            },
-            signed_by: None,
-        },
-        compliance_mappings: compliance,
+    // Build and emit evidence artifacts through the shared core pipeline.
+    let report = evidence::build_evidence_report(EvidenceReportParams {
+        run_id: &run_id,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        backup_id: &config.backup_id,
+        manifest: &manifest,
+        manifest_sha256,
+        storage_backend: format!("{:?}", config.storage),
+        pitr_timestamp: config.pitr_timestamp,
+        target_bootstrap_servers: config.target.bootstrap_servers.clone(),
+        summary: summary.clone(),
+        retention_days: config.evidence.storage.retention_days,
+        signing_enabled: config.evidence.signing.enabled,
         triggered_by: config.triggered_by.clone(),
-    };
+    });
 
-    // Compute report SHA-256
-    let canonical = report
-        .to_canonical_json()
-        .map_err(|e| anyhow::anyhow!("Failed to serialize report: {e}"))?;
-    let report_digest = report
-        .sha256_digest()
-        .map_err(|e| anyhow::anyhow!("Failed to compute report hash: {e}"))?;
-    report.integrity.report_sha256 = hex_encode(&report_digest);
+    let emission = evidence::emit_evidence(storage.as_ref(), &report, &config.evidence)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to emit evidence: {e}"))?;
 
+    for warning in &emission.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    println!(
+        "\nReport SHA-256 (stored JSON bytes): {}",
+        emission.report_sha256
+    );
     let mut evidence_url = String::new();
-
-    // Upload JSON evidence
-    // When signing is enabled, store canonical JSON (matches what was signed).
-    // Otherwise, store pretty-printed JSON for readability.
-    if config.evidence.formats.contains(&EvidenceFormat::Json) {
-        let json_bytes = if config.evidence.signing.enabled {
-            canonical.clone()
-        } else {
-            report
-                .to_pretty_json()
-                .map_err(|e| anyhow::anyhow!("Failed to serialize report: {e}"))?
-        };
-        let key = evidence_storage::upload_evidence_json(
-            storage.as_ref(),
-            &config.evidence.storage.prefix,
-            &run_id,
-            &json_bytes,
-        )
-        .await?;
+    if let Some(key) = &emission.json_key {
         evidence_url = key.clone();
-        println!("\nJSON evidence uploaded: {key}");
+        println!("JSON evidence uploaded: {key}");
     }
-
-    // Upload PDF evidence
-    if config.evidence.formats.contains(&EvidenceFormat::Pdf) {
-        match pdf::generate_pdf(&report) {
-            Ok(pdf_bytes) => {
-                let key = evidence_storage::upload_evidence_pdf(
-                    storage.as_ref(),
-                    &config.evidence.storage.prefix,
-                    &run_id,
-                    &pdf_bytes,
-                )
-                .await?;
-                println!("PDF evidence uploaded: {key}");
-            }
-            Err(e) => {
-                eprintln!("Warning: PDF generation failed: {e}");
-            }
-        }
+    if let Some(key) = &emission.pdf_key {
+        println!("PDF evidence uploaded: {key}");
     }
-
-    // Sign the report
-    if config.evidence.signing.enabled {
-        if let Some(ref key_path) = config.evidence.signing.private_key_path {
-            let pem = std::fs::read_to_string(key_path)
-                .with_context(|| format!("Failed to read signing key: {key_path}"))?;
-            let bundle = signing::sign_report(&canonical, &pem, &run_id)
-                .map_err(|e| anyhow::anyhow!("Signing failed: {e}"))?;
-            let sig_content = bundle.to_sig_file();
-            let key = evidence_storage::upload_evidence_signature(
-                storage.as_ref(),
-                &config.evidence.storage.prefix,
-                &run_id,
-                &sig_content,
-            )
-            .await?;
-            println!("Signature uploaded: {key}");
-        } else {
-            eprintln!("Warning: Signing enabled but no private_key_path configured");
-        }
+    if let Some(key) = &emission.signature_key {
+        println!("Signature envelope uploaded: {key}");
     }
 
     // Send notifications
@@ -258,8 +161,11 @@ pub async fn evidence_list(path: &str, limit: usize) -> Result<()> {
     let storage_config = kafka_backup_core::storage::StorageBackendConfig::from_url(path)?;
     let storage = create_backend(&storage_config)?;
 
-    let reports =
-        evidence_storage::list_evidence_reports(storage.as_ref(), "evidence-reports/").await?;
+    let reports = kafka_backup_core::evidence::storage::list_evidence_reports(
+        storage.as_ref(),
+        "evidence-reports/",
+    )
+    .await?;
 
     if reports.is_empty() {
         println!("No evidence reports found.");
@@ -281,6 +187,7 @@ pub async fn evidence_get(path: &str, report_id: &str, format: &str, output: &st
 
     let ext = match format {
         "pdf" => "pdf",
+        "sig" => "sig",
         _ => "json",
     };
 
@@ -292,7 +199,9 @@ pub async fn evidence_get(path: &str, report_id: &str, format: &str, output: &st
         .find(|k| k.ends_with(&format!(".{ext}")))
         .ok_or_else(|| anyhow::anyhow!("No {ext} report found for {report_id}"))?;
 
-    let data = evidence_storage::download_evidence_report(storage.as_ref(), key).await?;
+    let data =
+        kafka_backup_core::evidence::storage::download_evidence_report(storage.as_ref(), key)
+            .await?;
     std::fs::write(output, &data)
         .with_context(|| format!("Failed to write output file: {output}"))?;
 
@@ -300,55 +209,67 @@ pub async fn evidence_get(path: &str, report_id: &str, format: &str, output: &st
     Ok(())
 }
 
-/// Verify an evidence report's detached signature.
+/// Verify an evidence report against its detached signature artifact.
+///
+/// Supports both the v2 JSON envelope and the legacy v1 text `.sig` format;
+/// the version is detected from the artifact content. The stored report
+/// bytes are verified exactly as read — no re-serialization.
 pub async fn evidence_verify(
     report_path: &str,
     signature_path: &str,
     public_key_path: Option<&str>,
 ) -> Result<()> {
-    let report_json = std::fs::read_to_string(report_path)
+    let report_bytes = std::fs::read(report_path)
         .with_context(|| format!("Failed to read report: {report_path}"))?;
     let sig_content = std::fs::read_to_string(signature_path)
         .with_context(|| format!("Failed to read signature: {signature_path}"))?;
 
-    let bundle = signing::SignatureBundle::from_sig_file(&sig_content)
-        .map_err(|e| anyhow::anyhow!("Invalid signature file: {e}"))?;
-
-    println!("Report ID: {}", bundle.report_id);
-    println!("Algorithm: {}", bundle.algorithm);
-    println!("Report SHA-256: {}", bundle.report_sha256);
-
-    // Verify SHA-256 of report matches
-    let actual_sha256 = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(report_json.as_bytes());
-        hex_encode(&hasher.finalize())
+    let public_pem = match public_key_path {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read public key: {path}"))?,
+        ),
+        None => None,
     };
 
-    if actual_sha256 != bundle.report_sha256 {
-        eprintln!("FAILED: Report SHA-256 mismatch");
-        eprintln!("  Expected: {}", bundle.report_sha256);
-        eprintln!("  Actual:   {actual_sha256}");
-        std::process::exit(1);
+    let outcome = evidence::verify_evidence(&report_bytes, &sig_content, public_pem.as_deref())
+        .map_err(|e| anyhow::anyhow!("Verification error: {e}"))?;
+
+    println!("Evidence contract: {}", outcome.contract);
+    println!("Report ID: {}", outcome.report_id);
+    println!("Algorithm: {}", outcome.algorithm);
+    if let Some(schema) = &outcome.report_schema_version {
+        println!("Report schema version: {schema}");
     }
-    println!("SHA-256 checksum: VALID");
-
-    // Verify signature if public key provided
-    if let Some(pk_path) = public_key_path {
-        let public_pem = std::fs::read_to_string(pk_path)
-            .with_context(|| format!("Failed to read public key: {pk_path}"))?;
-        let valid = signing::verify_report(report_json.as_bytes(), &bundle, &public_pem)
-            .map_err(|e| anyhow::anyhow!("Verification error: {e}"))?;
-
-        if valid {
-            println!("ECDSA signature: VALID");
+    println!("Expected SHA-256: {}", outcome.expected_sha256);
+    println!("Actual SHA-256:   {}", outcome.actual_sha256);
+    println!(
+        "SHA-256 digest: {}",
+        if outcome.digest_valid {
+            "VALID"
         } else {
-            eprintln!("FAILED: ECDSA signature is INVALID");
-            std::process::exit(1);
+            "MISMATCH"
         }
+    );
+    if outcome.signature_checked {
+        println!(
+            "ECDSA signature: {}",
+            if outcome.signature_valid {
+                "VALID"
+            } else {
+                "INVALID"
+            }
+        );
     } else {
         println!("(No public key provided — skipping signature verification)");
+    }
+    for message in &outcome.messages {
+        println!("  note: {message}");
+    }
+
+    if !outcome.verified() {
+        eprintln!("\nFAILED: evidence report integrity could NOT be verified");
+        std::process::exit(1);
     }
 
     println!("\nEvidence report integrity: VERIFIED");

@@ -22,8 +22,8 @@ pub mod validation;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
-    Config, MetricsConfig, OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy,
-    RestoreOptions,
+    Config, HeaderPreflightMode, MetricsConfig, OffsetStorageBackend, OffsetStorageConfig,
+    OffsetStrategy, RestoreOptions,
 };
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
@@ -62,5 +62,8 @@ pub use restore::{
         RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
         VerificationResult,
     },
-    three_phase::{Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore},
+    preflight::{
+        HeaderPreflightReport, PartitionCoverageState, PartitionHeaderCoverage, SnapshotCheck,
+    },
+    three_phase::{ThreePhaseReport, ThreePhaseRestore},
 };

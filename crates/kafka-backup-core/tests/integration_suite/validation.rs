@@ -454,14 +454,16 @@ async fn test_evidence_report_generation_and_signing() {
         triggered_by: Some("integration-test".to_string()),
     };
 
-    // Test JSON canonical serialization is deterministic
-    let json1 = report.to_canonical_json().expect("canonical json");
-    let json2 = report.to_canonical_json().expect("canonical json 2");
-    assert_eq!(json1, json2, "Canonical JSON must be deterministic");
+    // Test JSON deterministic serialization
+    let json1 = report.to_deterministic_json().expect("deterministic json");
+    let json2 = report
+        .to_deterministic_json()
+        .expect("deterministic json 2");
+    assert_eq!(json1, json2, "Deterministic JSON must be reproducible");
 
-    // Test SHA-256 digest is consistent
-    let digest1 = report.sha256_digest().expect("digest 1");
-    let digest2 = report.sha256_digest().expect("digest 2");
+    // Test SHA-256 digest of the serialized bytes is consistent
+    let digest1 = kafka_backup_core::evidence::sha256_hex(&json1);
+    let digest2 = kafka_backup_core::evidence::sha256_hex(&json2);
     assert_eq!(digest1, digest2, "SHA-256 digest must be consistent");
 
     // Test ECDSA signing roundtrip
@@ -581,7 +583,8 @@ async fn test_evidence_pdf_generation() {
     };
 
     // Generate PDF — should not panic or error
-    let pdf_bytes = pdf::generate_pdf(&report).expect("PDF generation should succeed");
+    let pdf_bytes =
+        pdf::generate_pdf(&report, Some("cafe0123")).expect("PDF generation should succeed");
     assert!(pdf_bytes.len() > 100, "PDF should have meaningful content");
     assert_eq!(&pdf_bytes[0..5], b"%PDF-", "Should be a valid PDF header");
 
@@ -681,6 +684,7 @@ async fn test_evidence_upload_to_storage() {
         "evidence-reports/",
         &report.report_id,
         &json_bytes,
+        chrono::Utc::now(),
     )
     .await
     .expect("upload json");

@@ -570,6 +570,19 @@ impl PartitionLeaderRouter {
             .await
     }
 
+    /// Describe topic or broker configuration through the bootstrap client.
+    pub async fn describe_configs(
+        &self,
+        resources: &[(super::ConfigResourceType, String)],
+    ) -> Result<HashMap<(super::ConfigResourceType, String), Vec<super::ConfigEntry>>> {
+        super::describe_configs(self.bootstrap_client.as_ref(), resources).await
+    }
+
+    /// Apply incremental configuration changes through the bootstrap client.
+    pub async fn incremental_alter_configs(&self, changes: &[super::ConfigChange]) -> Result<()> {
+        super::incremental_alter_configs(self.bootstrap_client.as_ref(), changes).await
+    }
+
     /// Get metadata for a specific topic.
     pub async fn get_topic_metadata(&self, topic: &str) -> Result<TopicMetadata> {
         self.bootstrap_client.get_topic_metadata(topic).await
@@ -633,6 +646,37 @@ impl PartitionLeaderRouter {
             all_groups.len(),
             self.broker_metadata.read().await.len()
         );
+        Ok(all_groups)
+    }
+
+    /// List consumer groups from every known broker, failing if any broker
+    /// cannot be queried.
+    ///
+    /// This is intended for safety-critical operations such as restore
+    /// cutovers. The best-effort [`Self::list_groups_all_brokers`] variant is
+    /// appropriate for inventory and backup discovery, but could otherwise
+    /// report an incomplete empty set when a broker is unavailable.
+    pub async fn list_groups_all_brokers_strict(
+        &self,
+    ) -> Result<Vec<super::consumer_groups::ConsumerGroup>> {
+        let broker_ids: Vec<i32> = {
+            let meta = self.broker_metadata.read().await;
+            meta.keys().copied().collect()
+        };
+        if broker_ids.is_empty() {
+            return Err(KafkaError::NoBrokersAvailable.into());
+        }
+
+        let mut all_groups = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for broker_id in broker_ids {
+            let client = self.get_broker_connection(broker_id).await?;
+            for group in super::consumer_groups::list_groups(&client).await? {
+                if seen.insert(group.group_id.clone()) {
+                    all_groups.push(group);
+                }
+            }
+        }
         Ok(all_groups)
     }
 
@@ -705,6 +749,39 @@ impl PartitionLeaderRouter {
             all_offsets.len()
         );
         Ok(all_offsets)
+    }
+
+    /// Describe a consumer group through its coordinator.
+    ///
+    /// DescribeGroups is coordinator-scoped. Sending it to an arbitrary
+    /// bootstrap broker can return NOT_COORDINATOR or stale/empty state.
+    pub async fn describe_consumer_group(
+        &self,
+        group_id: &str,
+    ) -> Result<super::consumer_groups::ConsumerGroupDescription> {
+        let coordinator =
+            super::consumer_groups::find_group_coordinator(&self.bootstrap_client, group_id)
+                .await?;
+        {
+            let mut brokers = self.broker_metadata.write().await;
+            brokers
+                .entry(coordinator.node_id)
+                .or_insert_with(|| BrokerMetadata {
+                    node_id: coordinator.node_id,
+                    host: coordinator.host.clone(),
+                    port: coordinator.port,
+                    rack: None,
+                });
+        }
+        let client = self.get_broker_connection(coordinator.node_id).await?;
+        let mut descriptions =
+            super::consumer_groups::describe_groups(&client, &[group_id.to_string()]).await?;
+        descriptions.pop().ok_or_else(|| {
+            KafkaError::Protocol(format!(
+                "DescribeGroups returned no result for group {group_id}"
+            ))
+            .into()
+        })
     }
 
     /// Commit offsets for a consumer group through that group's coordinator.

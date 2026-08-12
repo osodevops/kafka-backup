@@ -49,13 +49,15 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::kafka::{KafkaClient, PartitionLeaderRouter};
-use crate::manifest::{OffsetMapping, RestoreReport};
-use crate::Result;
+use crate::manifest::{BackupManifest, OffsetMapping, RestoreReport};
+use crate::storage::create_backend;
+use crate::{Error, Result};
 
 use super::engine::RestoreEngine;
 use super::offset_reset::{
     OffsetResetExecutor, OffsetResetPlan, OffsetResetReport, OffsetResetStrategy,
 };
+use super::preflight::{self, HeaderPreflightReport};
 
 /// Three-phase restore orchestrator
 pub struct ThreePhaseRestore {
@@ -68,6 +70,11 @@ pub struct ThreePhaseRestore {
 pub struct ThreePhaseReport {
     /// Backup ID being restored
     pub backup_id: String,
+
+    /// Phase 1 preflight: tracking-metadata coverage of the backup,
+    /// evaluated before any target mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_preflight: Option<HeaderPreflightReport>,
 
     /// Phase 2: Restore report
     pub restore_report: RestoreReport,
@@ -97,7 +104,13 @@ impl ThreePhaseRestore {
     /// Run all three phases
     ///
     /// Note: Phase 1 (backup with headers) should have been done during backup.
-    /// This method runs Phase 2 (restore) and Phase 3 (offset reset).
+    /// This method validates Phase 1 tracking metadata (preflight), then runs
+    /// Phase 2 (restore) and Phase 3 (offset reset).
+    ///
+    /// The preflight runs before any target mutation: when consumer-offset
+    /// recovery is requested and required tracking metadata is missing,
+    /// partial, corrupt, or unprovable, this method fails without creating
+    /// topics or producing any record.
     pub async fn run_all_phases(&self) -> Result<ThreePhaseReport> {
         let start_time = std::time::Instant::now();
         let backup_id = self.config.backup_id.clone();
@@ -105,9 +118,32 @@ impl ThreePhaseRestore {
 
         info!("Starting three-phase restore for backup: {}", backup_id);
 
-        // Phase 2: Restore
+        // Phase 1 preflight: prove tracking-metadata coverage before Phase 2
+        // touches the target cluster (issue #137).
+        let preflight_options = self.config.restore.clone().unwrap_or_default();
+        let mode = preflight_options.header_preflight;
+        let recovery = preflight::offset_recovery_requested(&preflight_options);
+        info!(
+            "Phase 1: Validating backup tracking metadata (mode: {}, offset recovery requested: {})",
+            mode, recovery
+        );
+        let header_preflight = self.validate_phase1_headers().await?;
+        warnings.extend(header_preflight.warnings.clone());
+
+        if recovery && !header_preflight.passed {
+            return Err(Error::Preflight(format!(
+                "consumer-offset recovery was requested but the backup failed the tracking-\
+                 metadata preflight; no topics were created and no records were produced. {}. \
+                 Errors: {}",
+                header_preflight.summary(),
+                header_preflight.errors.join(" | ")
+            )));
+        }
+
+        // Phase 2: Restore. The engine is told the preflight already ran so
+        // it does not scan the backup a second time.
         info!("Phase 2: Restoring data and collecting offset mapping...");
-        let restore_report = self.run_restore_phase().await?;
+        let restore_report = self.run_restore_phase_internal(true).await?;
 
         info!(
             "Phase 2 complete: {} records restored, {} offset mappings collected",
@@ -191,6 +227,7 @@ impl ThreePhaseRestore {
 
         let report = ThreePhaseReport {
             backup_id,
+            header_preflight: Some(header_preflight),
             restore_report,
             offset_reset_plan,
             offset_reset_report,
@@ -215,8 +252,24 @@ impl ThreePhaseRestore {
     }
 
     /// Run Phase 2: Restore data and collect offset mapping
+    ///
+    /// When called directly (outside [`run_all_phases`]) the restore engine
+    /// performs its own header preflight according to the configuration.
     pub async fn run_restore_phase(&self) -> Result<RestoreReport> {
-        let engine = RestoreEngine::new(self.config.clone())?;
+        self.run_restore_phase_internal(false).await
+    }
+
+    async fn run_restore_phase_internal(
+        &self,
+        preflight_already_ran: bool,
+    ) -> Result<RestoreReport> {
+        let mut config = self.config.clone();
+        if preflight_already_ran {
+            if let Some(restore) = config.restore.as_mut() {
+                restore.header_preflight_external = true;
+            }
+        }
+        let engine = RestoreEngine::new(config)?;
         engine.run().await
     }
 
@@ -278,35 +331,54 @@ impl ThreePhaseRestore {
         executor.generate_shell_script(plan)
     }
 
-    /// Validate Phase 1 headers in backup
+    /// Validate Phase 1 tracking metadata in the backup.
     ///
-    /// Checks if the backup contains the required offset headers for three-phase restore.
-    pub async fn validate_phase1_headers(&self) -> Result<Phase1ValidationReport> {
-        // This would read sample records from the backup and check for headers
-        // For now, return a placeholder
-        Ok(Phase1ValidationReport {
-            has_offset_headers: true,
-            has_timestamp_headers: true,
-            has_source_cluster_header: false,
-            sample_records_checked: 0,
-            warnings: vec![],
-        })
-    }
-}
+    /// Loads the backup manifest and scans every selected topic/partition
+    /// through the segment reader (all supported segment formats), reporting
+    /// per-partition offset/timestamp/source-cluster header coverage with
+    /// explicit empty, missing-data, corrupt, and indeterminate states.
+    /// Zero records scanned is never reported as a positive pass.
+    ///
+    /// This is read-only and never contacts the target cluster. The scan
+    /// depth follows `restore.header_preflight` (`auto`/`full`/`skip`); in
+    /// `auto` mode segments are opened only when consumer-offset recovery is
+    /// requested, otherwise coverage is reported as indeterminate from
+    /// manifest metadata alone.
+    pub async fn validate_phase1_headers(&self) -> Result<HeaderPreflightReport> {
+        let storage = create_backend(&self.config.storage)?;
+        let manifest = self.load_manifest(storage.as_ref()).await?;
+        let restore_options = self.config.restore.clone().unwrap_or_default();
+        let selection = self
+            .config
+            .target
+            .as_ref()
+            .map(|t| t.topics.clone())
+            .unwrap_or_default();
 
-/// Phase 1 validation report
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Phase1ValidationReport {
-    /// Whether x-original-offset headers are present
-    pub has_offset_headers: bool,
-    /// Whether x-original-timestamp headers are present
-    pub has_timestamp_headers: bool,
-    /// Whether x-source-cluster headers are present
-    pub has_source_cluster_header: bool,
-    /// Number of sample records checked
-    pub sample_records_checked: usize,
-    /// Validation warnings
-    pub warnings: Vec<String>,
+        Ok(preflight::run_header_preflight(
+            storage.as_ref(),
+            &manifest,
+            &selection,
+            &restore_options,
+            restore_options.header_preflight,
+        )
+        .await)
+    }
+
+    /// Load the backup manifest from storage.
+    async fn load_manifest(
+        &self,
+        storage: &dyn crate::storage::StorageBackend,
+    ) -> Result<BackupManifest> {
+        let manifest_key = format!("{}/manifest.json", self.config.backup_id);
+        let data = storage.get(&manifest_key).await.map_err(|e| {
+            Error::BackupNotFound(format!(
+                "Could not load manifest for backup '{}': {}",
+                self.config.backup_id, e
+            ))
+        })?;
+        Ok(serde_json::from_slice(&data)?)
+    }
 }
 
 #[cfg(test)]

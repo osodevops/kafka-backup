@@ -101,7 +101,7 @@ impl ValidationCheck for MessageCountCheck {
         // Compute SHA-256 of the offset summary for the evidence report
         let mut hasher = Sha256::new();
         hasher.update(offset_summary.as_bytes());
-        let sha256_hex = hex_encode(hasher.finalize().as_slice());
+        let sha256_hex = hex_encode(&hasher.finalize());
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let outcome = if discrepancies.is_empty() {
