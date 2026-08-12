@@ -160,6 +160,46 @@ fn print_validation_report(report: &kafka_backup_core::manifest::DryRunReport) {
         sections.push(lines);
     }
 
+    // Phase 1 header preflight
+    if let Some(ref preflight) = report.header_preflight {
+        let mut lines = vec![BoxLine::Centered("HEADER PREFLIGHT (PHASE 1)".into())];
+        lines.push(BoxLine::Left(kv(
+            "Verdict",
+            if preflight.passed {
+                "✓ PASSED"
+            } else {
+                "✗ FAILED"
+            },
+        )));
+        lines.push(BoxLine::Left(kv("Mode", &preflight.mode)));
+        lines.push(BoxLine::Left(kv(
+            "Offset recovery",
+            &format!("requested: {}", preflight.offset_recovery_requested),
+        )));
+        lines.push(BoxLine::Left(kv(
+            "Records scanned",
+            &preflight.records_scanned_total.to_string(),
+        )));
+        for p in &preflight.partitions {
+            lines.push(BoxLine::Left(format!(
+                "{}/{}: {} ({}/{} records covered, {} segments)",
+                p.topic,
+                p.partition,
+                p.state,
+                p.records_with_required_headers,
+                p.records_scanned,
+                p.segments_selected
+            )));
+        }
+        if let Some(ref snapshot) = preflight.consumer_group_snapshot {
+            lines.push(BoxLine::Left(format!(
+                "consumer-groups snapshot: {} ({} groups, {} offsets)",
+                snapshot.state, snapshot.groups, snapshot.offsets
+            )));
+        }
+        sections.push(lines);
+    }
+
     // Errors
     if !report.errors.is_empty() {
         let mut lines = vec![BoxLine::Centered("ERRORS".into())];

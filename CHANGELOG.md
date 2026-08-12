@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-08-30
+
+### Added
+- **Topic configuration restore**
+  ([#136](https://github.com/osodevops/kafka-backup/issues/136)). Backups
+  capture an allow-listed set of mutable topic-level config overrides and the
+  source replication factor in the manifest (`backup.capture_topic_configs`,
+  default `true`; `backup.require_topic_configs` fails the backup when they
+  cannot be read). Restores re-apply them to created or existing topics under
+  `restore.restore_topic_configs` / `existing_topic_config_policy` /
+  `topic_config_overrides`, and report drift.
+- **Phase 1 header preflight**
+  ([#137](https://github.com/osodevops/kafka-backup/issues/137)). Before a
+  restore that asks for consumer-offset recovery (`reset_consumer_offsets` /
+  `auto_consumer_groups`) touches the target cluster, every selected
+  partition's segments are scanned for the `x-original-offset` /
+  `x-original-timestamp` tracking headers and classified (`full`, `partial`,
+  `missing`, `empty`, `data_missing`, `corrupt`, `indeterminate`); zero
+  records scanned never passes. `restore.header_preflight: auto | full | skip`
+  controls it; `validate-restore` / dry-run and `three-phase-restore` report
+  it. A tracking header whose value is null (see 0.18.0) does not count as
+  coverage.
+- `restore.rewrite_schema_ids` / `schema_id_mapping`: rewrite Confluent
+  wire-format schema IDs in keys and values while producing.
+- **Evidence contract v2**
+  ([#138](https://github.com/osodevops/kafka-backup/issues/138)). Report
+  schema `1.1` no longer embeds its own digest; the SHA-256 and ECDSA P-256
+  signature live in a detached DSSE-style envelope
+  (`kafka-backup/evidence-envelope/v2`) computed over the exact stored report
+  bytes. Legacy v1 `.sig` artifacts still verify. Creation and verification
+  are centralised in `evidence::emit` / `evidence::envelope`.
+
+### Changed
+- **Breaking (library API):** new public fields on `BackupOptions`
+  (`capture_topic_configs`, `require_topic_configs`), `RestoreOptions`
+  (`restore_topic_configs`, `existing_topic_config_policy`,
+  `topic_config_overrides`, `rewrite_schema_ids`, `schema_id_mapping`,
+  `header_preflight`, `header_preflight_external`), `TopicBackup`
+  (`source_replication_factor`, `configurations`), `DryRunReport` and
+  `ThreePhaseReport` (`header_preflight`); `Error::Preflight`;
+  `three_phase::Phase1ValidationReport` is replaced by
+  `preflight::HeaderPreflightReport`; `EvidenceReport::to_canonical_json` is
+  renamed `to_deterministic_json` and `sha256_digest` removed;
+  `evidence::pdf::generate_pdf` takes the report digest.
+- `auto_consumer_groups` with a missing or invalid snapshot, and
+  `reset_consumer_offsets` with nothing to act on, now fail **before** any
+  target mutation; `header_preflight: skip` restores the previous behaviour.
+- Dependencies: `object_store` 0.14, `printpdf` 0.12, `testcontainers` 0.27.
+
 ## [0.19.2] - 2026-08-30
 
 ### Fixed

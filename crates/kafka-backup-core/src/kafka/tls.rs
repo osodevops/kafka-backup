@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -41,15 +42,18 @@ pub fn build_tls_config(security: &SecurityConfig) -> Result<ClientConfig> {
             let certs = load_certificates(cert_path)?;
             let key = load_private_key(key_path)?;
 
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| {
-                    KafkaError::TlsConfig(format!(
-                        "Failed to configure client authentication: {}",
-                        e
-                    ))
-                })?
+            ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| {
+                KafkaError::TlsConfig(format!("TLS protocol configuration failed: {error}"))
+            })?
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| {
+                KafkaError::TlsConfig(format!("Failed to configure client authentication: {}", e))
+            })?
         }
         (Some(cert_path), None) => {
             return Err(KafkaError::TlsConfig(format!(
@@ -70,9 +74,15 @@ pub fn build_tls_config(security: &SecurityConfig) -> Result<ClientConfig> {
         (None, None) => {
             // No client auth
             debug!("Configuring TLS without client authentication");
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| {
+                KafkaError::TlsConfig(format!("TLS protocol configuration failed: {error}"))
+            })?
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
         }
     };
 

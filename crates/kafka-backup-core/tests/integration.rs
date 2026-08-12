@@ -11,7 +11,9 @@ use kafka_backup_core::config::{
     BackupOptions, CompressionType, Config, KafkaConfig, Mode, RestoreOptions, SecurityConfig,
     TopicSelection,
 };
-use kafka_backup_core::kafka::KafkaClient;
+use kafka_backup_core::kafka::{
+    ConfigChange, ConfigOp, ConfigResourceType, KafkaClient, PartitionLeaderRouter, TopicToCreate,
+};
 use kafka_backup_core::manifest::BackupRecord;
 use kafka_backup_core::restore::offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkResetStatus, OffsetMapping as BulkOffsetMapping,
@@ -231,6 +233,27 @@ async fn test_backup_and_restore() {
     let test_topic = "test-backup-restore";
     let test_records = generate_test_records(100, test_topic);
 
+    let admin_router = PartitionLeaderRouter::new(KafkaConfig {
+        bootstrap_servers: vec![bootstrap_server.clone()],
+        security: SecurityConfig::default(),
+        topics: TopicSelection::default(),
+        connection: Default::default(),
+    })
+    .await
+    .expect("Failed to create admin router");
+    admin_router
+        .create_topics(
+            vec![TopicToCreate {
+                name: test_topic.to_string(),
+                num_partitions: 1,
+                replication_factor: 1,
+            }],
+            30_000,
+        )
+        .await
+        .expect("Failed to create source topic");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     // Produce test records
     client.connect().await.expect("Failed to connect");
     for record in &test_records {
@@ -239,6 +262,34 @@ async fn test_backup_and_restore() {
             .await
             .expect("Failed to produce record");
     }
+
+    // Apply a non-default dynamic topic override. The backup must capture this
+    // and restore it to the newly created target topic.
+    admin_router
+        .incremental_alter_configs(&[ConfigChange {
+            resource_type: ConfigResourceType::Topic,
+            resource_name: test_topic.to_string(),
+            ops: vec![
+                ConfigOp::Set {
+                    name: "retention.ms".to_string(),
+                    value: "123456".to_string(),
+                },
+                ConfigOp::Set {
+                    name: "cleanup.policy".to_string(),
+                    value: "compact,delete".to_string(),
+                },
+                ConfigOp::Set {
+                    name: "min.insync.replicas".to_string(),
+                    value: "1".to_string(),
+                },
+                ConfigOp::Set {
+                    name: "compression.type".to_string(),
+                    value: "producer".to_string(),
+                },
+            ],
+        }])
+        .await
+        .expect("Failed to set source topic config");
 
     // Create temp directory for backup storage
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -270,6 +321,11 @@ async fn test_backup_and_restore() {
 
     assert_eq!(manifest.backup_id, backup_id);
     assert!(!manifest.topics.is_empty());
+    assert_eq!(manifest.topics[0].source_replication_factor, Some(1));
+    assert_eq!(
+        manifest.topics[0].configurations.get("cleanup.policy"),
+        Some(&"compact,delete".to_string())
+    );
 
     // Create a different topic for restore
     let restore_topic = "test-restore-target";
@@ -284,6 +340,7 @@ async fn test_backup_and_restore() {
 
     // Remap topic
     if let Some(ref mut restore_opts) = restore_config.restore {
+        restore_opts.create_topics = true;
         restore_opts
             .topic_mapping
             .insert(test_topic.to_string(), restore_topic.to_string());
@@ -292,6 +349,24 @@ async fn test_backup_and_restore() {
     let restore_engine =
         RestoreEngine::new(restore_config).expect("Failed to create restore engine");
     restore_engine.run().await.expect("Restore failed");
+
+    let restored_configs = admin_router
+        .describe_configs(&[(ConfigResourceType::Topic, restore_topic.to_string())])
+        .await
+        .expect("Failed to describe restored topic config");
+    let restored_entries = restored_configs
+        .get(&(ConfigResourceType::Topic, restore_topic.to_string()))
+        .expect("restored topic config response missing");
+    for (name, expected) in [
+        ("retention.ms", "123456"),
+        ("cleanup.policy", "compact,delete"),
+        ("min.insync.replicas", "1"),
+        ("compression.type", "producer"),
+    ] {
+        assert!(restored_entries
+            .iter()
+            .any(|entry| entry.name == name && entry.value.as_deref() == Some(expected)));
+    }
 
     // Verify restored data
     // Note: In a full test, we'd consume from restore_topic and verify records match

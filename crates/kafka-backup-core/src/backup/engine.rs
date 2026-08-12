@@ -12,7 +12,7 @@ use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset, TopicSelection};
 use crate::error::KafkaError;
 use crate::health::HealthCheck;
-use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
+use crate::kafka::{ConfigResourceType, PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_headers;
@@ -377,6 +377,18 @@ impl BackupEngine {
 
             info!("Backing up {} topics", topics_metadata.len());
 
+            if backup_opts.capture_topic_configs {
+                if let Err(error) = self.capture_topic_configs(&topics_metadata).await {
+                    if backup_opts.require_topic_configs {
+                        return Err(error);
+                    }
+                    warn!(
+                        %error,
+                        "Unable to capture topic configuration; continuing because require_topic_configs=false"
+                    );
+                }
+            }
+
             // Capture snapshot offsets if stop_at_current_offsets is enabled
             // This provides a consistent "point-in-time" snapshot for DR backups
             // Returns (earliest, latest) pairs to avoid redundant offset fetches later
@@ -416,6 +428,10 @@ impl BackupEngine {
                     let mut manifest = self.manifest.lock().await;
                     let topic_entry = manifest.get_or_create_topic(topic);
                     topic_entry.original_partition_count = Some(partitions.len() as i32);
+                    topic_entry.source_replication_factor = topic_meta
+                        .partitions
+                        .first()
+                        .map(|partition| partition.replica_nodes.len() as i16);
                 }
 
                 // Publish metadata before any partition task for this topic can
@@ -585,6 +601,43 @@ impl BackupEngine {
             info!("Backup completed successfully");
         }
 
+        Ok(())
+    }
+
+    async fn capture_topic_configs(&self, topics: &[TopicMetadata]) -> Result<()> {
+        let resources: Vec<_> = topics
+            .iter()
+            .map(|topic| (ConfigResourceType::Topic, topic.name.clone()))
+            .collect();
+        let described = self.router.describe_configs(&resources).await?;
+        let mut manifest = self.manifest.lock().await;
+
+        for topic in topics {
+            let entries = described
+                .get(&(ConfigResourceType::Topic, topic.name.clone()))
+                .ok_or_else(|| {
+                    Error::Kafka(crate::error::KafkaError::Protocol(format!(
+                        "DescribeConfigs returned no result for topic {}",
+                        topic.name
+                    )))
+                })?;
+            let captured = entries
+                .iter()
+                .filter(|entry| {
+                    entry.is_topic_override()
+                        && !entry.read_only
+                        && !entry.is_sensitive
+                        && is_recovery_topic_config(&entry.name)
+                })
+                .filter_map(|entry| {
+                    entry
+                        .value
+                        .as_ref()
+                        .map(|value| (entry.name.clone(), value.clone()))
+                })
+                .collect();
+            manifest.get_or_create_topic(&topic.name).configurations = captured;
+        }
         Ok(())
     }
 
@@ -959,6 +1012,36 @@ fn plan_snapshot_ranges(
             )
         })
         .collect()
+}
+
+fn is_recovery_topic_config(name: &str) -> bool {
+    matches!(
+        name,
+        "cleanup.policy"
+            | "compression.type"
+            | "delete.retention.ms"
+            | "file.delete.delay.ms"
+            | "flush.messages"
+            | "flush.ms"
+            | "index.interval.bytes"
+            | "max.compaction.lag.ms"
+            | "max.message.bytes"
+            | "message.downconversion.enable"
+            | "message.format.version"
+            | "message.timestamp.difference.max.ms"
+            | "message.timestamp.type"
+            | "min.cleanable.dirty.ratio"
+            | "min.compaction.lag.ms"
+            | "min.insync.replicas"
+            | "preallocate"
+            | "retention.bytes"
+            | "retention.ms"
+            | "segment.bytes"
+            | "segment.index.bytes"
+            | "segment.jitter.ms"
+            | "segment.ms"
+            | "unclean.leader.election.enable"
+    )
 }
 
 /// Context for backing up a single partition
@@ -2041,6 +2124,13 @@ mod tests {
     }
 
     #[test]
+    fn topic_config_capture_allowlist_excludes_unknown_entries() {
+        assert!(super::is_recovery_topic_config("cleanup.policy"));
+        assert!(super::is_recovery_topic_config("min.insync.replicas"));
+        assert!(!super::is_recovery_topic_config("vendor.secret.option"));
+    }
+
+    #[test]
     fn test_glob_match() {
         assert!(glob_match("orders", "orders"));
         assert!(glob_match("orders*", "orders"));
@@ -2148,6 +2238,8 @@ mod tests {
         TopicBackup {
             name: name.to_string(),
             original_partition_count: partition_count,
+            source_replication_factor: None,
+            configurations: Default::default(),
             partitions,
         }
     }
