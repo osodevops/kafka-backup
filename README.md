@@ -493,6 +493,12 @@ kafka-backup is licensed under the [MIT License](LICENSE) © [OSO](https://oso.s
 
 Built with these excellent Rust crates:
 - [kafka-protocol](https://crates.io/crates/kafka-protocol) — Kafka protocol implementation
+  (currently pinned to an upstream git revision via `[patch.crates-io]`: the
+  0.17.0 release misdecodes records whose timestamps span more than ~24.8 days
+  within one batch — see [issue #150](https://github.com/osodevops/kafka-backup/issues/150).
+  If you depend on `kafka-backup-core` as a library, add the same `[patch.crates-io]`
+  entry from this repo's `Cargo.toml` to your workspace until a fixed
+  kafka-protocol is released.)
 - [object_store](https://crates.io/crates/object_store) — Cloud storage abstraction
 - [tokio](https://tokio.rs) — Async runtime
 - [zstd](https://crates.io/crates/zstd) — Compression

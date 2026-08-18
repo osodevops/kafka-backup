@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.3] - 2026-08-18
+
+### Fixed
+- Backups no longer fail — and restores no longer refuse — on record batches
+  whose records' timestamps span more than ~24.8 days (`i32::MAX` ms), e.g.
+  1970-01-01 placeholder timestamps mixed with current ones. `kafka-protocol`
+  0.17.0 decodes each record's `timestampDelta` as a 32-bit varint (the wire
+  format is a varlong), so from the first such record on every field was
+  misread and the fetch failed with errors like `Failed to decode records:
+  Unexpected negative record value length (-54 bytes)` or `invalid utf-8
+  sequence`, permanently failing the partition; its encoder also refused to
+  produce such batches. `kafka-protocol` is now pinned via `[patch.crates-io]`
+  to upstream `main` (`946ceb77`), which carries the fix
+  (kafka-protocol-rs#159) and a snappy-decompression corruption fix
+  (kafka-protocol-rs#149). Fixes
+  [#150](https://github.com/osodevops/kafka-backup/issues/150).
+
+### Changed
+- All artifacts built from this repository (CLI binaries, Docker image,
+  Homebrew formula) carry the pinned kafka-protocol. The published
+  `kafka-backup-core` crate cannot be built against the crates.io
+  kafka-protocol 0.17.0 it declares, so **publishing kafka-backup-core to
+  crates.io is skipped while the patch is active** (the release workflow
+  detects the patch and skips the job; it resumes automatically once a fixed
+  kafka-protocol is on crates.io and the patch is removed). Library consumers
+  should depend on this repository by git and/or add the same
+  `[patch.crates-io]` entry to their workspace.
+- Restore still splits produced batches so no batch spans more than
+  `i32::MAX` ms; this is no longer required by the pinned encoder but keeps
+  restores working when built against the unpatched crate.
+
 ## [0.17.2] - 2026-08-18
 
 ### Fixed

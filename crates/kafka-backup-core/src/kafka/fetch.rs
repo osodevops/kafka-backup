@@ -391,6 +391,7 @@ mod tests {
         Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
             producer_id: NO_PRODUCER_ID,
             producer_epoch: NO_PRODUCER_EPOCH,
@@ -549,5 +550,80 @@ mod tests {
         let (records, next_offset) = parse(Vec::new(), 42);
         assert!(records.is_empty());
         assert_eq!(next_offset, 42);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #150: per-record timestampDelta is a varlong on the wire.
+    // ------------------------------------------------------------------
+
+    /// One v2 record batch exactly as Apache Kafka's Java client
+    /// (kafka-clients 4.3.1) produced it and the broker stored it: 20
+    /// uncompressed records on partition 0, alternating a 1970-01-01
+    /// placeholder timestamp (0) with "now" (1787086231121 + i). The batch's
+    /// base timestamp is 0, so every odd record's `timestampDelta` is
+    /// ~1.79e12 ms — far beyond `i32::MAX` — and is encoded as a **6-byte**
+    /// zigzag varlong (record 1: `a2 d9 9e ea 82 68`).
+    ///
+    /// kafka-protocol 0.17.0 decoded that field as a 5-byte-capped `VarInt`,
+    /// consumed 5 of the 6 bytes, and misread every field after it
+    /// ("Unexpected negative record value length (-54 bytes)", "invalid
+    /// utf-8 …"). Captured from the broker log segment (on-disk v2 format is
+    /// identical to the Fetch wire format); CRC is intact.
+    const JAVA_WIDE_TIMESTAMP_BATCH_HEX: &str = concat!(
+        "0000000000000000000001b7000000000269f94cec0000000000130000000000000000000001",
+        "a016a3d66300000000000003eb0000000000000000001420000000046b301076302d65706f63",
+        "68002600a2d99eea826802046b310c76312d6e6f770020000004046b321076322d65706f6368",
+        "002600a6d99eea826806046b330c76332d6e6f770020000008046b341076342d65706f636800",
+        "2600aad99eea82680a046b350c76352d6e6f77002000000c046b361076362d65706f63680026",
+        "00aed99eea82680e046b370c76372d6e6f770020000010046b381076382d65706f6368002600",
+        "b2d99eea826812046b390c76392d6e6f770024000014066b3130127631302d65706f6368002a",
+        "00b6d99eea826816066b31310e7631312d6e6f770024000018066b3132127631322d65706f63",
+        "68002a00bad99eea82681a066b31330e7631332d6e6f77002400001c066b3134127631342d65",
+        "706f6368002a00bed99eea82681e066b31350e7631352d6e6f770024000020066b3136127631",
+        "362d65706f6368002a00c2d99eea826822066b31370e7631372d6e6f770024000024066b3138",
+        "127631382d65706f6368002a00c6d99eea826826066b31390e7631392d6e6f7700"
+    );
+
+    #[test]
+    fn decodes_java_batch_whose_records_span_decades() {
+        let raw = hex_to_bytes(JAVA_WIDE_TIMESTAMP_BATCH_HEX);
+        assert_eq!(raw.len(), 451, "fixture is a single 451-byte batch");
+
+        let (records, next_offset) =
+            decode_fetch_data(&raw, 0).expect("batch produced by the Java client must decode");
+
+        assert_eq!(records.len(), 20);
+        assert_eq!(next_offset, 20);
+        let now = 1_787_086_231_121i64; // record 1's CreateTime as reported by kafka-console-consumer
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset, i as i64);
+            let expected_ts = if i % 2 == 0 { 0 } else { now + (i as i64 - 1) };
+            assert_eq!(r.timestamp, expected_ts, "record {i} timestamp");
+            assert_eq!(
+                r.key.as_deref(),
+                Some(format!("k{i}").as_bytes()),
+                "record {i} key"
+            );
+            let expected_value = format!("v{i}{}", if i % 2 == 0 { "-epoch" } else { "-now" });
+            assert_eq!(
+                r.value.as_deref(),
+                Some(expected_value.as_bytes()),
+                "record {i} value"
+            );
+            assert!(r.headers.is_empty());
+        }
+        // Sanity: the delta really is beyond i32 — this is the case that broke.
+        assert!(records[1].timestamp - records[0].timestamp > i32::MAX as i64);
+    }
+
+    fn hex_to_bytes(hex: &str) -> Bytes {
+        let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(clean.len() % 2, 0);
+        Bytes::from(
+            (0..clean.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).expect("hex"))
+                .collect::<Vec<u8>>(),
+        )
     }
 }

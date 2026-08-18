@@ -31,9 +31,14 @@ pub struct ProduceResponse {
     pub sub_batch_offsets: Vec<(i64, usize)>,
 }
 
-/// Max timestamp delta within a single record batch.
-/// Record batch v2 stores timestamp deltas as i32 (milliseconds).
-/// i32::MAX ≈ 24.8 days.
+/// Max timestamp delta within a single produced record batch.
+///
+/// The wire format stores each record's timestamp delta as a varlong, so a
+/// batch may legally span any range. This limit exists because
+/// kafka-protocol's `RecordBatchEncoder` up to and including the 0.17.0
+/// crates.io release refuses to encode deltas outside `i32` ("Timestamps
+/// within batch are too far apart"); splitting keeps restores working even
+/// when built against that release. i32::MAX ms ≈ 24.8 days.
 const MAX_TIMESTAMP_DELTA_MS: i64 = i32::MAX as i64;
 
 /// Split records into sub-batches where all timestamps within a sub-batch
@@ -85,6 +90,9 @@ fn build_kafka_records(records: Vec<BackupRecord>) -> Vec<Record> {
             Record {
                 transactional: false,
                 control: false,
+                // KIP-534 batch attribute; only set by the broker's log cleaner
+                // on tombstone/abort-marker batches, never on produced records.
+                delete_horizon: false,
                 partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
                 producer_id: NO_PRODUCER_ID,
                 producer_epoch: NO_PRODUCER_EPOCH,
@@ -403,5 +411,31 @@ mod tests {
             }
         }
         assert_eq!(record_idx, 50);
+    }
+
+    /// Issue #150: the encoder must accept records whose timestamps are more
+    /// than i32::MAX ms apart within one batch and write the delta as a
+    /// varlong (kafka-protocol 0.17.0 bailed with "Timestamps within batch
+    /// are too far apart"); the decoder must read it back exactly.
+    #[test]
+    fn test_encoder_round_trips_timestamp_delta_beyond_i32() {
+        use kafka_protocol::records::{RecordBatchDecoder, RecordBatchEncoder};
+
+        let now = 1_787_086_231_121i64;
+        let kafka_records = build_kafka_records(vec![make_record(0), make_record(now)]);
+        let options = RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        };
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(&mut buf, kafka_records.iter(), &options)
+            .expect("batch spanning decades must encode (varlong timestampDelta)");
+
+        let mut read_buf = buf.freeze();
+        let batches = RecordBatchDecoder::decode_all(&mut read_buf).unwrap();
+        assert_eq!(batches.len(), 1);
+        let ts: Vec<i64> = batches[0].records.iter().map(|r| r.timestamp).collect();
+        assert_eq!(ts, vec![0, now]);
+        assert!(now > i32::MAX as i64);
     }
 }
