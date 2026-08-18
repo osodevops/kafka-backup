@@ -292,10 +292,28 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
+      # Issue #150: while the workspace Cargo.toml carries a `[patch.crates-io]`
+      # git override for kafka-protocol, the packaged crate cannot be built
+      # against the crates.io release it declares (`cargo publish` verifies the
+      # package in isolation and ignores workspace patches), so publishing
+      # kafka-backup-core is skipped. This resumes automatically once the patch
+      # is removed, i.e. once a fixed kafka-protocol is on crates.io.
+      - name: Check for kafka-protocol source patch
+        id: patch
+        run: |
+          if grep -Eq '^\s*kafka-protocol\s*=\s*\{[^}]*git\s*=' Cargo.toml; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::kafka-protocol is patched to a git revision; skipping crates.io publish of kafka-backup-core (see issue #150)"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Verify package is publishable
+        if: steps.patch.outputs.active != 'true'
         run: cargo publish -p kafka-backup-core --dry-run
 
       - name: Publish kafka-backup-core to crates.io
+        if: steps.patch.outputs.active != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p kafka-backup-core
