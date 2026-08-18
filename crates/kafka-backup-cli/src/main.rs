@@ -38,7 +38,9 @@ enum Commands {
         config: String,
     },
 
-    /// Restore Kafka topics from a backup with optional PITR filtering
+    /// Restore Kafka topics from a backup with optional PITR filtering and,
+    /// when `reset_consumer_offsets` / `auto_consumer_groups` is set, consumer
+    /// group offset reset on the target after the data restore
     #[command(
         after_help = "Examples:\n  kafka-backup restore --config restore.yaml\n  kafka-backup validate-restore --config restore.yaml   # dry-run first"
     )]

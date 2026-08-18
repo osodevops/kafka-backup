@@ -585,7 +585,34 @@ restore:
     - another-group
 ```
 
+or, to take the groups from the snapshot the backup wrote
+(`backup.consumer_group_snapshot: true` or `kafka-backup snapshot-groups`):
+
+```yaml
+restore:
+  auto_consumer_groups: true   # implies reset_consumer_offsets
+```
+
 **WARNING**: This modifies `__consumer_offsets` on the target cluster. Only use with explicit understanding of the implications.
+
+How it is applied:
+
+1. The data restore runs first and builds the source→target offset mapping
+   (the restore engine itself never touches `__consumer_offsets`).
+2. Once all data is restored, `kafka-backup restore` (and
+   `kafka-backup three-phase-restore`, which is the explicit equivalent)
+   generates the offset reset plan from that mapping and commits the
+   translated offsets to the target — once. A `Consumer Group Offset Reset
+   (Phase 3)` summary is printed with the groups, partitions and any errors.
+3. If any commit fails the command **exits non-zero** even though the data
+   restore succeeded, so automation notices. The most common failure is
+   `error code 25 (UNKNOWN_MEMBER_ID …)`: the group still has active
+   consumers on the target. Stop them, then re-run the reset with
+   `kafka-backup offset-reset execute` (or the restore again — re-applying
+   the same offsets is idempotent).
+
+Consumer groups on the target must be **inactive** when the offsets are
+applied — the same rule MirrorMaker 2 and Confluent Replicator follow.
 
 ---
 

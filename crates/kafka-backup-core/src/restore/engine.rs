@@ -742,6 +742,19 @@ impl RestoreEngine {
 
         let offset_mapping = self.offset_mapping.lock().await.clone();
 
+        // Phase 2 ends here. The engine deliberately never commits consumer
+        // offsets — Phase 3 (`ThreePhaseRestore::run_offset_reset_phase`) does,
+        // exactly once, from the mapping in the returned report. The `restore`
+        // and `three-phase-restore` commands run it automatically when
+        // `reset_consumer_offsets` / `auto_consumer_groups` is set (issue #148).
+        if restore_options.reset_consumer_offsets && !restore_options.consumer_groups.is_empty() {
+            info!(
+                "Offset mapping ready for {} consumer group(s); offsets are applied in Phase 3 \
+                 (not by the restore engine)",
+                restore_options.consumer_groups.len()
+            );
+        }
+
         let report = RestoreReport {
             backup_id: self.config.backup_id.clone(),
             dry_run: false,

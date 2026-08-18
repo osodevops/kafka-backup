@@ -433,8 +433,11 @@ impl OffsetResetExecutor {
             } else {
                 partitions_failed += 1;
                 errors.push(format!(
-                    "{}:{}:{} - error code {}",
-                    plan.group_id, topic, partition, error_code
+                    "{}:{}:{} - {}",
+                    plan.group_id,
+                    topic,
+                    partition,
+                    describe_offset_commit_error(error_code)
                 ));
             }
         }
@@ -638,6 +641,46 @@ impl OffsetResetPlanBuilder {
             source_cluster_id: self.offset_mapping.source_cluster_id,
             target_bootstrap_servers: self.bootstrap_servers,
         }
+    }
+}
+
+/// Human-readable description of an `OffsetCommit` partition error code,
+/// with the operator action for the cases a restore is likely to hit.
+///
+/// Error code 25 in particular is what the coordinator returns for a
+/// generation-less commit to a group that still has active members — the
+/// usual reason a post-restore reset fails.
+pub fn describe_offset_commit_error(code: i16) -> String {
+    let (name, hint) = match code {
+        25 => (
+            "UNKNOWN_MEMBER_ID",
+            "the group has active members on the target; stop those consumers, then re-run the reset",
+        ),
+        22 => (
+            "ILLEGAL_GENERATION",
+            "the group is active or rebalancing on the target; stop its consumers first",
+        ),
+        27 => (
+            "REBALANCE_IN_PROGRESS",
+            "the group is rebalancing on the target; wait for it to settle or stop its consumers",
+        ),
+        14 => ("COORDINATOR_LOAD_IN_PROGRESS", "the group coordinator is still loading; retry"),
+        15 => ("COORDINATOR_NOT_AVAILABLE", "the group coordinator is unavailable; retry"),
+        16 => ("NOT_COORDINATOR", "the coordinator moved; retry"),
+        3 => (
+            "UNKNOWN_TOPIC_OR_PARTITION",
+            "the target topic/partition does not exist; check topic_mapping / create_topics",
+        ),
+        12 => ("OFFSET_METADATA_TOO_LARGE", "commit metadata exceeds the broker limit"),
+        29 => ("TOPIC_AUTHORIZATION_FAILED", "the restore principal lacks access to the topic"),
+        30 => ("GROUP_AUTHORIZATION_FAILED", "the restore principal lacks access to the group"),
+        69 => ("GROUP_ID_NOT_FOUND", "the group does not exist on the target"),
+        _ => ("", ""),
+    };
+    if name.is_empty() {
+        format!("error code {code}")
+    } else {
+        format!("error code {code} ({name}: {hint})")
     }
 }
 
@@ -902,5 +945,74 @@ mod tests {
                 ("orders".to_string(), 1, 42, Some("snapshot".to_string())),
             ]
         );
+    }
+
+    /// A committer that rejects every partition with a fixed error code, as the
+    /// coordinator does (25 = UNKNOWN_MEMBER_ID) when the group still has
+    /// active members on the target.
+    struct RejectingCommitter(i16);
+
+    #[async_trait::async_trait]
+    impl OffsetCommitter for RejectingCommitter {
+        async fn commit_offsets(
+            &self,
+            _group_id: &str,
+            offsets: &[(String, i32, i64, Option<String>)],
+        ) -> Result<Vec<(String, i32, i16)>> {
+            Ok(offsets
+                .iter()
+                .map(|(topic, partition, _, _)| (topic.clone(), *partition, self.0))
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_plan_reports_failure_with_descriptive_error() {
+        let executor = OffsetResetExecutor {
+            client: None,
+            committer: Some(std::sync::Arc::new(RejectingCommitter(25))),
+            bootstrap_servers: vec!["kafka:9092".to_string()],
+        };
+        let plan = OffsetResetPlan {
+            groups: vec![GroupResetPlan {
+                group_id: "issue148-app".to_string(),
+                partitions: vec![PartitionResetPlan {
+                    topic: "orders".to_string(),
+                    partition: 0,
+                    source_offset: 43,
+                    target_offset: 43,
+                    timestamp: 1000,
+                    metadata: None,
+                }],
+                partition_count: 1,
+                complete: true,
+            }],
+            generated_at: 0,
+            strategy: "Auto".to_string(),
+            dry_run: false,
+            backup_id: None,
+            source_cluster_id: None,
+            target_bootstrap_servers: vec![],
+        };
+
+        let report = executor.execute_plan(&plan).await.unwrap();
+        assert!(!report.success, "a rejected commit must not report success");
+        assert_eq!(report.partitions_reset, 0);
+        assert_eq!(report.errors.len(), 1);
+        let err = &report.errors[0];
+        assert!(err.contains("issue148-app:orders:0"), "{err}");
+        assert!(err.contains("error code 25"), "{err}");
+        assert!(err.contains("UNKNOWN_MEMBER_ID"), "{err}");
+        assert!(err.contains("active members"), "{err}");
+    }
+
+    #[test]
+    fn describe_offset_commit_error_covers_common_codes_and_falls_back() {
+        assert!(describe_offset_commit_error(25).contains("UNKNOWN_MEMBER_ID"));
+        assert!(describe_offset_commit_error(22).contains("ILLEGAL_GENERATION"));
+        assert!(describe_offset_commit_error(27).contains("REBALANCE_IN_PROGRESS"));
+        assert!(describe_offset_commit_error(3).contains("UNKNOWN_TOPIC_OR_PARTITION"));
+        assert!(describe_offset_commit_error(30).contains("GROUP_AUTHORIZATION_FAILED"));
+        assert_eq!(describe_offset_commit_error(999), "error code 999");
     }
 }

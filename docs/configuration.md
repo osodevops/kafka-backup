@@ -682,8 +682,16 @@ restore:
 |--------|------|----------|---------|-------------|
 | `consumer_group_strategy` | string | No | `skip` | Offset handling strategy |
 | `consumer_groups` | list[string] | No | `[]` | Consumer groups to process |
-| `reset_consumer_offsets` | bool | No | `false` | Actually reset offsets |
+| `reset_consumer_offsets` | bool | No | `false` | Commit translated offsets for `consumer_groups` on the target after the data restore (Phase 3) |
+| `auto_consumer_groups` | bool | No | `false` | Load the groups (and their offsets) from the backup's `consumer-groups-snapshot.json`; implies `reset_consumer_offsets` |
 | `offset_report` | string | No | - | Path to write offset report |
+
+`reset_consumer_offsets` / `auto_consumer_groups` are honoured by
+`kafka-backup restore` and `kafka-backup three-phase-restore` alike: the data
+restore runs first, then the offsets are applied exactly once from the mapping
+built during that run. A failed reset (e.g. the group still has active
+consumers on the target — `error code 25`) makes the command exit non-zero.
+See [Automatic Offset Reset](restore_guide.md#automatic-offset-reset-dangerous).
 
 #### Consumer Group Strategies
 

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] - 2026-08-18
+
+### Fixed
+- `kafka-backup restore` now applies consumer group offsets on the target when
+  the configuration asks for it (`reset_consumer_offsets: true`, or
+  `auto_consumer_groups: true` with the backup's consumer-groups snapshot).
+  Previously only `three-phase-restore` (and the Kubernetes operator) ran
+  Phase 3; plain `restore` built the offset mapping, logged
+  "imported N consumer group offsets" and "Restore completed successfully",
+  and discarded it — no groups were created on the target. Fixes
+  [#148](https://github.com/osodevops/kafka-backup/issues/148).
+- A failed offset reset after an otherwise successful restore now makes
+  `restore` exit non-zero, and the reset summary is printed. Offset commit
+  failures name the Kafka error and what to do about it — in particular
+  `error code 25 (UNKNOWN_MEMBER_ID: the group has active members on the
+  target; stop those consumers, then re-run the reset)`.
+
+### Added
+- `ThreePhaseRestore::run_offset_reset_phase(&RestoreReport)` and
+  `OffsetResetPhaseOutcome` — Phase 3 as a reusable step for a completed
+  Phase 2 restore; `run_all_phases`, the `restore` command and the operator
+  all go through it, so offsets are applied exactly once per run.
+  `ThreePhaseRestore::wants_offset_reset(&RestoreOptions)`.
+- `restore::offset_reset::describe_offset_commit_error(code)`.
+
+### Changed
+- The restore engine (Phase 2) still never commits consumer offsets; it now
+  logs "Offset mapping ready for N consumer group(s); offsets are applied in
+  Phase 3" when a reset is configured, so library callers running the engine
+  directly are pointed at `run_offset_reset_phase`. Documented in
+  `docs/restore_guide.md` and `docs/configuration.md`.
+
 ## [0.17.1] - 2026-08-18
 
 ### Fixed

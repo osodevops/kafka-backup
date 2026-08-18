@@ -63,5 +63,7 @@ pub use restore::{
         RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
         VerificationResult,
     },
-    three_phase::{Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore},
+    three_phase::{
+        OffsetResetPhaseOutcome, Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore,
+    },
 };
