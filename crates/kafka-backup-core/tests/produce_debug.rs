@@ -52,6 +52,7 @@ async fn test_produce_with_no_constants() {
     let records = [Record {
         transactional: false,
         control: false,
+        delete_horizon: false,
         partition_leader_epoch: NO_PARTITION_LEADER_EPOCH, // -1
         producer_id: NO_PRODUCER_ID,                       // -1
         producer_epoch: NO_PRODUCER_EPOCH,                 // -1
@@ -100,6 +101,7 @@ async fn test_produce_with_zero_epoch() {
         Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: 0, // <-- 0 instead of -1
             producer_id: -1,
             producer_epoch: -1,
@@ -114,6 +116,7 @@ async fn test_produce_with_zero_epoch() {
         Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: 0,
             producer_id: -1,
             producer_epoch: -1,
@@ -234,6 +237,7 @@ async fn test_batch_sequence_fix() {
         .map(|i| Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
             producer_id: NO_PRODUCER_ID,
             producer_epoch: NO_PRODUCER_EPOCH,
@@ -270,6 +274,7 @@ async fn test_batch_sequence_fix() {
         .map(|i| Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
             producer_id: NO_PRODUCER_ID,
             producer_epoch: NO_PRODUCER_EPOCH,
@@ -306,6 +311,7 @@ async fn test_batch_sequence_fix() {
         .map(|i| Record {
             transactional: false,
             control: false,
+            delete_horizon: false,
             partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
             producer_id: NO_PRODUCER_ID,
             producer_epoch: NO_PRODUCER_EPOCH,
