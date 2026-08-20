@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.4] - 2026-08-20
+
+### Changed
+- `kafka-protocol` is now the crates.io **0.18.0** release and the temporary
+  `[patch.crates-io]` git pin from 0.17.3 has been removed. 0.18.0 contains
+  both fixes the pin carried — the record `timestampDelta` varlong decode fix
+  (kafka-protocol-rs#159, our [#150](https://github.com/osodevops/kafka-backup/issues/150))
+  and the snappy-decompression fix (kafka-protocol-rs#149) — plus the KIP-534
+  `delete_horizon` batch attribute (kafka-protocol-rs#157), which this
+  codebase already supported. Requested upstream in
+  [kafka-protocol-rs#162](https://github.com/kafka-protocol-rs/kafka-protocol-rs/issues/162).
+- **Publishing `kafka-backup-core` to crates.io resumes with this release**
+  (it was skipped for 0.17.3 while the source patch was active). Library
+  consumers no longer need a `[patch.crates-io]` entry in their workspace.
+
 ## [0.17.3] - 2026-08-18
 
 ### Fixed

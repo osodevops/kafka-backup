@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.17.3"
+version = "0.17.4"
 edition = "2021"
 license = "MIT"
 authors = ["OSO"]
@@ -15,10 +15,10 @@ repository = "https://github.com/osodevops/kafka-backup"
 homepage = "https://github.com/osodevops/kafka-backup"
 
 [workspace.dependencies]
-# Kafka protocol. See `[patch.crates-io]` at the bottom of this file: the
-# 0.17.0 release has a record-decoding bug and is patched to upstream `main`
-# until a fixed version is published (issue #150).
-kafka-protocol = "0.17"
+# Kafka protocol. 0.18.0 carries the record `timestampDelta` varlong fix
+# (kafka-protocol-rs#159) and snappy-decompression fix (kafka-protocol-rs#149)
+# that 0.17.0 was patched for (issue #150); the git patch is no longer needed.
+kafka-protocol = "0.18"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -116,23 +116,3 @@ kafka-backup-core = { path = "crates/kafka-backup-core" }
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-# --------------------------------------------------------------------------
-# Temporary source patches. Applied to every build of this workspace (the CLI
-# binaries, Docker image and Homebrew formula all come from here). They are
-# NOT part of the published `kafka-backup-core` crate: consumers building it
-# from crates.io must add the same `[patch.crates-io]` entry to their own
-# workspace until the upstream fix is released.
-# --------------------------------------------------------------------------
-[patch.crates-io]
-# kafka-protocol 0.17.0 decodes each record's `timestampDelta` as a 32-bit
-# zigzag varint (the spec says varlong), so any batch whose records span more
-# than ~24.8 days (i32::MAX ms) — e.g. 1970 placeholder timestamps mixed with
-# current ones — is misread from that record on and the fetch fails with
-# "negative record value length" / "invalid utf-8" style errors, and its
-# encoder refuses to *produce* such batches. Fixed upstream in
-# kafka-protocol-rs#159 (merged 2026-08-04) but not yet released; this rev is
-# upstream `main` (0.17.0 + #149 snappy-decompress fix, #153, #157, #159,
-# #150). Remove once kafka-protocol ≥ 0.17.1 / 0.18.0 is on crates.io.
-# Tracking: https://github.com/osodevops/kafka-backup/issues/150
-kafka-protocol = { git = "https://github.com/kafka-protocol-rs/kafka-protocol-rs", rev = "946ceb7733af0dc125fda932d0491d2efc6b477e" }
