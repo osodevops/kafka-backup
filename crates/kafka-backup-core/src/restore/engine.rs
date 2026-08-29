@@ -691,6 +691,22 @@ impl RestoreEngine {
         }
 
         info!("Restoring {} topics", topics_to_restore.len());
+        if restore_options.strip_offset_headers {
+            info!(
+                "strip_offset_headers=true: removing {} headers from archived records before producing",
+                crate::offset_headers::ALL.join(", ")
+            );
+        }
+        if restore_options.include_original_offset_header
+            || restore_options.consumer_group_strategy == OffsetStrategy::HeaderBased
+        {
+            info!(
+                "Adding {}, {} and {} headers to every produced record (include_original_offset_header / header-based strategy)",
+                crate::offset_headers::X_ORIGINAL_OFFSET,
+                crate::offset_headers::X_ORIGINAL_TIMESTAMP,
+                crate::offset_headers::X_SOURCE_PARTITION
+            );
+        }
 
         let mut shutdown_rx = self.shutdown_receiver();
         let mut topic_reports = Vec::new();
@@ -1379,9 +1395,12 @@ impl RestorePartitionContext {
                 );
             }
 
-            // Add original offset headers if configured (header-based strategy)
+            // Drop the archive's kafka-backup headers if asked to, then add
+            // fresh original-offset headers if configured (header-based strategy)
+            let stripped_records =
+                super::helpers::strip_offset_headers(filtered_records, &self.options);
             let records_to_produce = super::helpers::inject_offset_headers(
-                filtered_records,
+                stripped_records,
                 self.source_partition,
                 &self.options,
             );
@@ -1536,7 +1555,7 @@ impl RestorePartitionContext {
         record
             .headers
             .iter()
-            .filter(|h| h.key == "x-original-offset")
+            .filter(|h| h.key == crate::offset_headers::X_ORIGINAL_OFFSET)
             .find_map(|h| decode_i64_header(h.value.as_deref()))
             .unwrap_or(record.offset)
     }
@@ -1547,7 +1566,7 @@ impl RestorePartitionContext {
         record
             .headers
             .iter()
-            .filter(|h| h.key == "x-original-timestamp")
+            .filter(|h| h.key == crate::offset_headers::X_ORIGINAL_TIMESTAMP)
             .find_map(|h| decode_i64_header(h.value.as_deref()))
             .unwrap_or(record.timestamp)
     }

@@ -442,9 +442,18 @@ pub struct BackupOptions {
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
 
-    /// Include original offset headers in backup (Phase 1 of three-phase restore)
-    /// Headers: x-original-offset, x-original-timestamp, x-source-cluster (if set)
-    /// Default: true for DR scenarios
+    /// Add offset-tracking headers to every record as it is archived
+    /// (Phase 1 of the three-phase restore).
+    ///
+    /// Adds `x-original-offset` and `x-original-timestamp` (little-endian
+    /// `i64`), plus `x-source-cluster` when `source_cluster_id` is set. They
+    /// are what makes `consumer_group_strategy: header-based` recovery
+    /// possible after a restore, but they also mean an archived record is
+    /// not header-for-header identical to the source record.
+    ///
+    /// **Default: `true`.** Set to `false` for a verbatim archive, or leave
+    /// it on and use `restore.strip_offset_headers: true` to drop the
+    /// headers at restore time.
     #[serde(default = "default_include_offset_headers")]
     pub include_offset_headers: bool,
 
@@ -671,9 +680,28 @@ pub struct RestoreOptions {
     #[serde(default)]
     pub dry_run: bool,
 
-    /// Include original offset as a header
+    /// Add `x-original-offset`, `x-original-timestamp` and
+    /// `x-source-partition` headers to every record as it is produced to
+    /// the target cluster. Also implied by `consumer_group_strategy:
+    /// header-based`. Default: `false`.
     #[serde(default)]
     pub include_original_offset_header: bool,
+
+    /// Remove the headers kafka-backup adds (`x-original-offset`,
+    /// `x-original-timestamp`, `x-source-cluster`, `x-source-partition`)
+    /// from archived records before producing them, so a restored record
+    /// carries exactly the headers the source record had.
+    ///
+    /// Use this to restore an archive taken with the default
+    /// `backup.include_offset_headers: true` header-for-header identical to
+    /// the source. Offset mapping is unaffected: the source offset is stored
+    /// natively in the segment, not only in the header. If
+    /// `include_original_offset_header` / `header-based` is also on, the
+    /// headers are stripped first and fresh ones injected.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub strip_offset_headers: bool,
 
     /// Rate limit in records per second
     #[serde(default)]
@@ -790,6 +818,7 @@ impl Default for RestoreOptions {
             consumer_group_strategy: OffsetStrategy::default(),
             dry_run: false,
             include_original_offset_header: false,
+            strip_offset_headers: false,
             rate_limit_records_per_sec: None,
             rate_limit_bytes_per_sec: None,
             max_concurrent_partitions: default_max_concurrent_partitions(),
@@ -1136,6 +1165,49 @@ logging:
             warnings.is_empty(),
             "expected no warnings, got {warnings:?}"
         );
+    }
+
+    /// Issue #154: the backup-side default is `true` and was undocumented.
+    /// This pins the contract so a change to it is a deliberate one.
+    #[test]
+    fn backup_include_offset_headers_defaults_to_true() {
+        assert!(BackupOptions::default().include_offset_headers);
+        let yaml = r#"
+mode: backup
+backup_id: defaults
+source:
+  bootstrap_servers: [localhost:9092]
+storage:
+  backend: filesystem
+  path: /tmp/defaults
+backup:
+  compression: zstd
+"#;
+        let (config, _) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert!(config.backup.unwrap().include_offset_headers);
+    }
+
+    #[test]
+    fn restore_strip_offset_headers_defaults_to_false_and_parses() {
+        assert!(!RestoreOptions::default().strip_offset_headers);
+        let yaml = r#"
+mode: restore
+backup_id: strip
+target:
+  bootstrap_servers: [localhost:9092]
+storage:
+  backend: filesystem
+  path: /tmp/strip
+restore:
+  strip_offset_headers: true
+  consumer_group_strategy: skip
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let restore = config.restore.unwrap();
+        assert!(restore.strip_offset_headers);
+        assert!(!restore.include_original_offset_header);
+        assert_eq!(restore.consumer_group_strategy, OffsetStrategy::Skip);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::health::HealthCheck;
 use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
 use crate::manifest::{BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
+use crate::offset_headers;
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use crate::segment::format::BinaryRecord;
 use crate::segment::writer::{SegmentWriter, SegmentWriterConfig};
@@ -349,6 +350,7 @@ impl BackupEngine {
             "Backup engine starting with max_concurrent_partitions={}, poll_interval_ms={}",
             backup_opts.max_concurrent_partitions, backup_opts.poll_interval_ms
         );
+        info!("{}", describe_offset_headers(&backup_opts));
 
         // Run backup loop
         loop {
@@ -1521,6 +1523,28 @@ fn should_create_offset_store(continuous: bool, offset_storage_configured: bool)
     continuous || offset_storage_configured
 }
 
+/// One-line startup summary of the headers this backup will add to every
+/// archived record, so the (default-on) behaviour is visible in the logs
+/// (issue #154).
+fn describe_offset_headers(options: &BackupOptions) -> String {
+    if !options.include_offset_headers {
+        return "include_offset_headers=false: records are archived with their original headers only"
+            .to_string();
+    }
+    let cluster = match &options.source_cluster_id {
+        Some(id) => format!(" and {}={id}", offset_headers::X_SOURCE_CLUSTER),
+        None => String::new(),
+    };
+    format!(
+        "include_offset_headers=true (default): every archived record gets {} and {}{cluster} \
+         headers for header-based consumer offset recovery; set backup.include_offset_headers: \
+         false for a header-for-header identical archive, or restore.strip_offset_headers: true \
+         to drop them at restore time",
+        offset_headers::X_ORIGINAL_OFFSET,
+        offset_headers::X_ORIGINAL_TIMESTAMP,
+    )
+}
+
 /// Convert a fetched record into the on-disk segment representation.
 ///
 /// Header values are copied as-is: a null header value stays `None` and is
@@ -1538,16 +1562,16 @@ fn to_binary_record(record: &BackupRecord, options: &BackupOptions) -> BinaryRec
 
     if options.include_offset_headers {
         headers.push((
-            "x-original-offset".to_string(),
+            offset_headers::X_ORIGINAL_OFFSET.to_string(),
             Some(Bytes::from(record.offset.to_le_bytes().to_vec())),
         ));
         headers.push((
-            "x-original-timestamp".to_string(),
+            offset_headers::X_ORIGINAL_TIMESTAMP.to_string(),
             Some(Bytes::from(record.timestamp.to_le_bytes().to_vec())),
         ));
         if let Some(cluster_id) = &options.source_cluster_id {
             headers.push((
-                "x-source-cluster".to_string(),
+                offset_headers::X_SOURCE_CLUSTER.to_string(),
                 Some(Bytes::from(cluster_id.as_bytes().to_vec())),
             ));
         }
@@ -1645,6 +1669,40 @@ mod tests {
             Some(&1_700_000_000_000i64.to_le_bytes()[..])
         );
         assert_eq!(binary.headers[3].1.as_deref(), Some(&b"src-eu"[..]));
+    }
+
+    #[test]
+    fn describe_offset_headers_names_the_headers_and_the_opt_outs() {
+        let on = describe_offset_headers(&BackupOptions::default());
+        assert!(
+            on.starts_with("include_offset_headers=true (default)"),
+            "{on}"
+        );
+        for needle in [
+            "x-original-offset",
+            "x-original-timestamp",
+            "backup.include_offset_headers: false",
+            "restore.strip_offset_headers: true",
+        ] {
+            assert!(on.contains(needle), "missing {needle:?} in {on}");
+        }
+        assert!(!on.contains("x-source-cluster"));
+
+        let with_cluster = describe_offset_headers(&BackupOptions {
+            source_cluster_id: Some("eu-prod".to_string()),
+            ..BackupOptions::default()
+        });
+        assert!(
+            with_cluster.contains("x-source-cluster=eu-prod"),
+            "{with_cluster}"
+        );
+
+        let off = describe_offset_headers(&BackupOptions {
+            include_offset_headers: false,
+            ..BackupOptions::default()
+        });
+        assert!(off.starts_with("include_offset_headers=false"), "{off}");
+        assert!(!off.contains("x-original-offset"));
     }
 
     #[test]

@@ -328,7 +328,7 @@ The offset mapping report contains:
 
 ## Best Practices
 
-1. **Always enable offset headers** during backup (`include_offset_headers: true`)
+1. **Keep offset headers enabled** during backup (`include_offset_headers: true`, the default — see [Offset-tracking headers](configuration.md#offset-tracking-headers))
 2. **Review offset reset plans** before applying in production
 3. **Use dry-run mode** first to validate the plan
 4. **Save offset mapping reports** for audit trails

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::compression::{decompress, detect_from_extension};
 use crate::config::{OffsetStrategy, RestoreOptions};
 use crate::manifest::{BackupRecord, RecordHeader, RestoreCheckpoint, SegmentMetadata};
+use crate::offset_headers;
 use crate::segment::format::{BinaryRecord, MAGIC_BYTES};
 use crate::segment::SegmentReader;
 use crate::storage::StorageBackend;
@@ -81,6 +82,32 @@ pub fn filter_records_by_time(
         .collect()
 }
 
+/// Remove the headers kafka-backup itself adds to records
+/// (`x-original-offset`, `x-original-timestamp`, `x-source-cluster`,
+/// `x-source-partition`) when `restore.strip_offset_headers` is set, so a
+/// restored record carries exactly the headers its source record had
+/// (issue #154). Every other header — including the same names with a
+/// different case — is kept, in order. A no-op when the option is off.
+///
+/// Called before [`inject_offset_headers`], so a restore that both strips
+/// and injects ends up with exactly one fresh set of restore-side headers.
+pub(crate) fn strip_offset_headers(
+    records: Vec<BackupRecord>,
+    options: &RestoreOptions,
+) -> Vec<BackupRecord> {
+    if !options.strip_offset_headers {
+        return records;
+    }
+    records
+        .into_iter()
+        .map(|mut r| {
+            r.headers
+                .retain(|h| !offset_headers::is_offset_header(&h.key));
+            r
+        })
+        .collect()
+}
+
 /// Inject original-offset tracking headers into records.
 ///
 /// Adds `x-original-offset`, `x-original-timestamp`, and `x-source-partition`
@@ -97,15 +124,15 @@ pub fn inject_offset_headers(
             .into_iter()
             .map(|mut r| {
                 r.headers.push(RecordHeader {
-                    key: "x-original-offset".to_string(),
+                    key: offset_headers::X_ORIGINAL_OFFSET.to_string(),
                     value: Some(r.offset.to_le_bytes().to_vec()),
                 });
                 r.headers.push(RecordHeader {
-                    key: "x-original-timestamp".to_string(),
+                    key: offset_headers::X_ORIGINAL_TIMESTAMP.to_string(),
                     value: Some(r.timestamp.to_le_bytes().to_vec()),
                 });
                 r.headers.push(RecordHeader {
-                    key: "x-source-partition".to_string(),
+                    key: offset_headers::X_SOURCE_PARTITION.to_string(),
                     value: Some(source_partition.to_le_bytes().to_vec()),
                 });
                 r
@@ -260,6 +287,132 @@ mod tests {
             Some(&1_700_000_000_000i64.to_le_bytes()[..])
         );
         assert_eq!(headers[3].value.as_deref(), Some(&3i32.to_le_bytes()[..]));
+    }
+
+    /// A record as it comes out of an archive taken with the default
+    /// `include_offset_headers: true`: user headers first, then the two
+    /// backup-side headers.
+    fn archived_record() -> BackupRecord {
+        BackupRecord {
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            headers: vec![
+                header("event-type", Some(b"created")),
+                header("trace-id", None),
+                header("X-Original-Offset", Some(b"user header, different case")),
+                header("x-original-offset", Some(&9i64.to_le_bytes())),
+                header(
+                    "x-original-timestamp",
+                    Some(&1_700_000_000_000i64.to_le_bytes()),
+                ),
+                header("x-source-cluster", Some(b"eu-prod")),
+            ],
+            timestamp: 1_700_000_000_000,
+            offset: 9,
+        }
+    }
+
+    /// Issue #154: `strip_offset_headers` drops exactly the headers
+    /// kafka-backup adds and nothing else, preserving order.
+    #[test]
+    fn strip_offset_headers_removes_only_kafka_backup_headers() {
+        let options = RestoreOptions {
+            strip_offset_headers: true,
+            ..RestoreOptions::default()
+        };
+
+        let out = strip_offset_headers(vec![archived_record()], &options);
+
+        assert_eq!(
+            out[0].headers,
+            vec![
+                header("event-type", Some(b"created")),
+                header("trace-id", None),
+                header("X-Original-Offset", Some(b"user header, different case")),
+            ]
+        );
+        // Everything else about the record is untouched.
+        assert_eq!(out[0].offset, 9);
+        assert_eq!(out[0].key.as_deref(), Some(&b"k"[..]));
+    }
+
+    #[test]
+    fn strip_offset_headers_also_drops_restore_side_headers_from_chained_restores() {
+        let options = RestoreOptions {
+            strip_offset_headers: true,
+            ..RestoreOptions::default()
+        };
+        let mut record = archived_record();
+        record
+            .headers
+            .push(header("x-source-partition", Some(&3i32.to_le_bytes())));
+
+        let out = strip_offset_headers(vec![record], &options);
+
+        assert!(out[0]
+            .headers
+            .iter()
+            .all(|h| !offset_headers::is_offset_header(&h.key)));
+        assert_eq!(out[0].headers.len(), 3);
+    }
+
+    #[test]
+    fn strip_offset_headers_is_a_no_op_by_default() {
+        let before = archived_record();
+        let out = strip_offset_headers(vec![before.clone()], &RestoreOptions::default());
+        assert_eq!(out[0].headers, before.headers);
+    }
+
+    #[test]
+    fn strip_offset_headers_leaves_records_without_such_headers_alone() {
+        let options = RestoreOptions {
+            strip_offset_headers: true,
+            ..RestoreOptions::default()
+        };
+        let record = BackupRecord {
+            key: None,
+            value: None,
+            headers: vec![header("trace-id", None), header("tenant", Some(b"42"))],
+            timestamp: 0,
+            offset: 0,
+        };
+        let out = strip_offset_headers(vec![record.clone()], &options);
+        assert_eq!(out[0].headers, record.headers);
+    }
+
+    /// Strip + inject (header-based strategy) yields exactly one fresh set of
+    /// restore-side headers rather than archived ones plus injected ones.
+    #[test]
+    fn strip_then_inject_yields_a_single_fresh_set_of_headers() {
+        let options = RestoreOptions {
+            strip_offset_headers: true,
+            consumer_group_strategy: OffsetStrategy::HeaderBased,
+            ..RestoreOptions::default()
+        };
+
+        let stripped = strip_offset_headers(vec![archived_record()], &options);
+        let out = inject_offset_headers(stripped, 4, &options);
+
+        let keys: Vec<&str> = out[0].headers.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "event-type",
+                "trace-id",
+                "X-Original-Offset",
+                "x-original-offset",
+                "x-original-timestamp",
+                "x-source-partition",
+            ]
+        );
+        assert_eq!(
+            out[0].headers[3].value.as_deref(),
+            Some(&9i64.to_le_bytes()[..])
+        );
+        assert_eq!(
+            out[0].headers[5].value.as_deref(),
+            Some(&4i32.to_le_bytes()[..])
+        );
     }
 
     #[test]
