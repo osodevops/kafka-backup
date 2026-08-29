@@ -326,7 +326,8 @@ async fn run_reader(
             continue;
         }
 
-        let records_to_send = helpers::inject_offset_headers(filtered, source_partition, options);
+        let stripped = helpers::strip_offset_headers(filtered, options);
+        let records_to_send = helpers::inject_offset_headers(stripped, source_partition, options);
 
         // Route each record through the partitioner
         for record in records_to_send {

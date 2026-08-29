@@ -60,10 +60,13 @@ Things that can make a restored record differ from its source:
 
 - **Injected headers.** `backup.include_offset_headers` (default `true`) adds
   `x-original-offset` and `x-original-timestamp` to every *archived* record;
-  set it to `false` on the backup for a header-for-header identical archive.
-  On the restore side, `include_original_offset_header: true` or
+  set it to `false` on the backup for a header-for-header identical archive,
+  or set `restore.strip_offset_headers: true` to drop them from an archive
+  that already has them. On the restore side,
+  `include_original_offset_header: true` or
   `consumer_group_strategy: header-based` add `x-original-offset`,
   `x-original-timestamp` and `x-source-partition` to every produced record.
+  See [Offset-tracking headers](configuration.md#offset-tracking-headers).
 - **Duplicate header keys** (two headers with the same key on one record) are
   currently collapsed to the last one at backup time
   ([#156](https://github.com/osodevops/kafka-backup/issues/156)).
@@ -211,6 +214,7 @@ restore:
   # Offset handling
   consumer_group_strategy: header-based
   include_original_offset_header: true
+  strip_offset_headers: false      # true = drop the x-original-*/x-source-* headers the backup added
 
   # Safety
   dry_run: false
@@ -243,7 +247,8 @@ restore:
 | `topic_mapping` | {str: str} | {} | Source to target topic mapping |
 | `consumer_group_strategy` | enum | skip | Offset handling strategy |
 | `dry_run` | bool | false | Validate without writing |
-| `include_original_offset_header` | bool | false | Add offset headers to records |
+| `include_original_offset_header` | bool | false | Add `x-original-offset` / `x-original-timestamp` / `x-source-partition` to produced records |
+| `strip_offset_headers` | bool | false | Remove the headers the backup added (`backup.include_offset_headers`, default on) so restored records match the source header-for-header |
 | `max_concurrent_partitions` | usize | 4 | Parallel partition restores |
 | `produce_batch_size` | usize | 1000 | Records per produce batch |
 | `rate_limit_records_per_sec` | u64 | None | Rate limit (records/sec) |

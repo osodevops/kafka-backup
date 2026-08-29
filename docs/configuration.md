@@ -375,20 +375,65 @@ storage:
 
 ## Backup Configuration
 
-Options specific to backup operations.
+Options specific to backup operations (the `backup:` section). Defaults are
+the values in `kafka-backup-core`'s `BackupOptions::default()`.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `compression` | string | No | `zstd` | Compression algorithm |
+| `compression` | string | No | `zstd` | Segment compression: `none`, `zstd` or `lz4` |
+| `compression_level` | int | No | `3` | Compression level (1–22; only meaningful for `zstd`) |
+| `start_offset` | string / map | No | `earliest` | Where a partition starts when there is no checkpoint: `earliest`, `latest`, or `specific: {topic: {partition: offset}}` |
 | `continuous` | bool | No | `false` | Run continuously (streaming replication) |
 | `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture HWMs at start, exit when caught up |
-| `checkpoint_interval_secs` | int | No | `60` | Checkpoint interval |
-| `segment_max_records` | int | No | `100000` | Max records per segment |
-| `segment_max_bytes` | int | No | `104857600` | Max bytes per segment (100MB) |
-| `segment_max_age_secs` | int | No | `3600` | Max segment age |
-| `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
 | `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
-| `fetch_max_bytes` | int | No | `1048576` | Max bytes per fetch |
+| `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
+| `segment_max_bytes` | int | No | `134217728` | Rotate a segment once it holds this many uncompressed bytes (128MB) |
+| `segment_max_interval_ms` | int | No | `60000` | Rotate a segment after this many milliseconds even if it is not full |
+| `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
+| `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
+| `checkpoint_interval_secs` | int | No | `5` | How often partition progress is checkpointed to the offset store |
+| `sync_interval_secs` | int | No | `30` | How often the offset store is synced to remote storage |
+| `include_offset_headers` | bool | No | **`true`** | Add `x-original-offset` / `x-original-timestamp` headers to every archived record — see [Offset-tracking headers](#offset-tracking-headers) |
+| `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
+| `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
+| `internal_topics` | list[string] | No | `[]` | Internal topics to include (e.g. `__consumer_offsets`) when `include_internal_topics` is set |
+| `consumer_group_snapshot` | bool | No | `false` | Write `consumer-groups-snapshot.json` after each cycle for `auto_consumer_groups` restores |
+
+### Offset-tracking headers
+
+`include_offset_headers` is **on by default**. With it, every record is
+archived with two extra headers appended after the record's own headers:
+
+| Header | Value | Added when |
+|--------|-------|------------|
+| `x-original-offset` | source offset, little-endian `i64` | always |
+| `x-original-timestamp` | source timestamp (epoch ms), little-endian `i64` | always |
+| `x-source-cluster` | `source_cluster_id`, UTF-8 | `source_cluster_id` is set |
+
+They are Phase 1 of the [three-phase restore](Three_Phase_Restore_Guide.md)
+and make `consumer_group_strategy: header-based` recovery possible. The
+trade-off is that an archived — and therefore a restored — record is not
+header-for-header identical to its source. The backup logs which headers it
+is adding at startup (`include_offset_headers=true (default): ...`).
+
+To get a verbatim copy, either:
+
+```yaml
+# at backup time — archive the record's own headers only
+backup:
+  include_offset_headers: false
+```
+
+```yaml
+# at restore time — works for archives that already carry the headers
+restore:
+  strip_offset_headers: true
+```
+
+`strip_offset_headers` removes `x-original-offset`, `x-original-timestamp`,
+`x-source-cluster` and `x-source-partition` from archived records before
+they are produced. Offset mapping is unaffected: the source offset is stored
+natively in the segment, not only in the header.
 
 ### Performance Tuning
 
@@ -449,10 +494,12 @@ the topic's retention so a full run fits inside the retention window.
 | Algorithm | Description |
 |-----------|-------------|
 | `none` | No compression |
-| `zstd` | Zstandard (default, best ratio) |
+| `zstd` | Zstandard (default, best ratio; `compression_level` 1–22, default 3) |
 | `lz4` | LZ4 (faster, lower ratio) |
-| `gzip` | Gzip (widely compatible) |
-| `snappy` | Snappy (balanced) |
+
+This is the compression of the segment files written to storage. It is
+independent of the compression the source topic uses on the broker — every
+broker-side codec (including gzip and snappy) is decoded on fetch.
 
 ### Examples
 
@@ -463,11 +510,11 @@ backup:
   continuous: true
   checkpoint_interval_secs: 30
   segment_max_records: 50000
-  segment_max_bytes: 52428800  # 50MB
-  segment_max_age_secs: 1800   # 30 minutes
-  max_concurrent_partitions: 8 # Limit concurrent partition tasks
-  poll_interval_ms: 100        # Delay between backup passes (lower = less lag)
-  fetch_max_bytes: 5242880     # 5MB
+  segment_max_bytes: 52428800     # 50MB
+  segment_max_interval_ms: 1800000 # 30 minutes
+  max_concurrent_partitions: 8    # Limit concurrent partition tasks
+  poll_interval_ms: 100           # Delay between backup passes (lower = less lag)
+  fetch_max_bytes: 5242880        # 5MB
 ```
 
 **Snapshot Backup (DR/Scheduled):**
@@ -475,9 +522,18 @@ backup:
 backup:
   compression: zstd
   stop_at_current_offsets: true  # Exit when caught up
-  include_offset_headers: true    # For offset remapping on restore
+  include_offset_headers: true    # Default; x-original-* headers for offset recovery on restore
+  source_cluster_id: prod-eu      # Optional; recorded as x-source-cluster
   checkpoint_interval_secs: 30
   segment_max_bytes: 134217728    # 128MB
+```
+
+**Verbatim Archive (no headers added):**
+```yaml
+backup:
+  compression: zstd
+  stop_at_current_offsets: true
+  include_offset_headers: false   # Records are archived with their own headers only
 ```
 
 ---
@@ -624,7 +680,15 @@ Options specific to restore operations.
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `dry_run` | bool | No | `false` | Simulate restore without writing |
-| `include_original_offset_header` | bool | No | `false` | Add original offset to headers |
+| `include_original_offset_header` | bool | No | `false` | Add `x-original-offset`, `x-original-timestamp` and `x-source-partition` headers to every record as it is produced (also implied by `consumer_group_strategy: header-based`) |
+| `strip_offset_headers` | bool | No | `false` | Remove the headers kafka-backup added at backup time (`x-original-*`, `x-source-*`) before producing, for a header-for-header identical restore — see [Offset-tracking headers](#offset-tracking-headers) |
+| `purge_topics` | bool | No | `false` | **Irreversible.** Advance every target partition's log-start-offset to its end-offset (`DeleteRecords`) before restoring, so the topic appears empty without being deleted (Strimzi-managed topics) |
+
+Note the two header options govern different sides of the pipeline:
+`backup.include_offset_headers` decides what goes *into* the archive,
+`restore.include_original_offset_header` what is added *on the way out*.
+Neither removes headers that are already in the archive — that is what
+`strip_offset_headers` is for.
 
 ### Time Window Filtering
 
@@ -661,6 +725,7 @@ restore:
 |--------|------|----------|---------|-------------|
 | `topic_mapping` | map[string, string] | No | `{}` | Rename topics during restore |
 | `partition_mapping` | map[int, int] | No | `{}` | Remap partitions during restore |
+| `repartitioning` | map[string, object] | No | `{}` | Per *target* topic: `{strategy: murmur2 \| automatic, target_partitions: N}` — re-partition records on the fly to a different partition count; mutually exclusive with `partition_mapping`. See [restore_guide.md](restore_guide.md#partition-remapping) |
 
 ```yaml
 restore:
@@ -719,7 +784,10 @@ restore:
 |--------|------|----------|---------|-------------|
 | `max_concurrent_partitions` | int | No | `4` | Concurrent partition restores |
 | `produce_batch_size` | int | No | `1000` | Records per produce batch |
+| `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget |
+| `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
 | `rate_limit_records_per_sec` | int | No | - | Rate limit (records/sec) |
+| `rate_limit_bytes_per_sec` | int | No | - | Rate limit (bytes/sec) |
 
 ```yaml
 restore:
@@ -1062,6 +1130,17 @@ The system validates configuration on load:
 - Time windows must have start < end
 - Partition mappings must be valid
 - Consumer group strategy must be recognized
+
+Unknown keys are **not** an error — a misspelled or mis-nested key (for
+example `fetch_max_bytez`, or `include_offset_headers` placed under
+`restore:` instead of `backup:`) is ignored. The CLI logs a warning for each
+one at startup:
+
+```
+WARN Ignoring unknown config key `restore.include_offset_headers` — check for typos
+```
+
+so check the first lines of output when an option seems to have no effect.
 
 ### Example Validation Error
 

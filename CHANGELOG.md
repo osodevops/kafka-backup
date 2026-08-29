@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-08-29
+
+### Added
+- `restore.strip_offset_headers` (default `false`): remove the headers
+  kafka-backup adds at backup time (`x-original-offset`,
+  `x-original-timestamp`, `x-source-cluster`, and `x-source-partition` from
+  chained restores) before producing, so a restore of an archive taken with
+  the default `include_offset_headers: true` is header-for-header identical
+  to the source ([#154](https://github.com/osodevops/kafka-backup/issues/154)).
+  Offset mapping is unaffected — the source offset is stored natively in the
+  segment. Combined with `header-based` / `include_original_offset_header`,
+  the archived headers are stripped first and one fresh set injected.
+- `kafka_backup_core::offset_headers`: the header names kafka-backup adds,
+  in one place, plus `is_offset_header()`.
+- The backup engine logs at startup which headers it will add to every
+  archived record (`include_offset_headers=true (default): ...`) and how to
+  turn that off.
+
+### Changed
+- **Breaking (library API):** `RestoreOptions` gains the public field
+  `strip_offset_headers` (struct-literal construction must set it).
+- `backup.include_offset_headers` keeps its default of **`true`** — the
+  three-phase restore and the operator CRD rely on it — but the default is
+  now documented, and `docs/configuration.md` gained an "Offset-tracking
+  headers" section explaining exactly which side adds which header and
+  the two ways to get a verbatim copy.
+
+### Fixed
+- `docs/configuration.md` backup options table: it listed 9 of 18 options,
+  a `segment_max_age_secs` option that does not exist (it is
+  `segment_max_interval_ms`), `gzip` / `snappy` segment compression that is
+  not offered (`none` / `zstd` / `lz4`), and wrong defaults for
+  `checkpoint_interval_secs` (5, not 60), `segment_max_bytes` (128MB, not
+  100MB), `segment_max_records` (unset, not 100000) and `fetch_max_bytes`
+  (unset → `min(segment_max_bytes, 16MB)`, not 1MB). Restore tables gained
+  `produce_acks`, `produce_timeout_ms`, `rate_limit_bytes_per_sec`,
+  `purge_topics` and `repartitioning`, and the Validation section now says
+  that unknown keys are warned about, not rejected.
+
 ## [0.18.0] - 2026-08-29
 
 ### Fixed
