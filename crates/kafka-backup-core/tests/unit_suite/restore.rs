@@ -237,7 +237,7 @@ fn offset_mapping_header_application() {
     // Add original offset header (as restore engine does)
     record.headers.push(RecordHeader {
         key: "x-original-offset".to_string(),
-        value: record.offset.to_string().into_bytes(),
+        value: Some(record.offset.to_string().into_bytes()),
     });
 
     assert!(record.headers.iter().any(|h| h.key == "x-original-offset"));
@@ -246,7 +246,7 @@ fn offset_mapping_header_application() {
         .iter()
         .find(|h| h.key == "x-original-offset")
         .unwrap();
-    assert_eq!(offset_header.value, b"12345".to_vec());
+    assert_eq!(offset_header.value.as_deref(), Some(&b"12345"[..]));
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn offset_mapping_preserves_existing_headers() {
         value: Some(b"value".to_vec()),
         headers: vec![RecordHeader {
             key: "existing-header".to_string(),
-            value: b"existing-value".to_vec(),
+            value: Some(b"existing-value".to_vec()),
         }],
         timestamp: 1672531200000,
         offset: 100,
@@ -265,7 +265,7 @@ fn offset_mapping_preserves_existing_headers() {
     // Add offset header
     record.headers.push(RecordHeader {
         key: "x-original-offset".to_string(),
-        value: b"100".to_vec(),
+        value: Some(b"100".to_vec()),
     });
 
     assert_eq!(record.headers.len(), 2);

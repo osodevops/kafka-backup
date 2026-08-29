@@ -1053,41 +1053,7 @@ impl BackupPartitionContext {
 
             // Convert to binary records and add to writer
             for record in &records {
-                // Start with existing headers
-                let mut headers: Vec<(String, Option<Bytes>)> = record
-                    .headers
-                    .iter()
-                    .map(|h| (h.key.clone(), Some(Bytes::from(h.value.clone()))))
-                    .collect();
-
-                // Phase 1: Add offset mapping headers if configured
-                if self.options.include_offset_headers {
-                    // Store original offset as binary i64 (8 bytes, little-endian)
-                    headers.push((
-                        "x-original-offset".to_string(),
-                        Some(Bytes::from(record.offset.to_le_bytes().to_vec())),
-                    ));
-                    // Store original timestamp as binary i64 (8 bytes, little-endian)
-                    headers.push((
-                        "x-original-timestamp".to_string(),
-                        Some(Bytes::from(record.timestamp.to_le_bytes().to_vec())),
-                    ));
-                    // Store source cluster ID if configured
-                    if let Some(ref cluster_id) = self.options.source_cluster_id {
-                        headers.push((
-                            "x-source-cluster".to_string(),
-                            Some(Bytes::from(cluster_id.as_bytes().to_vec())),
-                        ));
-                    }
-                }
-
-                let binary_record = BinaryRecord {
-                    timestamp: record.timestamp,
-                    offset: record.offset,
-                    key: record.key.as_ref().map(|k| Bytes::from(k.clone())),
-                    value: record.value.as_ref().map(|v| Bytes::from(v.clone())),
-                    headers,
-                };
+                let binary_record = to_binary_record(record, &self.options);
                 segment_writer.add_record(binary_record)?;
 
                 // Check if we should rotate
@@ -1555,10 +1521,142 @@ fn should_create_offset_store(continuous: bool, offset_storage_configured: bool)
     continuous || offset_storage_configured
 }
 
+/// Convert a fetched record into the on-disk segment representation.
+///
+/// Header values are copied as-is: a null header value stays `None` and is
+/// written with a `-1` length by the segment format (issue #155). When
+/// `include_offset_headers` is set, the Phase 1 offset-mapping headers
+/// (`x-original-offset`, `x-original-timestamp`, and `x-source-cluster` if a
+/// `source_cluster_id` is configured) are appended after the record's own
+/// headers, as binary little-endian i64 values.
+fn to_binary_record(record: &BackupRecord, options: &BackupOptions) -> BinaryRecord {
+    let mut headers: Vec<(String, Option<Bytes>)> = record
+        .headers
+        .iter()
+        .map(|h| (h.key.clone(), h.value.clone().map(Bytes::from)))
+        .collect();
+
+    if options.include_offset_headers {
+        headers.push((
+            "x-original-offset".to_string(),
+            Some(Bytes::from(record.offset.to_le_bytes().to_vec())),
+        ));
+        headers.push((
+            "x-original-timestamp".to_string(),
+            Some(Bytes::from(record.timestamp.to_le_bytes().to_vec())),
+        ));
+        if let Some(cluster_id) = &options.source_cluster_id {
+            headers.push((
+                "x-source-cluster".to_string(),
+                Some(Bytes::from(cluster_id.as_bytes().to_vec())),
+            ));
+        }
+    }
+
+    BinaryRecord {
+        timestamp: record.timestamp,
+        offset: record.offset,
+        key: record.key.as_ref().map(|k| Bytes::from(k.clone())),
+        value: record.value.as_ref().map(|v| Bytes::from(v.clone())),
+        headers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{PartitionBackup, TopicBackup};
+    use crate::manifest::{PartitionBackup, RecordHeader, TopicBackup};
+
+    fn record_with_headers(headers: Vec<RecordHeader>) -> BackupRecord {
+        BackupRecord {
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            headers,
+            timestamp: 1_700_000_000_000,
+            offset: 42,
+        }
+    }
+
+    fn header(key: &str, value: Option<&[u8]>) -> RecordHeader {
+        RecordHeader {
+            key: key.to_string(),
+            value: value.map(|v| v.to_vec()),
+        }
+    }
+
+    /// Issue #155: a null header value must reach the segment writer as
+    /// `None` (encoded as length -1), not be flattened into an empty value.
+    #[test]
+    fn to_binary_record_preserves_null_and_empty_header_values() {
+        let record = record_with_headers(vec![
+            header("trace-id", None),
+            header("empty", Some(b"")),
+            header("tenant", Some(b"42")),
+        ]);
+        let options = BackupOptions {
+            include_offset_headers: false,
+            ..BackupOptions::default()
+        };
+
+        let binary = to_binary_record(&record, &options);
+
+        assert_eq!(
+            binary.headers,
+            vec![
+                ("trace-id".to_string(), None),
+                ("empty".to_string(), Some(Bytes::new())),
+                ("tenant".to_string(), Some(Bytes::from_static(b"42"))),
+            ]
+        );
+        assert_eq!(binary.offset, 42);
+        assert_eq!(binary.timestamp, 1_700_000_000_000);
+        assert_eq!(binary.key.as_deref(), Some(&b"k"[..]));
+        assert_eq!(binary.value.as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn to_binary_record_appends_offset_headers_after_user_headers() {
+        let record = record_with_headers(vec![header("trace-id", None)]);
+        let options = BackupOptions {
+            include_offset_headers: true,
+            source_cluster_id: Some("src-eu".to_string()),
+            ..BackupOptions::default()
+        };
+
+        let binary = to_binary_record(&record, &options);
+
+        let keys: Vec<&str> = binary.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "trace-id",
+                "x-original-offset",
+                "x-original-timestamp",
+                "x-source-cluster"
+            ]
+        );
+        assert_eq!(binary.headers[0].1, None);
+        assert_eq!(
+            binary.headers[1].1.as_deref(),
+            Some(&42i64.to_le_bytes()[..])
+        );
+        assert_eq!(
+            binary.headers[2].1.as_deref(),
+            Some(&1_700_000_000_000i64.to_le_bytes()[..])
+        );
+        assert_eq!(binary.headers[3].1.as_deref(), Some(&b"src-eu"[..]));
+    }
+
+    #[test]
+    fn to_binary_record_without_offset_headers_adds_nothing() {
+        let record = record_with_headers(vec![]);
+        let options = BackupOptions {
+            include_offset_headers: false,
+            source_cluster_id: Some("ignored".to_string()),
+            ..BackupOptions::default()
+        };
+        assert!(to_binary_record(&record, &options).headers.is_empty());
+    }
 
     #[test]
     fn fetch_max_bytes_defaults_to_capped_segment_size() {

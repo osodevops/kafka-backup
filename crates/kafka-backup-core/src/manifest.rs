@@ -306,14 +306,20 @@ pub struct BackupRecord {
 }
 
 /// Record header
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Kafka distinguishes a header whose value is **null** from one whose value
+/// is **empty**; both are legal and consumers can (and do) branch on the
+/// difference. `value` is therefore `Option<Vec<u8>>`: `None` is a null value
+/// (`-1` length on the wire and in the binary segment format),
+/// `Some(vec![])` is an empty value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordHeader {
     /// Header key
     pub key: String,
 
-    /// Header value
-    #[serde(with = "bytes_base64")]
-    pub value: Vec<u8>,
+    /// Header value (`None` = null, `Some(vec![])` = empty)
+    #[serde(with = "optional_bytes", default)]
+    pub value: Option<Vec<u8>>,
 }
 
 /// Serde helper for optional byte arrays (base64 encoded)
@@ -343,27 +349,6 @@ mod optional_bytes {
                 .map_err(serde::de::Error::custom),
             None => Ok(None),
         }
-    }
-}
-
-/// Serde helper for byte arrays (base64 encoded)
-mod bytes_base64 {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&STANDARD.encode(value))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        STANDARD.decode(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1011,6 +996,42 @@ pub struct DryRunPartitionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #155: a null header value must serialize as JSON `null` and
+    /// deserialize back to `None` — never collapse into an empty value.
+    #[test]
+    fn record_header_null_value_roundtrips_as_json_null() {
+        let header = RecordHeader {
+            key: "trace-id".to_string(),
+            value: None,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert_eq!(json, r#"{"key":"trace-id","value":null}"#);
+        let back: RecordHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, header);
+    }
+
+    #[test]
+    fn record_header_empty_value_stays_distinct_from_null() {
+        let header = RecordHeader {
+            key: "empty".to_string(),
+            value: Some(Vec::new()),
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert_eq!(json, r#"{"key":"empty","value":""}"#);
+        let back: RecordHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.value, Some(Vec::new()));
+    }
+
+    #[test]
+    fn record_header_legacy_json_segments_still_deserialize() {
+        // Legacy JSON segments (pre-binary format) always wrote a base64 string.
+        let back: RecordHeader = serde_json::from_str(r#"{"key":"k","value":"YWJj"}"#).unwrap();
+        assert_eq!(back.value.as_deref(), Some(&b"abc"[..]));
+        // A header written without the field decodes as null.
+        let back: RecordHeader = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
+        assert_eq!(back.value, None);
+    }
 
     #[test]
     fn test_offset_mapping_basic() {

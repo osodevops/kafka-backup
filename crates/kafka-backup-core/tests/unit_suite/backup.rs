@@ -103,11 +103,11 @@ fn encode_record_preserves_headers() {
     let headers = vec![
         RecordHeader {
             key: "x-correlation-id".to_string(),
-            value: b"abc123".to_vec(),
+            value: Some(b"abc123".to_vec()),
         },
         RecordHeader {
             key: "x-source".to_string(),
-            value: b"service-a".to_vec(),
+            value: Some(b"service-a".to_vec()),
         },
     ];
 
@@ -131,12 +131,15 @@ fn encode_record_with_large_headers() {
     let large_header_value = vec![0u8; 1024 * 100]; // 100KB header
     let headers = vec![RecordHeader {
         key: "big-header".to_string(),
-        value: large_header_value.clone(),
+        value: Some(large_header_value.clone()),
     }];
 
     let record = create_test_record_with_headers(headers);
 
-    assert_eq!(record.headers[0].value.len(), large_header_value.len());
+    assert_eq!(
+        record.headers[0].value.as_ref().map(Vec::len),
+        Some(large_header_value.len())
+    );
 }
 
 // ============================================================================
@@ -327,11 +330,31 @@ fn record_with_binary_key() {
 fn record_with_empty_header_value() {
     let headers = vec![RecordHeader {
         key: "empty-value".to_string(),
-        value: vec![],
+        value: Some(vec![]),
     }];
 
     let record = create_test_record_with_headers(headers);
-    assert!(record.headers[0].value.is_empty());
+    assert_eq!(record.headers[0].value, Some(vec![]));
+}
+
+/// Issue #155: Kafka distinguishes a null header value from an empty one.
+#[test]
+fn record_with_null_header_value_is_distinct_from_empty() {
+    let headers = vec![
+        RecordHeader {
+            key: "null-value".to_string(),
+            value: None,
+        },
+        RecordHeader {
+            key: "empty-value".to_string(),
+            value: Some(vec![]),
+        },
+    ];
+
+    let record = create_test_record_with_headers(headers);
+    assert_eq!(record.headers[0].value, None);
+    assert_eq!(record.headers[1].value, Some(vec![]));
+    assert_ne!(record.headers[0].value, record.headers[1].value);
 }
 
 #[test]
@@ -340,11 +363,11 @@ fn record_with_duplicate_header_keys() {
     let headers = vec![
         RecordHeader {
             key: "x-tag".to_string(),
-            value: b"tag1".to_vec(),
+            value: Some(b"tag1".to_vec()),
         },
         RecordHeader {
             key: "x-tag".to_string(),
-            value: b"tag2".to_vec(),
+            value: Some(b"tag2".to_vec()),
         },
     ];
 

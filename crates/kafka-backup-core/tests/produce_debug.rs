@@ -374,7 +374,7 @@ async fn test_produce_from_backup_segment() {
                 .into_iter()
                 .map(|(k, v)| RecordHeader {
                     key: k,
-                    value: v.map(|b| b.to_vec()).unwrap_or_default(),
+                    value: v.map(|b| b.to_vec()),
                 })
                 .collect(),
             timestamp: br.timestamp,
