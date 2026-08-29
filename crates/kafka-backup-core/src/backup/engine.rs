@@ -380,9 +380,12 @@ impl BackupEngine {
             // Capture snapshot offsets if stop_at_current_offsets is enabled
             // This provides a consistent "point-in-time" snapshot for DR backups
             // Returns (earliest, latest) pairs to avoid redundant offset fetches later
-            let snapshot_offsets: Option<HashMap<(String, i32), (i64, i64)>> =
+            let snapshot_ranges: Option<HashMap<(String, i32), SnapshotRange>> =
                 if backup_opts.stop_at_current_offsets {
-                    Some(self.capture_snapshot_offsets(&topics_metadata).await?)
+                    Some(
+                        self.capture_snapshot_offsets(&topics_metadata, &backup_opts.start_offset)
+                            .await?,
+                    )
                 } else {
                     None
                 };
@@ -427,12 +430,10 @@ impl BackupEngine {
                 // acquiring the semaphore before spawning serialized the loop and caused
                 // severe slowdowns on high-latency connections (Issue #29).
                 for partition in partitions {
-                    // Get cached offsets for snapshot mode (if enabled)
-                    let (earliest_offset, target_offset) = snapshot_offsets
+                    // Planned offset range for snapshot mode (if enabled)
+                    let snapshot = snapshot_ranges
                         .as_ref()
-                        .and_then(|m| m.get(&(topic.clone(), partition)))
-                        .map(|(earliest, latest)| (Some(*earliest), Some(*latest)))
-                        .unwrap_or((None, None));
+                        .and_then(|m| m.get(&(topic.clone(), partition)).copied());
 
                     let sem = semaphore.clone();
 
@@ -452,8 +453,7 @@ impl BackupEngine {
                         offset_persistence: self.offset_persistence.clone(),
                         kafka_cb: Arc::clone(&self.kafka_circuit_breaker),
                         storage_cb: Arc::clone(&self.storage_circuit_breaker),
-                        earliest_offset,
-                        target_offset,
+                        snapshot,
                     };
 
                     all_handles.push(tokio::spawn(async move {
@@ -799,17 +799,24 @@ impl BackupEngine {
 
     /// Capture current offsets for all partitions (snapshot mode).
     ///
-    /// Returns both earliest and latest offsets for each partition.
-    /// The latest offsets provide a consistent snapshot point - all partitions
+    /// Returns the planned offset range for each partition: the log start and
+    /// high watermark at capture time plus the offset this run resumes from.
+    /// The high watermarks provide a consistent snapshot point - all partitions
     /// will backup to the same logical point in time.
     ///
     /// Uses batched ListOffsets requests (one per broker per timestamp) instead
     /// of per-partition requests. For 8,660 partitions across 3 brokers, this
     /// sends ~6 requests instead of ~17,320 (Issue #29).
+    ///
+    /// The progress gauges are sized from the records this run will actually
+    /// fetch, not the whole captured range: an incremental run that resumes
+    /// from checkpoints reports only its new records
+    /// (strimzi-backup-operator#57).
     async fn capture_snapshot_offsets(
         &self,
         topics_metadata: &[TopicMetadata],
-    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
+        start_offset: &StartOffset,
+    ) -> Result<HashMap<(String, i32), SnapshotRange>> {
         info!(
             "Snapshot mode: capturing offsets for {} topics",
             topics_metadata.len()
@@ -830,25 +837,128 @@ impl BackupEngine {
         // Batch fetch all offsets (grouped by leader broker)
         let offsets = self.router.batch_get_all_offsets(&all_partitions).await?;
 
-        let total_records: i64 = offsets
-            .values()
-            .map(|(earliest, latest)| latest - earliest)
-            .sum();
+        let checkpoints = self.load_checkpoints().await?;
+        let ranges = plan_snapshot_ranges(offsets, &checkpoints, start_offset);
+
+        let planned_records: i64 = ranges.values().map(SnapshotRange::planned_records).sum();
+        let captured_records: i64 = ranges.values().map(SnapshotRange::captured_records).sum();
+        let resumed_partitions = ranges
+            .keys()
+            .filter(|key| checkpoints.contains_key(*key))
+            .count();
 
         let snapshot_elapsed_ms = snapshot_start.elapsed().as_millis();
         info!(
-            "snapshot_capture_complete: {} partitions in {}ms ({} total records to backup)",
-            offsets.len(),
+            "snapshot_capture_complete: {} partitions in {}ms ({} records to back up this run, \
+             {} in the captured offset range, {} partitions resuming from a checkpoint)",
+            ranges.len(),
             snapshot_elapsed_ms,
-            total_records
+            planned_records,
+            captured_records,
+            resumed_partitions
         );
 
         if let Some(ref prom) = self.prometheus_metrics {
-            prom.initialize_snapshot_progress(&self.config.backup_id, total_records);
+            prom.initialize_snapshot_progress(&self.config.backup_id, planned_records);
         }
 
-        Ok(offsets)
+        Ok(ranges)
     }
+
+    /// Last checkpointed offset per partition for this backup id (empty without
+    /// an offset store). Read once, in bulk, at snapshot capture time: the store
+    /// has just been loaded and nothing has been written yet, so one query is
+    /// the complete picture — no per-partition lookups for large clusters.
+    async fn load_checkpoints(&self) -> Result<HashMap<(String, i32), i64>> {
+        let Some(ref offset_store) = self.offset_store else {
+            return Ok(HashMap::new());
+        };
+        let checkpoints = offset_store
+            .get_all_offsets(&self.config.backup_id)
+            .await?
+            .into_iter()
+            .map(|info| ((info.topic, info.partition), info.last_offset))
+            .collect();
+        Ok(checkpoints)
+    }
+}
+
+/// Offsets captured for one partition of a snapshot (`stop_at_current_offsets`) run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotRange {
+    /// Log start offset at capture time.
+    earliest: i64,
+    /// First offset this run fetches: the successor of the checkpointed offset
+    /// when one exists, otherwise the configured start position.
+    start: i64,
+    /// High watermark at capture time; the run stops here.
+    latest: i64,
+}
+
+impl SnapshotRange {
+    /// Offsets this run has to fetch. Zero when the checkpoint already covers
+    /// the captured range (nothing new since the previous run) and never
+    /// negative, even if a checkpoint outlives a recreated topic.
+    fn planned_records(&self) -> i64 {
+        (self.latest - self.start).max(0)
+    }
+
+    /// The whole captured range, whether or not earlier runs archived part of it.
+    fn captured_records(&self) -> i64 {
+        (self.latest - self.earliest).max(0)
+    }
+}
+
+/// Start offset for a partition from the configured `start_offset`, when no
+/// checkpoint exists. For backups `latest` has always meant "start fresh".
+fn configured_start_offset(
+    start_offset: &StartOffset,
+    topic: &str,
+    partition: i32,
+    earliest: i64,
+) -> i64 {
+    match start_offset {
+        StartOffset::Earliest => earliest,
+        StartOffset::Latest => earliest,
+        StartOffset::Specific(map) => map
+            .get(topic)
+            .and_then(|partitions| partitions.get(&partition))
+            .copied()
+            .unwrap_or(earliest),
+    }
+}
+
+/// Turn captured `(earliest, latest)` offsets into the range each partition
+/// will actually fetch this run. A checkpoint takes precedence over the
+/// configured start offset, exactly as `backup_partition` resumes.
+///
+/// A checkpoint below `earliest` (retention moved the log start since the
+/// previous run) is kept as the start: the fetch loop resumes there, hits
+/// OFFSET_OUT_OF_RANGE, records the gap and advances the progress gauge by the
+/// gap span, so counting from the checkpoint keeps target and remaining
+/// consistent.
+fn plan_snapshot_ranges(
+    offsets: HashMap<(String, i32), (i64, i64)>,
+    checkpoints: &HashMap<(String, i32), i64>,
+    start_offset: &StartOffset,
+) -> HashMap<(String, i32), SnapshotRange> {
+    offsets
+        .into_iter()
+        .map(|((topic, partition), (earliest, latest))| {
+            let start = match checkpoints.get(&(topic.clone(), partition)) {
+                Some(last_offset) => last_offset + 1,
+                None => configured_start_offset(start_offset, &topic, partition, earliest),
+            };
+            (
+                (topic, partition),
+                SnapshotRange {
+                    earliest,
+                    start,
+                    latest,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Context for backing up a single partition
@@ -869,64 +979,38 @@ struct BackupPartitionContext {
     kafka_cb: Arc<CircuitBreaker>,
     #[allow(dead_code)] // Reserved for future storage circuit breaker integration
     storage_cb: Arc<CircuitBreaker>,
-    /// Cached earliest offset from snapshot capture.
-    /// When set, avoids a redundant get_offsets() call in backup_partition().
-    earliest_offset: Option<i64>,
-    /// Target offset for snapshot mode (stop_at_current_offsets)
-    /// When set, backup stops when this offset is reached instead of latest
-    target_offset: Option<i64>,
+    /// Planned offset range from snapshot capture (stop_at_current_offsets).
+    /// When set, backup resumes at `start`, stops at `latest` instead of the
+    /// live high watermark, and skips the redundant get_offsets() call.
+    snapshot: Option<SnapshotRange>,
 }
 
 impl BackupPartitionContext {
     async fn backup_partition(self) -> Result<()> {
         debug!("Starting backup of {}:{}", self.topic, self.partition);
 
-        // Use cached offsets from snapshot capture if available (avoids redundant
-        // network calls that serialize through the broker mutex - Issue #29).
-        // In snapshot mode, capture_snapshot_offsets() already fetched both earliest
-        // and latest offsets for all partitions in batched requests.
-        let (earliest, latest) =
-            if let (Some(e), Some(l)) = (self.earliest_offset, self.target_offset) {
-                (e, l)
-            } else {
-                self.router.get_offsets(&self.topic, self.partition).await?
-            };
-
-        // Determine end offset: use snapshot target if set, otherwise current latest
-        // This enables "stop_at_current_offsets" mode for consistent DR snapshots
-        let end_offset = self.target_offset.unwrap_or(latest);
-
-        if self.target_offset.is_some() {
-            debug!(
-                "{}:{}: snapshot mode - target offset {} (current latest: {})",
-                self.topic, self.partition, end_offset, latest
-            );
-        }
-
-        // Determine starting offset
-        let start_offset = if let Some(ref offset_store) = self.offset_store {
-            // Check for saved offset first
-            if let Some(saved) = offset_store
-                .get_offset(&self.backup_id, &self.topic, self.partition)
-                .await?
-            {
-                saved + 1 // Start from next offset
-            } else {
-                self.get_configured_start_offset(earliest)
+        // Snapshot mode: capture_snapshot_offsets() already resolved this
+        // partition's earliest/start/latest in batched requests (avoids
+        // redundant network calls that serialize through the broker mutex -
+        // Issue #29) and sized the progress gauges from the planned start, so
+        // the end offset is the captured high watermark ("stop_at_current_offsets"
+        // for consistent DR snapshots). Otherwise resolve the offsets and the
+        // resume position here.
+        let (earliest, start_offset, end_offset) = match self.snapshot {
+            Some(range) => {
+                debug!(
+                    "{}:{}: snapshot mode - target offset {} (earliest {}, resuming at {})",
+                    self.topic, self.partition, range.latest, range.earliest, range.start
+                );
+                (range.earliest, range.start, range.latest)
             }
-        } else {
-            self.get_configured_start_offset(earliest)
+            None => {
+                let (earliest, latest) =
+                    self.router.get_offsets(&self.topic, self.partition).await?;
+                let start_offset = self.resolve_start_offset(earliest).await?;
+                (earliest, start_offset, latest)
+            }
         };
-
-        // The snapshot target spans earliest..latest. Account immediately for
-        // offsets skipped by the configured start position or an existing
-        // checkpoint, then decrement the remainder as fetches advance.
-        if self.target_offset.is_some() {
-            if let Some(ref prom) = self.prometheus_metrics {
-                let skipped_offsets = start_offset.min(end_offset) - earliest;
-                prom.advance_snapshot_progress(&self.backup_id, skipped_offsets.max(0));
-            }
-        }
 
         // Record consumer lag (how many records we need to catch up)
         let lag = end_offset - start_offset;
@@ -1111,7 +1195,7 @@ impl BackupPartitionContext {
                 prom.inc_records(&self.backup_id, record_count);
                 prom.inc_bytes(&self.backup_id, bytes_processed);
 
-                if self.target_offset.is_some() {
+                if self.snapshot.is_some() {
                     prom.advance_snapshot_progress(
                         &self.backup_id,
                         (next_offset - current_offset).max(0),
@@ -1151,7 +1235,7 @@ impl BackupPartitionContext {
             }
         }
 
-        if self.target_offset.is_some() {
+        if self.snapshot.is_some() {
             info!(
                 "Completed snapshot backup of {}:{} - {} segments (reached target offset {})",
                 self.topic, self.partition, segments_written, end_offset
@@ -1166,16 +1250,23 @@ impl BackupPartitionContext {
         Ok(())
     }
 
-    fn get_configured_start_offset(&self, earliest: i64) -> i64 {
-        match &self.options.start_offset {
-            StartOffset::Earliest => earliest,
-            StartOffset::Latest => earliest, // For backup, latest at start means start fresh
-            StartOffset::Specific(map) => map
-                .get(&self.topic)
-                .and_then(|partitions| partitions.get(&self.partition))
-                .copied()
-                .unwrap_or(earliest),
+    /// Resume position outside snapshot mode: the successor of the checkpointed
+    /// offset when one exists, otherwise the configured start position.
+    async fn resolve_start_offset(&self, earliest: i64) -> Result<i64> {
+        if let Some(ref offset_store) = self.offset_store {
+            if let Some(saved) = offset_store
+                .get_offset(&self.backup_id, &self.topic, self.partition)
+                .await?
+            {
+                return Ok(saved + 1);
+            }
         }
+        Ok(configured_start_offset(
+            &self.options.start_offset,
+            &self.topic,
+            self.partition,
+            earliest,
+        ))
     }
 
     fn segment_key(&self, start_offset: i64) -> String {
@@ -1228,7 +1319,7 @@ impl BackupPartitionContext {
             // The skipped span still counts towards the captured snapshot's
             // remaining offsets, otherwise the progress gauge never reaches
             // zero for a partition that recovered from a gap.
-            if self.target_offset.is_some() {
+            if self.snapshot.is_some() {
                 prom.advance_snapshot_progress(&self.backup_id, span);
             }
         }
@@ -1590,6 +1681,202 @@ fn to_binary_record(record: &BackupRecord, options: &BackupOptions) -> BinaryRec
 mod tests {
     use super::*;
     use crate::manifest::{PartitionBackup, RecordHeader, TopicBackup};
+
+    // ------------------------------------------------------------------
+    // Snapshot planning (strimzi-backup-operator#57)
+    //
+    // `kafka_backup_snapshot_records_target` / `_remaining` must describe the
+    // work of *this* run. An incremental run that resumes from checkpoints
+    // must not start its gauges at the size of the whole archive.
+    // ------------------------------------------------------------------
+
+    fn tp(topic: &str, partition: i32) -> (String, i32) {
+        (topic.to_string(), partition)
+    }
+
+    fn offsets(entries: &[(&str, i32, i64, i64)]) -> HashMap<(String, i32), (i64, i64)> {
+        entries
+            .iter()
+            .map(|(t, p, earliest, latest)| (tp(t, *p), (*earliest, *latest)))
+            .collect()
+    }
+
+    fn checkpoints(entries: &[(&str, i32, i64)]) -> HashMap<(String, i32), i64> {
+        entries
+            .iter()
+            .map(|(t, p, last)| (tp(t, *p), *last))
+            .collect()
+    }
+
+    fn planned_total(ranges: &HashMap<(String, i32), SnapshotRange>) -> i64 {
+        ranges.values().map(SnapshotRange::planned_records).sum()
+    }
+
+    #[test]
+    fn first_run_without_checkpoints_plans_the_full_captured_range() {
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 1_000), ("orders", 1, 250, 1_250)]),
+            &checkpoints(&[]),
+            &StartOffset::Earliest,
+        );
+
+        assert_eq!(
+            ranges[&tp("orders", 0)],
+            SnapshotRange {
+                earliest: 0,
+                start: 0,
+                latest: 1_000
+            }
+        );
+        assert_eq!(
+            ranges[&tp("orders", 1)],
+            SnapshotRange {
+                earliest: 250,
+                start: 250,
+                latest: 1_250
+            }
+        );
+        assert_eq!(planned_total(&ranges), 2_000);
+    }
+
+    #[test]
+    fn incremental_run_plans_only_offsets_after_the_checkpoint() {
+        // Previous run checkpointed offset 899 of 1_000 -> 100 new records.
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 1_000)]),
+            &checkpoints(&[("orders", 0, 899)]),
+            &StartOffset::Earliest,
+        );
+
+        let range = ranges[&tp("orders", 0)];
+        assert_eq!(range.start, 900);
+        assert_eq!(range.planned_records(), 100);
+        assert_eq!(range.captured_records(), 1_000);
+    }
+
+    #[test]
+    fn caught_up_partition_plans_zero_records() {
+        // Checkpoint is the last offset in the log: nothing new since last run.
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 1_000)]),
+            &checkpoints(&[("orders", 0, 999)]),
+            &StartOffset::Earliest,
+        );
+
+        assert_eq!(ranges[&tp("orders", 0)].planned_records(), 0);
+    }
+
+    #[test]
+    fn checkpoint_beyond_the_captured_watermark_never_goes_negative() {
+        // A recreated/truncated topic can leave a checkpoint past the new
+        // high watermark; the plan must clamp instead of counting backwards.
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 100)]),
+            &checkpoints(&[("orders", 0, 5_000)]),
+            &StartOffset::Earliest,
+        );
+
+        assert_eq!(ranges[&tp("orders", 0)].planned_records(), 0);
+        assert_eq!(planned_total(&ranges), 0);
+    }
+
+    #[test]
+    fn retention_gap_since_last_run_counts_from_the_checkpoint() {
+        // Log start moved past the checkpoint: the fetch loop resumes at
+        // checkpoint+1, hits OFFSET_OUT_OF_RANGE, records the gap and advances
+        // the progress gauge by the gap span — so the plan counts from the
+        // checkpoint too, keeping target and remaining consistent.
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 500, 1_000)]),
+            &checkpoints(&[("orders", 0, 99)]),
+            &StartOffset::Earliest,
+        );
+
+        let range = ranges[&tp("orders", 0)];
+        assert_eq!(range.start, 100);
+        assert_eq!(range.planned_records(), 900);
+        assert_eq!(range.captured_records(), 500);
+    }
+
+    #[test]
+    fn checkpoint_wins_over_configured_start_offset() {
+        let mut specific = HashMap::new();
+        specific.insert("orders".to_string(), HashMap::from([(0, 300_i64)]));
+
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 1_000)]),
+            &checkpoints(&[("orders", 0, 599)]),
+            &StartOffset::Specific(specific),
+        );
+
+        assert_eq!(ranges[&tp("orders", 0)].start, 600);
+    }
+
+    #[test]
+    fn configured_specific_offset_applies_without_a_checkpoint() {
+        let mut specific = HashMap::new();
+        specific.insert("orders".to_string(), HashMap::from([(0, 300_i64)]));
+
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 1_000), ("orders", 1, 0, 1_000)]),
+            &checkpoints(&[]),
+            &StartOffset::Specific(specific),
+        );
+
+        // Partition 0 has an explicit start; partition 1 falls back to earliest.
+        assert_eq!(ranges[&tp("orders", 0)].planned_records(), 700);
+        assert_eq!(ranges[&tp("orders", 1)].planned_records(), 1_000);
+        assert_eq!(planned_total(&ranges), 1_700);
+    }
+
+    #[test]
+    fn configured_latest_start_keeps_backup_semantics_of_earliest() {
+        // For backups `latest` has always meant "start fresh from earliest";
+        // planning must match what backup_partition() actually fetches.
+        assert_eq!(
+            configured_start_offset(&StartOffset::Latest, "orders", 0, 42),
+            42
+        );
+        assert_eq!(
+            configured_start_offset(&StartOffset::Earliest, "orders", 0, 42),
+            42
+        );
+    }
+
+    #[test]
+    fn checkpoints_for_other_partitions_do_not_leak() {
+        let ranges = plan_snapshot_ranges(
+            offsets(&[("orders", 0, 0, 100), ("orders", 1, 0, 100)]),
+            &checkpoints(&[("orders", 1, 49), ("payments", 0, 99)]),
+            &StartOffset::Earliest,
+        );
+
+        assert_eq!(ranges[&tp("orders", 0)].planned_records(), 100);
+        assert_eq!(ranges[&tp("orders", 1)].planned_records(), 50);
+        assert_eq!(ranges.len(), 2, "plan covers captured partitions only");
+    }
+
+    #[test]
+    fn mixed_partitions_sum_to_this_runs_work_not_the_archive_size() {
+        // The reporter's shape: a huge archive, a few new records per run.
+        let ranges = plan_snapshot_ranges(
+            offsets(&[
+                ("big", 0, 0, 8_000_000_000),
+                ("big", 1, 0, 8_000_000_000),
+                ("busy", 0, 0, 3_000_000),
+            ]),
+            &checkpoints(&[
+                ("big", 0, 7_999_999_999),
+                ("big", 1, 7_999_999_999),
+                ("busy", 0, 1_999_999),
+            ]),
+            &StartOffset::Earliest,
+        );
+
+        assert_eq!(planned_total(&ranges), 1_000_000);
+        let captured: i64 = ranges.values().map(SnapshotRange::captured_records).sum();
+        assert_eq!(captured, 16_003_000_000);
+    }
 
     fn record_with_headers(headers: Vec<RecordHeader>) -> BackupRecord {
         BackupRecord {

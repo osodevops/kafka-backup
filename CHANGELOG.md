@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-08-29
+
+### Fixed
+- `kafka_backup_snapshot_records_target` and
+  `kafka_backup_snapshot_records_remaining` now describe the work of the
+  current run. Snapshot mode (`stop_at_current_offsets`) sized both gauges
+  from the whole captured offset range (`latest - earliest` summed over
+  partitions) and only subtracted a partition's checkpointed prefix once that
+  partition's task started, so an incremental run over a large archive began
+  with "remaining" at the size of the entire archive even when only a few
+  records were new
+  ([strimzi-backup-operator#57](https://github.com/osodevops/strimzi-backup-operator/issues/57)).
+  The snapshot plan now resolves every partition's resume position (the
+  checkpoint's successor, else the configured `start_offset`) in one bulk read
+  of the offset store at capture time: `target` is the number of records this
+  run will fetch, `remaining` counts down from it to zero, and a run with
+  nothing new reports `0` / `0`. The `snapshot_capture_complete` log line
+  reports the planned records, the captured range and how many partitions
+  resume from a checkpoint. Dashboards using
+  `1 - remaining / clamp_min(target, 1)` keep working and now show per-run
+  progress.
+
 ## [0.19.0] - 2026-08-29
 
 ### Added
