@@ -341,8 +341,8 @@ the pod exits. Keep the value within the pod termination grace period.
 **Key metrics:**
 - `kafka_backup_lag_records` — Consumer lag per partition
 - `kafka_backup_lag_records_sum` — Current lag across all partitions
-- `kafka_backup_snapshot_records_target` — Captured snapshot offset span
-- `kafka_backup_snapshot_records_remaining` — Snapshot offset span still to process
+- `kafka_backup_snapshot_records_target` — Records this run will fetch (captured snapshot range minus what earlier runs already archived)
+- `kafka_backup_snapshot_records_remaining` — Records this run has still to fetch
 - `kafka_backup_records_total` — Total records backed up
 - `kafka_backup_compression_ratio` — Compression efficiency
 - `kafka_backup_storage_write_latency_seconds` — Storage I/O latency

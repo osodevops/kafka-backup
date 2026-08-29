@@ -658,8 +658,8 @@ metrics:
 |--------|------|-------------|
 | `kafka_backup_lag_records` | Gauge | Consumer lag per topic/partition |
 | `kafka_backup_lag_records_sum` | Gauge | Current lag summed across all partitions |
-| `kafka_backup_snapshot_records_target` | Gauge | Total captured snapshot offset span |
-| `kafka_backup_snapshot_records_remaining` | Gauge | Captured snapshot offset span still to process |
+| `kafka_backup_snapshot_records_target` | Gauge | Records this run will fetch: the captured snapshot range minus offsets already archived by earlier runs (checkpoints) |
+| `kafka_backup_snapshot_records_remaining` | Gauge | Records this run has still to fetch; reaches 0 when the run completes |
 | `kafka_backup_records_total` | Counter | Total records backed up |
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |

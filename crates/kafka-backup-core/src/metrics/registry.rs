@@ -284,12 +284,12 @@ impl PrometheusMetrics {
         );
         registry.register(
             "kafka_backup_snapshot_records_target",
-            "Total records in the captured snapshot offset range",
+            "Records this backup run will fetch: the captured snapshot range minus offsets already archived by earlier runs (checkpoints), summed over partitions",
             snapshot_records_target.clone(),
         );
         registry.register(
             "kafka_backup_snapshot_records_remaining",
-            "Records remaining before the captured snapshot target is reached",
+            "Records this backup run has still to fetch before the captured snapshot target is reached",
             snapshot_records_remaining.clone(),
         );
 

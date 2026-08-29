@@ -14,6 +14,7 @@
 //! - Issue #148: consumer group offsets applied in Phase 3 after restore
 //! - Issue #154: default offset headers are documented, logged, and strippable on restore
 //! - Issue #155: null header values survive backup and restore
+//! - strimzi-backup-operator#57: snapshot progress gauges describe the current run
 
 pub mod common;
 pub mod issue_144_offset_out_of_range;
@@ -22,6 +23,7 @@ pub mod issue_148_offset_reset_after_restore;
 pub mod issue_154_offset_headers;
 pub mod issue_155_null_header_value;
 pub mod issue_56_missing_topic;
+pub mod issue_57_incremental_snapshot_target;
 pub mod issue_67_fixes;
 pub mod offset_semantics;
 pub mod performance_issues;
