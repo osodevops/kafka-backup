@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-08-29
+
+### Fixed
+- **Null header values are no longer flattened to empty values on backup**
+  ([#155](https://github.com/osodevops/kafka-backup/issues/155)). Kafka
+  distinguishes a header whose value is null (`-1` length on the wire) from
+  one whose value is empty, and consumers branch on the difference.
+  `kafka/fetch.rs::convert_record` collapsed null into `[]` while turning a
+  fetched record into a `BackupRecord`, so every archive written by 0.x
+  stored such headers as empty (`value_len == 0`) and restored them as
+  empty — even though the binary segment format has always been able to
+  encode null (`value_len == -1`). Null now survives the whole path:
+  fetch → segment → restore → produce.
+- `x-original-offset` / `x-original-timestamp` header decoding on restore
+  treats a null header value as "not present" (falls back to the record's
+  own offset / timestamp) instead of trying to parse it.
+
+### Changed
+- **Breaking (library API):** `manifest::RecordHeader::value` is now
+  `Option<Vec<u8>>` — `None` is a null header value, `Some(vec![])` an empty
+  one. `RecordHeader` also derives `PartialEq` / `Eq`. Archives are
+  unaffected: binary segments already encode null as `-1`, and legacy JSON
+  segments (base64 string values) still deserialize; a null header value
+  serializes to JSON `null`.
+- **Archives written by earlier releases stay lossy for this case:** a
+  header that was null at the source is stored as empty, and nothing in the
+  archive records the difference, so no restore-side option can recover it.
+  Re-run the backup with 0.18.0 or later where the null / empty distinction
+  matters.
+
 ## [0.17.4] - 2026-08-20
 
 ### Changed

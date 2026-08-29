@@ -84,7 +84,9 @@ fn build_kafka_records(records: Vec<BackupRecord>) -> Vec<Record> {
             let headers: IndexMap<StrBytes, Option<Bytes>> = r
                 .headers
                 .into_iter()
-                .map(|h| (StrBytes::from_string(h.key), Some(Bytes::from(h.value))))
+                // `None` is a null header value and must be produced as
+                // such (issue #155) — it is not the same as an empty value.
+                .map(|h| (StrBytes::from_string(h.key), h.value.map(Bytes::from)))
                 .collect();
 
             Record {
@@ -246,6 +248,7 @@ fn parse_produce_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::RecordHeader;
 
     fn make_record(timestamp: i64) -> BackupRecord {
         BackupRecord {
@@ -255,6 +258,44 @@ mod tests {
             timestamp,
             offset: 0,
         }
+    }
+
+    /// Issue #155: a null header value must be produced as null, an empty
+    /// one as empty — they are different values to a Kafka consumer.
+    #[test]
+    fn build_kafka_records_preserves_null_and_empty_header_values() {
+        let mut record = make_record(1);
+        record.headers = vec![
+            RecordHeader {
+                key: "trace-id".to_string(),
+                value: None,
+            },
+            RecordHeader {
+                key: "empty".to_string(),
+                value: Some(vec![]),
+            },
+            RecordHeader {
+                key: "tenant".to_string(),
+                value: Some(b"42".to_vec()),
+            },
+        ];
+
+        let records = build_kafka_records(vec![record]);
+        let headers = &records[0].headers;
+
+        assert_eq!(headers.len(), 3);
+        assert_eq!(
+            headers.get(&StrBytes::from_static_str("trace-id")),
+            Some(&None)
+        );
+        assert_eq!(
+            headers.get(&StrBytes::from_static_str("empty")),
+            Some(&Some(Bytes::new()))
+        );
+        assert_eq!(
+            headers.get(&StrBytes::from_static_str("tenant")),
+            Some(&Some(Bytes::from_static(b"42")))
+        );
     }
 
     #[test]

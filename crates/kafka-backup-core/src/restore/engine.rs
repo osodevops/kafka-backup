@@ -1531,52 +1531,40 @@ impl RestorePartitionContext {
         super::helpers::filter_records_by_time(records, &self.options)
     }
 
-    /// Extract source offset from record headers or fall back to record.offset
-    /// Headers can be either binary (preferred) or string encoded
+    /// Extract source offset from record headers or fall back to record.offset.
     fn extract_source_offset(&self, record: &BackupRecord) -> i64 {
-        for header in &record.headers {
-            if header.key == "x-original-offset" {
-                // Try binary format first (8 bytes, little-endian i64)
-                if header.value.len() == 8 {
-                    if let Ok(bytes) = header.value[..8].try_into() {
-                        return i64::from_le_bytes(bytes);
-                    }
-                }
-                // Fall back to string format for backwards compatibility
-                if let Ok(s) = std::str::from_utf8(&header.value) {
-                    if let Ok(offset) = s.parse::<i64>() {
-                        return offset;
-                    }
-                }
-            }
-        }
-        // No header found, use record offset
-        record.offset
+        record
+            .headers
+            .iter()
+            .filter(|h| h.key == "x-original-offset")
+            .find_map(|h| decode_i64_header(h.value.as_deref()))
+            .unwrap_or(record.offset)
     }
 
-    /// Extract source timestamp from record headers or fall back to record.timestamp
-    /// Headers can be either binary (preferred) or string encoded
+    /// Extract source timestamp from record headers or fall back to record.timestamp.
     #[allow(dead_code)]
     fn extract_source_timestamp(&self, record: &BackupRecord) -> i64 {
-        for header in &record.headers {
-            if header.key == "x-original-timestamp" {
-                // Try binary format first (8 bytes, little-endian i64)
-                if header.value.len() == 8 {
-                    if let Ok(bytes) = header.value[..8].try_into() {
-                        return i64::from_le_bytes(bytes);
-                    }
-                }
-                // Fall back to string format for backwards compatibility
-                if let Ok(s) = std::str::from_utf8(&header.value) {
-                    if let Ok(ts) = s.parse::<i64>() {
-                        return ts;
-                    }
-                }
-            }
-        }
-        // No header found, use record timestamp
-        record.timestamp
+        record
+            .headers
+            .iter()
+            .filter(|h| h.key == "x-original-timestamp")
+            .find_map(|h| decode_i64_header(h.value.as_deref()))
+            .unwrap_or(record.timestamp)
     }
+}
+
+/// Decode an `x-original-*` header value.
+///
+/// The binary little-endian i64 the backup engine writes (8 bytes) is tried
+/// first; a decimal string is accepted for backwards compatibility. A null
+/// header value (`None`) decodes to `None` so callers fall back to the
+/// record's own offset/timestamp instead of misreading it as 0.
+fn decode_i64_header(value: Option<&[u8]>) -> Option<i64> {
+    let value = value?;
+    if let Ok(bytes) = <[u8; 8]>::try_from(value) {
+        return Some(i64::from_le_bytes(bytes));
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
 }
 
 /// Pattern matching for topic names.
@@ -1656,6 +1644,20 @@ mod tests {
     use super::*;
     use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetStrategy};
     use std::collections::HashMap;
+
+    #[test]
+    fn decode_i64_header_handles_binary_string_and_null() {
+        assert_eq!(
+            decode_i64_header(Some(&12345i64.to_le_bytes())),
+            Some(12345)
+        );
+        assert_eq!(decode_i64_header(Some(b"12345")), Some(12345));
+        assert_eq!(decode_i64_header(Some(b"-7")), Some(-7));
+        assert_eq!(decode_i64_header(Some(b"")), None);
+        assert_eq!(decode_i64_header(Some(b"not-a-number")), None);
+        // Issue #155: a null header value is not 0 and must not panic.
+        assert_eq!(decode_i64_header(None), None);
+    }
 
     #[test]
     fn test_glob_match() {

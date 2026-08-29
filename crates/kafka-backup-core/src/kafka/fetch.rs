@@ -203,7 +203,9 @@ fn convert_record(record: &Record) -> BackupRecord {
         .iter()
         .map(|(key, value)| crate::manifest::RecordHeader {
             key: key.to_string(),
-            value: value.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
+            // Preserve Kafka's null-vs-empty distinction (issue #155): a
+            // null header value must not be flattened into an empty one.
+            value: value.as_ref().map(|v| v.to_vec()),
         })
         .collect();
 
@@ -436,6 +438,50 @@ mod tests {
 
     fn parse(data: Vec<u8>, fetch_offset: i64) -> (Vec<BackupRecord>, i64) {
         decode_fetch_data(&Bytes::from(data), fetch_offset).expect("decode failed")
+    }
+
+    /// Issue #155: a null header value (`-1` length on the wire) must be
+    /// decoded as `None`, distinct from an empty value (`Some(vec![])`).
+    #[test]
+    fn null_and_empty_header_values_are_preserved_from_the_wire() {
+        let mut record = make_record(7);
+        record
+            .headers
+            .insert(StrBytes::from_static_str("trace-id"), None);
+        record
+            .headers
+            .insert(StrBytes::from_static_str("empty"), Some(Bytes::new()));
+        record.headers.insert(
+            StrBytes::from_static_str("tenant"),
+            Some(Bytes::from_static(b"42")),
+        );
+
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            std::iter::once(&record),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .expect("encode failed");
+
+        let (records, _) = parse(buf.to_vec(), 7);
+        assert_eq!(records.len(), 1);
+        let headers: Vec<(&str, Option<&[u8]>)> = records[0]
+            .headers
+            .iter()
+            .map(|h| (h.key.as_str(), h.value.as_deref()))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                ("trace-id", None),
+                ("empty", Some(&[][..])),
+                ("tenant", Some(&b"42"[..])),
+            ]
+        );
     }
 
     #[test]

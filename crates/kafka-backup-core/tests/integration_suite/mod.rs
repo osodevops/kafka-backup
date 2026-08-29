@@ -12,11 +12,13 @@
 //! - Issue #144: OFFSET_OUT_OF_RANGE recovery and data-gap recording
 //! - Issue #146: connection-error classification and reconnect (no Docker)
 //! - Issue #148: consumer group offsets applied in Phase 3 after restore
+//! - Issue #155: null header values survive backup and restore
 
 pub mod common;
 pub mod issue_144_offset_out_of_range;
 pub mod issue_146_connection_errors;
 pub mod issue_148_offset_reset_after_restore;
+pub mod issue_155_null_header_value;
 pub mod issue_56_missing_topic;
 pub mod issue_67_fixes;
 pub mod offset_semantics;

@@ -383,6 +383,7 @@ mod tests {
             headers: vec![
                 ("header1".to_string(), Some(Bytes::from("value1"))),
                 ("header2".to_string(), None),
+                ("header3".to_string(), Some(Bytes::new())),
             ],
         };
 
@@ -395,7 +396,9 @@ mod tests {
         assert_eq!(parsed.offset, record.offset);
         assert_eq!(parsed.key, record.key);
         assert_eq!(parsed.value, record.value);
-        assert_eq!(parsed.headers.len(), record.headers.len());
+        // Null (`None`) and empty (`Some("")`) header values are distinct and
+        // must both survive the round trip (issue #155).
+        assert_eq!(parsed.headers, record.headers);
     }
 
     #[test]

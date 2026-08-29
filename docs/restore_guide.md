@@ -43,6 +43,34 @@ The Kafka Backup Restore Engine enables recovery of backed-up topics with:
 | Checkpointing | Resume after failures without re-processing |
 | Pattern Matching | Glob and regex topic filtering |
 
+### Record Fidelity
+
+A restored record carries the source record's key, value, timestamp and
+headers verbatim:
+
+| Field | Preserved | Notes |
+|-------|-----------|-------|
+| Key | ✅ | A null key stays null; an empty key stays empty |
+| Value | ✅ | A null value (tombstone) stays null; an empty value stays empty |
+| Timestamp | ✅ | Re-produced as the record's create timestamp |
+| Headers | ✅ | Order preserved. A **null** header value stays null and an **empty** one stays empty — they are different values to a consumer ([#155](https://github.com/osodevops/kafka-backup/issues/155), fixed in 0.18.0) |
+| Offset | ➖ | Offsets are assigned by the target cluster; see [Consumer Offset Management](#consumer-offset-management) for mapping them back |
+
+Things that can make a restored record differ from its source:
+
+- **Injected headers.** `backup.include_offset_headers` (default `true`) adds
+  `x-original-offset` and `x-original-timestamp` to every *archived* record;
+  set it to `false` on the backup for a header-for-header identical archive.
+  On the restore side, `include_original_offset_header: true` or
+  `consumer_group_strategy: header-based` add `x-original-offset`,
+  `x-original-timestamp` and `x-source-partition` to every produced record.
+- **Duplicate header keys** (two headers with the same key on one record) are
+  currently collapsed to the last one at backup time
+  ([#156](https://github.com/osodevops/kafka-backup/issues/156)).
+- **Archives written before 0.18.0** store a null header value as an empty
+  one; nothing in those archives records the difference, so re-run the
+  backup with 0.18.0 or later where it matters.
+
 ---
 
 ## Restore Modes
