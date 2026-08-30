@@ -13,6 +13,7 @@ Core engine for high-performance Kafka backup and restore operations with point-
 - **Consumer offset recovery** - Automatically reset consumer group offsets after restore
 - **High performance** - 100+ MB/s throughput with zstd/lz4 compression
 - **Fault tolerance** - Circuit breaker pattern for resilient operations
+- **Faithful records** - Null vs empty keys, values and header values are preserved (0.18.0+); `restore.strip_offset_headers` gives header-for-header identical restores (0.19.0+)
 
 ## Installation
 
@@ -20,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kafka-backup-core = "0.1"
+kafka-backup-core = "0.19"
 tokio = { version = "1", features = ["full"] }
 ```
 

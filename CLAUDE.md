@@ -273,15 +273,17 @@ kafka-backup three-phase-restore --config restore.yaml
 s3://kafka-backups/
 └── {prefix}/
     └── {backup_id}/
-        ├── manifest.json
-        ├── state/
-        │   └── offsets.db           # SQLite checkpoint
+        ├── manifest.json                    # merged on every save
+        ├── offsets.db                       # SQLite offset store; only with continuous: true or offset_storage:
+        ├── consumer-groups-snapshot.json    # only with backup.consumer_group_snapshot: true
         └── topics/
             └── {topic}/
                 └── partition={id}/
-                    ├── segment-0001.zst
-                    └── segment-0002.zst
+                    ├── segment-00000000000000000000.bin.zst   # named by first offset; .lz4 / no ext for other codecs
+                    └── segment-00000000000000125000.bin.zst
 ```
+
+Header names kafka-backup adds live in `crates/kafka-backup-core/src/offset_headers.rs`.
 
 ## Configuration Format
 
@@ -310,10 +312,11 @@ storage:
   prefix: backups/
 
 backup:
-  compression: zstd | lz4 | gzip | snappy | none
+  compression: zstd | lz4 | none
   segment_max_bytes: 134217728  # 128MB
   checkpoint_interval_secs: 5
-  max_concurrent_partitions: 4
+  max_concurrent_partitions: 8
+  include_offset_headers: true  # default; adds x-original-offset / x-original-timestamp to every archived record
 
 restore:
   time_window_start: 1736899200000  # epoch millis (PITR)
@@ -321,6 +324,7 @@ restore:
   topic_mapping:
     orders: orders-recovered
   consumer_group_strategy: skip | header-based | timestamp-based | cluster-scan | manual
+  strip_offset_headers: false  # true = drop the x-original-*/x-source-* headers the backup added (v0.19.0+)
   dry_run: false
 ```
 
@@ -344,7 +348,7 @@ The project solves the **offset space discontinuity problem** (source cluster of
 ## Three-Phase Restore
 
 For exact consumer offset recovery:
-1. **Phase 1 (Backup):** Store original offset in message headers
+1. **Phase 1 (Backup):** Store original offset in message headers (`include_offset_headers`, default `true`; `restore.strip_offset_headers` is the opt-out on the way back)
 2. **Phase 2 (Restore):** Produce records, track source→target offset mapping
 3. **Phase 3 (Reset):** Apply offset resets using generated mapping
 

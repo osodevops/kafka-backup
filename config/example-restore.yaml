@@ -85,11 +85,16 @@ restore:
   dry_run: false
 
   # ==========================================
-  # Original Offset Headers
+  # Offset-tracking headers
   # ==========================================
-  # Include original offset as a header in restored records
-  # Headers added: x-original-offset, x-original-timestamp
+  # Add x-original-offset, x-original-timestamp and x-source-partition headers
+  # to every restored record (default: false; implied by header-based strategy).
   include_original_offset_header: true
+
+  # Remove the headers the backup added (x-original-*, x-source-*; the backup
+  # default include_offset_headers: true adds them) before producing, for a
+  # header-for-header identical restore. Default: false. (v0.19.0+)
+  strip_offset_headers: false
 
   # ==========================================
   # Rate Limiting

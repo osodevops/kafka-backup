@@ -320,7 +320,7 @@ The offset mapping report contains:
 
 ## Safety Guarantees
 
-- **No data loss**: Records are restored with 100% fidelity
+- **No data loss**: Records are restored with full fidelity — see [Record Fidelity](restore_guide.md#record-fidelity) for exactly what is preserved (null vs empty header values from v0.18.0) and the one known limitation (duplicate header keys, [#156](https://github.com/osodevops/kafka-backup/issues/156))
 - **No duplicates**: Each record is produced exactly once
 - **Exact positioning**: Consumer groups resume at the exact logical position
 - **Reversible**: Offset resets can be reverted if needed

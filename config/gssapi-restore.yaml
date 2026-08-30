@@ -37,6 +37,6 @@ restore:
     smoke-topic: smoke-topic-restored
   consumer_group_strategy: skip
   dry_run: false
-  include_original_offset_header: true
+  include_original_offset_header: true  # default: false; adds x-original-* / x-source-partition headers
   max_concurrent_partitions: 1
   produce_batch_size: 100
