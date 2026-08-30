@@ -2,7 +2,7 @@ use anyhow::Result;
 use kafka_backup_core::BackupManifest;
 use tracing::info;
 
-use super::storage_path::backend_from_path;
+use super::storage_path::backend_and_backup_id;
 
 /// Describe command output format
 pub enum OutputFormat {
@@ -21,8 +21,13 @@ impl OutputFormat {
     }
 }
 
-pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
-    let storage = backend_from_path(path)?;
+pub async fn run(
+    path: Option<&str>,
+    config: Option<&str>,
+    backup_id: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let (storage, backup_id) = backend_and_backup_id(path, config, backup_id)?;
     let output_format = OutputFormat::from_str(format);
 
     info!("Loading backup manifest: {}", backup_id);
