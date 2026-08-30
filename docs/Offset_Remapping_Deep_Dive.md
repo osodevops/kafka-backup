@@ -561,10 +561,11 @@ This is what **Kannika does** and what you should implement:
 
 ```
 PHASE 1: BACKUP
-├─ For each record, store in header:
-│  ├─ x-original-offset: i64
-│  ├─ x-original-timestamp: i64
-│  └─ x-original-partition: i32
+├─ For each record, store in header (on by default: include_offset_headers):
+│  ├─ x-original-offset: i64 (little-endian)
+│  ├─ x-original-timestamp: i64 (little-endian)
+│  └─ x-source-cluster: UTF-8 (only when source_cluster_id is set)
+│  (x-source-partition: i32 is added on the RESTORE side, not here)
 └─ Also backup __consumer_offsets topic (if readable)
 
 PHASE 2: RESTORE
@@ -719,8 +720,9 @@ Update your Restore PRD with this **Consumer Offset Handling** section:
 ### 8.1 Always Use Three-Phase Restore
 
 Phase 1: Backup
-  ✅ Store x-original-offset header on all records
+  ✅ Store x-original-offset header on all records (default: include_offset_headers: true)
   ✅ Store x-original-timestamp header
+  ℹ️  restore.strip_offset_headers: true removes them again for a verbatim restore
   ✅ (Optional) Backup __consumer_offsets topic if readable
 
 Phase 2: Restore
@@ -746,7 +748,11 @@ Phase 3: Offset Reset
 
 ### 8.3 Safety Guarantees
 
-✅ Records are restored with 100% fidelity (no loss/duplication)
+✅ Records are restored with full fidelity (no loss/duplication) — keys, values,
+   timestamps and headers verbatim, including null vs empty (null header values
+   from v0.18.0, see #155). Known limitation: duplicate header keys on one record
+   collapse to the last one (#156). The x-original-* headers are the one
+   deliberate addition; see restore_guide.md → Record Fidelity.
 ✅ Original offsets NEVER conflict with target data
 ✅ Offset reset is reversible (can revert if needed)
 ✅ Consumer groups start from correct position

@@ -139,6 +139,7 @@ storage:
 backup:
   compression: zstd
   segment_max_bytes: 134217728  # 128MB
+  include_offset_headers: true   # default — adds x-original-offset / x-original-timestamp to every archived record
 ```
 
 Run the backup:
@@ -171,7 +172,15 @@ restore:
   # Remap topics (optional)
   topic_mapping:
     orders-prod: orders-recovered
+
+  # Drop the x-original-*/x-source-* headers the backup added, so restored
+  # records are header-for-header identical to the source (v0.19.0+)
+  strip_offset_headers: false
 ```
+
+Records are restored verbatim — keys, values, timestamps and headers, including the
+difference between null and empty values; see
+[Record Fidelity](docs/restore_guide.md#record-fidelity) for details and known limits.
 
 Run the restore:
 ```bash

@@ -71,7 +71,8 @@ backup:
   checkpoint_interval_secs: 5
   sync_interval_secs: 30
 
-  # Include original offsets for DR scenarios
+  # Offset-tracking headers (default: true) — adds x-original-offset /
+  # x-original-timestamp to every archived record; set false for a verbatim archive
   include_offset_headers: true
   source_cluster_id: "prod-cluster-east"
 

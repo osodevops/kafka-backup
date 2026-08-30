@@ -538,22 +538,27 @@ restore:
   include_original_offset_header: true
 ```
 
-- **Behavior**: Stores original offset in message header `x-original-offset`
+- **Behavior**: Adds the source offset to every restored record as the `x-original-offset` header. The backup itself already archives that header by default (`backup.include_offset_headers: true`), so `header-based` works without any restore-side flag; `include_original_offset_header: true` merely forces the restore-side set on.
 - **Result**: Applications can read the original offset from headers
 - **Use Case**: Exact offset recovery when applications support header-based seeking
 
-**Headers Added:**
+**Headers Added** (values are **binary little-endian**, not strings):
 ```
-x-original-offset: 12345
-x-original-timestamp: 1705312800000
+x-original-offset:    i64 LE, 8 bytes   (e.g. 12345)
+x-original-timestamp: i64 LE, 8 bytes   (epoch ms, e.g. 1705312800000)
+x-source-partition:   i32 LE, 4 bytes   (source partition number)
 ```
 
 **Application-Side Usage (Java):**
 ```java
 ConsumerRecord<String, String> record = ...;
 Header offsetHeader = record.headers().lastHeader("x-original-offset");
-long originalOffset = Long.parseLong(new String(offsetHeader.value()));
+long originalOffset = ByteBuffer.wrap(offsetHeader.value())
+    .order(ByteOrder.LITTLE_ENDIAN)
+    .getLong();
 ```
+
+To restore records *without* any of these headers (header-for-header identical to the source) set `strip_offset_headers: true` — see [Record Fidelity](#record-fidelity).
 
 ### Strategy: Timestamp-Based
 

@@ -761,7 +761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend: Arc<dyn StorageBackend> = create_backend_from_config(&config)?;
 
     // 2. Write data
-    let manifest = r#"{"backup_id": "backup-001", "version": 1}"#;
+    let manifest = r#"{"backup_id": "backup-001", "created_at": 1733220000000, "topics": []}"#;
     backend.put("backup-001/manifest.json", Bytes::from(manifest)).await?;
 
     // 3. Check existence

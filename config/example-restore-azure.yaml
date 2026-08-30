@@ -42,7 +42,8 @@ restore:
   #   1: 1
 
   # Consumer group offset handling
-  consumer_group_strategy: skip  # skip | header-based | timestamp-based
+  consumer_group_strategy: skip  # skip | header-based | timestamp-based | cluster-scan | manual
+  # strip_offset_headers: true   # v0.19.0+: drop the x-original-*/x-source-* headers the backup added
 
   # Performance settings
   max_concurrent_partitions: 4

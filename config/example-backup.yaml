@@ -51,6 +51,12 @@ backup:
   # Continuous mode (keep running and backing up new data)
   continuous: false  # true for continuous, false for one-shot
 
+  # Offset-tracking headers (default: true). Adds x-original-offset and
+  # x-original-timestamp to every archived record for header-based consumer
+  # offset recovery. Set false for an archive whose records carry only their
+  # original headers (or use restore.strip_offset_headers at restore time).
+  include_offset_headers: true
+
 # Offset storage — enables resumable incremental backups.
 # Used automatically with continuous: true. For one-shot or snapshot mode,
 # add this section explicitly to resume from where the last run stopped.

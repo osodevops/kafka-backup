@@ -20,7 +20,7 @@ backup:
   compression: zstd
   compression_level: 3
   stop_at_current_offsets: true  # Snapshot mode - exit when caught up
-  include_offset_headers: true
+  include_offset_headers: true  # default; adds x-original-* headers to archived records
 
 logging:
   level: info
