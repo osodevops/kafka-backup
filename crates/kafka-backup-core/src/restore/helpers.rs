@@ -30,9 +30,11 @@ pub async fn read_segment(
             .map(binary_to_backup_record)
             .collect())
     } else {
-        // Legacy JSON format — detect compression from extension
-        let extension = segment.key.rsplit('.').next().unwrap_or("");
-        let algo = detect_from_extension(extension);
+        // Legacy JSON format — detect compression from the key's extension.
+        // `detect_from_extension` matches on `.zst` / `.lz4` suffixes, so it
+        // must see the full key (a bare `zst` never matched, which made every
+        // compressed legacy segment fail to decompress).
+        let algo = detect_from_extension(&segment.key);
         let decompressed = decompress(&data, algo)?;
         let records: Vec<BackupRecord> = serde_json::from_slice(&decompressed)?;
         Ok(records)
@@ -250,6 +252,66 @@ mod tests {
             assert_eq!(records[0].key.as_deref(), Some(&b"k"[..]));
             assert_eq!(records[0].value, None);
             assert_eq!(records[0].offset, 7);
+        }
+    }
+
+    /// Legacy (pre-binary) segments are a compressed JSON array of records.
+    /// The codec is taken from the key's extension — the full key must be
+    /// passed to `detect_from_extension`, which matches on `.zst` / `.lz4`
+    /// (issue: compressed legacy segments failed to decompress).
+    #[tokio::test]
+    async fn read_segment_reads_legacy_json_segments_for_every_codec() {
+        use crate::compression::compress;
+        use crate::config::CompressionType;
+
+        let records = vec![
+            BackupRecord {
+                key: Some(b"k".to_vec()),
+                value: None,
+                headers: vec![header("trace-id", None), header("tenant", Some(b"42"))],
+                timestamp: 1_700_000_000_000,
+                offset: 7,
+            },
+            BackupRecord {
+                key: None,
+                value: Some(b"v".to_vec()),
+                headers: vec![],
+                timestamp: 1_700_000_000_001,
+                offset: 8,
+            },
+        ];
+        let json = serde_json::to_vec(&records).unwrap();
+
+        for (codec, ext) in [
+            (CompressionType::None, ""),
+            (CompressionType::Zstd, ".zst"),
+            (CompressionType::Lz4, ".lz4"),
+        ] {
+            let storage = MemoryBackend::new();
+            let key = format!("b/topics/t/partition=0/segment-00000000.json{ext}");
+            storage
+                .put(&key, compress(&json, codec).unwrap().into())
+                .await
+                .unwrap();
+            let segment = SegmentMetadata {
+                key: key.clone(),
+                start_offset: 7,
+                end_offset: 8,
+                start_timestamp: 1_700_000_000_000,
+                end_timestamp: 1_700_000_000_001,
+                record_count: 2,
+                uncompressed_size: json.len() as u64,
+                compressed_size: 0,
+            };
+
+            let out = read_segment(&storage, &segment)
+                .await
+                .unwrap_or_else(|e| panic!("{codec:?} legacy segment {key}: {e}"));
+
+            assert_eq!(out.len(), 2, "{codec:?}");
+            assert_eq!(out[0].headers, records[0].headers, "{codec:?}");
+            assert_eq!(out[0].value, None, "{codec:?}");
+            assert_eq!(out[1].offset, 8, "{codec:?}");
         }
     }
 
