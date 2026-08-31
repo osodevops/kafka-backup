@@ -62,6 +62,7 @@ pub async fn run(
     let offsets_key = format!("{}/offsets.db", backup_id);
     let mut resume: HashMap<(String, i32), i64> = HashMap::new();
     let mut newest_checkpoint_ms: Option<i64> = None;
+    let mut job_status: Option<String> = None;
     if storage.exists(&offsets_key).await.unwrap_or(false) {
         let tmp = std::env::temp_dir().join(format!(
             "kafka-backup-prune-{}-{}",
@@ -81,6 +82,7 @@ pub async fn run(
             .await?;
         let offsets = store.get_all_offsets(&backup_id).await?;
         newest_checkpoint_ms = offsets.iter().map(|o| o.checkpoint_ts).max();
+        job_status = store.job_status(&backup_id).await?;
         resume = offsets
             .into_iter()
             .map(|o| ((o.topic, o.partition), o.last_offset + 1))
@@ -88,17 +90,22 @@ pub async fn run(
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
-    // Refuse when a run looks live: a checkpoint younger than 2 minutes
-    // means an active writer could resurrect the manifest we rewrite.
-    if let Some(ts) = newest_checkpoint_ms {
-        let age_ms = chrono::Utc::now().timestamp_millis() - ts;
-        if age_ms < 120_000 && !force {
-            bail!(
-                "a backup run for '{}' looks live (offset checkpoint {}s old); \
-                 re-run when it finishes, or pass --force",
-                backup_id,
-                age_ms / 1000
-            );
+    // Refuse when a run looks live: the job row says "running" (a clean
+    // finish flips it to "completed" before the final sync) AND the offset
+    // checkpoint is younger than 2 minutes — an active writer could
+    // resurrect the manifest we rewrite. A crashed run leaves "running"
+    // with an aging checkpoint, so it stops blocking after 2 minutes.
+    if job_status.as_deref() == Some("running") {
+        if let Some(ts) = newest_checkpoint_ms {
+            let age_ms = chrono::Utc::now().timestamp_millis() - ts;
+            if age_ms < 120_000 && !force {
+                bail!(
+                    "a backup run for '{}' looks live (job status 'running', offset \
+                     checkpoint {}s old); re-run when it finishes, or pass --force",
+                    backup_id,
+                    age_ms / 1000
+                );
+            }
         }
     }
 

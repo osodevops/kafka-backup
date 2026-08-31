@@ -721,15 +721,18 @@ impl BackupEngine {
     }
 
     async fn finalize(&self) -> Result<()> {
-        // Final checkpoint
+        // Final checkpoint. The job status flips to "completed" BEFORE the
+        // remote sync, so the copy of offsets.db in storage records that the
+        // run finished — tools like `kafka-backup prune` read it to decide
+        // whether a run is still live.
         if let Some(ref offset_store) = self.offset_store {
             offset_store.checkpoint().await?;
-            if let Some(ref offset_persistence) = self.offset_persistence {
-                offset_persistence.sync_now().await?;
-            }
             offset_store
                 .update_job_status(&self.config.backup_id, "completed")
                 .await?;
+            if let Some(ref offset_persistence) = self.offset_persistence {
+                offset_persistence.sync_now().await?;
+            }
         }
 
         // Save final manifest

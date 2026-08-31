@@ -98,6 +98,19 @@ impl SqliteOffsetStore {
         Ok(())
     }
 
+    /// Status of the backup job row for `backup_id` (`running`/`completed`),
+    /// or `None` when no run ever registered. Read by `kafka-backup prune`
+    /// to decide whether a run is still live.
+    pub async fn job_status(&self, backup_id: &str) -> Result<Option<String>> {
+        let pool = self.pool.read().await;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM backup_jobs WHERE backup_id = ?")
+                .bind(backup_id)
+                .fetch_optional(&*pool)
+                .await?;
+        Ok(row.map(|(status,)| status))
+    }
+
     /// Try to load database from storage if local doesn't exist
     pub async fn try_load_from_storage(
         &self,
