@@ -1,27 +1,35 @@
 //! Evidence report upload, download, and listing via the storage backend.
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::storage::StorageBackend;
 use crate::Result;
 
+fn evidence_key(prefix: &str, report_id: &str, now: DateTime<Utc>, ext: &str) -> String {
+    format!(
+        "{}{}/{:04}/{:02}/{}.{}",
+        prefix,
+        report_id,
+        now.format("%Y"),
+        now.format("%m"),
+        report_id,
+        ext
+    )
+}
+
 /// Upload a JSON evidence report to object storage.
+///
+/// `now` determines the year/month path components; pass the same timestamp
+/// for all artifacts of one run so they share a prefix.
 pub async fn upload_evidence_json(
     storage: &dyn StorageBackend,
     prefix: &str,
     report_id: &str,
     json_bytes: &[u8],
+    now: DateTime<Utc>,
 ) -> Result<String> {
-    let now = Utc::now();
-    let key = format!(
-        "{}{}/{:04}/{:02}/{}.json",
-        prefix,
-        report_id,
-        now.format("%Y"),
-        now.format("%m"),
-        report_id
-    );
+    let key = evidence_key(prefix, report_id, now, "json");
     storage.put(&key, Bytes::from(json_bytes.to_vec())).await?;
     Ok(key)
 }
@@ -32,36 +40,23 @@ pub async fn upload_evidence_pdf(
     prefix: &str,
     report_id: &str,
     pdf_bytes: &[u8],
+    now: DateTime<Utc>,
 ) -> Result<String> {
-    let now = Utc::now();
-    let key = format!(
-        "{}{}/{:04}/{:02}/{}.pdf",
-        prefix,
-        report_id,
-        now.format("%Y"),
-        now.format("%m"),
-        report_id
-    );
+    let key = evidence_key(prefix, report_id, now, "pdf");
     storage.put(&key, Bytes::from(pdf_bytes.to_vec())).await?;
     Ok(key)
 }
 
-/// Upload a detached signature file to object storage.
+/// Upload a detached signature artifact (v2 JSON envelope, or legacy v1 text
+/// bundle) to object storage.
 pub async fn upload_evidence_signature(
     storage: &dyn StorageBackend,
     prefix: &str,
     report_id: &str,
     sig_content: &str,
+    now: DateTime<Utc>,
 ) -> Result<String> {
-    let now = Utc::now();
-    let key = format!(
-        "{}{}/{:04}/{:02}/{}.sig",
-        prefix,
-        report_id,
-        now.format("%Y"),
-        now.format("%m"),
-        report_id
-    );
+    let key = evidence_key(prefix, report_id, now, "sig");
     storage
         .put(&key, Bytes::from(sig_content.as_bytes().to_vec()))
         .await?;

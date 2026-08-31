@@ -45,6 +45,70 @@ pub async fn run(config_path: &str) -> Result<()> {
     );
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
 
+    // Phase 1 preflight summary
+    if let Some(ref preflight) = report.header_preflight {
+        println!(
+            "║ PHASE 1: HEADER PREFLIGHT                                                    ║"
+        );
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
+        println!(
+            "║   Verdict: {:67} ║",
+            if preflight.passed {
+                "✓ PASSED"
+            } else {
+                "✗ FAILED"
+            }
+        );
+        println!(
+            "║   Mode: {:70} ║",
+            format!(
+                "{} (offset recovery requested: {}, scan performed: {})",
+                preflight.mode, preflight.offset_recovery_requested, preflight.scan_performed
+            )
+        );
+        println!(
+            "║   Records scanned: {:59} ║",
+            preflight.records_scanned_total
+        );
+        for p in &preflight.partitions {
+            println!(
+                "║   {:76} ║",
+                truncate_string(
+                    &format!(
+                        "{}/{}: {} ({}/{} records covered, {} segments)",
+                        p.topic,
+                        p.partition,
+                        p.state,
+                        p.records_with_required_headers,
+                        p.records_scanned,
+                        p.segments_selected
+                    ),
+                    76
+                )
+            );
+        }
+        if let Some(ref snapshot) = preflight.consumer_group_snapshot {
+            println!(
+                "║   {:76} ║",
+                truncate_string(
+                    &format!(
+                        "consumer-groups snapshot: {} ({} groups, {} offsets)",
+                        snapshot.state, snapshot.groups, snapshot.offsets
+                    ),
+                    76
+                )
+            );
+        }
+        for error in &preflight.errors {
+            println!("║     ✗ {:72} ║", truncate_string(error, 72));
+        }
+        println!(
+            "╟──────────────────────────────────────────────────────────────────────────────╢"
+        );
+    }
+
     // Phase 2 summary
     println!("║ PHASE 2: DATA RESTORE                                                        ║");
     println!("╟──────────────────────────────────────────────────────────────────────────────╢");
