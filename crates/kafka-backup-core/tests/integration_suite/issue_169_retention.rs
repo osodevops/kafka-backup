@@ -119,12 +119,15 @@ async fn retention_prunes_aged_segments_and_the_next_run_does_not_resurrect_them
     let cluster = KafkaTestCluster::start()
         .await
         .expect("failed to start Kafka");
-    cluster.create_topic(TOPIC).await.expect("create topic");
+    cluster
+        .create_topic(TOPIC, PARTITIONS)
+        .await
+        .expect("create topic");
 
     let storage = TempDir::new().unwrap();
     let offset_dir = TempDir::new().unwrap();
     let offset_db = offset_dir.path().join("offsets.db");
-    let bootstrap = cluster.bootstrap_servers();
+    let bootstrap = cluster.bootstrap_servers.clone();
 
     // Run 1 (no retention): seed the archive.
     produce(&cluster, 30, 0).await;
