@@ -7,6 +7,7 @@ pub mod offset_mapping;
 pub mod offset_reset;
 pub mod offset_reset_bulk;
 pub mod offset_rollback;
+pub mod prune;
 pub mod restore;
 pub mod sasl_plugin;
 pub mod security_args;

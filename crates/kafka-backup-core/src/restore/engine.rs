@@ -552,7 +552,55 @@ impl RestoreEngine {
                     .collect();
 
                 if segments.is_empty() {
+                    if !partition_backup.pruned.is_empty() {
+                        report.warnings.push(format!(
+                            "{}:{}: all segments in the selected window were pruned by retention",
+                            topic_backup.name, partition_backup.partition_id
+                        ));
+                    }
                     continue;
+                }
+
+                // Storage existence checks: the oldest overlapping segment is
+                // always checked (bucket lifecycle rules expire oldest-first,
+                // so this canary catches a wiped archive at one request per
+                // partition); dry_run_check_segments sweeps every segment.
+                let to_check: Vec<&SegmentMetadata> = if restore_options.dry_run_check_segments {
+                    segments.iter().map(|s| &**s).collect()
+                } else {
+                    segments.first().map(|s| &**s).into_iter().collect()
+                };
+                for segment in to_check {
+                    match self.storage.exists(&segment.key).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            report.valid = false;
+                            report.errors.push(format!(
+                                "segment missing from storage: {} (deleted by a bucket \
+                                 lifecycle rule? use `kafka-backup prune` instead — see the \
+                                 storage guide)",
+                                segment.key
+                            ));
+                        }
+                        Err(e) => {
+                            report
+                                .warnings
+                                .push(format!("could not check segment {}: {}", segment.key, e));
+                        }
+                    }
+                }
+
+                for range in &partition_backup.pruned {
+                    report.warnings.push(format!(
+                        "{}:{}: offsets {}..{} were pruned by retention on {}",
+                        topic_backup.name,
+                        partition_backup.partition_id,
+                        range.start_offset,
+                        range.end_offset,
+                        chrono::DateTime::from_timestamp_millis(range.pruned_at)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| range.pruned_at.to_string())
+                    ));
                 }
 
                 let mut partition_records = 0i64;

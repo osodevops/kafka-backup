@@ -13,7 +13,9 @@ use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset, T
 use crate::error::KafkaError;
 use crate::health::HealthCheck;
 use crate::kafka::{ConfigResourceType, PartitionLeaderRouter, TopicMetadata};
-use crate::manifest::{BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, SegmentMetadata};
+use crate::manifest::{
+    BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, PartitionBackup, SegmentMetadata,
+};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_headers;
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
@@ -569,6 +571,16 @@ impl BackupEngine {
             // Save manifest periodically
             self.save_manifest().await?;
 
+            // Apply backup.retention (issue #169): prune aged/oversized
+            // segments from this backup set. Runs each cycle in continuous
+            // mode, once for one-shot/snapshot runs. Non-fatal: a failed
+            // prune must not fail the backup that just succeeded.
+            if let Some(retention) = &backup_opts.retention {
+                if let Err(e) = self.apply_retention(retention).await {
+                    warn!("Retention prune failed (non-fatal): {}", e);
+                }
+            }
+
             // Optionally snapshot consumer group offsets (Issue #67 bug 5/6)
             if backup_opts.consumer_group_snapshot {
                 if let Err(e) = self.snapshot_consumer_groups().await {
@@ -601,6 +613,54 @@ impl BackupEngine {
             info!("Backup completed successfully");
         }
 
+        Ok(())
+    }
+
+    /// Apply `backup.retention` to this backup set: plan against the
+    /// in-memory manifest, remove the planned segments from it, persist the
+    /// manifest (manifest first, so a crash leaves orphan objects rather
+    /// than a manifest referencing deleted segments), then delete the
+    /// objects.
+    async fn apply_retention(&self, retention: &crate::config::RetentionOptions) -> Result<()> {
+        let criteria = retention.to_criteria()?;
+        let resume = match &self.offset_store {
+            Some(store) => {
+                super::prune::resume_positions(store.as_ref(), &self.config.backup_id).await?
+            }
+            None => std::collections::HashMap::new(),
+        };
+
+        let plan = {
+            let manifest = self.manifest.lock().await;
+            super::prune::plan_prune(
+                &manifest,
+                &resume,
+                &criteria,
+                chrono::Utc::now().timestamp_millis(),
+                crate::manifest::PruneReason::Retention,
+            )
+        };
+        if plan.segments == 0 {
+            return Ok(());
+        }
+
+        info!(
+            "Retention: pruning {} segment(s), {} bytes across {} partition(s)",
+            plan.segments,
+            plan.bytes,
+            plan.partitions.len()
+        );
+
+        {
+            let mut manifest = self.manifest.lock().await;
+            super::prune::apply_plan_to_manifest(&mut manifest, &plan);
+        }
+        self.manifest_persistence.save_now().await?;
+        super::prune::delete_planned_segments(self.storage.as_ref(), &plan).await;
+
+        if let Some(ref prom) = self.prometheus_metrics {
+            prom.record_segments_pruned(&self.config.backup_id, plan.segments, plan.bytes);
+        }
         Ok(())
     }
 
@@ -1566,6 +1626,27 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                     .iter_mut()
                     .find(|p| p.partition_id == cur_part.partition_id)
                 {
+                    // Pruned ranges are unioned FIRST: a segment either side
+                    // recorded as deliberately deleted must never come back,
+                    // even when the other side's in-memory manifest still
+                    // lists it (e.g. a run that pruned mid-flight, or a prune
+                    // that raced this run's save).
+                    for range in cur_part.pruned.clone() {
+                        ex_part.add_pruned(range);
+                    }
+                    let inside_pruned = |seg: &SegmentMetadata, part: &PartitionBackup| {
+                        part.pruned.iter().any(|r| {
+                            seg.start_offset >= r.start_offset && seg.end_offset <= r.end_offset
+                        })
+                    };
+                    ex_part.segments = {
+                        let pruned_view = ex_part.clone();
+                        ex_part
+                            .segments
+                            .drain(..)
+                            .filter(|seg| !inside_pruned(seg, &pruned_view))
+                            .collect()
+                    };
                     // Merge segments: deduplicate by key and start_offset; existing wins
                     let mut seen_keys: HM<String, ()> = ex_part
                         .segments
@@ -1578,6 +1659,9 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                         .map(|s| (s.start_offset, ()))
                         .collect();
                     for seg in cur_part.segments {
+                        if inside_pruned(&seg, ex_part) {
+                            continue;
+                        }
                         if !seen_keys.contains_key(&seg.key)
                             && !seen_offsets.contains_key(&seg.start_offset)
                         {
@@ -2219,6 +2303,8 @@ mod tests {
             record_count: end_offset - start_offset + 1,
             uncompressed_size: 0,
             compressed_size: 0,
+            sha256: String::new(),
+            uploaded_at: 0,
         }
     }
 
@@ -2227,6 +2313,7 @@ mod tests {
             partition_id: id,
             segments,
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }
     }
 
@@ -2570,6 +2657,105 @@ mod tests {
             reason: OffsetGapReason::OffsetOutOfRange,
             detected_at: 1_700_000_000_000,
         }
+    }
+
+    #[test]
+    fn merge_keeps_pruned_ranges_and_does_not_resurrect_pruned_segments() {
+        use crate::manifest::{PruneReason, PrunedRange};
+        let range = PrunedRange {
+            start_offset: 0,
+            end_offset: 9,
+            segments: 1,
+            bytes: 100,
+            pruned_at: 5,
+            cutoff_timestamp: 4,
+            reason: PruneReason::Retention,
+        };
+
+        // Existing (stored) manifest: segment pruned away, range recorded.
+        let mut existing_part = make_partition(0, vec![make_segment("k2", 10, 19)]);
+        existing_part.add_pruned(range.clone());
+        let existing = {
+            let mut m = BackupManifest::new("b".to_string());
+            m.topics.push(make_topic("t", Some(1), vec![existing_part]));
+            m
+        };
+
+        // Current (in-memory) manifest of a still-running process: it wrote
+        // the pruned segment this run and still lists it.
+        let current = {
+            let mut m = BackupManifest::new("b".to_string());
+            m.topics.push(make_topic(
+                "t",
+                Some(1),
+                vec![make_partition(
+                    0,
+                    vec![make_segment("k1", 0, 9), make_segment("k2", 10, 19)],
+                )],
+            ));
+            m
+        };
+
+        let merged = merge_manifests(existing, current);
+        let partition = &merged.topics[0].partitions[0];
+        assert_eq!(partition.pruned, vec![range]);
+        assert_eq!(
+            partition
+                .segments
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k2"],
+            "the pruned segment must not be resurrected by the merge"
+        );
+    }
+
+    #[test]
+    fn merge_drops_existing_segments_inside_a_newly_pruned_range() {
+        use crate::manifest::{PruneReason, PrunedRange};
+        let range = PrunedRange {
+            start_offset: 0,
+            end_offset: 9,
+            segments: 1,
+            bytes: 100,
+            pruned_at: 5,
+            cutoff_timestamp: 4,
+            reason: PruneReason::Manual,
+        };
+
+        // Existing (stored) manifest still lists the segment; the current
+        // side (an engine that pruned in memory) carries the range.
+        let existing = {
+            let mut m = BackupManifest::new("b".to_string());
+            m.topics.push(make_topic(
+                "t",
+                Some(1),
+                vec![make_partition(
+                    0,
+                    vec![make_segment("k1", 0, 9), make_segment("k2", 10, 19)],
+                )],
+            ));
+            m
+        };
+        let current = {
+            let mut part = make_partition(0, vec![make_segment("k2", 10, 19)]);
+            part.add_pruned(range);
+            let mut m = BackupManifest::new("b".to_string());
+            m.topics.push(make_topic("t", Some(1), vec![part]));
+            m
+        };
+
+        let merged = merge_manifests(existing, current);
+        let partition = &merged.topics[0].partitions[0];
+        assert_eq!(
+            partition
+                .segments
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k2"]
+        );
+        assert_eq!(partition.pruned.len(), 1);
     }
 
     #[test]

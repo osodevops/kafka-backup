@@ -87,6 +87,17 @@ fn print_manifest_text(manifest: &BackupManifest) {
             )
         );
     }
+    let total_pruned = manifest.total_pruned();
+    if total_pruned > 0 {
+        let pruned_bytes: u64 = manifest.pruned().map(|(_, _, r)| r.bytes).sum();
+        println!(
+            "║ Pruned Ranges:  {:55} ║",
+            format!(
+                "{} ({} bytes deleted by retention)",
+                total_pruned, pruned_bytes
+            )
+        );
+    }
 
     // Calculate total size
     let total_compressed: u64 = manifest
@@ -194,6 +205,17 @@ fn print_manifest_text(manifest: &BackupManifest) {
                     gap.end_offset,
                     gap.offset_span(),
                     gap.reason
+                );
+            }
+            for range in &partition.pruned {
+                println!(
+                    "║     P{}: PRUNED offsets {}..{} ({} segments, {} bytes: {}) ║",
+                    partition.partition_id,
+                    range.start_offset,
+                    range.end_offset,
+                    range.segments,
+                    range.bytes,
+                    range.reason
                 );
             }
         }

@@ -22,6 +22,7 @@ pub mod issue_146_connection_errors;
 pub mod issue_148_offset_reset_after_restore;
 pub mod issue_154_offset_headers;
 pub mod issue_155_null_header_value;
+pub mod issue_169_retention;
 pub mod issue_56_missing_topic;
 pub mod issue_57_incremental_snapshot_target;
 pub mod issue_67_fixes;

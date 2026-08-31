@@ -458,7 +458,33 @@ This ensures consistent "point-in-time" snapshots for disaster recovery, even wi
 
 > **Note:** `stop_at_current_offsets` is incompatible with `continuous: true`. Use snapshot mode for scheduled backups (CronJobs), and continuous mode for streaming replication.
 
-#### Retention deleting data before it is fetched
+### Backup Retention
+
+Prune aged or oversized segments from this backup set at the end of every
+backup cycle. Safe for incremental sets — the manifest is rewritten before
+any object is deleted and every removal is recorded as a `pruned` range
+(shown by `describe`/`validate`). **Never use bucket lifecycle rules on an
+incremental set** (see the storage guide). The on-demand form is
+`kafka-backup prune`.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `retention.max_age` | string | No | - | Prune segments older than this (`30d`, `12h`, `1d12h`; units ms/s/m/h/d/w) |
+| `retention.max_total_bytes` | int | No | - | Then prune oldest-first until the set fits under this many compressed bytes |
+| `retention.keep_segments` | int | No | `1` | Never prune a partition below this many newest segments |
+
+```yaml
+backup:
+  retention:
+    max_age: 30d
+    keep_segments: 1
+```
+
+Segments are aged by upload time (`uploaded_at`, recorded since 0.21) or,
+for older segments, by their newest record timestamp. The segment holding
+the resume position is never pruned.
+
+#### Kafka retention deleting data before it is fetched
 
 The offsets a backup starts from are captured before the fetch happens — for
 every partition up front in snapshot mode, and from the checkpoint on resume.
@@ -664,6 +690,8 @@ metrics:
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
 | `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
+| `kafka_backup_segments_pruned_total` | Counter | Segments deliberately deleted by retention (`prune` / `backup.retention`) |
+| `kafka_backup_bytes_pruned_total` | Counter | Compressed bytes deleted by retention |
 | `kafka_backup_compression_ratio` | Gauge | Compression efficiency |
 | `kafka_backup_storage_write_latency_seconds` | Histogram | Storage write latency |
 | `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
@@ -682,6 +710,7 @@ Options specific to restore operations.
 | `dry_run` | bool | No | `false` | Simulate restore without writing |
 | `include_original_offset_header` | bool | No | `false` | Add `x-original-offset`, `x-original-timestamp` and `x-source-partition` headers to every record as it is produced (also implied by `consumer_group_strategy: header-based`) |
 | `strip_offset_headers` | bool | No | `false` | Remove the headers kafka-backup added at backup time (`x-original-*`, `x-source-*`) before producing, for a header-for-header identical restore — see [Offset-tracking headers](#offset-tracking-headers) |
+| `dry_run_check_segments` | bool | No | `false` | `validate-restore`/dry-run: HEAD every segment in the window instead of only the oldest per partition (the default canary that catches lifecycle-rule expiry) |
 | `purge_topics` | bool | No | `false` | **Irreversible.** Advance every target partition's log-start-offset to its end-offset (`DeleteRecords`) before restoring, so the topic appears empty without being deleted (Strimzi-managed topics) |
 
 Note the two header options govern different sides of the pipeline:
@@ -990,6 +1019,26 @@ kafka-backup validate --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 | `--path` | Path to storage location |
 | `--backup-id` | Backup identifier |
 | `--deep` | Perform deep validation |
+
+### Prune Command
+
+Delete aged/oversized segments from a backup set, safely (plan-only unless
+`--execute`; see [Backup Retention](#backup-retention)):
+
+```bash
+kafka-backup prune --config backup.yaml --older-than 30d            # plan
+kafka-backup prune --config backup.yaml --older-than 30d --execute  # delete
+kafka-backup prune --path s3://bucket/prefix --backup-id daily \
+  --before 2026-08-01T00:00:00Z --keep-segments 2 --execute
+```
+
+Only a contiguous oldest-first prefix per partition is ever pruned; the
+resume position and the newest `--keep-segments` segments are protected; the
+manifest is rewritten before objects are deleted and each removal is
+recorded as a `pruned` range. Refuses while a backup run looks live unless
+`--force`. `--max-total-bytes` keeps pruning oldest-first until the set fits
+(compressed bytes). Never use bucket lifecycle rules for this — see the
+storage guide.
 
 ### Validate-Restore Command
 
