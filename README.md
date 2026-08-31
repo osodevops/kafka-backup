@@ -318,15 +318,20 @@ Backups are stored in a structured format:
 s3://kafka-backups/
 └── {prefix}/
     └── {backup_id}/
-        ├── manifest.json           # Backup metadata
-        ├── state/
-        │   └── offsets.db          # Checkpoint state (synced from local)
+        ├── manifest.json                    # topics, partitions, segments, gaps, pruned ranges
+        ├── offsets.db                       # resume state (synced from the local SQLite db)
+        ├── consumer-groups-snapshot.json    # committed offsets captured at backup time
         └── topics/
             └── {topic}/
                 └── partition={id}/
-                    ├── segment-0001.zst
-                    └── segment-0002.zst
+                    ├── segment-00000000000000000000.bin.zst
+                    └── segment-00000000000000012345.bin.zst
 ```
+
+Segment files are `segment-{start_offset:020}.bin` plus the compression
+extension (`.zst`, `.lz4`, or none). Everything above shares the backup
+prefix — see the storage guide before attaching lifecycle rules to it
+(retention belongs to `kafka-backup prune`, not bucket rules).
 
 A local SQLite offset database is maintained at `$TMPDIR/{backup_id}-offsets.db` (configurable via `offset_storage.db_path`) and periodically synced to remote storage for durability. To enable incremental one-shot backups (resume from where the last run stopped), add the `offset_storage` section to your config.
 

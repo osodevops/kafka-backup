@@ -142,6 +142,19 @@ impl StorageBackendConfig {
                     .find(|(k, _)| k == "path_style")
                     .map(|(_, v)| v == "true")
                     .unwrap_or(false);
+                // Plain-HTTP endpoints (in-cluster MinIO/Ceph RGW) need
+                // allow_http or the S3 client refuses to build; an explicit
+                // `allow_http=true` query param works too, and an
+                // `endpoint=http://…` implies it (issue #166).
+                let allow_http = parsed
+                    .query_pairs()
+                    .find(|(k, _)| k == "allow_http")
+                    .map(|(_, v)| v == "true")
+                    .unwrap_or_else(|| {
+                        endpoint
+                            .as_deref()
+                            .is_some_and(|e| e.starts_with("http://"))
+                    });
 
                 Ok(Self::S3 {
                     bucket,
@@ -151,7 +164,7 @@ impl StorageBackendConfig {
                     secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
                     prefix,
                     path_style,
-                    allow_http: false,
+                    allow_http,
                 })
             }
             "azure" | "az" => {
@@ -264,6 +277,48 @@ mod tests {
     fn test_memory_url_parsing() {
         let config = StorageBackendConfig::from_url("memory://").unwrap();
         assert!(matches!(config, StorageBackendConfig::Memory));
+    }
+
+    #[test]
+    fn from_url_s3_http_endpoint_implies_allow_http() {
+        let config = StorageBackendConfig::from_url(
+            "s3://bucket/prefix?endpoint=http://minio:9000&path_style=true",
+        )
+        .unwrap();
+        match config {
+            StorageBackendConfig::S3 {
+                allow_http,
+                path_style,
+                endpoint,
+                ..
+            } => {
+                assert!(allow_http, "http:// endpoint must imply allow_http");
+                assert!(path_style);
+                assert_eq!(endpoint.as_deref(), Some("http://minio:9000"));
+            }
+            _ => panic!("expected S3"),
+        }
+
+        // Explicit override wins in both directions.
+        let off = StorageBackendConfig::from_url(
+            "s3://bucket?endpoint=http://minio:9000&allow_http=false",
+        )
+        .unwrap();
+        match off {
+            StorageBackendConfig::S3 { allow_http, .. } => assert!(!allow_http),
+            _ => panic!("expected S3"),
+        }
+        let on = StorageBackendConfig::from_url("s3://bucket?allow_http=true").unwrap();
+        match on {
+            StorageBackendConfig::S3 { allow_http, .. } => assert!(allow_http),
+            _ => panic!("expected S3"),
+        }
+        let https =
+            StorageBackendConfig::from_url("s3://bucket?endpoint=https://s3.example").unwrap();
+        match https {
+            StorageBackendConfig::S3 { allow_http, .. } => assert!(!allow_http),
+            _ => panic!("expected S3"),
+        }
     }
 
     #[test]

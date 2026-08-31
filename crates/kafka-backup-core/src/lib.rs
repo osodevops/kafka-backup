@@ -19,6 +19,7 @@ pub mod offset_store;
 pub mod restore;
 pub mod segment;
 pub mod storage;
+pub mod util;
 pub mod validation;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
