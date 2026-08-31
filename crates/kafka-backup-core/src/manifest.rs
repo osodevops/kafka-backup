@@ -79,6 +79,26 @@ impl BackupManifest {
     /// Zero means the backup captured every offset it set out to. Non-zero
     /// means the source no longer had some records by the time they were
     /// fetched, and this backup is knowingly incomplete for those ranges.
+    /// Total pruned ranges across all partitions.
+    pub fn total_pruned(&self) -> usize {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(|p| p.pruned.len())
+            .sum()
+    }
+
+    /// Iterate every pruned range with its topic and partition.
+    pub fn pruned(&self) -> impl Iterator<Item = (&str, i32, &PrunedRange)> {
+        self.topics.iter().flat_map(|t| {
+            t.partitions.iter().flat_map(move |p| {
+                p.pruned
+                    .iter()
+                    .map(move |range| (t.name.as_str(), p.partition_id, range))
+            })
+        })
+    }
+
     pub fn total_gaps(&self) -> usize {
         self.topics
             .iter()
@@ -141,6 +161,7 @@ impl TopicBackup {
                 partition_id,
                 segments: Vec::new(),
                 gaps: Vec::new(),
+                pruned: Vec::new(),
             });
         }
         self.partitions
@@ -166,6 +187,14 @@ pub struct PartitionBackup {
     /// as an empty list. Sorted by `start_offset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<OffsetGap>,
+
+    /// Offset ranges deliberately deleted from this backup by retention
+    /// (`kafka-backup prune` / `backup.retention` — see [`PrunedRange`]).
+    /// Unlike [`gaps`](Self::gaps), these were captured and later removed on
+    /// purpose; `validate`/`describe` report them without failing. Sorted by
+    /// `start_offset`; omitted from JSON when empty (absent before 0.21).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned: Vec<PrunedRange>,
 }
 
 impl PartitionBackup {
@@ -191,6 +220,72 @@ impl PartitionBackup {
         }
         self.gaps.push(gap);
         self.gaps.sort_by_key(|g| g.start_offset);
+    }
+
+    /// Record a pruned range, keeping `pruned` sorted and free of duplicates
+    /// (same rule as [`add_gap`](Self::add_gap): manifest merges must not
+    /// double-count a range).
+    pub fn add_pruned(&mut self, range: PrunedRange) {
+        if self
+            .pruned
+            .iter()
+            .any(|p| p.start_offset == range.start_offset)
+        {
+            return;
+        }
+        self.pruned.push(range);
+        self.pruned.sort_by_key(|p| p.start_offset);
+    }
+}
+
+/// A contiguous range of offsets deliberately deleted from a backup by
+/// retention (`kafka-backup prune` or `backup.retention`).
+///
+/// The segments covering `[start_offset, end_offset]` were captured and then
+/// removed on purpose; the range is recorded so `describe`/`validate` can
+/// explain the hole and `restore` can distinguish "pruned" from "lost".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedRange {
+    /// First pruned offset (inclusive).
+    pub start_offset: i64,
+
+    /// Last pruned offset (inclusive — matches `SegmentMetadata.end_offset`).
+    pub end_offset: i64,
+
+    /// Number of segments deleted for this range.
+    pub segments: u32,
+
+    /// Compressed bytes deleted for this range.
+    pub bytes: u64,
+
+    /// When the prune ran (epoch milliseconds).
+    pub pruned_at: i64,
+
+    /// The age cutoff the prune used (epoch milliseconds; `0` for a purely
+    /// size-based prune).
+    pub cutoff_timestamp: i64,
+
+    /// Why the range was pruned.
+    pub reason: PruneReason,
+}
+
+/// Why a [`PrunedRange`] was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PruneReason {
+    /// `backup.retention` applied at the end of a backup run.
+    Retention,
+    /// An operator ran `kafka-backup prune`.
+    Manual,
+}
+
+impl std::fmt::Display for PruneReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PruneReason::Retention => write!(f, "retention"),
+            PruneReason::Manual => write!(f, "manual"),
+        }
     }
 }
 
@@ -277,6 +372,18 @@ pub struct SegmentMetadata {
     /// Compressed size in bytes
     #[serde(default)]
     pub compressed_size: u64,
+
+    /// SHA-256 of the stored segment bytes (header + compressed data + CRC
+    /// footer), hex-encoded. Written since 0.21; empty for older segments.
+    /// `validate --deep` verifies it when present.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+
+    /// When the segment was written to storage (epoch milliseconds). `0` for
+    /// segments written before 0.21. Retention prefers this over
+    /// `end_timestamp` (which is producer record time) when present.
+    #[serde(default)]
+    pub uploaded_at: i64,
 }
 
 impl SegmentMetadata {
@@ -482,6 +589,19 @@ pub struct RestoreReport {
     /// Consumer groups resolved during restore (includes groups auto-loaded from snapshot)
     #[serde(default)]
     pub resolved_consumer_groups: Vec<String>,
+
+    /// Records removed by the configured record filter (see
+    /// `restore::filter`); `0` when no filter was set.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records turned into tombstones by the configured record filter.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
+
+    /// Name of the record filter that ran, when one was configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_filter: Option<String>,
 }
 
 /// Per-topic restore report
@@ -501,6 +621,14 @@ pub struct TopicRestoreReport {
 
     /// Total bytes for this topic
     pub bytes: u64,
+
+    /// Records removed by the configured record filter for this topic.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records tombstoned by the configured record filter for this topic.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
 }
 
 /// Per-partition restore report
@@ -532,6 +660,14 @@ pub struct PartitionRestoreReport {
 
     /// Last timestamp restored
     pub last_timestamp: i64,
+
+    /// Records removed by the configured record filter for this partition.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records tombstoned by the configured record filter for this partition.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
 }
 
 /// Offset mapping for consumer group reset
@@ -1383,6 +1519,86 @@ mod tests {
             !json.contains("gaps"),
             "a backup with no gaps must not advertise a gaps field: {json}"
         );
+    }
+
+    fn pruned_range(start: i64, end: i64) -> PrunedRange {
+        PrunedRange {
+            start_offset: start,
+            end_offset: end,
+            segments: 2,
+            bytes: 2048,
+            pruned_at: 1_700_000_000_000,
+            cutoff_timestamp: 1_699_000_000_000,
+            reason: PruneReason::Retention,
+        }
+    }
+
+    #[test]
+    fn pruned_range_serde_round_trip() {
+        let range = pruned_range(0, 19);
+        let json = serde_json::to_string(&range).unwrap();
+        assert!(json.contains("\"reason\":\"retention\""), "{json}");
+        let back: PrunedRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, range);
+    }
+
+    #[test]
+    fn empty_pruned_is_omitted_from_json() {
+        let partition = PartitionBackup {
+            partition_id: 0,
+            segments: Vec::new(),
+            gaps: Vec::new(),
+            pruned: Vec::new(),
+        };
+        let json = serde_json::to_string(&partition).unwrap();
+        assert!(!json.contains("pruned"), "{json}");
+    }
+
+    #[test]
+    fn add_pruned_dedups_by_start_and_sorts() {
+        let mut partition = PartitionBackup {
+            partition_id: 0,
+            segments: Vec::new(),
+            gaps: Vec::new(),
+            pruned: Vec::new(),
+        };
+        partition.add_pruned(pruned_range(20, 29));
+        partition.add_pruned(pruned_range(0, 19));
+        partition.add_pruned(pruned_range(0, 25)); // duplicate start ignored
+        assert_eq!(partition.pruned.len(), 2);
+        assert_eq!(partition.pruned[0].start_offset, 0);
+        assert_eq!(partition.pruned[0].end_offset, 19);
+        assert_eq!(partition.pruned[1].start_offset, 20);
+    }
+
+    #[test]
+    fn manifest_written_before_pruned_and_sha256_existed_still_parses() {
+        // A 0.20-era segment/partition: no pruned, no sha256, no uploaded_at.
+        let legacy = r#"{
+            "backup_id": "legacy",
+            "created_at": 1700000000000,
+            "compression": "zstd",
+            "topics": [{
+                "name": "orders",
+                "partitions": [{
+                    "partition_id": 0,
+                    "segments": [{
+                        "key": "legacy/topics/orders/partition=0/segment-00000000000000000000.bin.zst",
+                        "start_offset": 0,
+                        "end_offset": 9,
+                        "start_timestamp": 1,
+                        "end_timestamp": 2,
+                        "record_count": 10
+                    }]
+                }]
+            }]
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(legacy).unwrap();
+        let segment = &manifest.topics[0].partitions[0].segments[0];
+        assert_eq!(segment.sha256, "");
+        assert_eq!(segment.uploaded_at, 0);
+        assert!(manifest.topics[0].partitions[0].pruned.is_empty());
+        assert_eq!(manifest.total_pruned(), 0);
     }
 
     #[test]

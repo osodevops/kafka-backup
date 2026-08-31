@@ -302,6 +302,8 @@ mod tests {
                 record_count: 2,
                 uncompressed_size: json.len() as u64,
                 compressed_size: 0,
+                sha256: String::new(),
+                uploaded_at: 0,
             };
 
             let out = read_segment(&storage, &segment)

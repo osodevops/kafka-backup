@@ -86,6 +86,13 @@ pub struct PrometheusMetrics {
     /// bound on records permanently missing from the backup.
     pub offsets_skipped_total: Family<BackupLabels, Counter>,
 
+    /// Segments deliberately deleted by retention (`prune` /
+    /// `backup.retention`). Each increment is one segment removed.
+    pub segments_pruned_total: Family<BackupLabels, Counter>,
+
+    /// Cumulative compressed bytes deleted by retention.
+    pub bytes_pruned_total: Family<BackupLabels, Counter>,
+
     // ========================================
     // Operation Duration Metrics
     // ========================================
@@ -212,6 +219,8 @@ impl PrometheusMetrics {
         let bytes_total = Family::<BackupLabels, Counter>::default();
         let offset_gaps_total = Family::<BackupLabels, Counter>::default();
         let offsets_skipped_total = Family::<BackupLabels, Counter>::default();
+        let segments_pruned_total = Family::<BackupLabels, Counter>::default();
+        let bytes_pruned_total = Family::<BackupLabels, Counter>::default();
 
         // Operation Duration Metrics
         let backup_duration_seconds =
@@ -323,6 +332,16 @@ impl PrometheusMetrics {
             "kafka_backup_offsets_skipped",
             "Cumulative source offsets skipped across all recorded gaps",
             offsets_skipped_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_segments_pruned",
+            "Segments deliberately deleted by retention (prune / backup.retention)",
+            segments_pruned_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_bytes_pruned",
+            "Cumulative compressed bytes deleted by retention",
+            bytes_pruned_total.clone(),
         );
 
         // Operation Duration Metrics
@@ -440,6 +459,8 @@ impl PrometheusMetrics {
             bytes_total,
             offset_gaps_total,
             offsets_skipped_total,
+            segments_pruned_total,
+            bytes_pruned_total,
             backup_duration_seconds,
             restore_duration_seconds,
             storage_write_latency_seconds,
@@ -608,6 +629,15 @@ impl PrometheusMetrics {
         self.offsets_skipped_total
             .get_or_create(&labels)
             .inc_by(offsets_skipped.max(0) as u64);
+    }
+
+    /// Record segments deleted by retention.
+    pub fn record_segments_pruned(&self, backup_id: &str, segments: u64, bytes: u64) {
+        let labels = BackupLabels::new(backup_id);
+        self.segments_pruned_total
+            .get_or_create(&labels)
+            .inc_by(segments);
+        self.bytes_pruned_total.get_or_create(&labels).inc_by(bytes);
     }
 
     /// Increment cumulative bytes counter.

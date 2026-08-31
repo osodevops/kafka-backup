@@ -158,6 +158,8 @@ fn write_legacy_json_segment(
         record_count: count,
         uncompressed_size: 0,
         compressed_size: 0,
+        sha256: String::new(),
+        uploaded_at: 0,
     }
 }
 
@@ -256,11 +258,13 @@ async fn full_coverage_passes_offset_recovery() {
                 partition_id: 0,
                 segments: vec![seg0],
                 gaps: Vec::new(),
+                pruned: Vec::new(),
             },
             PartitionBackup {
                 partition_id: 1,
                 segments: vec![seg1],
                 gaps: Vec::new(),
+                pruned: Vec::new(),
             },
         ],
     );
@@ -295,6 +299,7 @@ async fn missing_headers_fails_recovery_but_warns_without() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -342,6 +347,7 @@ async fn null_valued_tracking_headers_do_not_count_as_coverage() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -373,6 +379,7 @@ async fn partial_coverage_fails_offset_recovery() {
             partition_id: 0,
             segments: vec![seg_with, seg_without],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -403,6 +410,7 @@ async fn legacy_json_segments_are_scanned_and_flagged() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -429,6 +437,7 @@ async fn legacy_json_segments_are_scanned_and_flagged() {
             partition_id: 0,
             segments: vec![seg2],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
     let report2 = scan(
@@ -451,6 +460,7 @@ async fn empty_backup_is_never_a_positive_pass() {
             partition_id: 0,
             segments: vec![],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -500,6 +510,7 @@ async fn corrupt_segment_is_detected() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -529,6 +540,7 @@ async fn missing_segment_object_is_detected() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -587,6 +599,7 @@ async fn string_encoded_headers_count_as_coverage() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -612,6 +625,7 @@ async fn time_window_limits_the_scan_to_restorable_segments() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -639,6 +653,7 @@ async fn auto_consumer_groups_requires_snapshot() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -698,6 +713,7 @@ async fn reset_request_that_can_never_act_fails() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -729,6 +745,7 @@ async fn skip_mode_never_blocks_but_warns_loudly() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -750,6 +767,7 @@ async fn auto_mode_without_recovery_reports_indeterminate_without_scanning() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -784,6 +802,7 @@ async fn validate_phase1_headers_returns_structured_report() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -809,6 +828,7 @@ async fn run_all_phases_fails_preflight_before_target_connection() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -839,6 +859,7 @@ async fn restore_engine_fails_preflight_before_target_connection() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 
@@ -864,6 +885,7 @@ async fn restore_engine_fails_preflight_before_target_connection() {
             partition_id: 0,
             segments: vec![seg2],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
     write_consumer_group_snapshot(
@@ -891,6 +913,7 @@ async fn dry_run_embeds_preflight_and_blocks_invalid_recovery() {
             partition_id: 0,
             segments: vec![seg],
             gaps: Vec::new(),
+            pruned: Vec::new(),
         }],
     );
 

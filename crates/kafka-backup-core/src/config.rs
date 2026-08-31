@@ -531,6 +531,72 @@ pub struct BackupOptions {
     /// recommended for compliance and disaster-recovery jobs.
     #[serde(default)]
     pub require_topic_configs: bool,
+
+    /// Retention for this backup set: prune aged/oversized segments at the
+    /// end of each backup cycle (see `kafka-backup prune` for the on-demand
+    /// form). Off by default. Bucket lifecycle rules must NOT be used on an
+    /// incremental set — see the storage guide.
+    #[serde(default)]
+    pub retention: Option<RetentionOptions>,
+}
+
+/// Retention policy for a backup set (issue #169).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetentionOptions {
+    /// Prune segments older than this human-readable duration (`30d`, `12h`,
+    /// `1d12h`, …). Deviates from the `_secs` convention deliberately:
+    /// `2592000` is not a number a reviewer can read, and the operator's
+    /// `retention.maxAge` already uses this grammar.
+    #[serde(default)]
+    pub max_age: Option<String>,
+
+    /// After the age pass, keep pruning oldest-first until the set's total
+    /// compressed size fits under this many bytes (compressed sizes).
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+
+    /// Never prune a partition below this many newest segments.
+    #[serde(default = "default_keep_segments")]
+    pub keep_segments: usize,
+}
+
+fn default_keep_segments() -> usize {
+    1
+}
+
+impl RetentionOptions {
+    /// Convert to prune criteria, resolving `max_age` against "now".
+    pub fn to_criteria(&self) -> crate::Result<crate::backup::prune::PruneCriteria> {
+        let older_than = match &self.max_age {
+            Some(raw) => {
+                let d = crate::util::parse_duration(raw)?;
+                Some(chrono::Utc::now().timestamp_millis() - d.as_millis() as i64)
+            }
+            None => None,
+        };
+        Ok(crate::backup::prune::PruneCriteria {
+            older_than,
+            max_total_bytes: self.max_total_bytes,
+            keep_segments: self.keep_segments.max(1),
+        })
+    }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if let Some(raw) = &self.max_age {
+            crate::util::parse_duration(raw)?;
+        }
+        if self.max_age.is_none() && self.max_total_bytes.is_none() {
+            return Err(crate::Error::Config(
+                "backup.retention requires max_age and/or max_total_bytes".to_string(),
+            ));
+        }
+        if self.keep_segments == 0 {
+            return Err(crate::Error::Config(
+                "backup.retention.keep_segments must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_capture_topic_configs() -> bool {
@@ -572,6 +638,7 @@ impl Default for BackupOptions {
             segment_max_records: None,
             capture_topic_configs: default_capture_topic_configs(),
             require_topic_configs: false,
+            retention: None,
         }
     }
 }
@@ -877,6 +944,28 @@ pub struct RestoreOptions {
     /// second time. Not configurable from YAML.
     #[serde(skip)]
     pub header_preflight_external: bool,
+
+    /// During `validate-restore` / dry-run, HEAD every segment in the
+    /// selected time window instead of only the oldest per partition (the
+    /// default canary, which catches lifecycle-rule expiry at
+    /// one-request-per-partition cost). Full sweeps can take a long time on
+    /// large archives. Default: `false`.
+    #[serde(default)]
+    pub dry_run_check_segments: bool,
+
+    /// Programmatic per-record filter (Keep / Drop / Tombstone), consulted on
+    /// every restore path after time-window filtering. Set by code — e.g. an
+    /// embedding application or a commercial distribution — never from YAML.
+    /// See [`crate::restore::filter`].
+    #[serde(skip)]
+    pub record_filter: Option<crate::restore::filter::RecordFilterHandle>,
+
+    /// Opaque fingerprint of the configured record filter (e.g. a digest of
+    /// its rule set), folded into the restore checkpoint's `config_hash` so a
+    /// resumed restore notices when the filter changed. Set by whoever sets
+    /// `record_filter`; not configurable from YAML.
+    #[serde(skip)]
+    pub record_filter_fingerprint: Option<String>,
 }
 
 /// Controls the Phase 1 header preflight scan (see issue #137).
@@ -945,6 +1034,9 @@ impl Default for RestoreOptions {
             schema_id_mapping: Default::default(),
             header_preflight: HeaderPreflightMode::default(),
             header_preflight_external: false,
+            dry_run_check_segments: false,
+            record_filter: None,
+            record_filter_fingerprint: None,
         }
     }
 }
@@ -1075,6 +1167,10 @@ impl BackupOptions {
             return Err(crate::Error::Config(
                 "max_concurrent_partitions must be > 0".to_string(),
             ));
+        }
+
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
         }
 
         Ok(())

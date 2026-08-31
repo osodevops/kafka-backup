@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-08-31
+
+### Added
+- `restore::filter::RecordFilter` — a programmatic per-record hook on the
+  restore engine (`evaluate(topic, record) -> Keep | Drop | Tombstone`),
+  applied after time-window filtering on every restore path (standard,
+  repartitioning fan-out, and Phase 2 of the three-phase restore). Set via
+  the new `RestoreOptions::record_filter` handle from code — it is never
+  configurable from YAML. `Tombstone` produces the record with a null value
+  (retiring earlier copies of the key on compacted targets); `Drop` removes
+  it and the engine maps each dropped source offset to the next surviving
+  record's target offset, so consumer-group offset recovery stays exact.
+  The restore report gains `records_dropped_by_filter`,
+  `records_tombstoned_by_filter` (per partition, per topic and overall) and
+  the filter's name; `restore` and `three-phase-restore` print the counts
+  when non-zero. ([#170](https://github.com/osodevops/kafka-backup/issues/170))
+
+- `kafka-backup prune` and `backup.retention` — safe retention for backup
+  sets ([#169](https://github.com/osodevops/kafka-backup/issues/169)).
+  `prune` plans (default) or executes (`--execute`) the deletion of aged
+  (`--older-than 30d` / `--before <ts>`) or oversized (`--max-total-bytes`)
+  segments: only a contiguous oldest-first prefix per partition, never the
+  resume position or the newest `--keep-segments`, manifest rewritten
+  *before* objects are deleted, and every removal recorded as a
+  `pruned` range (`PartitionBackup.pruned`) that `describe`, `validate` and
+  `validate-restore` report without failing. `backup.retention`
+  (`max_age`, `max_total_bytes`, `keep_segments`) runs the same prune at the
+  end of each backup cycle. `prune` refuses while a backup run looks live
+  (offset checkpoint younger than 2 minutes) unless `--force`. New metrics
+  `kafka_backup_segments_pruned_total` and `kafka_backup_bytes_pruned_total`.
+  **Do not use bucket lifecycle rules on incremental backup sets** — they
+  delete segments the manifest still references; the storage guide now
+  explains the failure mode.
+- `SegmentMetadata` gains `sha256` (digest of the stored segment bytes,
+  verified by `validate --deep`) and `uploaded_at` (retention prefers upload
+  time over record time); both empty/zero for segments written by earlier
+  releases.
+- `validate-restore` now HEADs the oldest segment of every selected
+  partition (a canary that catches lifecycle-rule expiry at one request per
+  partition; `restore.dry_run_check_segments: true` sweeps every segment)
+  and fails the dry-run when a referenced segment is missing from storage.
+
+### Fixed
+- Resumable restores work from a fresh run: with `restore.checkpoint_state`
+  set, the engine now seeds the checkpoint file (previously it was only ever
+  read, so no checkpoint was ever created and `config_hash` was dead code)
+  and restarts from the beginning with a warning when the restore
+  configuration changed since the checkpoint was written.
+
+### Changed
+- **Breaking (library API):** `RestoreOptions` gains the public fields
+  `record_filter`, `record_filter_fingerprint` (both `#[serde(skip)]`) and
+  `dry_run_check_segments`; `BackupOptions` gains `retention`;
+  `PartitionBackup` gains `pruned`; `SegmentMetadata` gains `sha256` and
+  `uploaded_at` (struct-literal construction must set them — the Kubernetes
+  operators construct these types by struct literal and need a rebuild).
+  `RestoreReport`, `TopicRestoreReport` and `PartitionRestoreReport` gain
+  filter-count fields. All new fields carry serde defaults; existing
+  manifest and report JSON stays readable, and manifests written by 0.21
+  load in older releases minus the new fields.
+
 ## [0.20.0] - 2026-08-30
 
 ### Added

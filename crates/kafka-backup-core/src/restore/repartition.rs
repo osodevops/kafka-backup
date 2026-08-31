@@ -6,7 +6,7 @@
 //! based on their key — just like a native Kafka producer.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,6 +127,8 @@ pub async fn restore_topic_repartitioned(
             partitions: Vec::new(),
             records: 0,
             bytes: 0,
+            records_dropped_by_filter: 0,
+            records_tombstoned_by_filter: 0,
         });
     }
 
@@ -147,6 +149,9 @@ pub async fn restore_topic_repartitioned(
         num_target_partitions,
     ));
     let cancel = Arc::new(AtomicBool::new(false));
+    // Topic-level filter counters, shared by all reader tasks.
+    let filter_dropped = Arc::new(AtomicU64::new(0));
+    let filter_tombstoned = Arc::new(AtomicU64::new(0));
 
     // Spawn N reader tasks
     let semaphore = Arc::new(Semaphore::new(options.max_concurrent_partitions));
@@ -160,6 +165,8 @@ pub async fn restore_topic_repartitioned(
         let senders = senders.clone();
         let partitioner = Arc::clone(&partitioner);
         let cancel = Arc::clone(&cancel);
+        let filter_dropped = Arc::clone(&filter_dropped);
+        let filter_tombstoned = Arc::clone(&filter_tombstoned);
         let storage = Arc::clone(&storage);
         let storage_cb = Arc::clone(&storage_cb);
         let health = Arc::clone(&health);
@@ -179,6 +186,8 @@ pub async fn restore_topic_repartitioned(
                 &health,
                 &checkpoint,
                 &options,
+                &filter_dropped,
+                &filter_tombstoned,
             )
             .await;
             drop(permit);
@@ -263,6 +272,8 @@ pub async fn restore_topic_repartitioned(
         partitions: partition_reports,
         records: total_records,
         bytes: total_bytes,
+        records_dropped_by_filter: filter_dropped.load(Ordering::Relaxed),
+        records_tombstoned_by_filter: filter_tombstoned.load(Ordering::Relaxed),
     })
 }
 
@@ -280,6 +291,8 @@ async fn run_reader(
     health: &HealthCheck,
     checkpoint: &Mutex<Option<RestoreCheckpoint>>,
     options: &RestoreOptions,
+    filter_dropped: &AtomicU64,
+    filter_tombstoned: &AtomicU64,
 ) -> Result<()> {
     // Filter segments by time window
     let filtered_segments: Vec<&SegmentMetadata> = segments
@@ -320,6 +333,20 @@ async fn run_reader(
         };
 
         let filtered = helpers::filter_records_by_time(records, options);
+
+        // Programmatic record filter (Keep / Drop / Tombstone), if set. The
+        // fan-out path records no per-record offset mapping, so only the
+        // counters are tracked here.
+        let filtered = match &options.record_filter {
+            Some(handle) => {
+                let (kept, outcome) =
+                    super::filter::apply_record_filter(source_topic, filtered, handle);
+                filter_dropped.fetch_add(outcome.dropped, Ordering::Relaxed);
+                filter_tombstoned.fetch_add(outcome.tombstoned, Ordering::Relaxed);
+                kept
+            }
+            None => filtered,
+        };
 
         if filtered.is_empty() {
             helpers::mark_segment_completed(checkpoint, &segment.key).await;
@@ -448,6 +475,8 @@ async fn run_writer(
         last_offset: 0,
         first_timestamp: 0,
         last_timestamp: 0,
+        records_dropped_by_filter: 0, // tracked at topic level by readers
+        records_tombstoned_by_filter: 0,
     })
 }
 

@@ -1,6 +1,7 @@
 //! Restore engine module.
 
 pub mod engine;
+pub mod filter;
 pub(crate) mod helpers;
 pub mod offset_automation;
 pub mod offset_reset;
@@ -10,6 +11,7 @@ pub mod repartition;
 pub mod three_phase;
 
 pub use engine::{RestoreEngine, RestoreProgress};
+pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};
 pub use offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
     GroupResetOutcome, OffsetMapping as BulkOffsetMapping, OffsetResetBatch, OffsetResetMetrics,

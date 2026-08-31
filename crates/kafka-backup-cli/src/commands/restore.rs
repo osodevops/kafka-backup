@@ -74,6 +74,17 @@ pub async fn run(config_path: &str) -> Result<()> {
         }
     }
 
+    let filtered = report.records_dropped_by_filter + report.records_tombstoned_by_filter;
+    if filtered > 0 {
+        println!(
+            "Records filtered: {} ({} dropped, {} tombstoned; filter: {})",
+            filtered,
+            report.records_dropped_by_filter,
+            report.records_tombstoned_by_filter,
+            report.record_filter.as_deref().unwrap_or("unnamed"),
+        );
+    }
+
     info!("Restore completed successfully");
     Ok(())
 }
