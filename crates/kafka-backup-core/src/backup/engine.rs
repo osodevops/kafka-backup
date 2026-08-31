@@ -616,11 +616,16 @@ impl BackupEngine {
         Ok(())
     }
 
-    /// Apply `backup.retention` to this backup set: plan against the
-    /// in-memory manifest, remove the planned segments from it, persist the
-    /// manifest (manifest first, so a crash leaves orphan objects rather
-    /// than a manifest referencing deleted segments), then delete the
-    /// objects.
+    /// Apply `backup.retention` to this backup set.
+    ///
+    /// Plans against the STORED (merged) manifest — the in-memory manifest of
+    /// a fresh process only holds segments this run wrote, while the aged
+    /// segments retention exists for live in the merged manifest that
+    /// `save_manifest()` just persisted. The stored manifest is rewritten
+    /// first (a crash leaves orphan objects, never a manifest referencing
+    /// deleted segments), the pruned ranges are mirrored into the in-memory
+    /// manifest so later saves cannot resurrect the segments, and only then
+    /// are the objects deleted.
     async fn apply_retention(&self, retention: &crate::config::RetentionOptions) -> Result<()> {
         let criteria = retention.to_criteria()?;
         let resume = match &self.offset_store {
@@ -630,16 +635,21 @@ impl BackupEngine {
             None => std::collections::HashMap::new(),
         };
 
-        let plan = {
-            let manifest = self.manifest.lock().await;
-            super::prune::plan_prune(
-                &manifest,
-                &resume,
-                &criteria,
-                chrono::Utc::now().timestamp_millis(),
-                crate::manifest::PruneReason::Retention,
-            )
+        // Load the merged manifest that save_manifest() just wrote.
+        let key = format!("{}/manifest.json", self.config.backup_id);
+        let stored: BackupManifest = match self.storage.get(&key).await {
+            Ok(data) => serde_json::from_slice(&data)
+                .map_err(|e| Error::Config(format!("retention: manifest unparseable: {e}")))?,
+            Err(_) => return Ok(()), // nothing persisted yet
         };
+
+        let plan = super::prune::plan_prune(
+            &stored,
+            &resume,
+            &criteria,
+            chrono::Utc::now().timestamp_millis(),
+            crate::manifest::PruneReason::Retention,
+        );
         if plan.segments == 0 {
             return Ok(());
         }
@@ -651,12 +661,21 @@ impl BackupEngine {
             plan.partitions.len()
         );
 
+        // Mirror the pruned ranges (and drop any affected segments) into the
+        // in-memory manifest FIRST, so a concurrent/subsequent save merges
+        // consistently instead of resurrecting.
         {
             let mut manifest = self.manifest.lock().await;
             super::prune::apply_plan_to_manifest(&mut manifest, &plan);
+            for part_plan in &plan.partitions {
+                let topic = manifest.get_or_create_topic(&part_plan.topic);
+                let partition = topic.get_or_create_partition(part_plan.partition);
+                partition.add_pruned(part_plan.range.clone());
+            }
         }
-        self.manifest_persistence.save_now().await?;
-        super::prune::delete_planned_segments(self.storage.as_ref(), &plan).await;
+
+        // Rewrite the stored manifest directly, then delete the objects.
+        super::prune::execute_prune(self.storage.as_ref(), stored, &plan).await?;
 
         if let Some(ref prom) = self.prometheus_metrics {
             prom.record_segments_pruned(&self.config.backup_id, plan.segments, plan.bytes);
