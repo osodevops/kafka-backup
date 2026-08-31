@@ -482,6 +482,19 @@ pub struct RestoreReport {
     /// Consumer groups resolved during restore (includes groups auto-loaded from snapshot)
     #[serde(default)]
     pub resolved_consumer_groups: Vec<String>,
+
+    /// Records removed by the configured record filter (see
+    /// `restore::filter`); `0` when no filter was set.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records turned into tombstones by the configured record filter.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
+
+    /// Name of the record filter that ran, when one was configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_filter: Option<String>,
 }
 
 /// Per-topic restore report
@@ -501,6 +514,14 @@ pub struct TopicRestoreReport {
 
     /// Total bytes for this topic
     pub bytes: u64,
+
+    /// Records removed by the configured record filter for this topic.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records tombstoned by the configured record filter for this topic.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
 }
 
 /// Per-partition restore report
@@ -532,6 +553,14 @@ pub struct PartitionRestoreReport {
 
     /// Last timestamp restored
     pub last_timestamp: i64,
+
+    /// Records removed by the configured record filter for this partition.
+    #[serde(default)]
+    pub records_dropped_by_filter: u64,
+
+    /// Records tombstoned by the configured record filter for this partition.
+    #[serde(default)]
+    pub records_tombstoned_by_filter: u64,
 }
 
 /// Offset mapping for consumer group reset

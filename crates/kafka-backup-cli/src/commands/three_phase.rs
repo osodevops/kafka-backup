@@ -120,6 +120,19 @@ pub async fn run(config_path: &str) -> Result<()> {
         "║   Topics restored: {:59} ║",
         report.restore_report.topics_restored.len()
     );
+    let filtered = report.restore_report.records_dropped_by_filter
+        + report.restore_report.records_tombstoned_by_filter;
+    if filtered > 0 {
+        println!(
+            "║   Records filtered: {:58} ║",
+            format!(
+                "{} ({} dropped, {} tombstoned)",
+                filtered,
+                report.restore_report.records_dropped_by_filter,
+                report.restore_report.records_tombstoned_by_filter
+            )
+        );
+    }
     println!(
         "║   Offset mappings: {:59} ║",
         report

@@ -670,6 +670,9 @@ impl RestoreEngine {
                 errors: dry_run_report.errors,
                 offset_mapping: OffsetMapping::new(),
                 resolved_consumer_groups: Vec::new(),
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
+                record_filter: None,
             });
         }
 
@@ -677,10 +680,33 @@ impl RestoreEngine {
         info!("Loading backup manifest for: {}", self.config.backup_id);
         let manifest = self.load_manifest().await?;
 
-        // Load checkpoint if resuming
+        // Load or seed the resume checkpoint. The config hash covers the
+        // restore options (including any record-filter fingerprint), so a
+        // resumed run with a changed configuration starts over instead of
+        // silently skipping segments the new configuration would treat
+        // differently.
         if let Some(checkpoint_path) = &restore_options.checkpoint_state {
+            let expected_hash = restore_config_hash(&restore_options);
             if checkpoint_path.exists() {
                 self.load_checkpoint(checkpoint_path).await?;
+                let mut guard = self.checkpoint.lock().await;
+                if let Some(cp) = guard.as_mut() {
+                    if cp.config_hash != expected_hash {
+                        warn!(
+                            "Restore configuration changed since the checkpoint was written \
+                             (config hash mismatch); restarting from the beginning"
+                        );
+                        *cp = RestoreCheckpoint::new(
+                            self.config.backup_id.clone(),
+                            expected_hash.clone(),
+                        );
+                    }
+                }
+            } else {
+                *self.checkpoint.lock().await = Some(RestoreCheckpoint::new(
+                    self.config.backup_id.clone(),
+                    expected_hash,
+                ));
             }
         }
 
@@ -736,6 +762,9 @@ impl RestoreEngine {
                 errors: Vec::new(),
                 offset_mapping: OffsetMapping::new(),
                 resolved_consumer_groups: Vec::new(),
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
+                record_filter: None,
             });
         }
 
@@ -872,6 +901,14 @@ impl RestoreEngine {
             );
         }
 
+        let total_dropped_by_filter: u64 = topic_reports
+            .iter()
+            .map(|t| t.records_dropped_by_filter)
+            .sum();
+        let total_tombstoned_by_filter: u64 = topic_reports
+            .iter()
+            .map(|t| t.records_tombstoned_by_filter)
+            .sum();
         let report = RestoreReport {
             backup_id: self.config.backup_id.clone(),
             dry_run: false,
@@ -887,6 +924,12 @@ impl RestoreEngine {
             errors,
             offset_mapping,
             resolved_consumer_groups: restore_options.consumer_groups.clone(),
+            records_dropped_by_filter: total_dropped_by_filter,
+            records_tombstoned_by_filter: total_tombstoned_by_filter,
+            record_filter: restore_options
+                .record_filter
+                .as_ref()
+                .map(|f| f.name().to_string()),
         };
 
         finalize_restore_report(report)
@@ -1175,6 +1218,8 @@ impl RestoreEngine {
                 partitions: Vec::new(),
                 records: 0,
                 bytes: 0,
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
             });
         }
 
@@ -1230,6 +1275,8 @@ impl RestoreEngine {
         let mut partition_reports = Vec::new();
         let mut total_records = 0u64;
         let mut total_bytes = 0u64;
+        let mut dropped_by_filter = 0u64;
+        let mut tombstoned_by_filter = 0u64;
 
         for handle in handles {
             let report = handle.await.map_err(|e| {
@@ -1238,6 +1285,8 @@ impl RestoreEngine {
 
             total_records += report.records;
             total_bytes += report.bytes;
+            dropped_by_filter += report.records_dropped_by_filter;
+            tombstoned_by_filter += report.records_tombstoned_by_filter;
             partition_reports.push(report);
         }
 
@@ -1247,6 +1296,8 @@ impl RestoreEngine {
             partitions: partition_reports,
             records: total_records,
             bytes: total_bytes,
+            records_dropped_by_filter: dropped_by_filter,
+            records_tombstoned_by_filter: tombstoned_by_filter,
         })
     }
 
@@ -1599,6 +1650,8 @@ impl RestorePartitionContext {
                 last_offset: 0,
                 first_timestamp: 0,
                 last_timestamp: 0,
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
             });
         }
 
@@ -1614,6 +1667,8 @@ impl RestorePartitionContext {
         let mut total_records = 0u64;
         let mut total_bytes = 0u64;
         let mut segments_processed = 0u64;
+        let mut records_dropped_by_filter = 0u64;
+        let mut records_tombstoned_by_filter = 0u64;
         let mut first_offset = i64::MAX;
         let mut last_offset = i64::MIN;
         let mut first_timestamp = i64::MAX;
@@ -1643,6 +1698,16 @@ impl RestorePartitionContext {
 
             // Filter records by time window
             let filtered_records = self.filter_records_by_time(records);
+
+            // Programmatic record filter (Keep / Drop / Tombstone), if set.
+            let (filtered_records, filter_outcome) = match &self.options.record_filter {
+                Some(handle) => {
+                    super::filter::apply_record_filter(&self.source_topic, filtered_records, handle)
+                }
+                None => (filtered_records, super::filter::FilterOutcome::default()),
+            };
+            records_dropped_by_filter += filter_outcome.dropped;
+            records_tombstoned_by_filter += filter_outcome.tombstoned;
 
             if filtered_records.is_empty() {
                 // Mark segment as completed even if no records match
@@ -1692,7 +1757,11 @@ impl RestorePartitionContext {
                 })
                 .sum();
 
-            // Produce records in batches
+            // Produce records in batches. When the filter dropped records,
+            // collect (source, target) pairs for the survivors so the dropped
+            // source offsets can be mapped exactly afterwards.
+            let mut survivor_pairs: Vec<(i64, i64)> = Vec::new();
+            let collect_survivors = !filter_outcome.dropped_records.is_empty();
             let batch_size = self.options.produce_batch_size;
             for batch in records_to_produce.chunks(batch_size) {
                 // Apply rate limiting if configured
@@ -1737,6 +1806,9 @@ impl RestorePartitionContext {
                                     target_offset,
                                     record.timestamp,
                                 );
+                                if collect_survivors {
+                                    survivor_pairs.push((source_offset, target_offset));
+                                }
                                 record_idx += 1;
                             }
                         }
@@ -1759,6 +1831,27 @@ impl RestorePartitionContext {
                 total_records += batch.len() as u64;
                 self.metrics.record_records(batch.len() as u64);
                 self.health.record_records(batch.len() as u64);
+            }
+
+            // Keep the offset mapping exact for dropped records: a committed
+            // consumer offset pointing at a dropped record resolves to the
+            // next surviving record's target offset.
+            if collect_survivors {
+                survivor_pairs.sort_unstable_by_key(|&(src, _)| src);
+                let mapped = super::filter::map_dropped_offsets(
+                    &filter_outcome.dropped_records,
+                    &survivor_pairs,
+                );
+                let mut mapping = self.offset_mapping.lock().await;
+                for (src, target, ts) in mapped {
+                    mapping.add_detailed(
+                        &self.target_topic,
+                        self.target_partition,
+                        src,
+                        target,
+                        ts,
+                    );
+                }
             }
 
             total_bytes += batch_bytes;
@@ -1784,6 +1877,8 @@ impl RestorePartitionContext {
             segments_processed,
             records: total_records,
             bytes: total_bytes,
+            records_dropped_by_filter,
+            records_tombstoned_by_filter,
             first_offset: if first_offset == i64::MAX {
                 0
             } else {
@@ -1944,6 +2039,20 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+/// Hash the restore options (and any record-filter fingerprint) for the
+/// resume checkpoint. The serde representation skips the programmatic filter
+/// handle itself, so the fingerprint is folded in explicitly.
+fn restore_config_hash(options: &RestoreOptions) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(options).unwrap_or_default());
+    if let Some(fingerprint) = &options.record_filter_fingerprint {
+        hasher.update(fingerprint.as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
     if !report.errors.is_empty() {
         let error_count = report.errors.len();
@@ -2045,6 +2154,9 @@ mod tests {
             errors: vec!["Topic orders: Produce error for orders:5: code 6".to_string()],
             offset_mapping: OffsetMapping::new(),
             resolved_consumer_groups: Vec::new(),
+            records_dropped_by_filter: 0,
+            records_tombstoned_by_filter: 0,
+            record_filter: None,
         };
 
         let err = finalize_restore_report(report).expect_err(

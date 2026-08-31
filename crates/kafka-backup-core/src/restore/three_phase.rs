@@ -497,6 +497,9 @@ mod tests {
             errors: vec![],
             offset_mapping: OffsetMapping::new(),
             resolved_consumer_groups: groups.iter().map(|g| g.to_string()).collect(),
+            records_dropped_by_filter: 0,
+            records_tombstoned_by_filter: 0,
+            record_filter: None,
         }
     }
 

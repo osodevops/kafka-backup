@@ -877,6 +877,20 @@ pub struct RestoreOptions {
     /// second time. Not configurable from YAML.
     #[serde(skip)]
     pub header_preflight_external: bool,
+
+    /// Programmatic per-record filter (Keep / Drop / Tombstone), consulted on
+    /// every restore path after time-window filtering. Set by code — e.g. an
+    /// embedding application or a commercial distribution — never from YAML.
+    /// See [`crate::restore::filter`].
+    #[serde(skip)]
+    pub record_filter: Option<crate::restore::filter::RecordFilterHandle>,
+
+    /// Opaque fingerprint of the configured record filter (e.g. a digest of
+    /// its rule set), folded into the restore checkpoint's `config_hash` so a
+    /// resumed restore notices when the filter changed. Set by whoever sets
+    /// `record_filter`; not configurable from YAML.
+    #[serde(skip)]
+    pub record_filter_fingerprint: Option<String>,
 }
 
 /// Controls the Phase 1 header preflight scan (see issue #137).
@@ -945,6 +959,8 @@ impl Default for RestoreOptions {
             schema_id_mapping: Default::default(),
             header_preflight: HeaderPreflightMode::default(),
             header_preflight_external: false,
+            record_filter: None,
+            record_filter_fingerprint: None,
         }
     }
 }

@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-08-31
+
+### Added
+- `restore::filter::RecordFilter` — a programmatic per-record hook on the
+  restore engine (`evaluate(topic, record) -> Keep | Drop | Tombstone`),
+  applied after time-window filtering on every restore path (standard,
+  repartitioning fan-out, and Phase 2 of the three-phase restore). Set via
+  the new `RestoreOptions::record_filter` handle from code — it is never
+  configurable from YAML. `Tombstone` produces the record with a null value
+  (retiring earlier copies of the key on compacted targets); `Drop` removes
+  it and the engine maps each dropped source offset to the next surviving
+  record's target offset, so consumer-group offset recovery stays exact.
+  The restore report gains `records_dropped_by_filter`,
+  `records_tombstoned_by_filter` (per partition, per topic and overall) and
+  the filter's name; `restore` and `three-phase-restore` print the counts
+  when non-zero. ([#170](https://github.com/osodevops/kafka-backup/issues/170))
+
+### Fixed
+- Resumable restores work from a fresh run: with `restore.checkpoint_state`
+  set, the engine now seeds the checkpoint file (previously it was only ever
+  read, so no checkpoint was ever created and `config_hash` was dead code)
+  and restarts from the beginning with a warning when the restore
+  configuration changed since the checkpoint was written.
+
+### Changed
+- **Breaking (library API):** `RestoreOptions` gains the public fields
+  `record_filter` and `record_filter_fingerprint` (both `#[serde(skip)]`;
+  struct-literal construction must set them — the Kubernetes operators
+  construct `RestoreOptions` by struct literal and need a rebuild).
+  `RestoreReport`, `TopicRestoreReport` and `PartitionRestoreReport` gain
+  filter-count fields with serde defaults; existing report JSON stays
+  readable.
+
 ## [0.20.0] - 2026-08-30
 
 ### Added
