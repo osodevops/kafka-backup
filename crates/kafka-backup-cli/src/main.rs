@@ -94,16 +94,25 @@ enum Commands {
 
     /// Validate a backup's integrity (checksums, segment counts, manifests)
     #[command(
-        after_help = "Examples:\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
+        after_help = "Examples:\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --config backup.yaml --deep"
     )]
     Validate {
         /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
-        path: String,
+        #[arg(
+            short,
+            long,
+            conflicts_with = "config",
+            required_unless_present = "config"
+        )]
+        path: Option<String>,
 
-        /// Backup ID to validate
-        #[arg(short, long)]
-        backup_id: String,
+        /// Path to a backup configuration file
+        #[arg(short, long, conflicts_with = "path")]
+        config: Option<String>,
+
+        /// Backup ID to validate (overrides the value from --config)
+        #[arg(short, long, required_unless_present = "config")]
+        backup_id: Option<String>,
 
         /// Perform deep validation (read and verify each segment)
         #[arg(long, default_value = "false")]
@@ -159,14 +168,26 @@ enum Commands {
     },
 
     /// Show detailed backup manifest (topics, partitions, time ranges, record counts)
+    #[command(
+        after_help = "Examples:\n  kafka-backup describe --path s3://bucket --backup-id my-backup\n  kafka-backup describe --config backup.yaml --format json"
+    )]
     Describe {
         /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
-        path: String,
+        #[arg(
+            short,
+            long,
+            conflicts_with = "config",
+            required_unless_present = "config"
+        )]
+        path: Option<String>,
 
-        /// Backup ID to describe
-        #[arg(short, long)]
-        backup_id: String,
+        /// Path to a backup configuration file
+        #[arg(short, long, conflicts_with = "path")]
+        config: Option<String>,
+
+        /// Backup ID to describe (overrides the value from --config)
+        #[arg(short, long, required_unless_present = "config")]
+        backup_id: Option<String>,
 
         /// Output format (text, json, yaml)
         #[arg(short, long, default_value = "text")]
@@ -585,10 +606,17 @@ async fn main() -> Result<()> {
         }
         Commands::Validate {
             path,
+            config,
             backup_id,
             deep,
         } => {
-            commands::validate::run(&path, &backup_id, deep).await?;
+            commands::validate::run(
+                path.as_deref(),
+                config.as_deref(),
+                backup_id.as_deref(),
+                deep,
+            )
+            .await?;
         }
         Commands::Prune {
             config,
@@ -618,10 +646,17 @@ async fn main() -> Result<()> {
         }
         Commands::Describe {
             path,
+            config,
             backup_id,
             format,
         } => {
-            commands::describe::run(&path, &backup_id, &format).await?;
+            commands::describe::run(
+                path.as_deref(),
+                config.as_deref(),
+                backup_id.as_deref(),
+                &format,
+            )
+            .await?;
         }
         Commands::ValidateRestore { config, format } => {
             commands::validate_restore::run(&config, &format).await?;
@@ -825,4 +860,86 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_config_with_optional_backup_id_override() {
+        assert!(
+            Cli::try_parse_from(["kafka-backup", "validate", "--config", "backup.yaml"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "kafka-backup",
+            "validate",
+            "--config",
+            "backup.yaml",
+            "--backup-id",
+            "scheduled-id",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn describe_accepts_config() {
+        assert!(
+            Cli::try_parse_from(["kafka-backup", "describe", "--config", "backup.yaml"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn path_mode_requires_backup_id() {
+        assert!(
+            Cli::try_parse_from(["kafka-backup", "validate", "--path", "/tmp/backups"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["kafka-backup", "describe", "--path", "/tmp/backups"]).is_err()
+        );
+    }
+
+    #[test]
+    fn path_mode_remains_supported_with_backup_id() {
+        assert!(Cli::try_parse_from([
+            "kafka-backup",
+            "validate",
+            "--path",
+            "/tmp/backups",
+            "--backup-id",
+            "backup-001",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "kafka-backup",
+            "describe",
+            "--path",
+            "/tmp/backups",
+            "--backup-id",
+            "backup-001",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn config_conflicts_with_path() {
+        assert!(Cli::try_parse_from([
+            "kafka-backup",
+            "validate",
+            "--config",
+            "backup.yaml",
+            "--path",
+            "/tmp/backups",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kafka-backup",
+            "describe",
+            "--config",
+            "backup.yaml",
+            "--path",
+            "/tmp/backups",
+        ])
+        .is_err());
+    }
 }

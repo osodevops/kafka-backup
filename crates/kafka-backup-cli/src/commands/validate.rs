@@ -3,7 +3,7 @@ use kafka_backup_core::segment::SegmentReader;
 use kafka_backup_core::BackupManifest;
 use tracing::{error, info, warn};
 
-use super::storage_path::backend_from_path;
+use super::storage_path::backend_and_backup_id;
 
 #[derive(Debug, Default)]
 struct ValidationReport {
@@ -77,10 +77,14 @@ impl ValidationReport {
     }
 }
 
-pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
+pub async fn run(
+    path: Option<&str>,
+    config: Option<&str>,
+    backup_id: Option<&str>,
+    deep: bool,
+) -> Result<()> {
+    let (storage, backup_id) = backend_and_backup_id(path, config, backup_id)?;
     info!("Validating backup: {} (deep={})", backup_id, deep);
-
-    let storage = backend_from_path(path)?;
     let mut report = ValidationReport::default();
 
     // Load manifest
