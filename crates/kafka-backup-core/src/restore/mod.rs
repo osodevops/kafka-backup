@@ -1,14 +1,17 @@
 //! Restore engine module.
 
 pub mod engine;
+pub mod filter;
 pub(crate) mod helpers;
 pub mod offset_automation;
 pub mod offset_reset;
 pub mod offset_rollback;
+pub mod preflight;
 pub mod repartition;
 pub mod three_phase;
 
 pub use engine::{RestoreEngine, RestoreProgress};
+pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};
 pub use offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
     GroupResetOutcome, OffsetMapping as BulkOffsetMapping, OffsetResetBatch, OffsetResetMetrics,
@@ -25,6 +28,7 @@ pub use offset_rollback::{
     RestoreWithRollbackStatus, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
     VerificationResult,
 };
-pub use three_phase::{
-    OffsetResetPhaseOutcome, Phase1ValidationReport, ThreePhaseReport, ThreePhaseRestore,
+pub use preflight::{
+    HeaderPreflightReport, PartitionCoverageState, PartitionHeaderCoverage, SnapshotCheck,
 };
+pub use three_phase::{OffsetResetPhaseOutcome, ThreePhaseReport, ThreePhaseRestore};

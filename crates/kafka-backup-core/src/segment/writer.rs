@@ -102,6 +102,18 @@ impl SegmentFlusher {
 
         let compressed_size = segment.len();
 
+        // Digest of the exact bytes stored, for manifest-level integrity
+        // (verified by `validate --deep`) and safe retention bookkeeping.
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&segment);
+            digest
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
+        let uploaded_at = chrono::Utc::now().timestamp_millis();
+
         // Write to storage
         self.storage.put(&sealed.key, Bytes::from(segment)).await?;
 
@@ -140,6 +152,8 @@ impl SegmentFlusher {
             record_count: sealed.record_count as i64,
             uncompressed_size: uncompressed_size as u64,
             compressed_size: compressed_size as u64,
+            sha256,
+            uploaded_at,
         };
 
         info!(

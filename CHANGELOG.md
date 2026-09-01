@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-08-31
+
+### Added
+- `restore::filter::RecordFilter` — a programmatic per-record hook on the
+  restore engine (`evaluate(topic, record) -> Keep | Drop | Tombstone`),
+  applied after time-window filtering on every restore path (standard,
+  repartitioning fan-out, and Phase 2 of the three-phase restore). Set via
+  the new `RestoreOptions::record_filter` handle from code — it is never
+  configurable from YAML. `Tombstone` produces the record with a null value
+  (retiring earlier copies of the key on compacted targets); `Drop` removes
+  it and the engine maps each dropped source offset to the next surviving
+  record's target offset, so consumer-group offset recovery stays exact.
+  The restore report gains `records_dropped_by_filter`,
+  `records_tombstoned_by_filter` (per partition, per topic and overall) and
+  the filter's name; `restore` and `three-phase-restore` print the counts
+  when non-zero. ([#170](https://github.com/osodevops/kafka-backup/issues/170))
+
+- `kafka-backup prune` and `backup.retention` — safe retention for backup
+  sets ([#169](https://github.com/osodevops/kafka-backup/issues/169)).
+  `prune` plans (default) or executes (`--execute`) the deletion of aged
+  (`--older-than 30d` / `--before <ts>`) or oversized (`--max-total-bytes`)
+  segments: only a contiguous oldest-first prefix per partition, never the
+  resume position or the newest `--keep-segments`, manifest rewritten
+  *before* objects are deleted, and every removal recorded as a
+  `pruned` range (`PartitionBackup.pruned`) that `describe`, `validate` and
+  `validate-restore` report without failing. `backup.retention`
+  (`max_age`, `max_total_bytes`, `keep_segments`) runs the same prune at the
+  end of each backup cycle. `prune` refuses while a backup run looks live
+  (offset checkpoint younger than 2 minutes) unless `--force`. New metrics
+  `kafka_backup_segments_pruned_total` and `kafka_backup_bytes_pruned_total`.
+  **Do not use bucket lifecycle rules on incremental backup sets** — they
+  delete segments the manifest still references; the storage guide now
+  explains the failure mode.
+- `SegmentMetadata` gains `sha256` (digest of the stored segment bytes,
+  verified by `validate --deep`) and `uploaded_at` (retention prefers upload
+  time over record time); both empty/zero for segments written by earlier
+  releases.
+- `validate-restore` now HEADs the oldest segment of every selected
+  partition (a canary that catches lifecycle-rule expiry at one request per
+  partition; `restore.dry_run_check_segments: true` sweeps every segment)
+  and fails the dry-run when a referenced segment is missing from storage.
+
+### Fixed
+- Resumable restores work from a fresh run: with `restore.checkpoint_state`
+  set, the engine now seeds the checkpoint file (previously it was only ever
+  read, so no checkpoint was ever created and `config_hash` was dead code)
+  and restarts from the beginning with a warning when the restore
+  configuration changed since the checkpoint was written.
+
+### Changed
+- **Breaking (library API):** `RestoreOptions` gains the public fields
+  `record_filter`, `record_filter_fingerprint` (both `#[serde(skip)]`) and
+  `dry_run_check_segments`; `BackupOptions` gains `retention`;
+  `PartitionBackup` gains `pruned`; `SegmentMetadata` gains `sha256` and
+  `uploaded_at` (struct-literal construction must set them — the Kubernetes
+  operators construct these types by struct literal and need a rebuild).
+  `RestoreReport`, `TopicRestoreReport` and `PartitionRestoreReport` gain
+  filter-count fields. All new fields carry serde defaults; existing
+  manifest and report JSON stays readable, and manifests written by 0.21
+  load in older releases minus the new fields.
+
+## [0.20.0] - 2026-08-30
+
+### Added
+- **Topic configuration restore**
+  ([#136](https://github.com/osodevops/kafka-backup/issues/136)). Backups
+  capture an allow-listed set of mutable topic-level config overrides and the
+  source replication factor in the manifest (`backup.capture_topic_configs`,
+  default `true`; `backup.require_topic_configs` fails the backup when they
+  cannot be read). Restores re-apply them to created or existing topics under
+  `restore.restore_topic_configs` / `existing_topic_config_policy` /
+  `topic_config_overrides`, and report drift.
+- **Phase 1 header preflight**
+  ([#137](https://github.com/osodevops/kafka-backup/issues/137)). Before a
+  restore that asks for consumer-offset recovery (`reset_consumer_offsets` /
+  `auto_consumer_groups`) touches the target cluster, every selected
+  partition's segments are scanned for the `x-original-offset` /
+  `x-original-timestamp` tracking headers and classified (`full`, `partial`,
+  `missing`, `empty`, `data_missing`, `corrupt`, `indeterminate`); zero
+  records scanned never passes. `restore.header_preflight: auto | full | skip`
+  controls it; `validate-restore` / dry-run and `three-phase-restore` report
+  it. A tracking header whose value is null (see 0.18.0) does not count as
+  coverage.
+- `restore.rewrite_schema_ids` / `schema_id_mapping`: rewrite Confluent
+  wire-format schema IDs in keys and values while producing.
+- **Evidence contract v2**
+  ([#138](https://github.com/osodevops/kafka-backup/issues/138)). Report
+  schema `1.1` no longer embeds its own digest; the SHA-256 and ECDSA P-256
+  signature live in a detached DSSE-style envelope
+  (`kafka-backup/evidence-envelope/v2`) computed over the exact stored report
+  bytes. Legacy v1 `.sig` artifacts still verify. Creation and verification
+  are centralised in `evidence::emit` / `evidence::envelope`.
+
+### Changed
+- **Breaking (library API):** new public fields on `BackupOptions`
+  (`capture_topic_configs`, `require_topic_configs`), `RestoreOptions`
+  (`restore_topic_configs`, `existing_topic_config_policy`,
+  `topic_config_overrides`, `rewrite_schema_ids`, `schema_id_mapping`,
+  `header_preflight`, `header_preflight_external`), `TopicBackup`
+  (`source_replication_factor`, `configurations`), `DryRunReport` and
+  `ThreePhaseReport` (`header_preflight`); `Error::Preflight`;
+  `three_phase::Phase1ValidationReport` is replaced by
+  `preflight::HeaderPreflightReport`; `EvidenceReport::to_canonical_json` is
+  renamed `to_deterministic_json` and `sha256_digest` removed;
+  `evidence::pdf::generate_pdf` takes the report digest.
+- `auto_consumer_groups` with a missing or invalid snapshot, and
+  `reset_consumer_offsets` with nothing to act on, now fail **before** any
+  target mutation; `header_preflight: skip` restores the previous behaviour.
+- Dependencies: `object_store` 0.14, `printpdf` 0.12, `testcontainers` 0.27.
+
 ## [0.19.2] - 2026-08-30
 
 ### Fixed

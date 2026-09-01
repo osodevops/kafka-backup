@@ -862,21 +862,40 @@ storage:
   # Enable server-side encryption (configure in bucket policy)
 ```
 
-#### 3. Configure Lifecycle Policies
+#### 3. Retention: use `prune`, not bucket lifecycle rules
 
-Set up bucket lifecycle policies to automatically delete old backups:
+**Do not put an age-based lifecycle rule on an incremental backup set.** An
+incremental set (a stable `backup_id` with `offset_storage` configured, or a
+continuous backup) appends segments under one prefix and rewrites
+`manifest.json` and `offsets.db` on every run. An expiry rule therefore:
 
-**S3 Lifecycle Policy:**
-```json
-{
-  "Rules": [{
-    "ID": "DeleteOldBackups",
-    "Status": "Enabled",
-    "Filter": {"Prefix": "backups/"},
-    "Expiration": {"Days": 30}
-  }]
-}
+- deletes the oldest **segments while the manifest still references them** —
+  `restore` fails partway, `validate` reports the backup INVALID, and
+  `validate-restore` (before 0.21) said nothing;
+- never expires `manifest.json`/`offsets.db`, whose age resets on every run.
+
+Use built-in retention instead — it rewrites the manifest first and records
+every removal as a `pruned` range:
+
+```bash
+# On demand (plan first, then execute):
+kafka-backup prune --config backup.yaml --older-than 30d
+kafka-backup prune --config backup.yaml --older-than 30d --execute
 ```
+
+```yaml
+# Or automatically at the end of every backup cycle:
+backup:
+  retention:
+    max_age: 30d
+    keep_segments: 1
+```
+
+Lifecycle rules remain fine for **per-run backup IDs** (a unique
+`backup_id`/prefix per scheduled run, the Kubernetes operators' default when
+`offsetStorage` is unset) — expiring a whole self-contained run is safe.
+Avoid Archive/Glacier tiering on any prefix a restore may need: `get` fails
+until objects are rehydrated.
 
 #### 4. Use Prefixes for Multi-Tenancy
 

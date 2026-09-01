@@ -520,6 +520,87 @@ pub struct BackupOptions {
     /// `segment_max_interval_ms` only.
     #[serde(default)]
     pub segment_max_records: Option<u64>,
+
+    /// Capture explicit, mutable topic-level configuration overrides in the
+    /// backup manifest. Sensitive, read-only, and broker-default values are
+    /// never persisted.
+    #[serde(default = "default_capture_topic_configs")]
+    pub capture_topic_configs: bool,
+
+    /// Fail the backup when topic configuration cannot be captured. This is
+    /// recommended for compliance and disaster-recovery jobs.
+    #[serde(default)]
+    pub require_topic_configs: bool,
+
+    /// Retention for this backup set: prune aged/oversized segments at the
+    /// end of each backup cycle (see `kafka-backup prune` for the on-demand
+    /// form). Off by default. Bucket lifecycle rules must NOT be used on an
+    /// incremental set — see the storage guide.
+    #[serde(default)]
+    pub retention: Option<RetentionOptions>,
+}
+
+/// Retention policy for a backup set (issue #169).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetentionOptions {
+    /// Prune segments older than this human-readable duration (`30d`, `12h`,
+    /// `1d12h`, …). Deviates from the `_secs` convention deliberately:
+    /// `2592000` is not a number a reviewer can read, and the operator's
+    /// `retention.maxAge` already uses this grammar.
+    #[serde(default)]
+    pub max_age: Option<String>,
+
+    /// After the age pass, keep pruning oldest-first until the set's total
+    /// compressed size fits under this many bytes (compressed sizes).
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+
+    /// Never prune a partition below this many newest segments.
+    #[serde(default = "default_keep_segments")]
+    pub keep_segments: usize,
+}
+
+fn default_keep_segments() -> usize {
+    1
+}
+
+impl RetentionOptions {
+    /// Convert to prune criteria, resolving `max_age` against "now".
+    pub fn to_criteria(&self) -> crate::Result<crate::backup::prune::PruneCriteria> {
+        let older_than = match &self.max_age {
+            Some(raw) => {
+                let d = crate::util::parse_duration(raw)?;
+                Some(chrono::Utc::now().timestamp_millis() - d.as_millis() as i64)
+            }
+            None => None,
+        };
+        Ok(crate::backup::prune::PruneCriteria {
+            older_than,
+            max_total_bytes: self.max_total_bytes,
+            keep_segments: self.keep_segments.max(1),
+        })
+    }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if let Some(raw) = &self.max_age {
+            crate::util::parse_duration(raw)?;
+        }
+        if self.max_age.is_none() && self.max_total_bytes.is_none() {
+            return Err(crate::Error::Config(
+                "backup.retention requires max_age and/or max_total_bytes".to_string(),
+            ));
+        }
+        if self.keep_segments == 0 {
+            return Err(crate::Error::Config(
+                "backup.retention.keep_segments must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_capture_topic_configs() -> bool {
+    true
 }
 
 fn default_include_offset_headers() -> bool {
@@ -555,6 +636,9 @@ impl Default for BackupOptions {
             consumer_group_snapshot: false,
             fetch_max_bytes: None,
             segment_max_records: None,
+            capture_topic_configs: default_capture_topic_configs(),
+            require_topic_configs: false,
+            retention: None,
         }
     }
 }
@@ -647,6 +731,19 @@ pub enum OffsetStrategy {
     ClusterScan,
     /// Report mapping only, require manual reset
     Manual,
+}
+
+/// Policy for restoring topic configuration to topics that already exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingTopicConfigPolicy {
+    /// Report configuration drift but do not mutate an existing topic.
+    #[default]
+    ValidateOnly,
+    /// Apply source topic overrides to an existing topic.
+    Apply,
+    /// Fail restore when an existing topic differs from the backup.
+    Fail,
 }
 
 /// Restore-specific options
@@ -801,6 +898,101 @@ pub struct RestoreOptions {
     /// Default: `false`.
     #[serde(default)]
     pub auto_consumer_groups: bool,
+
+    /// Restore captured topic-level configuration overrides. Newly created
+    /// topics always receive the captured overrides when this is enabled.
+    #[serde(default = "default_restore_topic_configs")]
+    pub restore_topic_configs: bool,
+
+    /// How to handle captured configuration for target topics that existed
+    /// before the restore started.
+    #[serde(default)]
+    pub existing_topic_config_policy: ExistingTopicConfigPolicy,
+
+    /// Per-target-topic configuration overrides. These take precedence over
+    /// values captured from the source manifest.
+    #[serde(default)]
+    pub topic_config_overrides:
+        std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+
+    /// Rewrite Confluent wire-format schema IDs in record keys and values.
+    /// This is populated by the enterprise Schema Registry restore before the
+    /// Kafka data phase; it is inert unless explicitly enabled.
+    #[serde(default)]
+    pub rewrite_schema_ids: bool,
+
+    /// Source-to-target Schema Registry ID mapping used by
+    /// `rewrite_schema_ids`. Map keys are the IDs encoded after the Confluent
+    /// magic byte and values are the IDs registered in the target registry.
+    #[serde(default)]
+    pub schema_id_mapping: std::collections::HashMap<i32, i32>,
+
+    /// Phase 1 header preflight behaviour.
+    ///
+    /// - `auto` (default): scan the backup for tracking-header coverage when
+    ///   consumer-offset recovery is requested, and fail before any target
+    ///   mutation if required metadata is missing.
+    /// - `full`: always scan, even when offset recovery is not requested
+    ///   (findings are warnings in that case).
+    /// - `skip`: never scan. Explicit escape hatch; an offset-recovery
+    ///   request proceeds UNVERIFIED with a loud warning.
+    #[serde(default)]
+    pub header_preflight: HeaderPreflightMode,
+
+    /// Set by orchestrators (e.g. three-phase restore) that already ran the
+    /// header preflight, so the restore engine does not scan the backup a
+    /// second time. Not configurable from YAML.
+    #[serde(skip)]
+    pub header_preflight_external: bool,
+
+    /// During `validate-restore` / dry-run, HEAD every segment in the
+    /// selected time window instead of only the oldest per partition (the
+    /// default canary, which catches lifecycle-rule expiry at
+    /// one-request-per-partition cost). Full sweeps can take a long time on
+    /// large archives. Default: `false`.
+    #[serde(default)]
+    pub dry_run_check_segments: bool,
+
+    /// Programmatic per-record filter (Keep / Drop / Tombstone), consulted on
+    /// every restore path after time-window filtering. Set by code — e.g. an
+    /// embedding application or a commercial distribution — never from YAML.
+    /// See [`crate::restore::filter`].
+    #[serde(skip)]
+    pub record_filter: Option<crate::restore::filter::RecordFilterHandle>,
+
+    /// Opaque fingerprint of the configured record filter (e.g. a digest of
+    /// its rule set), folded into the restore checkpoint's `config_hash` so a
+    /// resumed restore notices when the filter changed. Set by whoever sets
+    /// `record_filter`; not configurable from YAML.
+    #[serde(skip)]
+    pub record_filter_fingerprint: Option<String>,
+}
+
+/// Controls the Phase 1 header preflight scan (see issue #137).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderPreflightMode {
+    /// Scan when consumer-offset recovery is requested; strict failure.
+    #[default]
+    Auto,
+    /// Always scan; strict only when offset recovery is requested.
+    Full,
+    /// Never scan (explicit operator override; loud warning).
+    Skip,
+}
+
+impl std::fmt::Display for HeaderPreflightMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Full => "full",
+            Self::Skip => "skip",
+        })
+    }
+}
+
+fn default_restore_topic_configs() -> bool {
+    true
 }
 
 /// Hand-written `Default` so that `RestoreOptions::default()` in Rust code
@@ -835,6 +1027,16 @@ impl Default for RestoreOptions {
             repartitioning: Default::default(),
             purge_topics: false,
             auto_consumer_groups: false,
+            restore_topic_configs: default_restore_topic_configs(),
+            existing_topic_config_policy: ExistingTopicConfigPolicy::default(),
+            topic_config_overrides: Default::default(),
+            rewrite_schema_ids: false,
+            schema_id_mapping: Default::default(),
+            header_preflight: HeaderPreflightMode::default(),
+            header_preflight_external: false,
+            dry_run_check_segments: false,
+            record_filter: None,
+            record_filter_fingerprint: None,
         }
     }
 }
@@ -965,6 +1167,10 @@ impl BackupOptions {
             return Err(crate::Error::Config(
                 "max_concurrent_partitions must be > 0".to_string(),
             ));
+        }
+
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
         }
 
         Ok(())

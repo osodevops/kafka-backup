@@ -7,9 +7,11 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use crate::config::{Config, Mode, OffsetStrategy, RestoreOptions};
+use crate::config::{Config, ExistingTopicConfigPolicy, Mode, OffsetStrategy, RestoreOptions};
 use crate::health::HealthCheck;
-use crate::kafka::{PartitionLeaderRouter, TopicToCreate};
+use crate::kafka::{
+    ConfigChange, ConfigOp, ConfigResourceType, PartitionLeaderRouter, TopicToCreate,
+};
 use crate::manifest::{
     BackupManifest, BackupRecord, DryRunPartitionReport, DryRunRepartitioningInfo, DryRunReport,
     DryRunTopicReport, OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport,
@@ -52,6 +54,49 @@ pub struct RestoreProgress {
     pub eta_ms: Option<u64>,
     /// Progress percentage (0.0 - 100.0)
     pub percentage: f64,
+}
+
+#[cfg(test)]
+mod schema_id_rewrite_tests {
+    use super::*;
+
+    fn record(key: Option<Vec<u8>>, value: Option<Vec<u8>>) -> BackupRecord {
+        BackupRecord {
+            key,
+            value,
+            headers: Vec::new(),
+            timestamp: 0,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn rewrites_confluent_key_and_value_without_touching_payload() {
+        let mut records = vec![record(
+            Some(vec![0, 0, 0, 0, 7, 10]),
+            Some(vec![0, 0, 0, 0, 7, 20, 21]),
+        )];
+        rewrite_confluent_schema_ids(&mut records, &[(7, 42)].into_iter().collect());
+        assert_eq!(records[0].key.as_deref(), Some(&[0, 0, 0, 0, 42, 10][..]));
+        assert_eq!(
+            records[0].value.as_deref(),
+            Some(&[0, 0, 0, 0, 42, 20, 21][..])
+        );
+    }
+
+    #[test]
+    fn ignores_null_short_non_confluent_and_unmapped_payloads() {
+        let mut records = vec![
+            record(None, Some(vec![0, 1, 2])),
+            record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8])),
+        ];
+        let original = records.clone();
+        rewrite_confluent_schema_ids(&mut records, &[(7, 42)].into_iter().collect());
+        assert_eq!(records[0].key, original[0].key);
+        assert_eq!(records[0].value, original[0].value);
+        assert_eq!(records[1].key, original[1].key);
+        assert_eq!(records[1].value, original[1].value);
+    }
 }
 
 impl RestoreProgress {
@@ -122,7 +167,7 @@ pub struct RestoreEngine {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct AutoConsumerGroupSnapshot {
+pub(crate) struct AutoConsumerGroupSnapshot {
     #[serde(default)]
     snapshot_time: Option<i64>,
     #[serde(default)]
@@ -130,7 +175,7 @@ struct AutoConsumerGroupSnapshot {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct AutoConsumerGroupSnapshotGroup {
+pub(crate) struct AutoConsumerGroupSnapshotGroup {
     group_id: String,
     #[serde(default)]
     offsets: HashMap<String, HashMap<String, i64>>,
@@ -143,9 +188,22 @@ impl AutoConsumerGroupSnapshot {
             .map(|group| group.group_id.clone())
             .collect()
     }
+
+    /// Number of consumer groups listed in the snapshot.
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Number of partition offsets recorded across all groups.
+    pub(crate) fn offset_count(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| group.offsets.values().map(HashMap::len).sum::<usize>())
+            .sum()
+    }
 }
 
-fn parse_auto_consumer_group_snapshot(data: &[u8]) -> Result<AutoConsumerGroupSnapshot> {
+pub(crate) fn parse_auto_consumer_group_snapshot(data: &[u8]) -> Result<AutoConsumerGroupSnapshot> {
     Ok(serde_json::from_slice(data)?)
 }
 
@@ -404,7 +462,33 @@ impl RestoreEngine {
             time_range: None,
             topics_to_restore: Vec::new(),
             consumer_offset_actions: Vec::new(),
+            header_preflight: None,
         };
+
+        // Phase 1 header preflight (issue #137): validate-restore runs the
+        // same scanner the real restore would, so a preflight that would
+        // block the restore is reported here first.
+        {
+            let mode = restore_options.header_preflight;
+            let recovery = super::preflight::offset_recovery_requested(&restore_options);
+            let scan = super::preflight::scan_required(mode, &restore_options);
+            if scan || recovery {
+                let preflight = super::preflight::run_header_preflight(
+                    self.storage.as_ref(),
+                    &manifest,
+                    &target.topics,
+                    &restore_options,
+                    mode,
+                )
+                .await;
+                report.warnings.extend(preflight.warnings.clone());
+                if recovery && !preflight.passed {
+                    report.valid = false;
+                    report.errors.extend(preflight.errors.clone());
+                }
+                report.header_preflight = Some(preflight);
+            }
+        }
 
         if topics_to_restore.is_empty() {
             report
@@ -468,7 +552,55 @@ impl RestoreEngine {
                     .collect();
 
                 if segments.is_empty() {
+                    if !partition_backup.pruned.is_empty() {
+                        report.warnings.push(format!(
+                            "{}:{}: all segments in the selected window were pruned by retention",
+                            topic_backup.name, partition_backup.partition_id
+                        ));
+                    }
                     continue;
+                }
+
+                // Storage existence checks: the oldest overlapping segment is
+                // always checked (bucket lifecycle rules expire oldest-first,
+                // so this canary catches a wiped archive at one request per
+                // partition); dry_run_check_segments sweeps every segment.
+                let to_check: Vec<&SegmentMetadata> = if restore_options.dry_run_check_segments {
+                    segments.iter().map(|s| &**s).collect()
+                } else {
+                    segments.first().map(|s| &**s).into_iter().collect()
+                };
+                for segment in to_check {
+                    match self.storage.exists(&segment.key).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            report.valid = false;
+                            report.errors.push(format!(
+                                "segment missing from storage: {} (deleted by a bucket \
+                                 lifecycle rule? use `kafka-backup prune` instead — see the \
+                                 storage guide)",
+                                segment.key
+                            ));
+                        }
+                        Err(e) => {
+                            report
+                                .warnings
+                                .push(format!("could not check segment {}: {}", segment.key, e));
+                        }
+                    }
+                }
+
+                for range in &partition_backup.pruned {
+                    report.warnings.push(format!(
+                        "{}:{}: offsets {}..{} were pruned by retention on {}",
+                        topic_backup.name,
+                        partition_backup.partition_id,
+                        range.start_offset,
+                        range.end_offset,
+                        chrono::DateTime::from_timestamp_millis(range.pruned_at)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| range.pruned_at.to_string())
+                    ));
                 }
 
                 let mut partition_records = 0i64;
@@ -586,6 +718,9 @@ impl RestoreEngine {
                 errors: dry_run_report.errors,
                 offset_mapping: OffsetMapping::new(),
                 resolved_consumer_groups: Vec::new(),
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
+                record_filter: None,
             });
         }
 
@@ -593,12 +728,45 @@ impl RestoreEngine {
         info!("Loading backup manifest for: {}", self.config.backup_id);
         let manifest = self.load_manifest().await?;
 
-        // Load checkpoint if resuming
+        // Load or seed the resume checkpoint. The config hash covers the
+        // restore options (including any record-filter fingerprint), so a
+        // resumed run with a changed configuration starts over instead of
+        // silently skipping segments the new configuration would treat
+        // differently.
         if let Some(checkpoint_path) = &restore_options.checkpoint_state {
+            let expected_hash = restore_config_hash(&restore_options);
             if checkpoint_path.exists() {
                 self.load_checkpoint(checkpoint_path).await?;
+                let mut guard = self.checkpoint.lock().await;
+                if let Some(cp) = guard.as_mut() {
+                    if cp.config_hash != expected_hash {
+                        warn!(
+                            "Restore configuration changed since the checkpoint was written \
+                             (config hash mismatch); restarting from the beginning"
+                        );
+                        *cp = RestoreCheckpoint::new(
+                            self.config.backup_id.clone(),
+                            expected_hash.clone(),
+                        );
+                    }
+                }
+            } else {
+                *self.checkpoint.lock().await = Some(RestoreCheckpoint::new(
+                    self.config.backup_id.clone(),
+                    expected_hash,
+                ));
             }
         }
+
+        // Phase 1 header preflight (issue #137): prove tracking-metadata
+        // coverage BEFORE connecting to the target and before any mutation
+        // (topic creation, config changes, purge, produce). When consumer-
+        // offset recovery is requested and required metadata is absent, the
+        // restore fails here.
+        let target = self.config.target.as_ref().unwrap();
+        let _header_preflight = self
+            .run_header_preflight(&manifest, &target.topics, &restore_options)
+            .await?;
 
         // Create partition leader router for multi-broker support
         info!("Connecting to target Kafka cluster via partition leader router...");
@@ -642,12 +810,22 @@ impl RestoreEngine {
                 errors: Vec::new(),
                 offset_mapping: OffsetMapping::new(),
                 resolved_consumer_groups: Vec::new(),
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
+                record_filter: None,
             });
         }
 
         // Auto-create topics if configured
-        if restore_options.create_topics {
+        let newly_created_topics = if restore_options.create_topics {
             self.ensure_topics_exist(&topics_to_restore, &restore_options)
+                .await?
+        } else {
+            HashSet::new()
+        };
+
+        if restore_options.restore_topic_configs {
+            self.restore_topic_configs(&topics_to_restore, &restore_options, &newly_created_topics)
                 .await?;
         }
 
@@ -771,6 +949,14 @@ impl RestoreEngine {
             );
         }
 
+        let total_dropped_by_filter: u64 = topic_reports
+            .iter()
+            .map(|t| t.records_dropped_by_filter)
+            .sum();
+        let total_tombstoned_by_filter: u64 = topic_reports
+            .iter()
+            .map(|t| t.records_tombstoned_by_filter)
+            .sum();
         let report = RestoreReport {
             backup_id: self.config.backup_id.clone(),
             dry_run: false,
@@ -786,6 +972,12 @@ impl RestoreEngine {
             errors,
             offset_mapping,
             resolved_consumer_groups: restore_options.consumer_groups.clone(),
+            records_dropped_by_filter: total_dropped_by_filter,
+            records_tombstoned_by_filter: total_tombstoned_by_filter,
+            record_filter: restore_options
+                .record_filter
+                .as_ref()
+                .map(|f| f.name().to_string()),
         };
 
         finalize_restore_report(report)
@@ -906,6 +1098,63 @@ impl RestoreEngine {
         Ok(manifest)
     }
 
+    /// Run the Phase 1 header preflight (issue #137) unless an orchestrator
+    /// already ran it (`header_preflight_external`) or nothing requires it.
+    ///
+    /// Returns the structured report when a preflight ran. Fails with
+    /// [`Error::Preflight`] when consumer-offset recovery is requested and
+    /// required tracking metadata is missing, partial, corrupt, or
+    /// unprovable — before any target mutation.
+    async fn run_header_preflight(
+        &self,
+        manifest: &BackupManifest,
+        selection: &crate::config::TopicSelection,
+        restore_options: &RestoreOptions,
+    ) -> Result<Option<super::preflight::HeaderPreflightReport>> {
+        if restore_options.header_preflight_external {
+            debug!("Header preflight already performed by orchestrator; skipping engine scan");
+            return Ok(None);
+        }
+
+        let mode = restore_options.header_preflight;
+        let recovery = super::preflight::offset_recovery_requested(restore_options);
+        let scan = super::preflight::scan_required(mode, restore_options);
+
+        // Nothing to do: no scan wanted and no offset recovery to protect.
+        if !scan && !recovery {
+            return Ok(None);
+        }
+
+        info!(
+            "Running Phase 1 header preflight (mode: {}, offset recovery requested: {})",
+            mode, recovery
+        );
+        let report = super::preflight::run_header_preflight(
+            self.storage.as_ref(),
+            manifest,
+            selection,
+            restore_options,
+            mode,
+        )
+        .await;
+
+        for warning in &report.warnings {
+            warn!("Header preflight: {}", warning);
+        }
+
+        if recovery && !report.passed {
+            return Err(Error::Preflight(format!(
+                "consumer-offset recovery was requested but the backup failed the tracking-\
+                 metadata preflight; no topics were created and no records were produced. {}. \
+                 Errors: {}",
+                report.summary(),
+                report.errors.join(" | ")
+            )));
+        }
+
+        Ok(Some(report))
+    }
+
     /// Filter topics based on target configuration.
     /// Supports both glob patterns (e.g., `orders-*`) and regex patterns (prefixed with `~`, e.g., `~orders-\d+`).
     fn filter_topics(
@@ -1017,6 +1266,8 @@ impl RestoreEngine {
                 partitions: Vec::new(),
                 records: 0,
                 bytes: 0,
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
             });
         }
 
@@ -1072,6 +1323,8 @@ impl RestoreEngine {
         let mut partition_reports = Vec::new();
         let mut total_records = 0u64;
         let mut total_bytes = 0u64;
+        let mut dropped_by_filter = 0u64;
+        let mut tombstoned_by_filter = 0u64;
 
         for handle in handles {
             let report = handle.await.map_err(|e| {
@@ -1080,6 +1333,8 @@ impl RestoreEngine {
 
             total_records += report.records;
             total_bytes += report.bytes;
+            dropped_by_filter += report.records_dropped_by_filter;
+            tombstoned_by_filter += report.records_tombstoned_by_filter;
             partition_reports.push(report);
         }
 
@@ -1089,6 +1344,8 @@ impl RestoreEngine {
             partitions: partition_reports,
             records: total_records,
             bytes: total_bytes,
+            records_dropped_by_filter: dropped_by_filter,
+            records_tombstoned_by_filter: tombstoned_by_filter,
         })
     }
 
@@ -1135,7 +1392,7 @@ impl RestoreEngine {
         &self,
         topics_to_restore: &[TopicBackup],
         options: &RestoreOptions,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let router = self
             .router
             .read()
@@ -1199,8 +1456,13 @@ impl RestoreEngine {
 
         if missing_topics.is_empty() {
             debug!("All target topics already exist");
-            return Ok(());
+            return Ok(HashSet::new());
         }
+
+        let missing_names: HashSet<String> = missing_topics
+            .iter()
+            .map(|topic| topic.name.clone())
+            .collect();
 
         info!(
             "Creating {} missing topics: {:?}",
@@ -1227,6 +1489,115 @@ impl RestoreEngine {
         router.refresh_metadata().await?;
         info!("Refreshed metadata after topic creation");
 
+        Ok(missing_names)
+    }
+
+    async fn restore_topic_configs(
+        &self,
+        topics_to_restore: &[TopicBackup],
+        options: &RestoreOptions,
+        newly_created: &HashSet<String>,
+    ) -> Result<()> {
+        let with_configs: Vec<_> = topics_to_restore
+            .iter()
+            .filter(|topic| !topic.configurations.is_empty())
+            .collect();
+        if with_configs.is_empty() {
+            return Ok(());
+        }
+
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+        let target_name = |topic: &TopicBackup| {
+            options
+                .topic_mapping
+                .get(&topic.name)
+                .cloned()
+                .unwrap_or_else(|| topic.name.clone())
+        };
+        let resources: Vec<_> = with_configs
+            .iter()
+            .map(|topic| (ConfigResourceType::Topic, target_name(topic)))
+            .collect();
+        let current = router.describe_configs(&resources).await?;
+        let mut changes = Vec::new();
+        let mut fail_drift = Vec::new();
+
+        for topic in with_configs {
+            let target = target_name(topic);
+            let current_entries = current
+                .get(&(ConfigResourceType::Topic, target.clone()))
+                .ok_or_else(|| {
+                    Error::Kafka(crate::error::KafkaError::Protocol(format!(
+                        "DescribeConfigs returned no result for target topic {target}"
+                    )))
+                })?;
+            let current_values: HashMap<_, _> = current_entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .value
+                        .as_ref()
+                        .map(|value| (entry.name.as_str(), value.as_str()))
+                })
+                .collect();
+            let mut desired = topic.configurations.clone();
+            if let Some(overrides) = options.topic_config_overrides.get(&target) {
+                desired.extend(overrides.clone());
+            }
+            let drift: Vec<String> = desired
+                .iter()
+                .filter(|(name, value)| {
+                    current_values.get(name.as_str()).copied() != Some(value.as_str())
+                })
+                .map(|(name, value)| {
+                    format!(
+                        "{name}: target={:?}, backup={value}",
+                        current_values.get(name.as_str())
+                    )
+                })
+                .collect();
+
+            if drift.is_empty() {
+                continue;
+            }
+
+            let should_apply = newly_created.contains(&target)
+                || options.existing_topic_config_policy == ExistingTopicConfigPolicy::Apply;
+            if should_apply {
+                changes.push(ConfigChange {
+                    resource_type: ConfigResourceType::Topic,
+                    resource_name: target,
+                    ops: desired
+                        .iter()
+                        .map(|(name, value)| ConfigOp::Set {
+                            name: name.clone(),
+                            value: value.clone(),
+                        })
+                        .collect(),
+                });
+            } else if options.existing_topic_config_policy == ExistingTopicConfigPolicy::Fail {
+                fail_drift.push(format!("{target}: {}", drift.join(", ")));
+            } else {
+                warn!(
+                    topic = %target,
+                    drift = %drift.join(", "),
+                    "Existing target topic configuration differs from backup; validate_only policy left it unchanged"
+                );
+            }
+        }
+
+        if !fail_drift.is_empty() {
+            return Err(Error::Config(format!(
+                "Target topic configuration drift: {}",
+                fail_drift.join("; ")
+            )));
+        }
+        router.incremental_alter_configs(&changes).await?;
         Ok(())
     }
 
@@ -1327,6 +1698,8 @@ impl RestorePartitionContext {
                 last_offset: 0,
                 first_timestamp: 0,
                 last_timestamp: 0,
+                records_dropped_by_filter: 0,
+                records_tombstoned_by_filter: 0,
             });
         }
 
@@ -1342,6 +1715,8 @@ impl RestorePartitionContext {
         let mut total_records = 0u64;
         let mut total_bytes = 0u64;
         let mut segments_processed = 0u64;
+        let mut records_dropped_by_filter = 0u64;
+        let mut records_tombstoned_by_filter = 0u64;
         let mut first_offset = i64::MAX;
         let mut last_offset = i64::MIN;
         let mut first_timestamp = i64::MAX;
@@ -1372,6 +1747,16 @@ impl RestorePartitionContext {
             // Filter records by time window
             let filtered_records = self.filter_records_by_time(records);
 
+            // Programmatic record filter (Keep / Drop / Tombstone), if set.
+            let (filtered_records, filter_outcome) = match &self.options.record_filter {
+                Some(handle) => {
+                    super::filter::apply_record_filter(&self.source_topic, filtered_records, handle)
+                }
+                None => (filtered_records, super::filter::FilterOutcome::default()),
+            };
+            records_dropped_by_filter += filter_outcome.dropped;
+            records_tombstoned_by_filter += filter_outcome.tombstoned;
+
             if filtered_records.is_empty() {
                 // Mark segment as completed even if no records match
                 self.mark_segment_completed(&segment.key).await;
@@ -1399,11 +1784,17 @@ impl RestorePartitionContext {
             // fresh original-offset headers if configured (header-based strategy)
             let stripped_records =
                 super::helpers::strip_offset_headers(filtered_records, &self.options);
-            let records_to_produce = super::helpers::inject_offset_headers(
+            let mut records_to_produce = super::helpers::inject_offset_headers(
                 stripped_records,
                 self.source_partition,
                 &self.options,
             );
+            if self.options.rewrite_schema_ids {
+                rewrite_confluent_schema_ids(
+                    &mut records_to_produce,
+                    &self.options.schema_id_mapping,
+                );
+            }
 
             // Track bytes
             let batch_bytes: u64 = records_to_produce
@@ -1414,7 +1805,11 @@ impl RestorePartitionContext {
                 })
                 .sum();
 
-            // Produce records in batches
+            // Produce records in batches. When the filter dropped records,
+            // collect (source, target) pairs for the survivors so the dropped
+            // source offsets can be mapped exactly afterwards.
+            let mut survivor_pairs: Vec<(i64, i64)> = Vec::new();
+            let collect_survivors = !filter_outcome.dropped_records.is_empty();
             let batch_size = self.options.produce_batch_size;
             for batch in records_to_produce.chunks(batch_size) {
                 // Apply rate limiting if configured
@@ -1459,6 +1854,9 @@ impl RestorePartitionContext {
                                     target_offset,
                                     record.timestamp,
                                 );
+                                if collect_survivors {
+                                    survivor_pairs.push((source_offset, target_offset));
+                                }
                                 record_idx += 1;
                             }
                         }
@@ -1481,6 +1879,27 @@ impl RestorePartitionContext {
                 total_records += batch.len() as u64;
                 self.metrics.record_records(batch.len() as u64);
                 self.health.record_records(batch.len() as u64);
+            }
+
+            // Keep the offset mapping exact for dropped records: a committed
+            // consumer offset pointing at a dropped record resolves to the
+            // next surviving record's target offset.
+            if collect_survivors {
+                survivor_pairs.sort_unstable_by_key(|&(src, _)| src);
+                let mapped = super::filter::map_dropped_offsets(
+                    &filter_outcome.dropped_records,
+                    &survivor_pairs,
+                );
+                let mut mapping = self.offset_mapping.lock().await;
+                for (src, target, ts) in mapped {
+                    mapping.add_detailed(
+                        &self.target_topic,
+                        self.target_partition,
+                        src,
+                        target,
+                        ts,
+                    );
+                }
             }
 
             total_bytes += batch_bytes;
@@ -1506,6 +1925,8 @@ impl RestorePartitionContext {
             segments_processed,
             records: total_records,
             bytes: total_bytes,
+            records_dropped_by_filter,
+            records_tombstoned_by_filter,
             first_offset: if first_offset == i64::MAX {
                 0
             } else {
@@ -1586,11 +2007,32 @@ fn decode_i64_header(value: Option<&[u8]>) -> Option<i64> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
+/// Rewrite the 4-byte schema ID following Confluent's magic byte in both keys
+/// and values. Avro, JSON Schema and Protobuf all share this five-byte prefix;
+/// any format-specific bytes after it are preserved verbatim.
+fn rewrite_confluent_schema_ids(records: &mut [BackupRecord], mapping: &HashMap<i32, i32>) {
+    for record in records {
+        rewrite_confluent_payload(record.key.as_mut(), mapping);
+        rewrite_confluent_payload(record.value.as_mut(), mapping);
+    }
+}
+
+fn rewrite_confluent_payload(payload: Option<&mut Vec<u8>>, mapping: &HashMap<i32, i32>) {
+    let Some(payload) = payload else { return };
+    if payload.len() < 5 || payload[0] != 0 {
+        return;
+    }
+    let source_id = i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    if let Some(target_id) = mapping.get(&source_id) {
+        payload[1..5].copy_from_slice(&target_id.to_be_bytes());
+    }
+}
+
 /// Pattern matching for topic names.
 /// Supports:
 /// - Glob patterns: `orders-*`, `?-topic`, `*-test-*`
 /// - Regex patterns (prefixed with `~`): `~orders-\d+`, `~^test-.*$`
-fn pattern_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn pattern_match(pattern: &str, text: &str) -> bool {
     if let Some(regex_pattern) = pattern.strip_prefix('~') {
         // Regex pattern
         match regex::Regex::new(regex_pattern) {
@@ -1643,6 +2085,20 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
             }
         }
     }
+}
+
+/// Hash the restore options (and any record-filter fingerprint) for the
+/// resume checkpoint. The serde representation skips the programmatic filter
+/// handle itself, so the fingerprint is folded in explicitly.
+fn restore_config_hash(options: &RestoreOptions) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(options).unwrap_or_default());
+    if let Some(fingerprint) = &options.record_filter_fingerprint {
+        hasher.update(fingerprint.as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
@@ -1746,6 +2202,9 @@ mod tests {
             errors: vec!["Topic orders: Produce error for orders:5: code 6".to_string()],
             offset_mapping: OffsetMapping::new(),
             resolved_consumer_groups: Vec::new(),
+            records_dropped_by_filter: 0,
+            records_tombstoned_by_filter: 0,
+            record_filter: None,
         };
 
         let err = finalize_restore_report(report).expect_err(

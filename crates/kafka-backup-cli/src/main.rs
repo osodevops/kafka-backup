@@ -119,6 +119,54 @@ enum Commands {
         deep: bool,
     },
 
+    /// Delete aged/oversized segments from a backup set, recording the
+    /// pruned ranges in the manifest. Plan-only unless --execute is passed.
+    /// Do NOT use bucket lifecycle rules on incremental backup sets.
+    #[command(
+        after_help = "Examples:\n  kafka-backup prune --config backup.yaml --older-than 30d\n  kafka-backup prune --path s3://bucket/prefix --backup-id daily --before 2026-08-01T00:00:00Z --execute"
+    )]
+    Prune {
+        /// Path to the backup configuration file
+        #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
+        config: Option<String>,
+
+        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
+        #[arg(short, long, requires = "backup_id")]
+        path: Option<String>,
+
+        /// Backup ID to prune
+        #[arg(short, long, requires = "path")]
+        backup_id: Option<String>,
+
+        /// Prune segments older than this duration (30d, 12h, 1d12h, ...)
+        #[arg(long, conflicts_with = "before")]
+        older_than: Option<String>,
+
+        /// Prune segments older than this instant (RFC 3339 or epoch ms)
+        #[arg(long)]
+        before: Option<String>,
+
+        /// Never prune a partition below this many newest segments
+        #[arg(long, default_value = "1")]
+        keep_segments: usize,
+
+        /// Keep pruning oldest-first until the set fits under this many compressed bytes
+        #[arg(long)]
+        max_total_bytes: Option<u64>,
+
+        /// Actually delete (default is a dry-run plan)
+        #[arg(long)]
+        execute: bool,
+
+        /// Proceed even when a backup run looks live
+        #[arg(long)]
+        force: bool,
+
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
     /// Show detailed backup manifest (topics, partitions, time ranges, record counts)
     #[command(
         after_help = "Examples:\n  kafka-backup describe --path s3://bucket --backup-id my-backup\n  kafka-backup describe --config backup.yaml --format json"
@@ -567,6 +615,32 @@ async fn main() -> Result<()> {
                 config.as_deref(),
                 backup_id.as_deref(),
                 deep,
+            )
+            .await?;
+        }
+        Commands::Prune {
+            config,
+            path,
+            backup_id,
+            older_than,
+            before,
+            keep_segments,
+            max_total_bytes,
+            execute,
+            force,
+            format,
+        } => {
+            commands::prune::run(
+                config.as_deref(),
+                path.as_deref(),
+                backup_id.as_deref(),
+                older_than.as_deref(),
+                before.as_deref(),
+                keep_segments,
+                max_total_bytes,
+                execute,
+                force,
+                &format,
             )
             .await?;
         }

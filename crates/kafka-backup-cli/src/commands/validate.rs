@@ -20,6 +20,9 @@ struct ValidationReport {
     /// knowingly incomplete for these ranges.
     data_gaps: Vec<String>,
     offsets_missing: i64,
+    /// Ranges deliberately deleted by retention (`prune` /
+    /// `backup.retention`). Informational, never an integrity failure.
+    pruned_ranges: Vec<String>,
 }
 
 impl ValidationReport {
@@ -35,6 +38,7 @@ impl ValidationReport {
         println!("Segments Corrupted: {}", self.segments_corrupted);
         println!("Records Validated:  {}", self.records_validated);
         println!("Data Gaps:          {}", self.data_gaps.len());
+        println!("Pruned Ranges:      {}", self.pruned_ranges.len());
 
         if !self.issues.is_empty() {
             println!("\nIssues Found:");
@@ -51,6 +55,13 @@ impl ValidationReport {
             );
             for gap in &self.data_gaps {
                 println!("  - {}", gap);
+            }
+        }
+
+        if !self.pruned_ranges.is_empty() {
+            println!("\nPruned Ranges (deliberately deleted by retention — not data loss):");
+            for range in &self.pruned_ranges {
+                println!("  - {}", range);
             }
         }
 
@@ -126,6 +137,24 @@ pub async fn run(
             detected
         ));
         report.offsets_missing += gap.offset_span();
+    }
+
+    // Ranges deliberately removed by retention (issue #169).
+    for (topic, partition, range) in manifest.pruned() {
+        let when = chrono::DateTime::from_timestamp_millis(range.pruned_at)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| range.pruned_at.to_string());
+        report.pruned_ranges.push(format!(
+            "{}:{} offsets {}..{} ({} segments, {} bytes, {}, pruned {})",
+            topic,
+            partition,
+            range.start_offset,
+            range.end_offset,
+            range.segments,
+            range.bytes,
+            range.reason,
+            when
+        ));
     }
 
     // Validate each segment
