@@ -93,6 +93,23 @@ struct OffsetPersistence {
     sync_interval: Duration,
 }
 
+/// Remote key of the offset database for a backup set. Fixed by design —
+/// `prune`, `status` and the operators all assume it (issue #161).
+pub fn offsets_key(backup_id: &str) -> String {
+    format!("{}/offsets.db", backup_id)
+}
+
+/// `offset_storage.sync_interval_secs` overrides `backup.sync_interval_secs`
+/// for the offset database sync; the backup value applies when unset.
+fn effective_offset_sync_secs(
+    offset_storage: Option<&crate::config::OffsetStorageConfig>,
+    backup: &crate::config::BackupOptions,
+) -> u64 {
+    offset_storage
+        .and_then(|os| os.sync_interval_secs)
+        .unwrap_or(backup.sync_interval_secs)
+}
+
 impl OffsetPersistence {
     fn new(
         backup_id: String,
@@ -112,10 +129,7 @@ impl OffsetPersistence {
     async fn sync_now(&self) -> Result<()> {
         let mut last_sync = self.sync_lock.lock().await;
         self.offset_store
-            .sync_to_storage(
-                self.storage.as_ref(),
-                &format!("{}/offsets.db", self.backup_id),
-            )
+            .sync_to_storage(self.storage.as_ref(), &offsets_key(&self.backup_id))
             .await?;
 
         *last_sync = Some(Instant::now());
@@ -129,10 +143,7 @@ impl OffsetPersistence {
         }
 
         self.offset_store
-            .sync_to_storage(
-                self.storage.as_ref(),
-                &format!("{}/offsets.db", self.backup_id),
-            )
+            .sync_to_storage(self.storage.as_ref(), &offsets_key(&self.backup_id))
             .await?;
         *last_sync = Some(Instant::now());
         Ok(())
@@ -220,9 +231,12 @@ impl BackupEngine {
 
             let offset_config = OffsetStoreConfig {
                 db_path,
-                s3_key: Some(format!("{}/offsets.db", config.backup_id)),
+                s3_key: Some(offsets_key(&config.backup_id)),
                 checkpoint_interval_secs: backup_opts.checkpoint_interval_secs,
-                sync_interval_secs: backup_opts.sync_interval_secs,
+                sync_interval_secs: effective_offset_sync_secs(
+                    config.offset_storage.as_ref(),
+                    &backup_opts,
+                ),
             };
             Some(Arc::new(SqliteOffsetStore::new(offset_config).await?))
         } else {
@@ -243,7 +257,10 @@ impl BackupEngine {
                 config.backup_id.clone(),
                 storage.clone(),
                 offset_store.clone(),
-                Duration::from_secs(backup_opts.sync_interval_secs),
+                Duration::from_secs(effective_offset_sync_secs(
+                    config.offset_storage.as_ref(),
+                    &backup_opts,
+                )),
             ))
         });
 
@@ -322,10 +339,7 @@ impl BackupEngine {
         // Try to load offset store from remote if continuous
         if let Some(ref offset_store) = self.offset_store {
             if let Err(e) = offset_store
-                .try_load_from_storage(
-                    self.storage.as_ref(),
-                    &format!("{}/offsets.db", self.config.backup_id),
-                )
+                .try_load_from_storage(self.storage.as_ref(), &offsets_key(&self.config.backup_id))
                 .await
             {
                 warn!("Failed to load offset store from remote: {}", e);
@@ -2833,5 +2847,26 @@ mod tests {
         let (topic, partition, gap) = merged.gaps().next().unwrap();
         assert_eq!((topic, partition), ("orders", 1));
         assert_eq!(gap, &make_gap(0, 50));
+    }
+
+    #[test]
+    fn effective_offset_sync_secs_precedence() {
+        use crate::config::{BackupOptions, OffsetStorageConfig};
+        let backup = BackupOptions {
+            sync_interval_secs: 5,
+            ..Default::default()
+        };
+        // No offset_storage section → backup value.
+        assert_eq!(effective_offset_sync_secs(None, &backup), 5);
+        // Section present but interval unset → backup value (no silent reset to 30).
+        let unset = OffsetStorageConfig::default();
+        assert_eq!(effective_offset_sync_secs(Some(&unset), &backup), 5);
+        // Explicit override wins.
+        let set = OffsetStorageConfig {
+            sync_interval_secs: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(effective_offset_sync_secs(Some(&set), &backup), 60);
+        assert_eq!(offsets_key("daily"), "daily/offsets.db");
     }
 }
