@@ -52,9 +52,16 @@ pub fn create_backend_from_config(
             access_key,
             secret_key,
             prefix,
-            path_style: _,
+            path_style,
             allow_http,
         } => {
+            let effective_allow_http =
+                crate::storage::config::implied_allow_http(endpoint.as_deref(), *allow_http);
+            if effective_allow_http && !*allow_http {
+                tracing::info!(
+                    "storage.endpoint uses http://; enabling allow_http (set storage.allow_http: true to make this explicit)"
+                );
+            }
             let s3_config = S3Config {
                 bucket: bucket.clone(),
                 region: region.clone(),
@@ -62,7 +69,8 @@ pub fn create_backend_from_config(
                 access_key_id: access_key.clone(),
                 secret_access_key: secret_key.clone(),
                 prefix: prefix.clone(),
-                allow_http: *allow_http,
+                path_style: *path_style,
+                allow_http: effective_allow_http,
             };
             Ok(Arc::new(S3Backend::new(s3_config)?))
         }
@@ -156,6 +164,7 @@ pub fn create_backend_legacy(
                 access_key_id: config.access_key.clone(),
                 secret_access_key: config.secret_key.clone(),
                 prefix: config.prefix.clone(),
+                path_style: false,
                 allow_http: config
                     .endpoint
                     .as_ref()

@@ -27,6 +27,9 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     /// Key prefix for all operations
     pub prefix: Option<String>,
+    /// Use path-style requests (bucket in the path, not the host). Implied by
+    /// a custom `endpoint`; set explicitly for path-style-only AWS setups.
+    pub path_style: bool,
     /// Allow HTTP (insecure) connections
     pub allow_http: bool,
 }
@@ -40,9 +43,17 @@ impl Default for S3Config {
             access_key_id: None,
             secret_access_key: None,
             prefix: None,
+            path_style: false,
             allow_http: false,
         }
     }
+}
+
+/// Path-style requests are used when asked for explicitly, or implied by a
+/// custom endpoint (MinIO / Ceph RGW). Before 0.22.0 the flag was silently
+/// discarded and only the endpoint side effect applied (issue #166).
+pub(crate) fn use_path_style(endpoint: Option<&str>, path_style: bool) -> bool {
+    path_style || endpoint.is_some()
 }
 
 /// S3 storage backend
@@ -62,7 +73,9 @@ impl S3Backend {
 
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
-            // For custom endpoints, we typically need virtual hosted style disabled
+        }
+
+        if use_path_style(config.endpoint.as_deref(), config.path_style) {
             builder = builder.with_virtual_hosted_style_request(false);
         }
 
@@ -282,5 +295,21 @@ mod tests {
         // Test delete
         backend.delete("test-key").await.unwrap();
         assert!(!backend.exists("test-key").await.unwrap());
+    }
+
+    #[test]
+    fn use_path_style_cases() {
+        assert!(
+            use_path_style(Some("http://minio:9000"), false),
+            "endpoint implies path style"
+        );
+        assert!(
+            use_path_style(None, true),
+            "explicit flag honoured without endpoint"
+        );
+        assert!(
+            !use_path_style(None, false),
+            "plain AWS keeps the client default"
+        );
     }
 }
