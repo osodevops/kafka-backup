@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-09-07
+
+### Added
+- `backup.on_missing_topic: fail | warn` — what to do when a literal (non-glob)
+  `topics.include` entry does not exist in the cluster. `fail` (default) keeps
+  the current behaviour; `warn` logs, records the absent names in the manifest's
+  new `missing_topics` field, exposes the `kafka_backup_missing_topics` gauge
+  (re-evaluated every cycle) and continues — a run with nothing left to back up
+  still fails. `describe` and `validate` show the recorded topics (informational,
+  never an integrity failure). Globs that match nothing are unaffected.
+  ([#167](https://github.com/osodevops/kafka-backup/issues/167))
+- `describe` and `validate` accept `--config backup.yaml` (parity with `status`
+  and `prune`): storage — including `prefix` — and `backup_id` come from the
+  backup configuration. `--path` + `--backup-id` still work; the two forms are
+  mutually exclusive. ([#168](https://github.com/osodevops/kafka-backup/issues/168))
+- S3 config accepts `access_key_id` / `secret_access_key` as aliases of
+  `access_key` / `secret_key` — the configuration reference documented the
+  former, so configs written from it were silently dropping credentials.
+  ([#166](https://github.com/osodevops/kafka-backup/issues/166))
+
+### Fixed
+- S3 `path_style` was discarded by the backend factory; path-style requests are
+  now used when set explicitly or implied by a custom `endpoint` (plain-AWS
+  default unchanged). ([#166](https://github.com/osodevops/kafka-backup/issues/166))
+- A YAML `storage.endpoint` starting with `http://` now implies `allow_http`
+  (logged at info), matching the `--path` URL behaviour, so on-prem HTTP stores
+  (Ceph RGW, MinIO) work without `AWS_ALLOW_HTTP`.
+  ([#166](https://github.com/osodevops/kafka-backup/issues/166))
+- Azure Workload Identity: YAML `client_id` / `tenant_id` now take precedence
+  over the webhook-injected `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` (they were
+  ignored on that path).
+- `offset_storage.sync_interval_secs` is honoured: it overrides
+  `backup.sync_interval_secs` for the offset-database sync; when unset the
+  backup value applies. ([#161](https://github.com/osodevops/kafka-backup/issues/161))
+- Documentation: the S3 and Azure sections of the configuration reference now
+  list the real option names (`allow_http`, `use_workload_identity`, `client_id`,
+  `tenant_id`, `client_secret`, `endpoint`), the Azure credential precedence and
+  environment variables (including `AZURE_FEDERATED_TOKEN_FILE`), the `--path`
+  URL query parameters, and an AKS Workload Identity example as a Job.
+  ([#166](https://github.com/osodevops/kafka-backup/issues/166))
+
+### Deprecated
+- `offset_storage.s3_key` — ignored; the offset database is always stored at
+  `{backup_id}/offsets.db` under the storage prefix (`prune`, `status` and the
+  operators rely on it). A warning is logged when set.
+  ([#161](https://github.com/osodevops/kafka-backup/issues/161))
+- `offset_storage.backend: memory` — not implemented; `sqlite` is used and a
+  warning is logged. ([#161](https://github.com/osodevops/kafka-backup/issues/161))
+- `backup.checkpoint_interval_secs` — never had an effect; offsets are
+  checkpointed at the end of every backup cycle. A warning is logged when set to
+  a non-default value. ([#161](https://github.com/osodevops/kafka-backup/issues/161))
+
+### Changed
+- **Breaking (library API):** `BackupOptions` gains `on_missing_topic`,
+  `BackupManifest` gains `missing_topics`, `OffsetStorageConfig::sync_interval_secs`
+  is now `Option<u64>`, and `storage::S3Config` gains `path_style`. Consumers
+  that build these structs by literal (the generic kafka-backup-operator does)
+  must add the fields — `..Default::default()` where available.
+
 ## [0.21.0] - 2026-08-31
 
 ### Added
