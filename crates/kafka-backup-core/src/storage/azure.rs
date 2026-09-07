@@ -37,6 +37,18 @@ pub struct AzureConfig {
     pub sas_token: Option<String>,
 }
 
+/// Resolve Workload Identity parameters: explicit config values take precedence
+/// over the environment variables injected by the AKS Workload Identity webhook.
+fn resolve_workload_identity(
+    config: &AzureConfig,
+    env: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let client_id = config.client_id.clone().or_else(|| env("AZURE_CLIENT_ID"));
+    let tenant_id = config.tenant_id.clone().or_else(|| env("AZURE_TENANT_ID"));
+    let token_file = env("AZURE_FEDERATED_TOKEN_FILE");
+    (client_id, tenant_id, token_file)
+}
+
 /// Azure Blob Storage backend
 pub struct AzureBackend {
     store: Arc<dyn ObjectStore>,
@@ -50,7 +62,8 @@ impl AzureBackend {
     /// 1. SAS token (`sas_token`)
     /// 2. Storage account key (`account_key`)
     /// 3. Service principal (`client_id` + `client_secret` + `tenant_id`)
-    /// 4. Workload Identity (`use_workload_identity` or AZURE_FEDERATED_TOKEN_FILE env var)
+    /// 4. Workload Identity (`use_workload_identity` or AZURE_FEDERATED_TOKEN_FILE env var);
+    ///    YAML `client_id` / `tenant_id` override the webhook-injected env vars
     /// 5. DefaultAzureCredential chain (environment, managed identity, CLI)
     pub fn new(config: AzureConfig) -> Result<Self> {
         let mut builder = MicrosoftAzureBuilder::new()
@@ -97,11 +110,12 @@ impl AzureBackend {
         } else if config.use_workload_identity.unwrap_or(false)
             || std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_ok()
         {
-            // Workload Identity - explicitly configure federated token authentication
-            // Read from environment variables set by Azure Workload Identity webhook
-            let client_id = std::env::var("AZURE_CLIENT_ID").ok();
-            let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
-            let token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok();
+            // Workload Identity - explicitly configure federated token authentication.
+            // YAML `client_id` / `tenant_id` win; otherwise the values injected by the
+            // Azure Workload Identity webhook (AZURE_CLIENT_ID / AZURE_TENANT_ID) are
+            // used. The token file always comes from AZURE_FEDERATED_TOKEN_FILE.
+            let (client_id, tenant_id, token_file) =
+                resolve_workload_identity(&config, |name| std::env::var(name).ok());
 
             if let Some(ref file) = token_file {
                 builder = builder.with_federated_token_file(file);
@@ -350,5 +364,54 @@ mod tests {
         backend.delete("test-key").await.unwrap();
         backend.delete("test-key-copy").await.unwrap();
         assert!(!backend.exists("test-key").await.unwrap());
+    }
+
+    fn wi_config(client_id: Option<&str>, tenant_id: Option<&str>) -> AzureConfig {
+        AzureConfig {
+            account_name: "acct".to_string(),
+            container_name: "backups".to_string(),
+            account_key: None,
+            prefix: None,
+            endpoint: None,
+            use_workload_identity: Some(true),
+            client_id: client_id.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
+            client_secret: None,
+            sas_token: None,
+        }
+    }
+
+    fn fake_env(name: &str) -> Option<String> {
+        match name {
+            "AZURE_CLIENT_ID" => Some("env-client".to_string()),
+            "AZURE_TENANT_ID" => Some("env-tenant".to_string()),
+            "AZURE_FEDERATED_TOKEN_FILE" => {
+                Some("/var/run/secrets/azure/tokens/azure-identity-token".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn workload_identity_prefers_yaml_ids_over_env() {
+        let (client_id, tenant_id, token_file) = resolve_workload_identity(
+            &wi_config(Some("yaml-client"), Some("yaml-tenant")),
+            fake_env,
+        );
+        assert_eq!(client_id.as_deref(), Some("yaml-client"));
+        assert_eq!(tenant_id.as_deref(), Some("yaml-tenant"));
+        assert_eq!(
+            token_file.as_deref(),
+            Some("/var/run/secrets/azure/tokens/azure-identity-token")
+        );
+    }
+
+    #[test]
+    fn workload_identity_falls_back_to_env() {
+        let (client_id, tenant_id, _) = resolve_workload_identity(&wi_config(None, None), fake_env);
+        assert_eq!(client_id.as_deref(), Some("env-client"));
+        assert_eq!(tenant_id.as_deref(), Some("env-tenant"));
+        let (client_id, _, token) = resolve_workload_identity(&wi_config(None, None), |_| None);
+        assert!(client_id.is_none() && token.is_none());
     }
 }

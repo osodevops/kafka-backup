@@ -307,12 +307,13 @@ storage:
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `bucket` | string | Yes | - | S3 bucket name |
-| `region` | string | Yes | - | AWS region |
+| `region` | string | No | - | AWS region |
 | `prefix` | string | No | `""` | Key prefix (folder) |
-| `endpoint` | string | No | - | Custom endpoint (for MinIO, etc.) |
-| `path_style` | bool | No | `false` | Use path-style URLs |
-| `access_key_id` | string | No | - | AWS access key (or use env/IAM) |
-| `secret_access_key` | string | No | - | AWS secret key |
+| `endpoint` | string | No | - | Custom endpoint (MinIO, Ceph RGW, etc.). Setting one implies path-style requests |
+| `path_style` | bool | No | `false` | Force path-style requests (bucket in the path) even without a custom endpoint |
+| `allow_http` | bool | No | `false` | Allow a plain-HTTP endpoint. Since 0.22.0 an `endpoint` starting with `http://` implies it |
+| `access_key` | string | No | - | AWS access key (or use env/IAM). `access_key_id` is accepted as an alias |
+| `secret_key` | string | No | - | AWS secret key. `secret_access_key` is accepted as an alias |
 
 ```yaml
 storage:
@@ -328,10 +329,10 @@ storage:
 storage:
   backend: s3
   bucket: kafka-backups
-  endpoint: http://minio.local:9000
-  path_style: true
-  access_key_id: minioadmin
-  secret_access_key: ${MINIO_SECRET}
+  endpoint: http://minio.local:9000   # http:// implies allow_http (0.22.0+) and path-style
+  allow_http: true                     # explicit is clearer for on-prem stores (Ceph RGW, MinIO)
+  access_key: minioadmin
+  secret_key: ${MINIO_SECRET}
 ```
 
 ### Azure Blob Storage Backend
@@ -341,9 +342,18 @@ storage:
 | `account_name` | string | Yes | - | Azure storage account name |
 | `container_name` | string | Yes | - | Blob container name |
 | `prefix` | string | No | `""` | Blob prefix (folder) |
-| `account_key` | string | No | - | Account key (or use managed identity) |
-| `sas_token` | string | No | - | SAS token |
-| `use_managed_identity` | bool | No | `false` | Use managed identity |
+| `endpoint` | string | No | - | Custom endpoint (sovereign clouds) |
+| `sas_token` | string | No | - | Shared access signature |
+| `account_key` | string | No | - | Storage account key (`AZURE_STORAGE_KEY` env fallback) |
+| `client_id` | string | No | - | Azure AD client ID (service principal or Workload Identity) |
+| `tenant_id` | string | No | - | Azure AD tenant ID |
+| `client_secret` | string | No | - | Service-principal secret |
+| `use_workload_identity` | bool | No | auto | AKS Workload Identity (federated token). Auto-enabled when `AZURE_FEDERATED_TOKEN_FILE` is set |
+
+Credential precedence: `sas_token` → `account_key` → service principal (`client_secret`) →
+Workload Identity → `DefaultAzureCredential` chain (environment, managed identity, Azure CLI).
+For Workload Identity, YAML `client_id`/`tenant_id` override the webhook-injected
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`; the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
 
 ```yaml
 storage:
@@ -351,7 +361,7 @@ storage:
   account_name: mybackupstorage
   container_name: kafka-backups
   prefix: production/
-  use_managed_identity: true
+  use_workload_identity: true   # AKS: pod label azure.workload.identity/use=true + SA annotation
 ```
 
 ### Google Cloud Storage Backend
@@ -944,8 +954,13 @@ source:
 | `AWS_ACCESS_KEY_ID` | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key |
 | `AWS_REGION` | AWS region |
+| `AWS_ENDPOINT` | Custom S3 endpoint (alternative to `storage.endpoint`) |
+| `AWS_ALLOW_HTTP` | `true` to allow a plain-HTTP S3 endpoint (alternative to `storage.allow_http`) |
 | `AZURE_STORAGE_ACCOUNT` | Azure storage account |
 | `AZURE_STORAGE_KEY` | Azure storage key |
+| `AZURE_STORAGE_SAS_TOKEN` | Azure SAS token |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_CLIENT_SECRET` | Azure AD service principal (client secret) or Workload Identity ids |
+| `AZURE_FEDERATED_TOKEN_FILE` | Projected token path injected by the AKS Workload Identity webhook; its presence enables Workload Identity |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP credentials |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
