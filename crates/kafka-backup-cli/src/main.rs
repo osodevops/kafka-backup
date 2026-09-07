@@ -94,16 +94,20 @@ enum Commands {
 
     /// Validate a backup's integrity (checksums, segment counts, manifests)
     #[command(
-        after_help = "Examples:\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
+        after_help = "Examples:\n  kafka-backup validate --config backup.yaml\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
     )]
     Validate {
+        /// Path to the backup configuration file (storage + backup_id come from it)
+        #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
+        config: Option<String>,
+
         /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
-        path: String,
+        #[arg(short, long, requires = "backup_id")]
+        path: Option<String>,
 
         /// Backup ID to validate
-        #[arg(short, long)]
-        backup_id: String,
+        #[arg(short, long, requires = "path")]
+        backup_id: Option<String>,
 
         /// Perform deep validation (read and verify each segment)
         #[arg(long, default_value = "false")]
@@ -159,14 +163,21 @@ enum Commands {
     },
 
     /// Show detailed backup manifest (topics, partitions, time ranges, record counts)
+    #[command(
+        after_help = "Examples:\n  kafka-backup describe --config backup.yaml\n  kafka-backup describe --path s3://bucket --backup-id my-backup --format json"
+    )]
     Describe {
+        /// Path to the backup configuration file (storage + backup_id come from it)
+        #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
+        config: Option<String>,
+
         /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
-        path: String,
+        #[arg(short, long, requires = "backup_id")]
+        path: Option<String>,
 
         /// Backup ID to describe
-        #[arg(short, long)]
-        backup_id: String,
+        #[arg(short, long, requires = "path")]
+        backup_id: Option<String>,
 
         /// Output format (text, json, yaml)
         #[arg(short, long, default_value = "text")]
@@ -584,11 +595,18 @@ async fn main() -> Result<()> {
             .await?;
         }
         Commands::Validate {
+            config,
             path,
             backup_id,
             deep,
         } => {
-            commands::validate::run(&path, &backup_id, deep).await?;
+            commands::validate::run(
+                config.as_deref(),
+                path.as_deref(),
+                backup_id.as_deref(),
+                deep,
+            )
+            .await?;
         }
         Commands::Prune {
             config,
@@ -617,11 +635,18 @@ async fn main() -> Result<()> {
             .await?;
         }
         Commands::Describe {
+            config,
             path,
             backup_id,
             format,
         } => {
-            commands::describe::run(&path, &backup_id, &format).await?;
+            commands::describe::run(
+                config.as_deref(),
+                path.as_deref(),
+                backup_id.as_deref(),
+                &format,
+            )
+            .await?;
         }
         Commands::ValidateRestore { config, format } => {
             commands::validate_restore::run(&config, &format).await?;
