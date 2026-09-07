@@ -5,12 +5,12 @@ use anyhow::{bail, Context, Result};
 use kafka_backup_core::backup::prune::{self, PruneCriteria, PrunePlan};
 use kafka_backup_core::manifest::{BackupManifest, PruneReason};
 use kafka_backup_core::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
-use kafka_backup_core::storage::{create_backend, StorageBackend};
+use kafka_backup_core::storage::StorageBackend;
 use kafka_backup_core::util::parse_duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::storage_path::backend_from_path;
+use super::storage_path::resolve_target;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -25,16 +25,8 @@ pub async fn run(
     force: bool,
     format: &str,
 ) -> Result<()> {
-    let (storage, backup_id): (Arc<dyn StorageBackend>, String) = match (config, path, backup_id) {
-        (Some(config_path), None, None) => {
-            let content = tokio::fs::read_to_string(config_path).await?;
-            let content = super::config::expand_env_vars(&content);
-            let cfg = super::config::parse_config(&content)?;
-            (create_backend(&cfg.storage)?, cfg.backup_id)
-        }
-        (None, Some(path), Some(id)) => (backend_from_path(path)?, id.to_string()),
-        _ => bail!("pass either --config, or --path together with --backup-id"),
-    };
+    let (storage, backup_id): (Arc<dyn StorageBackend>, String) =
+        resolve_target(config, path, backup_id).await?;
 
     let cutoff = match (older_than, before) {
         (Some(raw), None) => {

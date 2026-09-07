@@ -1014,25 +1014,29 @@ kafka-backup list --path /path/to/storage [OPTIONS]
 ### Describe Command
 
 ```bash
+kafka-backup describe --config backup.yaml [OPTIONS]
 kafka-backup describe --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `--path` | Path to storage location |
-| `--backup-id` | Backup identifier |
+| `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
+| `--path` | Path to storage location (requires `--backup-id`) |
+| `--backup-id` | Backup identifier (requires `--path`) |
 | `--format` | Output format |
 
 ### Validate Command
 
 ```bash
+kafka-backup validate --config backup.yaml [OPTIONS]
 kafka-backup validate --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `--path` | Path to storage location |
-| `--backup-id` | Backup identifier |
+| `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
+| `--path` | Path to storage location (requires `--backup-id`) |
+| `--backup-id` | Backup identifier (requires `--path`) |
 | `--deep` | Perform deep validation |
 
 ### Prune Command
