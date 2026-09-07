@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +121,8 @@ fn default_max_partition_labels() -> usize {
 /// Offset storage configuration for tracking backup progress
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OffsetStorageConfig {
-    /// Storage backend type (sqlite or memory)
+    /// Storage backend type. **Deprecated since 0.22.0** — only `sqlite` is
+    /// implemented; `memory` is accepted but ignored (a warning is logged).
     #[serde(default)]
     pub backend: OffsetStorageBackend,
 
@@ -128,13 +130,17 @@ pub struct OffsetStorageConfig {
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
 
-    /// S3 key for syncing offset database
+    /// **Deprecated since 0.22.0 — ignored.** The offset database is always
+    /// stored at `{backup_id}/offsets.db` under the storage prefix (`prune`,
+    /// `status` and the operator rely on that location). A warning is logged
+    /// when this is set.
     #[serde(default)]
     pub s3_key: Option<String>,
 
-    /// Sync interval to remote storage in seconds (default: 30)
-    #[serde(default = "default_sync_interval_secs")]
-    pub sync_interval_secs: u64,
+    /// Override `backup.sync_interval_secs` for syncing the offset database to
+    /// remote storage. When unset the backup value (default 30) applies.
+    #[serde(default)]
+    pub sync_interval_secs: Option<u64>,
 }
 
 impl Default for OffsetStorageConfig {
@@ -143,7 +149,7 @@ impl Default for OffsetStorageConfig {
             backend: OffsetStorageBackend::default(),
             db_path: default_db_path(),
             s3_key: None,
-            sync_interval_secs: default_sync_interval_secs(),
+            sync_interval_secs: None,
         }
     }
 }
@@ -434,7 +440,9 @@ pub struct BackupOptions {
     #[serde(default)]
     pub internal_topics: Vec<String>,
 
-    /// Checkpoint interval in seconds (default: 5)
+    /// **Deprecated since 0.22.0 — no effect.** Offsets are checkpointed at
+    /// the end of every backup cycle; a warning is logged when this is set to
+    /// a non-default value.
     #[serde(default = "default_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
 
@@ -1104,8 +1112,44 @@ impl Config {
         Ok((config, ignored))
     }
 
+    /// Keys that are accepted for backwards compatibility but have no effect
+    /// (issue #161). Pure so it can be unit-tested; `validate()` logs each one.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(os) = &self.offset_storage {
+            if os.s3_key.is_some() {
+                warnings.push(
+                    "offset_storage.s3_key is ignored (deprecated since 0.22.0): the offset \
+                     database is always stored at {backup_id}/offsets.db under the storage prefix"
+                        .to_string(),
+                );
+            }
+            if os.backend == OffsetStorageBackend::Memory {
+                warnings.push(
+                    "offset_storage.backend: memory is not implemented (deprecated since 0.22.0); \
+                     sqlite is used"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(backup) = &self.backup {
+            if backup.checkpoint_interval_secs != default_checkpoint_interval_secs() {
+                warnings.push(
+                    "backup.checkpoint_interval_secs has no effect (deprecated since 0.22.0): \
+                     offsets are checkpointed at the end of every backup cycle"
+                        .to_string(),
+                );
+            }
+        }
+        warnings
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> crate::Result<()> {
+        for warning in self.deprecation_warnings() {
+            warn!("{}", warning);
+        }
+
         match self.mode {
             Mode::Backup => {
                 if self.source.is_none() {
@@ -1662,5 +1706,58 @@ repartitioning:
             },
         );
         assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn deprecation_warnings_list_ignored_offset_keys() {
+        let yaml = r#"
+mode: backup
+backup_id: dep
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+backup:
+  checkpoint_interval_secs: 30
+offset_storage:
+  backend: memory
+  s3_key: custom/offsets.db
+  sync_interval_secs: 60
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let warnings = config.deprecation_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("offset_storage.s3_key")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("offset_storage.backend")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("backup.checkpoint_interval_secs")));
+        assert_eq!(
+            config.offset_storage.as_ref().unwrap().sync_interval_secs,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn deprecation_warnings_empty_for_defaults() {
+        let yaml = r#"
+mode: backup
+backup_id: clean
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+offset_storage:
+  db_path: /tmp/offsets.db
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.deprecation_warnings().is_empty());
+        assert_eq!(
+            config.offset_storage.as_ref().unwrap().sync_interval_secs,
+            None,
+            "unset means: use backup.sync_interval_secs"
+        );
     }
 }

@@ -401,8 +401,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `segment_max_interval_ms` | int | No | `60000` | Rotate a segment after this many milliseconds even if it is not full |
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
 | `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
-| `checkpoint_interval_secs` | int | No | `5` | How often partition progress is checkpointed to the offset store |
-| `sync_interval_secs` | int | No | `30` | How often the offset store is synced to remote storage |
+| `checkpoint_interval_secs` | int | No | `5` | **Deprecated (0.22.0) — no effect.** Offsets are checkpointed at the end of every backup cycle; a warning is logged if set |
+| `sync_interval_secs` | int | No | `30` | How often the manifest and the offset store are synced to remote storage (`offset_storage.sync_interval_secs` overrides it for the offset store) |
 | `include_offset_headers` | bool | No | **`true`** | Add `x-original-offset` / `x-original-timestamp` headers to every archived record — see [Offset-tracking headers](#offset-tracking-headers) |
 | `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
 | `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
@@ -544,7 +544,6 @@ broker-side codec (including gzip and snappy) is decoded on fetch.
 backup:
   compression: zstd
   continuous: true
-  checkpoint_interval_secs: 30
   segment_max_records: 50000
   segment_max_bytes: 52428800     # 50MB
   segment_max_interval_ms: 1800000 # 30 minutes
@@ -560,7 +559,6 @@ backup:
   stop_at_current_offsets: true  # Exit when caught up
   include_offset_headers: true    # Default; x-original-* headers for offset recovery on restore
   source_cluster_id: prod-eu      # Optional; recorded as x-source-cluster
-  checkpoint_interval_secs: 30
   segment_max_bytes: 134217728    # 128MB
 ```
 
@@ -580,10 +578,10 @@ Configuration for the local SQLite database used to track backup progress. When 
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `offset_storage.backend` | string | No | `sqlite` | Storage backend: `sqlite` or `memory` |
+| `offset_storage.backend` | string | No | `sqlite` | Only `sqlite` is implemented; `memory` is **deprecated (0.22.0)** and ignored with a warning |
 | `offset_storage.db_path` | string | No | `$TMPDIR/{backup_id}-offsets.db` | Path to local SQLite database file |
-| `offset_storage.s3_key` | string | No | - | Remote storage key for syncing the database |
-| `offset_storage.sync_interval_secs` | int | No | `30` | How often to sync the local DB to remote storage |
+| `offset_storage.s3_key` | string | No | - | **Deprecated (0.22.0) — ignored.** The database is always stored at `{backup_id}/offsets.db` under the storage prefix (`prune`/`status`/operators rely on it); a warning is logged if set |
+| `offset_storage.sync_interval_secs` | int | No | `backup.sync_interval_secs` | Override for how often the local DB is synced to remote storage (honoured since 0.22.0) |
 
 The offset store is created when `continuous: true` is set **or** when `offset_storage` is explicitly configured. This allows incremental one-shot and snapshot backups by adding the `offset_storage` section to your config:
 
