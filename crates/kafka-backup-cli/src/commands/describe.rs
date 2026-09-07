@@ -2,7 +2,7 @@ use anyhow::Result;
 use kafka_backup_core::BackupManifest;
 use tracing::info;
 
-use super::storage_path::backend_from_path;
+use super::storage_path::resolve_target;
 
 /// Describe command output format
 pub enum OutputFormat {
@@ -21,8 +21,13 @@ impl OutputFormat {
     }
 }
 
-pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
-    let storage = backend_from_path(path)?;
+pub async fn run(
+    config: Option<&str>,
+    path: Option<&str>,
+    backup_id: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let (storage, backup_id) = resolve_target(config, path, backup_id).await?;
     let output_format = OutputFormat::from_str(format);
 
     info!("Loading backup manifest: {}", backup_id);
@@ -95,6 +100,16 @@ fn print_manifest_text(manifest: &BackupManifest) {
             format!(
                 "{} ({} bytes deleted by retention)",
                 total_pruned, pruned_bytes
+            )
+        );
+    }
+    if !manifest.missing_topics.is_empty() {
+        println!(
+            "║ Missing Topics: {:55} ║",
+            format!(
+                "{} (configured but absent at last run: {})",
+                manifest.missing_topics.len(),
+                manifest.missing_topics.join(", ")
             )
         );
     }

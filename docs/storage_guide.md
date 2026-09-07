@@ -448,24 +448,36 @@ storage:
   account_name: mystorageaccount
   container_name: kafka-backups
 
-  # Optional - Account key (uses DefaultAzureCredential if omitted)
+  # Optional - Account key (uses the credential chain below if omitted)
   account_key: your-account-key
 
   # Optional - Key prefix for all operations
   prefix: cluster-prod
+
+  # Optional - sovereign cloud endpoint (Azure Government, Azure China)
+  # endpoint: https://mystorageaccount.blob.core.usgovcloudapi.net
+
+  # Optional - other credential types
+  # sas_token: "sv=2023-...&sig=..."
+  # client_id: <app-or-managed-identity-client-id>
+  # tenant_id: <tenant-id>
+  # client_secret: ${AZURE_CLIENT_SECRET}      # service principal
+  # use_workload_identity: true                 # AKS Workload Identity (federated token)
 ```
 
 **Environment Variables:**
 - `AZURE_STORAGE_KEY` - Account key (fallback)
-- `AZURE_TENANT_ID` - Tenant ID for service principal
-- `AZURE_CLIENT_ID` - Client ID for service principal
+- `AZURE_STORAGE_SAS_TOKEN` - SAS token (fallback)
+- `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` - Tenant / client ID (service principal or Workload Identity)
 - `AZURE_CLIENT_SECRET` - Client secret for service principal
+- `AZURE_FEDERATED_TOKEN_FILE` - Projected token file injected by the AKS Workload Identity webhook; when set, Workload Identity is used automatically
 
-**Credential Chain (when account_key omitted):**
-1. Environment variables (service principal)
-2. Managed Identity
-3. Azure CLI credentials
-4. Azure Developer CLI credentials
+**Credential precedence:**
+1. `sas_token`
+2. `account_key`
+3. Service principal (`client_id` + `tenant_id` + `client_secret`)
+4. Workload Identity (`use_workload_identity: true` or `AZURE_FEDERATED_TOKEN_FILE` present) — YAML `client_id`/`tenant_id` override the webhook-injected `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`
+5. `DefaultAzureCredential` chain (environment, managed identity, Azure CLI, Azure Developer CLI)
 
 ### Google Cloud Storage
 
@@ -512,7 +524,7 @@ storage:
 
 | Backend | URL Format |
 |---------|------------|
-| S3 | `s3://bucket?region=us-east-1&endpoint=http://host:9000` |
+| S3 | `s3://bucket/prefix?region=us-east-1&endpoint=http://host:9000&path_style=true&allow_http=true` — an `endpoint=http://…` implies `allow_http=true` (and path-style); pass `allow_http=false` to override |
 | Azure | `azure://account.blob.core.windows.net/container` |
 | GCS | `gcs://bucket` or `gs://bucket` |
 | Filesystem | `file:///path/to/storage` |
@@ -770,9 +782,26 @@ spec:
                 name: kafka-backup-config
 ```
 
-### Azure Kubernetes Service (AKS) with Managed Identity
+### Azure Kubernetes Service (AKS) with Workload Identity
 
-#### Enable Workload Identity
+Works for the CLI running as a plain Kubernetes Job (no operator required). The AKS
+Workload Identity webhook injects `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_AUTHORITY_HOST` and `AZURE_FEDERATED_TOKEN_FILE` into any pod that carries the
+`azure.workload.identity/use: "true"` label and runs under an annotated ServiceAccount.
+
+#### 1. Federated credential (Azure side, once)
+
+```bash
+AKS_OIDC_ISSUER=$(az aks show -g <rg> -n <cluster> --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create \
+  --name kafka-backup --identity-name <managed-identity> -g <rg> \
+  --issuer "$AKS_OIDC_ISSUER" \
+  --subject system:serviceaccount:<namespace>:kafka-backup \
+  --audiences api://AzureADTokenExchange
+# The identity needs "Storage Blob Data Contributor" on the container/account.
+```
+
+#### 2. ServiceAccount + Job
 
 ```yaml
 apiVersion: v1
@@ -782,32 +811,40 @@ metadata:
   annotations:
     azure.workload.identity/client-id: <MANAGED_IDENTITY_CLIENT_ID>
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: kafka-backup
 spec:
   template:
     metadata:
       labels:
-        azure.workload.identity/use: "true"
+        azure.workload.identity/use: "true"   # required: triggers the token injection
     spec:
       serviceAccountName: kafka-backup
+      restartPolicy: OnFailure
       containers:
         - name: kafka-backup
-          image: kafka-backup:latest
+          image: osodevops/kafka-backup:latest
+          args: ["backup", "--config", "/config/backup.yaml"]
           # No credentials needed - uses Workload Identity
 ```
 
-#### Storage Config (No account_key)
+#### 3. Storage config
 
 ```yaml
 storage:
   backend: azure
   account_name: mystorageaccount
   container_name: kafka-backups
-  # account_key omitted - uses Managed Identity
+  use_workload_identity: true
+  # client_id / tenant_id are optional: the webhook-injected AZURE_CLIENT_ID /
+  # AZURE_TENANT_ID are used unless set here.
 ```
+
+Troubleshooting: run with `RUST_LOG=debug` — the backend logs
+`Azure authentication: Workload Identity (client_id=…, tenant_id=…, token_file=…)`;
+a `not set` token file means the pod label or ServiceAccount annotation is missing.
 
 ### Google Kubernetes Engine (GKE) with Workload Identity
 

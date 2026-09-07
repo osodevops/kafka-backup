@@ -242,8 +242,10 @@ kafka-backup three-phase-restore --config restore.yaml   # restore + offset reco
 # Inspect backups
 kafka-backup list --path s3://bucket/prefix
 kafka-backup describe --path s3://bucket --backup-id backup-001 --format json
+kafka-backup describe --config backup.yaml                 # same, using the backup config
 kafka-backup status --config backup.yaml --watch          # live monitoring
 kafka-backup validate --path s3://bucket --backup-id backup-001 --deep
+kafka-backup validate --config backup.yaml --deep
 
 # Restore validation (dry-run)
 kafka-backup validate-restore --config restore.yaml

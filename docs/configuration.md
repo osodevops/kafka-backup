@@ -307,12 +307,13 @@ storage:
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `bucket` | string | Yes | - | S3 bucket name |
-| `region` | string | Yes | - | AWS region |
+| `region` | string | No | - | AWS region |
 | `prefix` | string | No | `""` | Key prefix (folder) |
-| `endpoint` | string | No | - | Custom endpoint (for MinIO, etc.) |
-| `path_style` | bool | No | `false` | Use path-style URLs |
-| `access_key_id` | string | No | - | AWS access key (or use env/IAM) |
-| `secret_access_key` | string | No | - | AWS secret key |
+| `endpoint` | string | No | - | Custom endpoint (MinIO, Ceph RGW, etc.). Setting one implies path-style requests |
+| `path_style` | bool | No | `false` | Force path-style requests (bucket in the path) even without a custom endpoint |
+| `allow_http` | bool | No | `false` | Allow a plain-HTTP endpoint. Since 0.22.0 an `endpoint` starting with `http://` implies it |
+| `access_key` | string | No | - | AWS access key (or use env/IAM). `access_key_id` is accepted as an alias |
+| `secret_key` | string | No | - | AWS secret key. `secret_access_key` is accepted as an alias |
 
 ```yaml
 storage:
@@ -328,10 +329,10 @@ storage:
 storage:
   backend: s3
   bucket: kafka-backups
-  endpoint: http://minio.local:9000
-  path_style: true
-  access_key_id: minioadmin
-  secret_access_key: ${MINIO_SECRET}
+  endpoint: http://minio.local:9000   # http:// implies allow_http (0.22.0+) and path-style
+  allow_http: true                     # explicit is clearer for on-prem stores (Ceph RGW, MinIO)
+  access_key: minioadmin
+  secret_key: ${MINIO_SECRET}
 ```
 
 ### Azure Blob Storage Backend
@@ -341,9 +342,18 @@ storage:
 | `account_name` | string | Yes | - | Azure storage account name |
 | `container_name` | string | Yes | - | Blob container name |
 | `prefix` | string | No | `""` | Blob prefix (folder) |
-| `account_key` | string | No | - | Account key (or use managed identity) |
-| `sas_token` | string | No | - | SAS token |
-| `use_managed_identity` | bool | No | `false` | Use managed identity |
+| `endpoint` | string | No | - | Custom endpoint (sovereign clouds) |
+| `sas_token` | string | No | - | Shared access signature |
+| `account_key` | string | No | - | Storage account key (`AZURE_STORAGE_KEY` env fallback) |
+| `client_id` | string | No | - | Azure AD client ID (service principal or Workload Identity) |
+| `tenant_id` | string | No | - | Azure AD tenant ID |
+| `client_secret` | string | No | - | Service-principal secret |
+| `use_workload_identity` | bool | No | auto | AKS Workload Identity (federated token). Auto-enabled when `AZURE_FEDERATED_TOKEN_FILE` is set |
+
+Credential precedence: `sas_token` → `account_key` → service principal (`client_secret`) →
+Workload Identity → `DefaultAzureCredential` chain (environment, managed identity, Azure CLI).
+For Workload Identity, YAML `client_id`/`tenant_id` override the webhook-injected
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`; the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
 
 ```yaml
 storage:
@@ -351,7 +361,7 @@ storage:
   account_name: mybackupstorage
   container_name: kafka-backups
   prefix: production/
-  use_managed_identity: true
+  use_workload_identity: true   # AKS: pod label azure.workload.identity/use=true + SA annotation
 ```
 
 ### Google Cloud Storage Backend
@@ -391,12 +401,13 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `segment_max_interval_ms` | int | No | `60000` | Rotate a segment after this many milliseconds even if it is not full |
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
 | `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
-| `checkpoint_interval_secs` | int | No | `5` | How often partition progress is checkpointed to the offset store |
-| `sync_interval_secs` | int | No | `30` | How often the offset store is synced to remote storage |
+| `checkpoint_interval_secs` | int | No | `5` | **Deprecated (0.22.0) — no effect.** Offsets are checkpointed at the end of every backup cycle; a warning is logged if set |
+| `sync_interval_secs` | int | No | `30` | How often the manifest and the offset store are synced to remote storage (`offset_storage.sync_interval_secs` overrides it for the offset store) |
 | `include_offset_headers` | bool | No | **`true`** | Add `x-original-offset` / `x-original-timestamp` headers to every archived record — see [Offset-tracking headers](#offset-tracking-headers) |
 | `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
 | `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
 | `internal_topics` | list[string] | No | `[]` | Internal topics to include (e.g. `__consumer_offsets`) when `include_internal_topics` is set |
+| `on_missing_topic` | string | No | `fail` | When a literal (non-glob) `topics.include` entry is absent from the cluster: `fail` errors (default, protects one-shot runs from a zero-record "success"); `warn` logs, records the names in the manifest's `missing_topics`, exposes `kafka_backup_missing_topics`, and continues — the run still fails if nothing is left to back up. Globs that match nothing are always skipped silently |
 | `consumer_group_snapshot` | bool | No | `false` | Write `consumer-groups-snapshot.json` after each cycle for `auto_consumer_groups` restores |
 
 ### Offset-tracking headers
@@ -534,7 +545,6 @@ broker-side codec (including gzip and snappy) is decoded on fetch.
 backup:
   compression: zstd
   continuous: true
-  checkpoint_interval_secs: 30
   segment_max_records: 50000
   segment_max_bytes: 52428800     # 50MB
   segment_max_interval_ms: 1800000 # 30 minutes
@@ -550,7 +560,6 @@ backup:
   stop_at_current_offsets: true  # Exit when caught up
   include_offset_headers: true    # Default; x-original-* headers for offset recovery on restore
   source_cluster_id: prod-eu      # Optional; recorded as x-source-cluster
-  checkpoint_interval_secs: 30
   segment_max_bytes: 134217728    # 128MB
 ```
 
@@ -570,10 +579,10 @@ Configuration for the local SQLite database used to track backup progress. When 
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `offset_storage.backend` | string | No | `sqlite` | Storage backend: `sqlite` or `memory` |
+| `offset_storage.backend` | string | No | `sqlite` | Only `sqlite` is implemented; `memory` is **deprecated (0.22.0)** and ignored with a warning |
 | `offset_storage.db_path` | string | No | `$TMPDIR/{backup_id}-offsets.db` | Path to local SQLite database file |
-| `offset_storage.s3_key` | string | No | - | Remote storage key for syncing the database |
-| `offset_storage.sync_interval_secs` | int | No | `30` | How often to sync the local DB to remote storage |
+| `offset_storage.s3_key` | string | No | - | **Deprecated (0.22.0) — ignored.** The database is always stored at `{backup_id}/offsets.db` under the storage prefix (`prune`/`status`/operators rely on it); a warning is logged if set |
+| `offset_storage.sync_interval_secs` | int | No | `backup.sync_interval_secs` | Override for how often the local DB is synced to remote storage (honoured since 0.22.0) |
 
 The offset store is created when `continuous: true` is set **or** when `offset_storage` is explicitly configured. This allows incremental one-shot and snapshot backups by adding the `offset_storage` section to your config:
 
@@ -690,6 +699,7 @@ metrics:
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
 | `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
+| `kafka_backup_missing_topics` | Gauge | Literal include topics absent from the cluster at the last discovery pass (`backup.on_missing_topic: warn`); returns to 0 once they exist |
 | `kafka_backup_segments_pruned_total` | Counter | Segments deliberately deleted by retention (`prune` / `backup.retention`) |
 | `kafka_backup_bytes_pruned_total` | Counter | Compressed bytes deleted by retention |
 | `kafka_backup_compression_ratio` | Gauge | Compression efficiency |
@@ -944,8 +954,13 @@ source:
 | `AWS_ACCESS_KEY_ID` | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key |
 | `AWS_REGION` | AWS region |
+| `AWS_ENDPOINT` | Custom S3 endpoint (alternative to `storage.endpoint`) |
+| `AWS_ALLOW_HTTP` | `true` to allow a plain-HTTP S3 endpoint (alternative to `storage.allow_http`) |
 | `AZURE_STORAGE_ACCOUNT` | Azure storage account |
 | `AZURE_STORAGE_KEY` | Azure storage key |
+| `AZURE_STORAGE_SAS_TOKEN` | Azure SAS token |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_CLIENT_SECRET` | Azure AD service principal (client secret) or Workload Identity ids |
+| `AZURE_FEDERATED_TOKEN_FILE` | Projected token path injected by the AKS Workload Identity webhook; its presence enables Workload Identity |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP credentials |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
@@ -999,25 +1014,29 @@ kafka-backup list --path /path/to/storage [OPTIONS]
 ### Describe Command
 
 ```bash
+kafka-backup describe --config backup.yaml [OPTIONS]
 kafka-backup describe --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `--path` | Path to storage location |
-| `--backup-id` | Backup identifier |
+| `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
+| `--path` | Path to storage location (requires `--backup-id`) |
+| `--backup-id` | Backup identifier (requires `--path`) |
 | `--format` | Output format |
 
 ### Validate Command
 
 ```bash
+kafka-backup validate --config backup.yaml [OPTIONS]
 kafka-backup validate --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `--path` | Path to storage location |
-| `--backup-id` | Backup identifier |
+| `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
+| `--path` | Path to storage location (requires `--backup-id`) |
+| `--backup-id` | Backup identifier (requires `--path`) |
 | `--deep` | Perform deep validation |
 
 ### Prune Command

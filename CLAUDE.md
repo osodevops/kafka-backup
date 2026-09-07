@@ -255,9 +255,11 @@ kafka-backup list --path s3://bucket/prefix
 
 # Describe backup
 kafka-backup describe --path s3://bucket --backup-id backup-001 --format json
+kafka-backup describe --config backup.yaml --format json   # storage + backup_id from the config
 
 # Validate backup integrity
 kafka-backup validate --path s3://bucket --backup-id backup-001 --deep
+kafka-backup validate --config backup.yaml --deep
 
 # Offset management
 kafka-backup offset-reset plan --path s3://bucket --backup-id backup-001 --groups my-group
@@ -314,7 +316,7 @@ storage:
 backup:
   compression: zstd | lz4 | none
   segment_max_bytes: 134217728  # 128MB
-  checkpoint_interval_secs: 5
+  on_missing_topic: fail           # or warn: skip absent literal topics, record them (0.22.0)
   max_concurrent_partitions: 8
   include_offset_headers: true  # default; adds x-original-offset / x-original-timestamp to every archived record
 

@@ -25,11 +25,13 @@ pub enum StorageBackendConfig {
         /// Custom endpoint URL (for S3-compatible services like MinIO)
         #[serde(default)]
         endpoint: Option<String>,
-        /// Access key ID (falls back to AWS_ACCESS_KEY_ID env var)
-        #[serde(default)]
+        /// Access key ID (falls back to AWS_ACCESS_KEY_ID env var).
+        /// `access_key_id` is accepted as an alias (issue #166).
+        #[serde(default, alias = "access_key_id")]
         access_key: Option<String>,
-        /// Secret access key (falls back to AWS_SECRET_ACCESS_KEY env var)
-        #[serde(default)]
+        /// Secret access key (falls back to AWS_SECRET_ACCESS_KEY env var).
+        /// `secret_access_key` is accepted as an alias (issue #166).
+        #[serde(default, alias = "secret_access_key")]
         secret_key: Option<String>,
         /// Key prefix for all operations
         #[serde(default)]
@@ -107,6 +109,14 @@ pub enum StorageBackendConfig {
     Memory,
 }
 
+/// Plain-HTTP S3 endpoints (in-cluster MinIO / Ceph RGW) need `allow_http` or
+/// the client refuses to build. An explicit `allow_http: true` always wins;
+/// otherwise an `endpoint` starting with `http://` implies it (issue #166).
+/// Shared by the YAML and `--path` URL code paths.
+pub(crate) fn implied_allow_http(endpoint: Option<&str>, explicit: bool) -> bool {
+    explicit || endpoint.is_some_and(|e| e.starts_with("http://"))
+}
+
 impl StorageBackendConfig {
     /// Parse configuration from a URL string
     ///
@@ -150,11 +160,7 @@ impl StorageBackendConfig {
                     .query_pairs()
                     .find(|(k, _)| k == "allow_http")
                     .map(|(_, v)| v == "true")
-                    .unwrap_or_else(|| {
-                        endpoint
-                            .as_deref()
-                            .is_some_and(|e| e.starts_with("http://"))
-                    });
+                    .unwrap_or_else(|| implied_allow_http(endpoint.as_deref(), false));
 
                 Ok(Self::S3 {
                     bucket,
@@ -411,5 +417,36 @@ backend: memory
 "#;
         let config: StorageBackendConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(config, StorageBackendConfig::Memory));
+    }
+
+    #[test]
+    fn yaml_accepts_legacy_access_key_id_aliases() {
+        let yaml = r#"
+backend: s3
+bucket: backups
+access_key_id: AKIA
+secret_access_key: shh
+"#;
+        let config: StorageBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            StorageBackendConfig::S3 {
+                access_key,
+                secret_key,
+                ..
+            } => {
+                assert_eq!(access_key.as_deref(), Some("AKIA"));
+                assert_eq!(secret_key.as_deref(), Some("shh"));
+            }
+            _ => panic!("expected S3"),
+        }
+    }
+
+    #[test]
+    fn implied_allow_http_cases() {
+        assert!(implied_allow_http(Some("http://minio:9000"), false));
+        assert!(!implied_allow_http(Some("https://s3.example"), false));
+        assert!(!implied_allow_http(None, false));
+        assert!(implied_allow_http(None, true));
+        assert!(implied_allow_http(Some("https://s3.example"), true));
     }
 }

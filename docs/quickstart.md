@@ -368,7 +368,6 @@ Run backup continuously to capture all changes:
 ```yaml
 backup:
   continuous: true
-  checkpoint_interval_secs: 5
 ```
 
 ### 3. Consumer Offset Management

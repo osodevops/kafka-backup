@@ -67,8 +67,7 @@ backup:
   segment_max_bytes: 134217728
   segment_max_interval_ms: 60000
 
-  # Checkpoint settings
-  checkpoint_interval_secs: 5
+  # Remote sync interval for the manifest and offset store
   sync_interval_secs: 30
 
   # Offset-tracking headers (default: true) — adds x-original-offset /

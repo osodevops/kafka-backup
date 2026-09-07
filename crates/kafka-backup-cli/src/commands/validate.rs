@@ -3,7 +3,7 @@ use kafka_backup_core::segment::SegmentReader;
 use kafka_backup_core::BackupManifest;
 use tracing::{error, info, warn};
 
-use super::storage_path::backend_from_path;
+use super::storage_path::resolve_target;
 
 #[derive(Debug, Default)]
 struct ValidationReport {
@@ -23,6 +23,9 @@ struct ValidationReport {
     /// Ranges deliberately deleted by retention (`prune` /
     /// `backup.retention`). Informational, never an integrity failure.
     pruned_ranges: Vec<String>,
+    /// Literal include topics absent from the cluster at the last backup run
+    /// and skipped (`backup.on_missing_topic: warn`). Not an integrity failure.
+    missing_topics: Vec<String>,
 }
 
 impl ValidationReport {
@@ -39,6 +42,7 @@ impl ValidationReport {
         println!("Records Validated:  {}", self.records_validated);
         println!("Data Gaps:          {}", self.data_gaps.len());
         println!("Pruned Ranges:      {}", self.pruned_ranges.len());
+        println!("Missing Topics:     {}", self.missing_topics.len());
 
         if !self.issues.is_empty() {
             println!("\nIssues Found:");
@@ -65,6 +69,16 @@ impl ValidationReport {
             }
         }
 
+        if !self.missing_topics.is_empty() {
+            println!(
+                "\nMissing Topics (configured with backup.on_missing_topic: warn and absent during \
+                 the backup — not an integrity failure):"
+            );
+            for topic in &self.missing_topics {
+                println!("  - {}", topic);
+            }
+        }
+
         println!();
         match (self.is_valid(), self.data_gaps.is_empty()) {
             (true, true) => println!("Result: VALID"),
@@ -77,10 +91,14 @@ impl ValidationReport {
     }
 }
 
-pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
+pub async fn run(
+    config: Option<&str>,
+    path: Option<&str>,
+    backup_id: Option<&str>,
+    deep: bool,
+) -> Result<()> {
+    let (storage, backup_id) = resolve_target(config, path, backup_id).await?;
     info!("Validating backup: {} (deep={})", backup_id, deep);
-
-    let storage = backend_from_path(path)?;
     let mut report = ValidationReport::default();
 
     // Load manifest
@@ -152,6 +170,9 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
             when
         ));
     }
+
+    // Literal include topics skipped under on_missing_topic: warn (issue #167).
+    report.missing_topics = manifest.missing_topics.clone();
 
     // Validate each segment
     for topic in &manifest.topics {
