@@ -4,14 +4,14 @@
 
 Please **do not** open a public GitHub issue for a security problem.
 
-Report it to `<<security@oso.sh>>` (or through
+Report it to security@oso.sh (or through
 [GitHub private vulnerability reporting](https://github.com/osodevops/kafka-backup/security/advisories/new)
 on this repository). Include the kafka-backup version, the storage backend and
 Kafka version involved, a description of the issue, and steps to reproduce if
 you have them.
 
-You will receive an acknowledgement within `<<2 business days>>` and a
-severity assessment within `<<5 business days>>`. We follow coordinated
+You will receive an acknowledgement within two business days and a
+severity assessment within five business days. We follow coordinated
 disclosure: we ask for up to 90 days to ship a fix before details are
 published, and we credit reporters in the advisory unless they prefer not to
 be named.
