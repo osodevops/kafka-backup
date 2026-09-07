@@ -177,6 +177,7 @@ fn write_manifest(dir: &Path, partitions: Vec<PartitionBackup>) -> BackupManifes
             configurations: Default::default(),
             partitions,
         }],
+        missing_topics: Vec::new(),
     };
     let path = dir.join(BACKUP_ID).join("manifest.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

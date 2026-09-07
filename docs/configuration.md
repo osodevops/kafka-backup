@@ -407,6 +407,7 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
 | `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
 | `internal_topics` | list[string] | No | `[]` | Internal topics to include (e.g. `__consumer_offsets`) when `include_internal_topics` is set |
+| `on_missing_topic` | string | No | `fail` | When a literal (non-glob) `topics.include` entry is absent from the cluster: `fail` errors (default, protects one-shot runs from a zero-record "success"); `warn` logs, records the names in the manifest's `missing_topics`, exposes `kafka_backup_missing_topics`, and continues — the run still fails if nothing is left to back up. Globs that match nothing are always skipped silently |
 | `consumer_group_snapshot` | bool | No | `false` | Write `consumer-groups-snapshot.json` after each cycle for `auto_consumer_groups` restores |
 
 ### Offset-tracking headers
@@ -698,6 +699,7 @@ metrics:
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
 | `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
+| `kafka_backup_missing_topics` | Gauge | Literal include topics absent from the cluster at the last discovery pass (`backup.on_missing_topic: warn`); returns to 0 once they exist |
 | `kafka_backup_segments_pruned_total` | Counter | Segments deliberately deleted by retention (`prune` / `backup.retention`) |
 | `kafka_backup_bytes_pruned_total` | Counter | Compressed bytes deleted by retention |
 | `kafka_backup_compression_ratio` | Gauge | Compression efficiency |

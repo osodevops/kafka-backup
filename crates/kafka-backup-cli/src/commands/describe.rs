@@ -103,6 +103,16 @@ fn print_manifest_text(manifest: &BackupManifest) {
             )
         );
     }
+    if !manifest.missing_topics.is_empty() {
+        println!(
+            "║ Missing Topics: {:55} ║",
+            format!(
+                "{} (configured but absent at last run: {})",
+                manifest.missing_topics.len(),
+                manifest.missing_topics.join(", ")
+            )
+        );
+    }
 
     // Calculate total size
     let total_compressed: u64 = manifest

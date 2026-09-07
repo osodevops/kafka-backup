@@ -405,6 +405,22 @@ pub enum StorageBackendType {
     S3,
 }
 
+/// What to do when a literal (non-glob) `topics.include` entry does not exist
+/// in the cluster (issue #167). Glob patterns that match nothing are always
+/// skipped silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnMissingTopic {
+    /// Fail the run (default) — a requested topic that is absent must not
+    /// produce a "successful" backup with zero records for it.
+    #[default]
+    Fail,
+    /// Log a warning, record the topic in the manifest's `missing_topics`,
+    /// expose it via `kafka_backup_missing_topics`, and continue. The run
+    /// still fails if nothing is left to back up.
+    Warn,
+}
+
 /// Backup-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupOptions {
@@ -439,6 +455,11 @@ pub struct BackupOptions {
     /// Internal topics to backup (e.g., __consumer_offsets, __transaction_state)
     #[serde(default)]
     pub internal_topics: Vec<String>,
+
+    /// Behaviour when a literal `topics.include` entry is absent from the
+    /// cluster: `fail` (default) or `warn` (skip it, record it, continue).
+    #[serde(default)]
+    pub on_missing_topic: OnMissingTopic,
 
     /// **Deprecated since 0.22.0 — no effect.** Offsets are checkpointed at
     /// the end of every backup cycle; a warning is logged when this is set to
@@ -634,6 +655,7 @@ impl Default for BackupOptions {
             continuous: false,
             include_internal_topics: false,
             internal_topics: Vec::new(),
+            on_missing_topic: OnMissingTopic::default(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             sync_interval_secs: default_sync_interval_secs(),
             include_offset_headers: default_include_offset_headers(),
@@ -1759,5 +1781,30 @@ offset_storage:
             None,
             "unset means: use backup.sync_interval_secs"
         );
+    }
+
+    #[test]
+    fn on_missing_topic_parses_and_defaults_to_fail() {
+        let base = r#"
+mode: backup
+backup_id: omt
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+"#;
+        let config: Config = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            config.backup.unwrap_or_default().on_missing_topic,
+            OnMissingTopic::Fail
+        );
+        let warn = format!("{base}backup:\n  on_missing_topic: warn\n");
+        let config: Config = serde_yaml::from_str(&warn).unwrap();
+        assert_eq!(
+            config.backup.unwrap().on_missing_topic,
+            OnMissingTopic::Warn
+        );
+        let bad = format!("{base}backup:\n  on_missing_topic: ignore\n");
+        assert!(serde_yaml::from_str::<Config>(&bad).is_err());
     }
 }
