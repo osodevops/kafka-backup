@@ -93,6 +93,11 @@ pub struct PrometheusMetrics {
     /// Cumulative compressed bytes deleted by retention.
     pub bytes_pruned_total: Family<BackupLabels, Counter>,
 
+    /// Literal `topics.include` entries absent from the cluster at the last
+    /// discovery pass and skipped (`backup.on_missing_topic: warn`,
+    /// issue #167). Re-evaluated every cycle; 0 once they exist again.
+    pub missing_topics: Family<BackupLabels, Gauge>,
+
     // ========================================
     // Operation Duration Metrics
     // ========================================
@@ -221,6 +226,7 @@ impl PrometheusMetrics {
         let offsets_skipped_total = Family::<BackupLabels, Counter>::default();
         let segments_pruned_total = Family::<BackupLabels, Counter>::default();
         let bytes_pruned_total = Family::<BackupLabels, Counter>::default();
+        let missing_topics = Family::<BackupLabels, Gauge>::default();
 
         // Operation Duration Metrics
         let backup_duration_seconds =
@@ -343,6 +349,11 @@ impl PrometheusMetrics {
             "Cumulative compressed bytes deleted by retention",
             bytes_pruned_total.clone(),
         );
+        registry.register(
+            "kafka_backup_missing_topics",
+            "Literal include topics absent from the cluster at the last discovery pass (backup.on_missing_topic: warn)",
+            missing_topics.clone(),
+        );
 
         // Operation Duration Metrics
         registry.register(
@@ -461,6 +472,7 @@ impl PrometheusMetrics {
             offsets_skipped_total,
             segments_pruned_total,
             bytes_pruned_total,
+            missing_topics,
             backup_duration_seconds,
             restore_duration_seconds,
             storage_write_latency_seconds,
@@ -638,6 +650,13 @@ impl PrometheusMetrics {
             .get_or_create(&labels)
             .inc_by(segments);
         self.bytes_pruned_total.get_or_create(&labels).inc_by(bytes);
+    }
+
+    /// Set the number of literal include topics absent at the last discovery
+    /// pass (`backup.on_missing_topic: warn`). Re-evaluated every cycle.
+    pub fn set_missing_topics(&self, backup_id: &str, count: usize) {
+        let labels = BackupLabels::new(backup_id);
+        self.missing_topics.get_or_create(&labels).set(count as i64);
     }
 
     /// Increment cumulative bytes counter.
@@ -1148,5 +1167,20 @@ mod tests {
         ] {
             assert!(encoded.contains(name), "missing counter series: {name}");
         }
+    }
+
+    #[test]
+    fn missing_topics_gauge_encodes_and_resets() {
+        let metrics = PrometheusMetrics::with_max_labels(10);
+        metrics.set_missing_topics("daily", 2);
+        let text = metrics.encode();
+        assert!(
+            text.contains("kafka_backup_missing_topics{backup_id=\"daily\"} 2"),
+            "{text}"
+        );
+        metrics.set_missing_topics("daily", 0);
+        assert!(metrics
+            .encode()
+            .contains("kafka_backup_missing_topics{backup_id=\"daily\"} 0"));
     }
 }

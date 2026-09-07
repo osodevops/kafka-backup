@@ -97,7 +97,13 @@ fn describe_accepts_config() {
     create_backup_set(&storage, "daily");
     let config = write_config(&dir, &storage, "daily");
 
-    let out = run(&["describe", "--config", config.to_str().unwrap(), "--format", "json"]);
+    let out = run(&[
+        "describe",
+        "--config",
+        config.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
     let all = text(&out);
     assert!(out.status.success(), "{all}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json manifest");
@@ -114,7 +120,10 @@ fn describe_accepts_config() {
         "json",
     ]);
     assert!(out_path.status.success(), "{}", text(&out_path));
-    assert_eq!(out.stdout, out_path.stdout, "--config and --path must agree");
+    assert_eq!(
+        out.stdout, out_path.stdout,
+        "--config and --path must agree"
+    );
 }
 
 #[test]
@@ -165,7 +174,13 @@ fn prune_still_resolves_from_config() {
     let config = write_config(&dir, &storage, "daily");
 
     // Plan-only prune through the shared resolver (regression for #169).
-    let out = run(&["prune", "--config", config.to_str().unwrap(), "--older-than", "30d"]);
+    let out = run(&[
+        "prune",
+        "--config",
+        config.to_str().unwrap(),
+        "--older-than",
+        "30d",
+    ]);
     let all = text(&out);
     assert!(out.status.success(), "{all}");
     assert!(all.contains("Prune plan for 'daily'"), "{all}");

@@ -568,7 +568,7 @@ impl BackupEngine {
             // the cycle. This catches topics deleted while a backup is running
             // before a zero-record/empty-artifact result can be reported as
             // successful.
-            self.ensure_literal_topic_includes_exist(&source.topics)
+            self.ensure_literal_topic_includes_exist(&source.topics, &backup_opts)
                 .await?;
 
             // Checkpoint offsets
@@ -773,7 +773,8 @@ impl BackupEngine {
         // Fetch ALL topic metadata in a single bulk call
         let all_topics = self.router.fetch_metadata(None).await?;
 
-        fail_if_literal_topic_includes_missing(selection, &all_topics)?;
+        let missing =
+            check_literal_topic_includes(backup_opts.on_missing_topic, selection, &all_topics)?;
 
         let mut selected = Vec::new();
         for topic in all_topics {
@@ -816,12 +817,53 @@ impl BackupEngine {
 
         // Sort by topic name for consistent ordering
         selected.sort_by(|a, b| a.name.cmp(&b.name));
+        missing_topics_outcome(&missing, selected.len())?;
+        self.record_missing_topics(missing, false).await;
         Ok(selected)
     }
 
-    async fn ensure_literal_topic_includes_exist(&self, selection: &TopicSelection) -> Result<()> {
+    /// Record the literal include topics skipped under `on_missing_topic: warn`
+    /// in the manifest and the `kafka_backup_missing_topics` gauge. With
+    /// `union = false` the list replaces the previous cycle's (so a topic
+    /// created later clears the record); with `union = true` (mid-run check)
+    /// it is added to it.
+    async fn record_missing_topics(&self, missing: Vec<String>, union: bool) {
+        if !missing.is_empty() {
+            warn!(
+                topics = ?missing,
+                "configured backup topic(s) not found in Kafka cluster; continuing (backup.on_missing_topic: warn)"
+            );
+        }
+        let recorded = {
+            let mut manifest = self.manifest.lock().await;
+            if union {
+                let mut all: Vec<String> =
+                    manifest.missing_topics.drain(..).chain(missing).collect();
+                all.sort();
+                all.dedup();
+                manifest.missing_topics = all;
+            } else {
+                manifest.missing_topics = missing;
+            }
+            manifest.missing_topics.len()
+        };
+        if let Some(prom) = &self.prometheus_metrics {
+            prom.set_missing_topics(&self.config.backup_id, recorded);
+        }
+    }
+
+    async fn ensure_literal_topic_includes_exist(
+        &self,
+        selection: &TopicSelection,
+        backup_opts: &BackupOptions,
+    ) -> Result<()> {
         let all_topics = self.router.fetch_metadata(None).await?;
-        fail_if_literal_topic_includes_missing(selection, &all_topics)
+        let missing =
+            check_literal_topic_includes(backup_opts.on_missing_topic, selection, &all_topics)?;
+        if !missing.is_empty() {
+            self.record_missing_topics(missing, true).await;
+        }
+        Ok(())
     }
 
     /// Save the manifest to storage, merging with any existing manifest.
@@ -1646,6 +1688,10 @@ async fn save_manifest_snapshot(
 fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> BackupManifest {
     use std::collections::HashMap as HM;
 
+    // Latest discovery pass wins: the field must be copied here or every
+    // save_manifest (which starts from the stored manifest) would drop it.
+    existing.missing_topics = current.missing_topics.clone();
+
     for cur_topic in current.topics {
         if let Some(ex_topic) = existing
             .topics
@@ -1732,19 +1778,38 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_impl(&pattern_chars, &text_chars)
 }
 
-fn fail_if_literal_topic_includes_missing(
+/// Check literal `topics.include` entries against the cluster. In `fail` mode
+/// any missing entry is an error; in `warn` mode the missing names are
+/// returned for the caller to record (issue #167).
+fn check_literal_topic_includes(
+    mode: crate::config::OnMissingTopic,
     selection: &TopicSelection,
     existing_topics: &[TopicMetadata],
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let missing = missing_literal_topic_includes(selection, existing_topics);
     if missing.is_empty() {
-        return Ok(());
+        return Ok(missing);
     }
+    match mode {
+        crate::config::OnMissingTopic::Fail => Err(Error::TopicNotFound(format!(
+            "configured backup topic(s) not found in Kafka cluster: {}",
+            missing.join(", ")
+        ))),
+        crate::config::OnMissingTopic::Warn => Ok(missing),
+    }
+}
 
-    Err(Error::TopicNotFound(format!(
-        "configured backup topic(s) not found in Kafka cluster: {}",
-        missing.join(", ")
-    )))
+/// `warn` mode still refuses a run that has nothing left to back up. A
+/// selection that is empty for other reasons (globs matching nothing) keeps
+/// the existing warn-and-skip behaviour.
+fn missing_topics_outcome(missing: &[String], selected_count: usize) -> Result<()> {
+    if !missing.is_empty() && selected_count == 0 {
+        return Err(Error::TopicNotFound(format!(
+            "all configured backup topics are missing from the Kafka cluster: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn missing_literal_topic_includes(
@@ -2868,5 +2933,71 @@ mod tests {
         };
         assert_eq!(effective_offset_sync_secs(Some(&set), &backup), 60);
         assert_eq!(offsets_key("daily"), "daily/offsets.db");
+    }
+
+    #[test]
+    fn check_literal_topic_includes_mode_matrix() {
+        use crate::config::OnMissingTopic;
+        let selection = TopicSelection {
+            include: vec![
+                "orders".to_string(),
+                "ghost".to_string(),
+                "logs-*".to_string(),
+            ],
+            exclude: vec![],
+        };
+        let existing = vec![topic_metadata("orders")];
+
+        let err =
+            check_literal_topic_includes(OnMissingTopic::Fail, &selection, &existing).unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+
+        let missing =
+            check_literal_topic_includes(OnMissingTopic::Warn, &selection, &existing).unwrap();
+        assert_eq!(
+            missing,
+            vec!["ghost".to_string()],
+            "globs are never reported"
+        );
+
+        let all_present = vec![topic_metadata("orders"), topic_metadata("ghost")];
+        assert!(
+            check_literal_topic_includes(OnMissingTopic::Fail, &selection, &all_present)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_topics_outcome_rules() {
+        let missing = vec!["ghost".to_string()];
+        assert!(
+            missing_topics_outcome(&missing, 2).is_ok(),
+            "something left to back up"
+        );
+        assert!(
+            missing_topics_outcome(&missing, 0).is_err(),
+            "nothing left to back up"
+        );
+        assert!(
+            missing_topics_outcome(&[], 0).is_ok(),
+            "empty glob selection keeps today's behaviour"
+        );
+    }
+
+    #[test]
+    fn merge_manifests_carries_missing_topics() {
+        let mut existing = BackupManifest::new("m".to_string());
+        existing.missing_topics = vec!["stale".to_string()];
+        let mut current = BackupManifest::new("m".to_string());
+        current.missing_topics = vec!["ghost".to_string()];
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.missing_topics, vec!["ghost".to_string()]);
+
+        let cleared = merge_manifests(merged, BackupManifest::new("m".to_string()));
+        assert!(
+            cleared.missing_topics.is_empty(),
+            "a clean pass clears the record"
+        );
     }
 }

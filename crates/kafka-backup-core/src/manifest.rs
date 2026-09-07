@@ -26,6 +26,12 @@ pub struct BackupManifest {
 
     /// Topics included in this backup
     pub topics: Vec<TopicBackup>,
+
+    /// Literal `topics.include` entries that were absent from the cluster at
+    /// the last discovery pass and skipped because `backup.on_missing_topic`
+    /// is `warn` (issue #167). Empty — and omitted from JSON — otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_topics: Vec<String>,
 }
 
 impl BackupManifest {
@@ -38,6 +44,7 @@ impl BackupManifest {
             source_brokers: Vec::new(),
             compression: "zstd".to_string(),
             topics: Vec::new(),
+            missing_topics: Vec::new(),
         }
     }
 
@@ -1628,5 +1635,23 @@ mod tests {
         assert!(manifest.topics[0].partitions[0].gaps.is_empty());
         assert_eq!(manifest.total_gaps(), 0);
         assert_eq!(manifest.gaps().count(), 0);
+    }
+
+    #[test]
+    fn missing_topics_round_trip_and_omitted_when_empty() {
+        let mut manifest = BackupManifest::new("m".to_string());
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("missing_topics"), "{json}");
+
+        manifest.missing_topics = vec!["ghost".to_string()];
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("\"missing_topics\":[\"ghost\"]"), "{json}");
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.missing_topics, vec!["ghost".to_string()]);
+
+        // Manifests written before the field existed still load.
+        let legacy = r#"{"backup_id":"old","created_at":1,"topics":[]}"#;
+        let old: BackupManifest = serde_json::from_str(legacy).unwrap();
+        assert!(old.missing_topics.is_empty());
     }
 }
