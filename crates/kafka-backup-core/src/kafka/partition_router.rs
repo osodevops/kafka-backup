@@ -956,10 +956,12 @@ impl PartitionLeaderRouter {
                         "NOT_LEADER_FOR_PARTITION during DeleteRecords for topic {} (attempt {}/{}), refreshing metadata after {:?}: {}",
                         topic, leader_attempts, MAX_LEADER_RETRIES, backoff, e
                     );
-                    // DeleteRecords spans multiple leaders; refresh everything
-                    // but only clear pools after metadata is updated.
-                    self.clear_connection_cache().await;
+                    // DeleteRecords spans multiple leaders, so the per-broker
+                    // eviction used by produce/fetch does not apply: refresh
+                    // all metadata, then drop every pool so the next attempt
+                    // reconnects to the refreshed leaders.
                     self.refresh_metadata().await?;
+                    self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e)

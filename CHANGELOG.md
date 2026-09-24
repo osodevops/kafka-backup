@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to rebuild TCP/TLS/SASL connections. Concurrent pool rebuilds keep an
   already-installed full pool instead of racing `insert`.
   ([#197](https://github.com/osodevops/kafka-backup/issues/197))
+- `OffsetMapping` detailed mappings now stay sorted by source offset even
+  when a record filter maps a segment's dropped records after its survivors,
+  so `lookup_target_offset` always takes the exact binary-search path.
 
 ### Changed
 - **Breaking (library API):** `BackupOptions` and `RestoreOptions` gain

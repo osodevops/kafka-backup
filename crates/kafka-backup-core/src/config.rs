@@ -427,8 +427,10 @@ pub enum OnMissingTopic {
 /// log state transitions, but do not currently block requests when Open.
 /// Transient connection and leadership errors are retried by
 /// `PartitionLeaderRouter` before a partition fails. Exposing these knobs
-/// lets operators tune (or disable) the health-signal behaviour for large
-/// restores — see issue #197.
+/// lets operators tune when the breaker opens, or keep it permanently Closed
+/// with `enabled: false`. The `HealthCheck` component status
+/// (`Component kafka became Degraded` / `recovered`) is independent of the
+/// breaker and is not affected by these settings — see issue #197.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CircuitBreakerSettings {
@@ -628,7 +630,7 @@ pub struct BackupOptions {
     #[serde(default)]
     pub retention: Option<RetentionOptions>,
 
-    /// Kafka circuit-breaker settings (advisory health signal; see
+    /// Kafka circuit-breaker settings (advisory — never blocks requests; see
     /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
     /// thresholds (failure=5, reset=30s, success=2).
     #[serde(default)]
@@ -1064,7 +1066,7 @@ pub struct RestoreOptions {
     #[serde(skip)]
     pub record_filter_fingerprint: Option<String>,
 
-    /// Kafka circuit-breaker settings (advisory health signal; see
+    /// Kafka circuit-breaker settings (advisory — never blocks requests; see
     /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
     /// thresholds (failure=5, reset=30s, success=2).
     #[serde(default)]

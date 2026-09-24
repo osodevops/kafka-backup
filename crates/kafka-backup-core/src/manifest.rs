@@ -825,6 +825,12 @@ impl OffsetMapping {
     /// worth of work). Prefer this over repeated [`Self::add_detailed`] calls
     /// during restore so concurrent partitions do not serialize on the
     /// mapping mutex per record (issue #197).
+    ///
+    /// The per-partition list stays sorted by `source_offset` — the invariant
+    /// [`Self::lookup_target_offset`]'s binary search relies on — regardless
+    /// of the order pairs arrive in. Only the tail that overlaps the new batch
+    /// is re-sorted, so appending in offset order (the common case) moves
+    /// nothing.
     pub fn add_detailed_batch(&mut self, topic: &str, partition: i32, pairs: Vec<OffsetPair>) {
         if pairs.is_empty() {
             return;
@@ -861,8 +867,22 @@ impl OffsetMapping {
         }
 
         let entry = self.detailed_mappings.entry(key).or_default();
+        // Entries are only added through this method, so `entry` is sorted and
+        // `partition_point` is valid: `start` is where the batch's smallest
+        // offset belongs. When a record filter maps a segment's dropped
+        // records after that segment's survivors, the overlapping tail is
+        // bounded by one segment — never the partition's full history.
+        let start = entry.partition_point(|p| p.source_offset < min_pair.source_offset);
+        let old_len = entry.len();
         entry.reserve(pairs.len());
         entry.extend(pairs);
+        let appended_in_order = start == old_len
+            && entry[old_len..]
+                .windows(2)
+                .all(|w| w[0].source_offset <= w[1].source_offset);
+        if !appended_in_order {
+            entry[start..].sort_by_key(|p| p.source_offset);
+        }
     }
 
     /// Update offset range for a topic/partition
@@ -1431,6 +1451,62 @@ mod tests {
         assert_eq!(pe.source_last_offset, be.source_last_offset);
         assert_eq!(pe.target_first_offset, be.target_first_offset);
         assert_eq!(pe.target_last_offset, be.target_last_offset);
+    }
+
+    fn pairs(list: &[(i64, i64)]) -> Vec<OffsetPair> {
+        list.iter()
+            .map(|&(source_offset, target_offset)| OffsetPair {
+                source_offset,
+                target_offset,
+                timestamp: 1_700_000_000_000 + source_offset,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn add_detailed_batch_keeps_detailed_mappings_sorted() {
+        let mut mapping = OffsetMapping::new();
+
+        // Segment survivors arrive in offset order (records 1 and 3 were
+        // dropped by a record filter).
+        mapping.add_detailed_batch("orders", 0, pairs(&[(0, 100), (2, 101), (4, 102)]));
+        // The restore engine then maps the dropped records to the next
+        // survivor's target — behind the survivors, i.e. out of offset order.
+        mapping.add_detailed_batch("orders", 0, pairs(&[(1, 101), (3, 102)]));
+        // A batch that is itself unsorted.
+        mapping.add_detailed_batch("orders", 0, pairs(&[(7, 104), (5, 103), (6, 104)]));
+        // Single out-of-order insert through the per-record API.
+        mapping.add_detailed("orders", 0, 8, 105, 1_700_000_000_008);
+
+        let offsets: Vec<i64> = mapping.detailed_mappings["orders/0"]
+            .iter()
+            .map(|p| p.source_offset)
+            .collect();
+        assert_eq!(offsets, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Exact lookups resolve via the binary-search path.
+        assert_eq!(mapping.lookup_target_offset("orders", 0, 1), Some(101));
+        assert_eq!(mapping.lookup_target_offset("orders", 0, 3), Some(102));
+        assert_eq!(mapping.lookup_target_offset("orders", 0, 5), Some(103));
+        assert_eq!(mapping.lookup_target_offset("orders", 0, 8), Some(105));
+
+        // Range mapping still reflects the true extremes.
+        let entry = &mapping.entries["orders/0"];
+        assert_eq!(entry.source_first_offset, 0);
+        assert_eq!(entry.source_last_offset, 8);
+        assert_eq!(entry.target_first_offset, Some(100));
+        assert_eq!(entry.target_last_offset, Some(105));
+    }
+
+    #[test]
+    fn add_detailed_batch_in_order_append_preserves_input_order() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed_batch("orders", 0, pairs(&[(10, 500), (11, 501)]));
+        mapping.add_detailed_batch("orders", 0, pairs(&[(12, 502), (13, 503)]));
+        let detailed = &mapping.detailed_mappings["orders/0"];
+        let offsets: Vec<i64> = detailed.iter().map(|p| p.source_offset).collect();
+        assert_eq!(offsets, vec![10, 11, 12, 13]);
+        assert_eq!(detailed[3].target_offset, 503);
     }
 
     #[test]

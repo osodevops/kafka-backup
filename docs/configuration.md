@@ -409,7 +409,7 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `internal_topics` | list[string] | No | `[]` | Internal topics to include (e.g. `__consumer_offsets`) when `include_internal_topics` is set |
 | `on_missing_topic` | string | No | `fail` | When a literal (non-glob) `topics.include` entry is absent from the cluster: `fail` errors (default, protects one-shot runs from a zero-record "success"); `warn` logs, records the names in the manifest's `missing_topics`, exposes `kafka_backup_missing_topics`, and continues — the run still fails if nothing is left to back up. Globs that match nothing are always skipped silently |
 | `consumer_group_snapshot` | bool | No | `false` | Write `consumer-groups-snapshot.json` after each cycle for `auto_consumer_groups` restores |
-| `circuit_breaker` | map | No | see below | Kafka circuit-breaker settings (advisory health signal) |
+| `circuit_breaker` | map | No | see below | Kafka circuit-breaker settings (advisory — never blocks requests) |
 
 ### Circuit breaker (backup and restore)
 
@@ -427,9 +427,16 @@ failures and log state transitions (`[kafka] Circuit opening after N failures`),
 but they do **not** block produce/fetch requests when the breaker is Open.
 Transient connection and leadership errors are retried by the partition
 leader router (up to 5 connection retries / 20 NOT_LEADER retries) before a
-partition fails. Use `enabled: false` to silence the health signal for large
-one-shot restores, or raise `failure_threshold` / lower `reset_timeout_ms` if
-you want different logging behaviour. See issue #197.
+partition fails. Use `enabled: false` to keep the breaker permanently Closed
+(no `Circuit opening` / `Circuit closing` log lines; `kafka_circuit_state()`
+always reports `Closed`), or raise `failure_threshold` / lower
+`reset_timeout_ms` to change when it opens.
+
+The health status messages `Component kafka became Degraded` /
+`Component kafka recovered` are **independent of the breaker** and are not
+affected by these settings: `Degraded` is logged when a partition task fails
+after the router's retries are exhausted, and `recovered` when any other
+partition's next produce succeeds. See issue #197.
 
 ### Offset-tracking headers
 

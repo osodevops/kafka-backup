@@ -1771,28 +1771,39 @@ impl RestorePartitionContext {
 
             // Track offset range locally, then update mapping once per segment
             // (avoids holding the shared mutex once per record — issue #197).
+            // The segment extremes are found by offset, not by position, so
+            // this does not depend on the records being offset-ordered.
+            let mut segment_min = (i64::MAX, 0i64); // (offset, timestamp)
+            let mut segment_max = (i64::MIN, 0i64);
             for record in &filtered_records {
                 first_offset = first_offset.min(record.offset);
                 last_offset = last_offset.max(record.offset);
                 first_timestamp = first_timestamp.min(record.timestamp);
                 last_timestamp = last_timestamp.max(record.timestamp);
+                if record.offset < segment_min.0 {
+                    segment_min = (record.offset, record.timestamp);
+                }
+                if record.offset > segment_max.0 {
+                    segment_max = (record.offset, record.timestamp);
+                }
             }
-            if let (Some(first), Some(last)) = (filtered_records.first(), filtered_records.last()) {
+            {
+                // filtered_records is non-empty here, so both extremes are set.
                 let mut mapping = self.offset_mapping.lock().await;
                 mapping.update_range(
                     &self.target_topic,
                     self.target_partition,
-                    first.offset,
+                    segment_min.0,
                     None,
-                    first.timestamp,
+                    segment_min.1,
                 );
-                if last.offset != first.offset {
+                if segment_max.0 != segment_min.0 {
                     mapping.update_range(
                         &self.target_topic,
                         self.target_partition,
-                        last.offset,
+                        segment_max.0,
                         None,
-                        last.timestamp,
+                        segment_max.1,
                     );
                 }
             }
