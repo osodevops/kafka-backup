@@ -42,8 +42,10 @@ const TOPIC: &str = "issue-197-topic";
 enum ProduceMode {
     /// Always succeed with a monotonically increasing base offset.
     Ok,
-    /// Kill the TCP connection after reading one Produce (connection error).
-    KillOnce,
+    /// Kill the next `n` Produce requests (TCP RST). Use `n >= 2` to outlast
+    /// `KafkaClient::send_request`'s single reconnect-and-retry so the
+    /// router's produce loop sees the failure and runs eviction.
+    KillRemaining(u32),
     /// Return broker error code 7 (REQUEST_TIMED_OUT) — terminal, no retry.
     BrokerError,
 }
@@ -148,10 +150,25 @@ async fn serve_broker(
             ApiKey::Produce => {
                 let mode = *produce_mode.lock().await;
                 match mode {
-                    ProduceMode::KillOnce => {
-                        *produce_mode.lock().await = ProduceMode::Ok;
+                    ProduceMode::KillRemaining(n) if n > 0 => {
+                        *produce_mode.lock().await = if n == 1 {
+                            ProduceMode::Ok
+                        } else {
+                            ProduceMode::KillRemaining(n - 1)
+                        };
                         kill_rst(stream);
                         return;
+                    }
+                    ProduceMode::KillRemaining(_) => {
+                        // n == 0 falls through as Ok
+                        let n = produce_count.fetch_add(1, Ordering::SeqCst);
+                        produce_timestamps_ms
+                            .lock()
+                            .await
+                            .push(start.elapsed().as_millis() as u64);
+                        let resp = produce_ok_response(TOPIC, partition_for(broker_id), n as i64);
+                        write_response(&mut stream, api_key, api_version, correlation_id, &resp)
+                            .await;
                     }
                     ProduceMode::BrokerError => {
                         let resp = produce_error_response(TOPIC, partition_for(broker_id), 7);
@@ -333,17 +350,29 @@ async fn produce_connection_error_evicts_only_the_failing_broker() {
     let b2_after_warm = b2.connections();
     assert!(b2_after_warm >= 1, "broker 2 should have a warm pool");
 
-    // Next produce to partition 0 (broker 1) dies once, then succeeds after retries.
-    b1.set_mode(ProduceMode::KillOnce).await;
+    // Kill the next 2 Produce requests so the failure outlasts
+    // send_request's single reconnect and the router's eviction path runs.
+    b1.set_mode(ProduceMode::KillRemaining(2)).await;
     router
         .produce(TOPIC, 0, vec![record(1)], 1, 5_000)
         .await
-        .expect("produce after kill should retry and succeed");
+        .expect("produce after kills should retry at router layer and succeed");
+
+    // Touch partition 1 again. With scoped eviction the warm broker-2 pool is
+    // reused (connection count unchanged). With the old global
+    // clear_connection_cache the pool was dropped and this produce rebuilds
+    // it, bumping broker 2's accept count.
+    router
+        .produce(TOPIC, 1, vec![record(1)], 1, 5_000)
+        .await
+        .expect("produce p1 after broker1 blip");
 
     assert_eq!(
         b2.connections(),
         b2_after_warm,
-        "broker 2 pool must not be rebuilt when broker 1 fails (scoped eviction)"
+        "broker 2 pool must not be rebuilt when broker 1 fails (scoped eviction); \
+         after_warm={b2_after_warm}, now={}",
+        b2.connections()
     );
 
     b1.shutdown().await;
