@@ -810,26 +810,59 @@ impl OffsetMapping {
         target_offset: i64,
         timestamp: i64,
     ) {
-        let key = format!("{}/{}", topic, partition);
-
-        // Update range mapping
-        self.update_range(
+        self.add_detailed_batch(
             topic,
             partition,
-            source_offset,
-            Some(target_offset),
-            timestamp,
-        );
-
-        // Add detailed mapping
-        self.detailed_mappings
-            .entry(key)
-            .or_default()
-            .push(OffsetPair {
+            vec![OffsetPair {
                 source_offset,
                 target_offset,
                 timestamp,
-            });
+            }],
+        );
+    }
+
+    /// Add many detailed offset mappings under a single key (one lock holder's
+    /// worth of work). Prefer this over repeated [`Self::add_detailed`] calls
+    /// during restore so concurrent partitions do not serialize on the
+    /// mapping mutex per record (issue #197).
+    pub fn add_detailed_batch(&mut self, topic: &str, partition: i32, pairs: Vec<OffsetPair>) {
+        if pairs.is_empty() {
+            return;
+        }
+
+        let key = format!("{}/{}", topic, partition);
+
+        // Update range from batch extremes (copy values before mutating self)
+        let mut min_pair = pairs[0].clone();
+        let mut max_pair = pairs[0].clone();
+        for p in &pairs[1..] {
+            if p.source_offset < min_pair.source_offset {
+                min_pair = p.clone();
+            }
+            if p.source_offset > max_pair.source_offset {
+                max_pair = p.clone();
+            }
+        }
+        self.update_range(
+            topic,
+            partition,
+            min_pair.source_offset,
+            Some(min_pair.target_offset),
+            min_pair.timestamp,
+        );
+        if max_pair.source_offset != min_pair.source_offset {
+            self.update_range(
+                topic,
+                partition,
+                max_pair.source_offset,
+                Some(max_pair.target_offset),
+                max_pair.timestamp,
+            );
+        }
+
+        let entry = self.detailed_mappings.entry(key).or_default();
+        entry.reserve(pairs.len());
+        entry.extend(pairs);
     }
 
     /// Update offset range for a topic/partition
@@ -1360,6 +1393,44 @@ mod tests {
         assert_eq!(pair.source_offset, 100);
         assert_eq!(pair.target_offset, 5100);
         assert_eq!(pair.timestamp, 1700000000000);
+    }
+
+    #[test]
+    fn add_detailed_batch_matches_per_record_add_detailed() {
+        let mut per_record = OffsetMapping::new();
+        let mut batched = OffsetMapping::new();
+        let pairs: Vec<OffsetPair> = (0..10)
+            .map(|i| OffsetPair {
+                source_offset: i,
+                target_offset: 1000 + i,
+                timestamp: 1_700_000_000_000 + i,
+            })
+            .collect();
+
+        for p in &pairs {
+            per_record.add_detailed("orders", 0, p.source_offset, p.target_offset, p.timestamp);
+        }
+        batched.add_detailed_batch("orders", 0, pairs);
+
+        assert_eq!(
+            per_record.detailed_mapping_count(),
+            batched.detailed_mapping_count()
+        );
+        assert_eq!(
+            per_record.lookup_target_offset("orders", 0, 5),
+            batched.lookup_target_offset("orders", 0, 5)
+        );
+        let key = "orders/0";
+        assert_eq!(
+            per_record.detailed_mappings[key].len(),
+            batched.detailed_mappings[key].len()
+        );
+        let pe = &per_record.entries[key];
+        let be = &batched.entries[key];
+        assert_eq!(pe.source_first_offset, be.source_first_offset);
+        assert_eq!(pe.source_last_offset, be.source_last_offset);
+        assert_eq!(pe.target_first_offset, be.target_first_offset);
+        assert_eq!(pe.target_last_offset, be.target_last_offset);
     }
 
     #[test]

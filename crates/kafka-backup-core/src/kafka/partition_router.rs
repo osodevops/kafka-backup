@@ -301,16 +301,51 @@ impl PartitionLeaderRouter {
             pool.push(client);
         }
 
-        // Store in connection pool and return one via round-robin
-        let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
-        let selected = Arc::clone(&pool[idx]);
-
-        {
+        // Store in connection pool — if another task already installed a full
+        // pool while we were connecting, keep theirs and drop ours (avoids a
+        // reconnect storm after scoped eviction; issue #197).
+        let selected = {
             let mut connections = self.connections.write().await;
-            connections.insert(broker_id, pool);
-        }
+            let pool = match connections.get(&broker_id) {
+                Some(existing) if existing.len() >= pool_size => {
+                    drop(pool);
+                    existing
+                }
+                _ => {
+                    connections.insert(broker_id, pool);
+                    connections.get(&broker_id).expect("just inserted")
+                }
+            };
+            let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
+            Arc::clone(&pool[idx])
+        };
 
         Ok(selected)
+    }
+
+    /// Drop cached connections for a single broker.
+    ///
+    /// Prefer this over [`Self::clear_connection_cache`] so a failure on one
+    /// broker does not force every concurrent partition (including those on
+    /// healthy brokers) to rebuild their pools (issue #197).
+    async fn evict_broker_connections(&self, broker_id: i32) {
+        let mut connections = self.connections.write().await;
+        if connections.remove(&broker_id).is_some() {
+            debug!("Evicted connection pool for broker {}", broker_id);
+        }
+    }
+
+    /// Evict the current leader's pool for `topic`/`partition`, falling back
+    /// to a full cache clear when the leader is unknown.
+    async fn evict_leader_or_all(&self, topic: &str, partition: i32) {
+        let leader = {
+            let leaders = self.partition_leaders.read().await;
+            leaders.get(&(topic.to_string(), partition)).copied()
+        };
+        match leader {
+            Some(id) => self.evict_broker_connections(id).await,
+            None => self.clear_connection_cache().await,
+        }
     }
 
     /// Get a client connected to the partition's leader broker.
@@ -356,8 +391,8 @@ impl PartitionLeaderRouter {
                         "NOT_LEADER_FOR_PARTITION error for {}/{}, refreshing metadata",
                         topic, partition
                     );
+                    self.evict_leader_or_all(topic, partition).await;
                     self.refresh_partition_leader(topic, partition).await?;
-                    self.clear_connection_cache().await;
                     return self
                         .fetch_internal(topic, partition, offset, max_bytes)
                         .await;
@@ -371,7 +406,7 @@ impl PartitionLeaderRouter {
                         "Connection error fetching {}/{} (attempt {}/{}), retrying after {:?}: {}",
                         topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
                     );
-                    self.clear_connection_cache().await;
+                    self.evict_leader_or_all(topic, partition).await;
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e) => return Err(e),
@@ -529,8 +564,8 @@ impl PartitionLeaderRouter {
                         backoff,
                         e
                     );
+                    self.evict_leader_or_all(topic, partition).await;
                     self.refresh_partition_leader(topic, partition).await?;
-                    self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e)
@@ -542,7 +577,7 @@ impl PartitionLeaderRouter {
                         "Connection error for {}/{} (attempt {}/{}), retrying after {:?}: {}",
                         topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
                     );
-                    self.clear_connection_cache().await;
+                    self.evict_leader_or_all(topic, partition).await;
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e) => return Err(e),
@@ -921,8 +956,10 @@ impl PartitionLeaderRouter {
                         "NOT_LEADER_FOR_PARTITION during DeleteRecords for topic {} (attempt {}/{}), refreshing metadata after {:?}: {}",
                         topic, leader_attempts, MAX_LEADER_RETRIES, backoff, e
                     );
-                    self.refresh_metadata().await?;
+                    // DeleteRecords spans multiple leaders; refresh everything
+                    // but only clear pools after metadata is updated.
                     self.clear_connection_cache().await;
+                    self.refresh_metadata().await?;
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e)
@@ -934,6 +971,8 @@ impl PartitionLeaderRouter {
                         "Connection error during DeleteRecords for topic {} (attempt {}/{}), retrying after {:?}: {}",
                         topic, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
                     );
+                    // Multi-broker request: clear all pools so the next attempt
+                    // rebuilds every leader connection.
                     self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
                 }

@@ -421,6 +421,66 @@ pub enum OnMissingTopic {
     Warn,
 }
 
+/// Kafka circuit-breaker settings for backup and restore.
+///
+/// The breaker is **advisory**: the engines record successes and failures and
+/// log state transitions, but do not currently block requests when Open.
+/// Transient connection and leadership errors are retried by
+/// `PartitionLeaderRouter` before a partition fails. Exposing these knobs
+/// lets operators tune (or disable) the health-signal behaviour for large
+/// restores — see issue #197.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CircuitBreakerSettings {
+    /// When `false`, the Kafka breaker is a no-op (always Closed). Default: `true`.
+    pub enabled: bool,
+
+    /// Consecutive failures before the breaker opens. Default: `5`.
+    pub failure_threshold: u32,
+
+    /// Milliseconds to wait in Open before transitioning to HalfOpen. Default: `30000`.
+    pub reset_timeout_ms: u64,
+
+    /// Consecutive successes in HalfOpen required to close. Default: `2`.
+    pub success_threshold: u32,
+}
+
+impl Default for CircuitBreakerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: 5,
+            reset_timeout_ms: 30_000,
+            success_threshold: 2,
+        }
+    }
+}
+
+impl CircuitBreakerSettings {
+    /// Validate circuit-breaker settings.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.failure_threshold < 1 {
+            return Err(crate::Error::Config(
+                "circuit_breaker.failure_threshold must be >= 1".to_string(),
+            ));
+        }
+        if self.success_threshold < 1 {
+            return Err(crate::Error::Config(
+                "circuit_breaker.success_threshold must be >= 1".to_string(),
+            ));
+        }
+        if self.reset_timeout_ms < 1 {
+            return Err(crate::Error::Config(
+                "circuit_breaker.reset_timeout_ms must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Backup-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupOptions {
@@ -567,6 +627,12 @@ pub struct BackupOptions {
     /// incremental set — see the storage guide.
     #[serde(default)]
     pub retention: Option<RetentionOptions>,
+
+    /// Kafka circuit-breaker settings (advisory health signal; see
+    /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
+    /// thresholds (failure=5, reset=30s, success=2).
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerSettings,
 }
 
 /// Retention policy for a backup set (issue #169).
@@ -669,6 +735,7 @@ impl Default for BackupOptions {
             capture_topic_configs: default_capture_topic_configs(),
             require_topic_configs: false,
             retention: None,
+            circuit_breaker: CircuitBreakerSettings::default(),
         }
     }
 }
@@ -996,6 +1063,12 @@ pub struct RestoreOptions {
     /// `record_filter`; not configurable from YAML.
     #[serde(skip)]
     pub record_filter_fingerprint: Option<String>,
+
+    /// Kafka circuit-breaker settings (advisory health signal; see
+    /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
+    /// thresholds (failure=5, reset=30s, success=2).
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerSettings,
 }
 
 /// Controls the Phase 1 header preflight scan (see issue #137).
@@ -1067,6 +1140,7 @@ impl Default for RestoreOptions {
             dry_run_check_segments: false,
             record_filter: None,
             record_filter_fingerprint: None,
+            circuit_breaker: CircuitBreakerSettings::default(),
         }
     }
 }
@@ -1239,6 +1313,8 @@ impl BackupOptions {
             retention.validate()?;
         }
 
+        self.circuit_breaker.validate()?;
+
         Ok(())
     }
 }
@@ -1333,6 +1409,8 @@ impl RestoreOptions {
         // takes precedence for topics that have it configured, while partition_mapping
         // applies to the remaining topics. The engine handles this via early-return
         // branching in restore_topic().
+
+        self.circuit_breaker.validate()?;
 
         Ok(())
     }
@@ -1806,5 +1884,54 @@ storage:
         );
         let bad = format!("{base}backup:\n  on_missing_topic: ignore\n");
         assert!(serde_yaml::from_str::<Config>(&bad).is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_defaults_match_previous_hardcoded_values() {
+        let opts = RestoreOptions::default();
+        assert!(opts.circuit_breaker.enabled);
+        assert_eq!(opts.circuit_breaker.failure_threshold, 5);
+        assert_eq!(opts.circuit_breaker.reset_timeout_ms, 30_000);
+        assert_eq!(opts.circuit_breaker.success_threshold, 2);
+
+        let backup = BackupOptions::default();
+        assert!(backup.circuit_breaker.enabled);
+        assert_eq!(backup.circuit_breaker.failure_threshold, 5);
+    }
+
+    #[test]
+    fn circuit_breaker_yaml_round_trip() {
+        let yaml = r#"
+circuit_breaker:
+  enabled: false
+  failure_threshold: 15
+  reset_timeout_ms: 2000
+  success_threshold: 1
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert!(!opts.circuit_breaker.enabled);
+        assert_eq!(opts.circuit_breaker.failure_threshold, 15);
+        assert_eq!(opts.circuit_breaker.reset_timeout_ms, 2000);
+        assert_eq!(opts.circuit_breaker.success_threshold, 1);
+        assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_validation_rejects_zero_thresholds() {
+        let mut opts = valid_restore_options();
+        opts.circuit_breaker.failure_threshold = 0;
+        assert!(opts.validate().is_err());
+
+        opts.circuit_breaker.failure_threshold = 5;
+        opts.circuit_breaker.success_threshold = 0;
+        assert!(opts.validate().is_err());
+
+        opts.circuit_breaker.success_threshold = 1;
+        opts.circuit_breaker.reset_timeout_ms = 0;
+        assert!(opts.validate().is_err());
+
+        // Disabled breaker skips threshold validation
+        opts.circuit_breaker.enabled = false;
+        assert!(opts.validate().is_ok());
     }
 }

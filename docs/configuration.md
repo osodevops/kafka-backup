@@ -409,6 +409,27 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `internal_topics` | list[string] | No | `[]` | Internal topics to include (e.g. `__consumer_offsets`) when `include_internal_topics` is set |
 | `on_missing_topic` | string | No | `fail` | When a literal (non-glob) `topics.include` entry is absent from the cluster: `fail` errors (default, protects one-shot runs from a zero-record "success"); `warn` logs, records the names in the manifest's `missing_topics`, exposes `kafka_backup_missing_topics`, and continues — the run still fails if nothing is left to back up. Globs that match nothing are always skipped silently |
 | `consumer_group_snapshot` | bool | No | `false` | Write `consumer-groups-snapshot.json` after each cycle for `auto_consumer_groups` restores |
+| `circuit_breaker` | map | No | see below | Kafka circuit-breaker settings (advisory health signal) |
+
+### Circuit breaker (backup and restore)
+
+```yaml
+backup:   # or restore:
+  circuit_breaker:
+    enabled: true              # false = no-op (always Closed)
+    failure_threshold: 5       # consecutive failures before Open
+    reset_timeout_ms: 30000    # Open → HalfOpen wait
+    success_threshold: 2       # HalfOpen successes to re-Close
+```
+
+The Kafka circuit breaker is **advisory**: the engines record successes and
+failures and log state transitions (`[kafka] Circuit opening after N failures`),
+but they do **not** block produce/fetch requests when the breaker is Open.
+Transient connection and leadership errors are retried by the partition
+leader router (up to 5 connection retries / 20 NOT_LEADER retries) before a
+partition fails. Use `enabled: false` to silence the health signal for large
+one-shot restores, or raise `failure_threshold` / lower `reset_timeout_ms` if
+you want different logging behaviour. See issue #197.
 
 ### Offset-tracking headers
 
@@ -827,12 +848,18 @@ restore:
 | `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
 | `rate_limit_records_per_sec` | int | No | - | Rate limit (records/sec) |
 | `rate_limit_bytes_per_sec` | int | No | - | Rate limit (bytes/sec) |
+| `circuit_breaker` | map | No | see [Circuit breaker](#circuit-breaker-backup-and-restore) | Kafka circuit-breaker settings (advisory) |
 
 ```yaml
 restore:
   max_concurrent_partitions: 8
   produce_batch_size: 500
   rate_limit_records_per_sec: 10000
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 15
+    reset_timeout_ms: 2000
+    success_threshold: 1
 ```
 
 ### Resumable Restores
