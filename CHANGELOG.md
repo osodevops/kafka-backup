@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.23.0] - 2026-09-24
+## [0.23.0] - 2026-09-29
 
 ### Added
 - `backup.circuit_breaker` / `restore.circuit_breaker` YAML settings
@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `circuit_breaker: CircuitBreakerSettings`; `CircuitBreakerConfig` gains
   `enabled: bool` (default `true`). Consumers that build these structs by
   literal must add the fields — `..Default::default()` where available.
+- Dependencies: `p256` 0.14 (RustCrypto 0.14 generation — evidence signing
+  and verification unchanged) and the routine minor/patch refresh of
+  `futures`, `serde`, `rustls`, `object_store`, `hyper`, `regex`, `uuid`,
+  `tempfile` and friends ([#128](https://github.com/osodevops/kafka-backup/pull/128),
+  [#200](https://github.com/osodevops/kafka-backup/pull/200)).
 
 ## [0.22.0] - 2026-09-07
 
