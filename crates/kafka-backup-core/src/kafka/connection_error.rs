@@ -73,6 +73,12 @@ pub fn is_connection_error(error: &crate::Error) -> bool {
             kind, raw_os_error, ..
         }) => is_connection_io_kind(*kind, *raw_os_error),
         crate::Error::Kafka(KafkaError::Protocol(msg)) => is_legacy_connection_message(msg),
+        // A broker that refuses, resets or never completes a *new* connection
+        // (it is restarting, or its address is briefly unreachable) is the
+        // same class of failure as a connection it dropped: retry with
+        // back-off instead of failing the partition (issue #201).
+        crate::Error::Kafka(KafkaError::ConnectionFailed { .. })
+        | crate::Error::Kafka(KafkaError::NoBrokersAvailable) => true,
         _ => false,
     }
 }
@@ -301,12 +307,22 @@ mod tests {
                 message: "not leader".into(),
             }
         )));
-        assert!(!is_connection_error(&Error::Kafka(
+        assert!(!is_connection_error(&Error::Compression("zstd".into())));
+    }
+
+    /// A refused / timed-out *new* connection is retried like a dropped one
+    /// (issue #201): a broker that is restarting refuses connections for a
+    /// few seconds, and a hard-killed one has no listener at all.
+    #[test]
+    fn refused_or_failed_connect_is_a_connection_error() {
+        assert!(is_connection_error(&Error::Kafka(
             KafkaError::ConnectionFailed {
                 broker: "b:9092".into(),
-                message: "refused".into(),
+                message: "Connection refused (os error 61)".into(),
             }
         )));
-        assert!(!is_connection_error(&Error::Compression("zstd".into())));
+        assert!(is_connection_error(&Error::Kafka(
+            KafkaError::NoBrokersAvailable
+        )));
     }
 }

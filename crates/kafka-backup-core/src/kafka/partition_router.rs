@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -24,6 +24,30 @@ const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const NOT_COORDINATOR: i16 = 16;
 const MAX_COORDINATOR_RETRIES: u32 = 12;
+const LEADER_NOT_AVAILABLE: i16 = 5;
+
+/// Total time a single produce / fetch / get_offsets keeps retrying
+/// *transient* failures — connection errors (reset, EOF, timeout, refused)
+/// and leader-unavailable errors (NOT_LEADER_FOR_PARTITION,
+/// LEADER_NOT_AVAILABLE, or metadata reporting no leader) — before giving
+/// up. One budget covers both classes because a failure alternates between
+/// them: a hard-killed broker refuses connections until the controller
+/// fences it (KRaft `broker.session.timeout.ms`, 9 s by default), only then
+/// does metadata report no leader / a new leader. Sized like the Java
+/// producer's `delivery.timeout.ms` (2 min): a rolling restart or an
+/// election is waited out; a partition whose only replica stays down longer
+/// fails the run (issue #201).
+const TRANSIENT_RETRY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Back-off between leader refreshes: 250 ms, 500 ms, … capped at 2 s.
+fn leader_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((250 * u64::from(attempt)).min(2_000))
+}
+
+/// Back-off between reconnect attempts: 500 ms, 1 s, … capped at 5 s.
+fn connection_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((500 * u64::from(attempt)).min(5_000))
+}
 
 /// Routes Kafka requests to the correct partition leader broker.
 ///
@@ -124,6 +148,16 @@ impl PartitionLeaderRouter {
 
             for topic in &topics {
                 for partition in &topic.partitions {
+                    if partition.leader_id < 0 {
+                        // Election in progress or the only replica is down:
+                        // leave the partition unmapped so the next request
+                        // refreshes again instead of asking for broker -1.
+                        debug!(
+                            "Partition {}/{} has no leader yet (leader_id={})",
+                            topic.name, partition.partition_id, partition.leader_id
+                        );
+                        continue;
+                    }
                     leaders.insert(
                         (topic.name.clone(), partition.partition_id),
                         partition.leader_id,
@@ -204,6 +238,22 @@ impl PartitionLeaderRouter {
                 for p in t.partitions {
                     if p.partition_id == partition {
                         let mut leaders = self.partition_leaders.write().await;
+                        if p.leader_id < 0 {
+                            // No leader elected yet (rolling restart, or the
+                            // only replica is down). Never cache -1: the
+                            // caller waits and refreshes (issue #201).
+                            leaders.remove(&(topic.to_string(), partition));
+                            warn!(
+                                "{}/{} has no leader yet (leader_id={}): election in progress \
+                                 or its only replica is down",
+                                topic, partition, p.leader_id
+                            );
+                            return Err(KafkaError::PartitionNotAvailable {
+                                topic: topic.to_string(),
+                                partition,
+                            }
+                            .into());
+                        }
                         leaders.insert((topic.to_string(), partition), p.leader_id);
                         info!(
                             "Updated leader for {}/{}: broker {}",
@@ -350,6 +400,50 @@ impl PartitionLeaderRouter {
         }
     }
 
+    /// Best-effort leader refresh between retries. A failure here is not
+    /// fatal — metadata is often unavailable for the same reason the request
+    /// failed (election in progress, bootstrap broker restarting) — the next
+    /// attempt simply refreshes again.
+    async fn refresh_leader_best_effort(&self, topic: &str, partition: i32) {
+        if let Err(e) = self.refresh_partition_leader(topic, partition).await {
+            debug!(
+                "Leader refresh for {}/{} failed (will retry): {}",
+                topic, partition, e
+            );
+        }
+    }
+
+    /// Decide whether to keep waiting for a usable leader after a
+    /// leader-unavailable error. Returns `false` once the
+    /// [`TRANSIENT_RETRY_TIMEOUT`] budget (measured from `since`) is exhausted;
+    /// otherwise backs off, refreshes the leader and returns `true`.
+    async fn wait_for_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+        attempt: u32,
+        since: Instant,
+        error: &crate::Error,
+    ) -> bool {
+        let waited = since.elapsed();
+        if waited >= TRANSIENT_RETRY_TIMEOUT {
+            warn!(
+                "No usable leader for {}/{} after {:?} ({} attempts); giving up: {}",
+                topic, partition, waited, attempt, error
+            );
+            return false;
+        }
+        let backoff = leader_backoff(attempt);
+        warn!(
+            "No usable leader for {}/{} (NOT_LEADER / LEADER_NOT_AVAILABLE / none elected; \
+             attempt {}, waited {:.1?} of {:?}), refreshing metadata after {:?}: {}",
+            topic, partition, attempt, waited, TRANSIENT_RETRY_TIMEOUT, backoff, error
+        );
+        tokio::time::sleep(backoff).await;
+        self.refresh_leader_best_effort(topic, partition).await;
+        true
+    }
+
     /// Resolve the leader for `topic`/`partition` and a pooled connection to
     /// it, remembering which broker was chosen so a failure can be attributed
     /// to it (see [`RoutedError`]).
@@ -379,14 +473,17 @@ impl PartitionLeaderRouter {
     ///
     /// Handles the same two failure classes as [`Self::produce`]:
     ///
-    /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
-    ///    cache and retries once. The old leader answered, so its connections
-    ///    are healthy and are kept for the partitions it still leads.
+    /// 1. Leader unavailable — `NOT_LEADER_FOR_PARTITION` (6),
+    ///    `LEADER_NOT_AVAILABLE` (5), or metadata reporting no leader: refreshes
+    ///    the partition-leader cache with back-off for up to
+    ///    [`TRANSIENT_RETRY_TIMEOUT`] (issue #201). The old leader answered, so its
+    ///    connections are healthy and are kept for the partitions it still leads.
     ///
-    /// 2. Connection errors (see [`super::connection_error`]): retries up to
-    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, dropping only the
-    ///    failing broker's cached connections in between (issue #197).
-    ///    `KafkaClient::send_request` already
+    /// 2. Connection errors (see [`super::connection_error`]): retries with
+    ///    linear back-off (500 ms steps, capped at 5 s) within the same
+    ///    [`TRANSIENT_RETRY_TIMEOUT`] budget, dropping only the failing
+    ///    broker's cached connections and refreshing the leader in between
+    ///    (issue #197, #201). `KafkaClient::send_request` already
     ///    reconnects and retries once *immediately*; this loop covers blips that
     ///    outlast that single retry — a proxy or broker resetting connections
     ///    for a second or two would otherwise fail the partition, and with it
@@ -398,9 +495,9 @@ impl PartitionLeaderRouter {
         offset: i64,
         max_bytes: i32,
     ) -> Result<FetchResponse> {
-        const MAX_CONNECTION_RETRIES: u32 = 5;
-
         let mut connection_attempts = 0;
+        let mut leader_attempts = 0;
+        let started = Instant::now();
 
         loop {
             match self
@@ -408,36 +505,39 @@ impl PartitionLeaderRouter {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(RoutedError { error, .. }) if is_not_leader_error(&error) => {
-                    // Leadership moved: refresh the routing table and retry
-                    // once. No pool is evicted — the old leader is healthy.
-                    warn!(
-                        "NOT_LEADER_FOR_PARTITION error for {}/{}, refreshing metadata",
-                        topic, partition
-                    );
-                    self.refresh_partition_leader(topic, partition).await?;
-                    return self
-                        .fetch_internal(topic, partition, offset, max_bytes)
+                Err(RoutedError { error, .. }) if is_leader_unavailable_error(&error) => {
+                    // Routing problem, not a connection problem: no pool is
+                    // evicted. Wait for a leader (bounded), then retry.
+                    leader_attempts += 1;
+                    if !self
+                        .wait_for_leader(topic, partition, leader_attempts, started, &error)
                         .await
-                        .map_err(RoutedError::into_error);
+                    {
+                        return Err(error);
+                    }
                 }
                 Err(RoutedError { leader, error })
                     if is_connection_error(&error)
-                        && connection_attempts < MAX_CONNECTION_RETRIES =>
+                        && started.elapsed() < TRANSIENT_RETRY_TIMEOUT =>
                 {
                     connection_attempts += 1;
-                    let backoff = Duration::from_millis(500 * connection_attempts as u64);
+                    let backoff = connection_backoff(connection_attempts);
                     warn!(
-                        "Connection error fetching {}/{} (attempt {}/{}), retrying after {:?}: {}",
+                        "Connection error fetching {}/{} (attempt {}, {:.1?} of {:?} budget used), \
+                         retrying after {:?}: {}",
                         topic,
                         partition,
                         connection_attempts,
-                        MAX_CONNECTION_RETRIES,
+                        started.elapsed(),
+                        TRANSIENT_RETRY_TIMEOUT,
                         backoff,
                         error
                     );
                     self.evict_failed_broker(leader).await;
                     tokio::time::sleep(backoff).await;
+                    // The broker may have died rather than blipped: pick up a
+                    // moved leader before reconnecting to the old one.
+                    self.refresh_leader_best_effort(topic, partition).await;
                 }
                 Err(RoutedError { error, .. }) => return Err(error),
             }
@@ -529,21 +629,24 @@ impl PartitionLeaderRouter {
 
     /// Get the earliest and latest offsets for a partition.
     pub async fn get_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        // First attempt
-        match self.get_offsets_internal(topic, partition).await {
-            Ok(offsets) => Ok(offsets),
-            Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
-                warn!(
-                    "NOT_LEADER_FOR_PARTITION error for {}/{} during get_offsets, refreshing metadata",
-                    topic, partition
-                );
-                // Routing problem, not a connection problem: refresh the
-                // leader map and retry; every pool stays intact.
-                self.refresh_partition_leader(topic, partition).await?;
-                self.get_offsets_internal(topic, partition).await
+        let mut leader_attempts = 0;
+        let started = Instant::now();
+        loop {
+            match self.get_offsets_internal(topic, partition).await {
+                Ok(offsets) => return Ok(offsets),
+                Err(e) if is_leader_unavailable_error(&e) => {
+                    // Routing problem, not a connection problem: every pool
+                    // stays intact; wait for a leader (bounded) and retry.
+                    leader_attempts += 1;
+                    if !self
+                        .wait_for_leader(topic, partition, leader_attempts, started, &e)
+                        .await
+                    {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -557,15 +660,22 @@ impl PartitionLeaderRouter {
     ///
     /// Handles two failure classes (Issue #67 bug 8):
     ///
-    /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
-    ///    cache and retries with back-off. This covers planned leader elections
-    ///    and rolling restarts. The old leader answered, so its connection pool
-    ///    is kept — it usually still leads other partitions of this restore.
+    /// 1. Leader unavailable — `NOT_LEADER_FOR_PARTITION` (6),
+    ///    `LEADER_NOT_AVAILABLE` (5), or metadata reporting no leader (a partition
+    ///    whose replicas are all down, or mid-election): refreshes the
+    ///    partition-leader cache with back-off for up to [`TRANSIENT_RETRY_TIMEOUT`]
+    ///    (issue #201). This covers planned leader elections and rolling
+    ///    restarts. The old leader answered, so its connection pool is kept — it
+    ///    usually still leads other partitions of this restore.
     ///
-    /// 2. Connection errors (broken pipe, timeout, etc.): retries up to
-    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, evicting only the
-    ///    pool of the broker the failed request was sent to (issue #197). This
-    ///    covers transient network blips and broker restarts.
+    /// 2. Connection errors (broken pipe, timeout, refused, etc.): retries with
+    ///    linear back-off (500 ms steps, capped at 5 s) within the same
+    ///    [`TRANSIENT_RETRY_TIMEOUT`] budget, evicting only the pool of the
+    ///    broker the failed request was sent to and refreshing the leader in
+    ///    between (issue #197, #201). This covers transient network blips and
+    ///    broker restarts, including hard kills where the old address refuses
+    ///    connections until the controller fences the broker and moves (or
+    ///    re-elects) the leader.
     ///
     /// Records are only cloned when a retry is actually required.
     pub async fn produce(
@@ -576,11 +686,9 @@ impl PartitionLeaderRouter {
         acks: i16,
         timeout_ms: i32,
     ) -> Result<ProduceResponse> {
-        const MAX_CONNECTION_RETRIES: u32 = 5;
-        const MAX_LEADER_RETRIES: u32 = 20;
-
         let mut connection_attempts = 0;
         let mut leader_attempts = 0;
+        let started = Instant::now();
 
         loop {
             match self
@@ -588,41 +696,39 @@ impl PartitionLeaderRouter {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(RoutedError { error, .. })
-                    if is_not_leader_error(&error) && leader_attempts < MAX_LEADER_RETRIES =>
-                {
-                    leader_attempts += 1;
-                    let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
-                    warn!(
-                        "NOT_LEADER_FOR_PARTITION for {}/{} (attempt {}/{}), refreshing metadata after {:?}: {}",
-                        topic,
-                        partition,
-                        leader_attempts,
-                        MAX_LEADER_RETRIES,
-                        backoff,
-                        error
-                    );
+                Err(RoutedError { error, .. }) if is_leader_unavailable_error(&error) => {
                     // Routing problem, not a connection problem: no eviction.
-                    self.refresh_partition_leader(topic, partition).await?;
-                    tokio::time::sleep(backoff).await;
+                    // Wait for a leader (bounded), then retry.
+                    leader_attempts += 1;
+                    if !self
+                        .wait_for_leader(topic, partition, leader_attempts, started, &error)
+                        .await
+                    {
+                        return Err(error);
+                    }
                 }
                 Err(RoutedError { leader, error })
                     if is_connection_error(&error)
-                        && connection_attempts < MAX_CONNECTION_RETRIES =>
+                        && started.elapsed() < TRANSIENT_RETRY_TIMEOUT =>
                 {
                     connection_attempts += 1;
-                    let backoff = Duration::from_millis(500 * connection_attempts as u64);
+                    let backoff = connection_backoff(connection_attempts);
                     warn!(
-                        "Connection error for {}/{} (attempt {}/{}), retrying after {:?}: {}",
+                        "Connection error for {}/{} (attempt {}, {:.1?} of {:?} budget used), \
+                         retrying after {:?}: {}",
                         topic,
                         partition,
                         connection_attempts,
-                        MAX_CONNECTION_RETRIES,
+                        started.elapsed(),
+                        TRANSIENT_RETRY_TIMEOUT,
                         backoff,
                         error
                     );
                     self.evict_failed_broker(leader).await;
                     tokio::time::sleep(backoff).await;
+                    // The broker may have died rather than blipped: pick up a
+                    // moved leader before reconnecting to the old one.
+                    self.refresh_leader_best_effort(topic, partition).await;
                 }
                 Err(RoutedError { error, .. }) => return Err(error),
             }
@@ -1110,10 +1216,6 @@ impl RoutedError {
             error,
         }
     }
-
-    fn into_error(self) -> crate::Error {
-        self.error
-    }
 }
 
 /// Check if an error is a connection-level error that warrants a retry.
@@ -1122,6 +1224,23 @@ impl RoutedError {
 /// produce / delete-records retry loops recognise the same set of failures.
 fn is_connection_error(error: &crate::Error) -> bool {
     super::connection_error::is_connection_error(error)
+}
+
+/// True if the partition currently has no usable leader from this client's
+/// point of view: the broker answered NOT_LEADER_FOR_PARTITION (6) or
+/// LEADER_NOT_AVAILABLE (5), or metadata reported no leader at all
+/// (`PartitionNotAvailable`, leader_id -1). All three are transient — an
+/// election is in progress or a replica is restarting — and are waited out
+/// with back-off up to [`TRANSIENT_RETRY_TIMEOUT`] (issue #201).
+fn is_leader_unavailable_error(error: &crate::Error) -> bool {
+    is_not_leader_error(error)
+        || matches!(
+            error,
+            crate::Error::Kafka(KafkaError::BrokerError {
+                code: LEADER_NOT_AVAILABLE,
+                ..
+            }) | crate::Error::Kafka(KafkaError::PartitionNotAvailable { .. })
+        )
 }
 
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).
