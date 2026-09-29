@@ -319,19 +319,22 @@ impl RestoreEngine {
         health.register_component("kafka");
         health.register_component("storage");
 
-        // Initialize circuit breakers
-        let kafka_circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
-            failure_threshold: 5,
-            reset_timeout: Duration::from_secs(30),
-            success_threshold: 2,
-            name: "kafka".to_string(),
-        }));
+        // Initialize circuit breakers from restore options (Kafka breaker is
+        // advisory — see CircuitBreakerSettings docs / issue #197).
+        let breaker_settings = config
+            .restore
+            .as_ref()
+            .map(|r| r.circuit_breaker.clone())
+            .unwrap_or_default();
+        let kafka_circuit_breaker =
+            Arc::new(CircuitBreaker::from_settings(&breaker_settings, "kafka"));
 
         let storage_circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 3,
             reset_timeout: Duration::from_secs(60),
             success_threshold: 1,
             name: "storage".to_string(),
+            enabled: true,
         }));
 
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -351,6 +354,11 @@ impl RestoreEngine {
             progress_tx,
             target_config: Some(target_config),
         })
+    }
+
+    /// Current Kafka circuit-breaker state (for tests / observability).
+    pub fn kafka_circuit_state(&self) -> crate::circuit_breaker::CircuitState {
+        self.kafka_circuit_breaker.state()
     }
 
     /// Subscribe to progress updates
@@ -1763,21 +1771,45 @@ impl RestorePartitionContext {
                 continue;
             }
 
-            // Track offset range
+            // Track offset range locally, then update mapping once per segment
+            // (avoids holding the shared mutex once per record — issue #197).
+            // The segment extremes are found by offset value, not by position,
+            // so this does not depend on the records being offset-ordered; the
+            // timestamps passed are the segment's earliest / latest so the
+            // range's timestamp bounds match what the per-record path produced.
+            let mut segment_min_offset = i64::MAX;
+            let mut segment_max_offset = i64::MIN;
+            let mut segment_min_ts = i64::MAX;
+            let mut segment_max_ts = i64::MIN;
             for record in &filtered_records {
                 first_offset = first_offset.min(record.offset);
                 last_offset = last_offset.max(record.offset);
                 first_timestamp = first_timestamp.min(record.timestamp);
                 last_timestamp = last_timestamp.max(record.timestamp);
-
-                // Update offset mapping
-                self.offset_mapping.lock().await.update_range(
+                segment_min_offset = segment_min_offset.min(record.offset);
+                segment_max_offset = segment_max_offset.max(record.offset);
+                segment_min_ts = segment_min_ts.min(record.timestamp);
+                segment_max_ts = segment_max_ts.max(record.timestamp);
+            }
+            {
+                // filtered_records is non-empty here, so all extremes are set.
+                let mut mapping = self.offset_mapping.lock().await;
+                mapping.update_range(
                     &self.target_topic,
                     self.target_partition,
-                    record.offset,
+                    segment_min_offset,
                     None,
-                    record.timestamp,
+                    segment_min_ts,
                 );
+                if segment_max_offset != segment_min_offset || segment_max_ts != segment_min_ts {
+                    mapping.update_range(
+                        &self.target_topic,
+                        self.target_partition,
+                        segment_max_offset,
+                        None,
+                        segment_max_ts,
+                    );
+                }
             }
 
             // Drop the archive's kafka-backup headers if asked to, then add
@@ -1837,6 +1869,10 @@ impl RestorePartitionContext {
                         // Capture offset mapping (Phase 2: detailed offset mapping)
                         // Use per-sub-batch offsets for correct mapping when records
                         // were split across multiple produce requests.
+                        // Collect pairs locally then take the mapping lock once
+                        // per produce batch (issue #197).
+                        let mut batch_pairs: Vec<crate::manifest::OffsetPair> =
+                            Vec::with_capacity(batch.len());
                         let mut record_idx = 0;
                         for (sub_base_offset, sub_count) in &produce_response.sub_batch_offsets {
                             for j in 0..*sub_count {
@@ -1846,14 +1882,11 @@ impl RestorePartitionContext {
                                 // Extract source offset from header (if available) or use record offset
                                 let source_offset = self.extract_source_offset(record);
 
-                                // Add detailed mapping for exact offset lookup during consumer group reset
-                                self.offset_mapping.lock().await.add_detailed(
-                                    &self.target_topic,
-                                    self.target_partition,
+                                batch_pairs.push(crate::manifest::OffsetPair {
                                     source_offset,
                                     target_offset,
-                                    record.timestamp,
-                                );
+                                    timestamp: record.timestamp,
+                                });
                                 if collect_survivors {
                                     survivor_pairs.push((source_offset, target_offset));
                                 }
@@ -1866,6 +1899,11 @@ impl RestorePartitionContext {
                             "sub_batch_offsets total count ({}) != batch length ({})",
                             record_idx,
                             batch.len()
+                        );
+                        self.offset_mapping.lock().await.add_detailed_batch(
+                            &self.target_topic,
+                            self.target_partition,
+                            batch_pairs,
                         );
                     }
                     Err(e) => {
@@ -1890,16 +1928,19 @@ impl RestorePartitionContext {
                     &filter_outcome.dropped_records,
                     &survivor_pairs,
                 );
-                let mut mapping = self.offset_mapping.lock().await;
-                for (src, target, ts) in mapped {
-                    mapping.add_detailed(
-                        &self.target_topic,
-                        self.target_partition,
-                        src,
-                        target,
-                        ts,
-                    );
-                }
+                let pairs: Vec<crate::manifest::OffsetPair> = mapped
+                    .into_iter()
+                    .map(|(src, target, ts)| crate::manifest::OffsetPair {
+                        source_offset: src,
+                        target_offset: target,
+                        timestamp: ts,
+                    })
+                    .collect();
+                self.offset_mapping.lock().await.add_detailed_batch(
+                    &self.target_topic,
+                    self.target_partition,
+                    pairs,
+                );
             }
 
             total_bytes += batch_bytes;

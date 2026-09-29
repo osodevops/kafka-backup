@@ -197,23 +197,24 @@ impl BackupEngine {
         health.register_component("storage");
         health.register_component("checkpointing");
 
-        // Initialize circuit breakers
-        let kafka_circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
-            failure_threshold: 5,
-            reset_timeout: Duration::from_secs(30),
-            success_threshold: 2,
-            name: "kafka".to_string(),
-        }));
+        // Initialize offset store for continuous backups or when explicitly configured
+        let backup_opts = config.backup.clone().unwrap_or_default();
+
+        // Initialize circuit breakers (Kafka breaker from backup options —
+        // advisory health signal; see CircuitBreakerSettings / issue #197).
+        let kafka_circuit_breaker = Arc::new(CircuitBreaker::from_settings(
+            &backup_opts.circuit_breaker,
+            "kafka",
+        ));
 
         let storage_circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 3,
             reset_timeout: Duration::from_secs(60),
             success_threshold: 1,
             name: "storage".to_string(),
+            enabled: true,
         }));
 
-        // Initialize offset store for continuous backups or when explicitly configured
-        let backup_opts = config.backup.clone().unwrap_or_default();
         let offset_store = if should_create_offset_store(
             backup_opts.continuous,
             config.offset_storage.is_some(),

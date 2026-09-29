@@ -24,8 +24,8 @@ pub mod validation;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
-    Config, HeaderPreflightMode, MetricsConfig, OffsetStorageBackend, OffsetStorageConfig,
-    OffsetStrategy, RestoreOptions,
+    CircuitBreakerSettings, Config, HeaderPreflightMode, MetricsConfig, OffsetStorageBackend,
+    OffsetStorageConfig, OffsetStrategy, RestoreOptions,
 };
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};

@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-09-29
+
+### Added
+- `backup.circuit_breaker` / `restore.circuit_breaker` YAML settings
+  (`enabled`, `failure_threshold`, `reset_timeout_ms`, `success_threshold`)
+  so operators can tune or disable the Kafka circuit breaker for large
+  restores. Defaults match the previous hardcoded Kafka thresholds
+  (failure=5, reset=30s, success=2). The breaker remains **advisory**:
+  engines record successes/failures and log state transitions but do not
+  block requests when Open — transient failures are retried by
+  `PartitionLeaderRouter`. ([#197](https://github.com/osodevops/kafka-backup/issues/197))
+- `CircuitBreaker::disabled` / `CircuitBreaker::from_settings` and
+  `RestoreEngine::kafka_circuit_state()` for observability and tests.
+- `OffsetMapping::add_detailed_batch` for batched per-record offset mapping.
+
+### Fixed
+- Restore no longer takes the shared `offset_mapping` mutex once per record;
+  range updates and detailed pairs are applied per segment / produce batch,
+  cutting lock contention under `max_concurrent_partitions` > 1.
+  ([#197](https://github.com/osodevops/kafka-backup/issues/197))
+- `PartitionLeaderRouter` connection-error retries now evict only the pool
+  of the broker the failed request was sent to (captured at dispatch, so a
+  concurrent leader change cannot make the retry drop the new leader's
+  healthy pool) instead of clearing every broker's pool; NOT_LEADER retries
+  (produce, fetch, get_offsets) refresh metadata without dropping any pool,
+  since the broker that answered is healthy and usually still leads other
+  partitions of the same run. A blip on one leader therefore no longer forces
+  unrelated partitions to rebuild TCP/TLS/SASL connections. Concurrent pool
+  rebuilds keep an already-installed full pool instead of racing `insert`.
+  ([#197](https://github.com/osodevops/kafka-backup/issues/197))
+- `OffsetMapping` detailed mappings now stay sorted by source offset even
+  when a record filter maps a segment's dropped records after its survivors,
+  so `lookup_target_offset` always takes the exact binary-search path.
+
+### Changed
+- **Breaking (library API):** `BackupOptions` and `RestoreOptions` gain
+  `circuit_breaker: CircuitBreakerSettings`; `CircuitBreakerConfig` gains
+  `enabled: bool` (default `true`). Consumers that build these structs by
+  literal must add the fields — `..Default::default()` where available.
+- Dependencies: `p256` 0.14 (RustCrypto 0.14 generation — evidence signing
+  and verification unchanged) and the routine minor/patch refresh of
+  `futures`, `serde`, `rustls`, `object_store`, `hyper`, `regex`, `uuid`,
+  `tempfile` and friends ([#128](https://github.com/osodevops/kafka-backup/pull/128),
+  [#200](https://github.com/osodevops/kafka-backup/pull/200)).
+
 ## [0.22.0] - 2026-09-07
 
 ### Added

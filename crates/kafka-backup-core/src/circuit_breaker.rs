@@ -2,10 +2,19 @@
 //!
 //! Implements a circuit breaker that helps prevent cascading failures
 //! by temporarily blocking operations when a service is failing.
+//!
+//! **Advisory use in kafka-backup:** the backup and restore engines currently
+//! only call [`CircuitBreaker::record_success`] / [`CircuitBreaker::record_failure`]
+//! for health signalling. They do **not** gate requests on [`CircuitBreaker::is_allowed`].
+//! Transient Kafka failures are retried by `PartitionLeaderRouter` instead.
+//! Operators can still tune or disable the breaker via
+//! [`crate::config::CircuitBreakerSettings`] (issue #197).
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+use crate::config::CircuitBreakerSettings;
 
 /// Circuit breaker state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +38,8 @@ pub struct CircuitBreakerConfig {
     pub success_threshold: u32,
     /// Name for logging
     pub name: String,
+    /// When `false`, the breaker is a permanent no-op (always Closed).
+    pub enabled: bool,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -38,6 +49,20 @@ impl Default for CircuitBreakerConfig {
             reset_timeout: Duration::from_secs(30),
             success_threshold: 2,
             name: "circuit".to_string(),
+            enabled: true,
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    /// Build a Kafka breaker config from operator settings.
+    pub fn from_settings(settings: &CircuitBreakerSettings, name: impl Into<String>) -> Self {
+        Self {
+            failure_threshold: settings.failure_threshold,
+            reset_timeout: Duration::from_millis(settings.reset_timeout_ms),
+            success_threshold: settings.success_threshold,
+            name: name.into(),
+            enabled: settings.enabled,
         }
     }
 }
@@ -58,7 +83,11 @@ struct CircuitBreakerState {
 impl CircuitBreaker {
     /// Create a new circuit breaker
     pub fn new(config: CircuitBreakerConfig) -> Self {
-        info!("Created circuit breaker: {}", config.name);
+        if config.enabled {
+            info!("Created circuit breaker: {}", config.name);
+        } else {
+            info!("Created disabled circuit breaker: {}", config.name);
+        }
         Self {
             config,
             state: Mutex::new(CircuitBreakerState {
@@ -70,8 +99,30 @@ impl CircuitBreaker {
         }
     }
 
+    /// Create a permanently disabled (always-Closed) circuit breaker.
+    pub fn disabled(name: impl Into<String>) -> Self {
+        Self::new(CircuitBreakerConfig {
+            name: name.into(),
+            enabled: false,
+            ..Default::default()
+        })
+    }
+
+    /// Build from operator settings (enabled or disabled).
+    pub fn from_settings(settings: &CircuitBreakerSettings, name: impl Into<String>) -> Self {
+        Self::new(CircuitBreakerConfig::from_settings(settings, name))
+    }
+
+    /// Whether this breaker records failures / opens.
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
     /// Get the current circuit state
     pub fn state(&self) -> CircuitState {
+        if !self.config.enabled {
+            return CircuitState::Closed;
+        }
         let mut state = self.state.lock();
         self.maybe_transition_to_half_open(&mut state);
         state.state
@@ -79,6 +130,9 @@ impl CircuitBreaker {
 
     /// Check if the circuit allows the operation
     pub fn is_allowed(&self) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
         let mut state = self.state.lock();
         self.maybe_transition_to_half_open(&mut state);
 
@@ -91,6 +145,9 @@ impl CircuitBreaker {
 
     /// Record a successful operation
     pub fn record_success(&self) {
+        if !self.config.enabled {
+            return;
+        }
         let mut state = self.state.lock();
 
         match state.state {
@@ -125,6 +182,9 @@ impl CircuitBreaker {
 
     /// Record a failed operation
     pub fn record_failure(&self) {
+        if !self.config.enabled {
+            return;
+        }
         let mut state = self.state.lock();
 
         state.failure_count += 1;
@@ -340,5 +400,44 @@ mod tests {
         let result: Result<i32, CircuitBreakerError<&str>> =
             cb.call(async { Ok::<_, &str>(42) }).await;
         assert!(matches!(result, Err(CircuitBreakerError::Open)));
+    }
+
+    #[test]
+    fn disabled_breaker_ignores_failures() {
+        let cb = CircuitBreaker::disabled("kafka");
+        assert!(!cb.is_enabled());
+        for _ in 0..20 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.is_allowed());
+    }
+
+    #[test]
+    fn from_settings_respects_enabled_false() {
+        let settings = CircuitBreakerSettings {
+            enabled: false,
+            failure_threshold: 1,
+            reset_timeout_ms: 1,
+            success_threshold: 1,
+        };
+        let cb = CircuitBreaker::from_settings(&settings, "kafka");
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn from_settings_opens_when_enabled() {
+        let settings = CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 2,
+            reset_timeout_ms: 30_000,
+            success_threshold: 1,
+        };
+        let cb = CircuitBreaker::from_settings(&settings, "kafka");
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 }

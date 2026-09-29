@@ -301,16 +301,72 @@ impl PartitionLeaderRouter {
             pool.push(client);
         }
 
-        // Store in connection pool and return one via round-robin
-        let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
-        let selected = Arc::clone(&pool[idx]);
-
-        {
+        // Store in connection pool — if another task already installed a full
+        // pool while we were connecting, keep theirs and drop ours (avoids a
+        // reconnect storm after scoped eviction; issue #197).
+        let selected = {
             let mut connections = self.connections.write().await;
-            connections.insert(broker_id, pool);
-        }
+            let pool = match connections.get(&broker_id) {
+                Some(existing) if existing.len() >= pool_size => {
+                    drop(pool);
+                    existing
+                }
+                _ => {
+                    connections.insert(broker_id, pool);
+                    connections.get(&broker_id).expect("just inserted")
+                }
+            };
+            let idx = self.connection_index.fetch_add(1, Ordering::Relaxed) % pool.len();
+            Arc::clone(&pool[idx])
+        };
 
         Ok(selected)
+    }
+
+    /// Drop cached connections for a single broker.
+    ///
+    /// Prefer this over [`Self::clear_connection_cache`] so a failure on one
+    /// broker does not force every concurrent partition (including those on
+    /// healthy brokers) to rebuild their pools (issue #197).
+    async fn evict_broker_connections(&self, broker_id: i32) {
+        let mut connections = self.connections.write().await;
+        if connections.remove(&broker_id).is_some() {
+            debug!("Evicted connection pool for broker {}", broker_id);
+        }
+    }
+
+    /// Drop the pool of the broker a failed request was actually sent to.
+    ///
+    /// The id comes from the request itself ([`RoutedError::leader`]), not
+    /// from a fresh leader-map lookup: a concurrent metadata refresh may have
+    /// already moved the partition, and looking the leader up after the fact
+    /// would evict the *new* leader's healthy pool. `None` means routing
+    /// failed before a broker was chosen, so no pool was involved and there
+    /// is nothing to evict.
+    async fn evict_failed_broker(&self, leader: Option<i32>) {
+        match leader {
+            Some(id) => self.evict_broker_connections(id).await,
+            None => debug!("Request failed before a broker was chosen; no pool to evict"),
+        }
+    }
+
+    /// Resolve the leader for `topic`/`partition` and a pooled connection to
+    /// it, remembering which broker was chosen so a failure can be attributed
+    /// to it (see [`RoutedError`]).
+    async fn route(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> std::result::Result<(i32, Arc<KafkaClient>), RoutedError> {
+        let leader_id = self
+            .get_leader(topic, partition)
+            .await
+            .map_err(RoutedError::before_routing)?;
+        let client = self
+            .get_broker_connection(leader_id)
+            .await
+            .map_err(|error| RoutedError::at(leader_id, error))?;
+        Ok((leader_id, client))
     }
 
     /// Get a client connected to the partition's leader broker.
@@ -324,11 +380,13 @@ impl PartitionLeaderRouter {
     /// Handles the same two failure classes as [`Self::produce`]:
     ///
     /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
-    ///    cache and retries once.
+    ///    cache and retries once. The old leader answered, so its connections
+    ///    are healthy and are kept for the partitions it still leads.
     ///
     /// 2. Connection errors (see [`super::connection_error`]): retries up to
-    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, dropping the cached
-    ///    broker connections in between. `KafkaClient::send_request` already
+    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, dropping only the
+    ///    failing broker's cached connections in between (issue #197).
+    ///    `KafkaClient::send_request` already
     ///    reconnects and retries once *immediately*; this loop covers blips that
     ///    outlast that single retry — a proxy or broker resetting connections
     ///    for a second or two would otherwise fail the partition, and with it
@@ -350,45 +408,55 @@ impl PartitionLeaderRouter {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(e) if is_not_leader_error(&e) => {
-                    // Refresh metadata and retry once with the new leader
+                Err(RoutedError { error, .. }) if is_not_leader_error(&error) => {
+                    // Leadership moved: refresh the routing table and retry
+                    // once. No pool is evicted — the old leader is healthy.
                     warn!(
                         "NOT_LEADER_FOR_PARTITION error for {}/{}, refreshing metadata",
                         topic, partition
                     );
                     self.refresh_partition_leader(topic, partition).await?;
-                    self.clear_connection_cache().await;
                     return self
                         .fetch_internal(topic, partition, offset, max_bytes)
-                        .await;
+                        .await
+                        .map_err(RoutedError::into_error);
                 }
-                Err(e)
-                    if is_connection_error(&e) && connection_attempts < MAX_CONNECTION_RETRIES =>
+                Err(RoutedError { leader, error })
+                    if is_connection_error(&error)
+                        && connection_attempts < MAX_CONNECTION_RETRIES =>
                 {
                     connection_attempts += 1;
                     let backoff = Duration::from_millis(500 * connection_attempts as u64);
                     warn!(
                         "Connection error fetching {}/{} (attempt {}/{}), retrying after {:?}: {}",
-                        topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
+                        topic,
+                        partition,
+                        connection_attempts,
+                        MAX_CONNECTION_RETRIES,
+                        backoff,
+                        error
                     );
-                    self.clear_connection_cache().await;
+                    self.evict_failed_broker(leader).await;
                     tokio::time::sleep(backoff).await;
                 }
-                Err(e) => return Err(e),
+                Err(RoutedError { error, .. }) => return Err(error),
             }
         }
     }
 
-    /// Internal fetch implementation.
+    /// Internal fetch implementation, tagged with the broker it was sent to.
     async fn fetch_internal(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<FetchResponse> {
-        let client = self.get_leader_client(topic, partition).await?;
-        client.fetch(topic, partition, offset, max_bytes).await
+    ) -> std::result::Result<FetchResponse, RoutedError> {
+        let (leader_id, client) = self.route(topic, partition).await?;
+        client
+            .fetch(topic, partition, offset, max_bytes)
+            .await
+            .map_err(|error| RoutedError::at(leader_id, error))
     }
 
     /// Batch get offsets for all given topic-partitions in minimal network calls.
@@ -470,8 +538,9 @@ impl PartitionLeaderRouter {
                     "NOT_LEADER_FOR_PARTITION error for {}/{} during get_offsets, refreshing metadata",
                     topic, partition
                 );
+                // Routing problem, not a connection problem: refresh the
+                // leader map and retry; every pool stays intact.
                 self.refresh_partition_leader(topic, partition).await?;
-                self.clear_connection_cache().await;
                 self.get_offsets_internal(topic, partition).await
             }
             Err(e) => Err(e),
@@ -489,12 +558,14 @@ impl PartitionLeaderRouter {
     /// Handles two failure classes (Issue #67 bug 8):
     ///
     /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
-    ///    cache and retries once. This covers planned leader elections and rolling
-    ///    restarts.
+    ///    cache and retries with back-off. This covers planned leader elections
+    ///    and rolling restarts. The old leader answered, so its connection pool
+    ///    is kept — it usually still leads other partitions of this restore.
     ///
     /// 2. Connection errors (broken pipe, timeout, etc.): retries up to
-    ///    `MAX_CONNECTION_RETRIES` times with linear back-off. This covers transient
-    ///    network blips and broker restarts.
+    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, evicting only the
+    ///    pool of the broker the failed request was sent to (issue #197). This
+    ///    covers transient network blips and broker restarts.
     ///
     /// Records are only cloned when a retry is actually required.
     pub async fn produce(
@@ -517,7 +588,9 @@ impl PartitionLeaderRouter {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(e) if is_not_leader_error(&e) && leader_attempts < MAX_LEADER_RETRIES => {
+                Err(RoutedError { error, .. })
+                    if is_not_leader_error(&error) && leader_attempts < MAX_LEADER_RETRIES =>
+                {
                     leader_attempts += 1;
                     let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
                     warn!(
@@ -527,30 +600,37 @@ impl PartitionLeaderRouter {
                         leader_attempts,
                         MAX_LEADER_RETRIES,
                         backoff,
-                        e
+                        error
                     );
+                    // Routing problem, not a connection problem: no eviction.
                     self.refresh_partition_leader(topic, partition).await?;
-                    self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
                 }
-                Err(e)
-                    if is_connection_error(&e) && connection_attempts < MAX_CONNECTION_RETRIES =>
+                Err(RoutedError { leader, error })
+                    if is_connection_error(&error)
+                        && connection_attempts < MAX_CONNECTION_RETRIES =>
                 {
                     connection_attempts += 1;
                     let backoff = Duration::from_millis(500 * connection_attempts as u64);
                     warn!(
                         "Connection error for {}/{} (attempt {}/{}), retrying after {:?}: {}",
-                        topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
+                        topic,
+                        partition,
+                        connection_attempts,
+                        MAX_CONNECTION_RETRIES,
+                        backoff,
+                        error
                     );
-                    self.clear_connection_cache().await;
+                    self.evict_failed_broker(leader).await;
                     tokio::time::sleep(backoff).await;
                 }
-                Err(e) => return Err(e),
+                Err(RoutedError { error, .. }) => return Err(error),
             }
         }
     }
 
-    /// Internal produce implementation — borrows records to avoid unnecessary cloning.
+    /// Internal produce implementation — borrows records to avoid unnecessary
+    /// cloning; tagged with the broker it was sent to.
     async fn produce_internal(
         &self,
         topic: &str,
@@ -558,11 +638,12 @@ impl PartitionLeaderRouter {
         records: &[BackupRecord],
         acks: i16,
         timeout_ms: i32,
-    ) -> Result<ProduceResponse> {
-        let client = self.get_leader_client(topic, partition).await?;
+    ) -> std::result::Result<ProduceResponse, RoutedError> {
+        let (leader_id, client) = self.route(topic, partition).await?;
         client
             .produce(topic, partition, records.to_vec(), acks, timeout_ms)
             .await
+            .map_err(|error| RoutedError::at(leader_id, error))
     }
 
     /// Clear the connection cache (useful after metadata refresh).
@@ -921,6 +1002,10 @@ impl PartitionLeaderRouter {
                         "NOT_LEADER_FOR_PARTITION during DeleteRecords for topic {} (attempt {}/{}), refreshing metadata after {:?}: {}",
                         topic, leader_attempts, MAX_LEADER_RETRIES, backoff, e
                     );
+                    // DeleteRecords spans multiple leaders, so the per-broker
+                    // eviction used by produce/fetch does not apply: refresh
+                    // all metadata, then drop every pool so the next attempt
+                    // reconnects to the refreshed leaders.
                     self.refresh_metadata().await?;
                     self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
@@ -934,6 +1019,8 @@ impl PartitionLeaderRouter {
                         "Connection error during DeleteRecords for topic {} (attempt {}/{}), retrying after {:?}: {}",
                         topic, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
                     );
+                    // Multi-broker request: clear all pools so the next attempt
+                    // rebuilds every leader connection.
                     self.clear_connection_cache().await;
                     tokio::time::sleep(backoff).await;
                 }
@@ -996,6 +1083,37 @@ fn group_partition_offsets_by_leader(
     }
 
     Ok(broker_partitions)
+}
+
+/// A failed routed request together with the broker it was sent to.
+///
+/// `leader` is `None` when the failure happened before a broker was chosen
+/// (leader lookup / metadata refresh), in which case no pooled connection was
+/// involved. The retry loops use it to evict exactly the pool that failed,
+/// instead of re-reading the leader map after the fact (issue #197).
+struct RoutedError {
+    leader: Option<i32>,
+    error: crate::Error,
+}
+
+impl RoutedError {
+    fn before_routing(error: crate::Error) -> Self {
+        Self {
+            leader: None,
+            error,
+        }
+    }
+
+    fn at(leader: i32, error: crate::Error) -> Self {
+        Self {
+            leader: Some(leader),
+            error,
+        }
+    }
+
+    fn into_error(self) -> crate::Error {
+        self.error
+    }
 }
 
 /// Check if an error is a connection-level error that warrants a retry.
