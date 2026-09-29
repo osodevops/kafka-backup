@@ -321,11 +321,13 @@ impl RestoreEngine {
 
         // Initialize circuit breakers from restore options (Kafka breaker is
         // advisory — see CircuitBreakerSettings docs / issue #197).
-        let restore_opts = config.restore.clone().unwrap_or_default();
-        let kafka_circuit_breaker = Arc::new(CircuitBreaker::from_settings(
-            &restore_opts.circuit_breaker,
-            "kafka",
-        ));
+        let breaker_settings = config
+            .restore
+            .as_ref()
+            .map(|r| r.circuit_breaker.clone())
+            .unwrap_or_default();
+        let kafka_circuit_breaker =
+            Arc::new(CircuitBreaker::from_settings(&breaker_settings, "kafka"));
 
         let storage_circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 3,
@@ -1771,39 +1773,41 @@ impl RestorePartitionContext {
 
             // Track offset range locally, then update mapping once per segment
             // (avoids holding the shared mutex once per record — issue #197).
-            // The segment extremes are found by offset, not by position, so
-            // this does not depend on the records being offset-ordered.
-            let mut segment_min = (i64::MAX, 0i64); // (offset, timestamp)
-            let mut segment_max = (i64::MIN, 0i64);
+            // The segment extremes are found by offset value, not by position,
+            // so this does not depend on the records being offset-ordered; the
+            // timestamps passed are the segment's earliest / latest so the
+            // range's timestamp bounds match what the per-record path produced.
+            let mut segment_min_offset = i64::MAX;
+            let mut segment_max_offset = i64::MIN;
+            let mut segment_min_ts = i64::MAX;
+            let mut segment_max_ts = i64::MIN;
             for record in &filtered_records {
                 first_offset = first_offset.min(record.offset);
                 last_offset = last_offset.max(record.offset);
                 first_timestamp = first_timestamp.min(record.timestamp);
                 last_timestamp = last_timestamp.max(record.timestamp);
-                if record.offset < segment_min.0 {
-                    segment_min = (record.offset, record.timestamp);
-                }
-                if record.offset > segment_max.0 {
-                    segment_max = (record.offset, record.timestamp);
-                }
+                segment_min_offset = segment_min_offset.min(record.offset);
+                segment_max_offset = segment_max_offset.max(record.offset);
+                segment_min_ts = segment_min_ts.min(record.timestamp);
+                segment_max_ts = segment_max_ts.max(record.timestamp);
             }
             {
-                // filtered_records is non-empty here, so both extremes are set.
+                // filtered_records is non-empty here, so all extremes are set.
                 let mut mapping = self.offset_mapping.lock().await;
                 mapping.update_range(
                     &self.target_topic,
                     self.target_partition,
-                    segment_min.0,
+                    segment_min_offset,
                     None,
-                    segment_min.1,
+                    segment_min_ts,
                 );
-                if segment_max.0 != segment_min.0 {
+                if segment_max_offset != segment_min_offset || segment_max_ts != segment_min_ts {
                     mapping.update_range(
                         &self.target_topic,
                         self.target_partition,
-                        segment_max.0,
+                        segment_max_offset,
                         None,
-                        segment_max.1,
+                        segment_max_ts,
                     );
                 }
             }

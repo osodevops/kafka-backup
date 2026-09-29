@@ -838,9 +838,15 @@ impl OffsetMapping {
 
         let key = format!("{}/{}", topic, partition);
 
-        // Update range from batch extremes (copy values before mutating self)
+        // Update the range from the batch extremes: offsets by value, and the
+        // batch's earliest / latest timestamps (not the timestamps of the
+        // extreme-offset records) so `first_timestamp` / `last_timestamp`
+        // still bound every record when timestamps are not monotonic in
+        // offset order, exactly as the per-record path did.
         let mut min_pair = pairs[0].clone();
         let mut max_pair = pairs[0].clone();
+        let mut min_ts = pairs[0].timestamp;
+        let mut max_ts = pairs[0].timestamp;
         for p in &pairs[1..] {
             if p.source_offset < min_pair.source_offset {
                 min_pair = p.clone();
@@ -848,21 +854,23 @@ impl OffsetMapping {
             if p.source_offset > max_pair.source_offset {
                 max_pair = p.clone();
             }
+            min_ts = min_ts.min(p.timestamp);
+            max_ts = max_ts.max(p.timestamp);
         }
         self.update_range(
             topic,
             partition,
             min_pair.source_offset,
             Some(min_pair.target_offset),
-            min_pair.timestamp,
+            min_ts,
         );
-        if max_pair.source_offset != min_pair.source_offset {
+        if max_pair.source_offset != min_pair.source_offset || max_ts != min_ts {
             self.update_range(
                 topic,
                 partition,
                 max_pair.source_offset,
                 Some(max_pair.target_offset),
-                max_pair.timestamp,
+                max_ts,
             );
         }
 
@@ -1111,10 +1119,12 @@ pub struct OffsetMappingEntry {
     /// Last target offset (after restore)
     pub target_last_offset: Option<i64>,
 
-    /// First timestamp in range
+    /// Earliest record timestamp at the low end of the range (bounds every
+    /// record that established `source_first_offset`)
     pub first_timestamp: i64,
 
-    /// Last timestamp in range
+    /// Latest record timestamp seen while extending the range (the maximum
+    /// record timestamp for an in-order restore)
     pub last_timestamp: i64,
 }
 
@@ -1496,6 +1506,50 @@ mod tests {
         assert_eq!(entry.source_last_offset, 8);
         assert_eq!(entry.target_first_offset, Some(100));
         assert_eq!(entry.target_last_offset, Some(105));
+    }
+
+    #[test]
+    fn add_detailed_batch_range_timestamps_bound_the_whole_batch() {
+        // Timestamps are not monotonic in offset order (CreateTime records
+        // can arrive out of order). The per-record path tracked the maximum
+        // timestamp while extending the range; the batch path must not
+        // regress to "timestamp of the highest offset".
+        let batch = vec![
+            OffsetPair {
+                source_offset: 0,
+                target_offset: 100,
+                timestamp: 1_000,
+            },
+            OffsetPair {
+                source_offset: 1,
+                target_offset: 101,
+                timestamp: 3_000,
+            },
+            OffsetPair {
+                source_offset: 2,
+                target_offset: 102,
+                timestamp: 2_000,
+            },
+        ];
+        let mut per_record = OffsetMapping::new();
+        for p in &batch {
+            per_record.add_detailed("orders", 0, p.source_offset, p.target_offset, p.timestamp);
+        }
+        let mut batched = OffsetMapping::new();
+        batched.add_detailed_batch("orders", 0, batch);
+
+        let pe = &per_record.entries["orders/0"];
+        let be = &batched.entries["orders/0"];
+        assert_eq!((be.first_timestamp, be.last_timestamp), (1_000, 3_000));
+        assert_eq!(
+            (be.first_timestamp, be.last_timestamp),
+            (pe.first_timestamp, pe.last_timestamp)
+        );
+        assert_eq!((be.source_first_offset, be.source_last_offset), (0, 2));
+        assert_eq!(
+            (be.target_first_offset, be.target_last_offset),
+            (Some(100), Some(102))
+        );
     }
 
     #[test]

@@ -25,11 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   range updates and detailed pairs are applied per segment / produce batch,
   cutting lock contention under `max_concurrent_partitions` > 1.
   ([#197](https://github.com/osodevops/kafka-backup/issues/197))
-- `PartitionLeaderRouter` connection-error and NOT_LEADER retries now evict
-  only the failing broker's connection pool instead of clearing every
-  broker's pool, so a blip on one leader does not force unrelated partitions
-  to rebuild TCP/TLS/SASL connections. Concurrent pool rebuilds keep an
-  already-installed full pool instead of racing `insert`.
+- `PartitionLeaderRouter` connection-error retries now evict only the pool
+  of the broker the failed request was sent to (captured at dispatch, so a
+  concurrent leader change cannot make the retry drop the new leader's
+  healthy pool) instead of clearing every broker's pool; NOT_LEADER retries
+  (produce, fetch, get_offsets) refresh metadata without dropping any pool,
+  since the broker that answered is healthy and usually still leads other
+  partitions of the same run. A blip on one leader therefore no longer forces
+  unrelated partitions to rebuild TCP/TLS/SASL connections. Concurrent pool
+  rebuilds keep an already-installed full pool instead of racing `insert`.
   ([#197](https://github.com/osodevops/kafka-backup/issues/197))
 - `OffsetMapping` detailed mappings now stay sorted by source offset even
   when a record filter maps a segment's dropped records after its survivors,

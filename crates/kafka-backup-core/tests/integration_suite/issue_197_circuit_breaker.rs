@@ -38,7 +38,7 @@ use super::sasl_mock_broker::{read_request, write_response};
 
 const TOPIC: &str = "issue-197-topic";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ProduceMode {
     /// Always succeed with a monotonically increasing base offset.
     Ok,
@@ -46,8 +46,14 @@ enum ProduceMode {
     /// `KafkaClient::send_request`'s single reconnect-and-retry so the
     /// router's produce loop sees the failure and runs eviction.
     KillRemaining(u32),
-    /// Return broker error code 7 (REQUEST_TIMED_OUT) — terminal, no retry.
-    BrokerError,
+    /// Return broker error code 7 (REQUEST_TIMED_OUT) — terminal, no retry —
+    /// but only once the peer's produce counter is >= 1, so a test can assert
+    /// on the healthy partition's progress without racing the failure.
+    BrokerErrorAfterPeerProduced(Arc<AtomicUsize>),
+    /// Answer the next `n` Produce requests with error code 6
+    /// (NOT_LEADER_FOR_PARTITION), then succeed. Metadata is unchanged, so
+    /// the router refreshes and retries against the same broker.
+    NotLeaderRemaining(u32),
 }
 
 struct BrokerMock {
@@ -148,7 +154,7 @@ async fn serve_broker(
                 write_response(&mut stream, api_key, api_version, correlation_id, &resp).await;
             }
             ApiKey::Produce => {
-                let mode = *produce_mode.lock().await;
+                let mode = produce_mode.lock().await.clone();
                 match mode {
                     ProduceMode::KillRemaining(n) if n > 0 => {
                         *produce_mode.lock().await = if n == 1 {
@@ -170,8 +176,31 @@ async fn serve_broker(
                         write_response(&mut stream, api_key, api_version, correlation_id, &resp)
                             .await;
                     }
-                    ProduceMode::BrokerError => {
+                    ProduceMode::BrokerErrorAfterPeerProduced(peer_count) => {
+                        while peer_count.load(Ordering::SeqCst) == 0 {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                         let resp = produce_error_response(TOPIC, partition_for(broker_id), 7);
+                        write_response(&mut stream, api_key, api_version, correlation_id, &resp)
+                            .await;
+                    }
+                    ProduceMode::NotLeaderRemaining(n) if n > 0 => {
+                        *produce_mode.lock().await = if n == 1 {
+                            ProduceMode::Ok
+                        } else {
+                            ProduceMode::NotLeaderRemaining(n - 1)
+                        };
+                        let resp = produce_error_response(TOPIC, partition_for(broker_id), 6);
+                        write_response(&mut stream, api_key, api_version, correlation_id, &resp)
+                            .await;
+                    }
+                    ProduceMode::NotLeaderRemaining(_) => {
+                        let n = produce_count.fetch_add(1, Ordering::SeqCst);
+                        produce_timestamps_ms
+                            .lock()
+                            .await
+                            .push(start.elapsed().as_millis() as u64);
+                        let resp = produce_ok_response(TOPIC, partition_for(broker_id), n as i64);
                         write_response(&mut stream, api_key, api_version, correlation_id, &resp)
                             .await;
                     }
@@ -379,6 +408,57 @@ async fn produce_connection_error_evicts_only_the_failing_broker() {
     b2.shutdown().await;
 }
 
+/// NOT_LEADER_FOR_PARTITION is a routing event: the broker that answered is
+/// healthy, so neither its pool nor any other broker's pool may be dropped.
+/// (Before this fix the old leader's pool — typically still leading other
+/// partitions of the same restore — was rebuilt on every leader change.)
+#[tokio::test]
+async fn not_leader_does_not_evict_any_pool() {
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let b1 = BrokerMock::start(1, peers.clone()).await;
+    let b2 = BrokerMock::start(2, peers.clone()).await;
+    *peers.lock().await = vec![(1, b1.addr), (2, b2.addr)];
+
+    let router = PartitionLeaderRouter::new(client_config(&b1.addr.to_string()))
+        .await
+        .expect("router bootstrap");
+
+    router
+        .produce(TOPIC, 0, vec![record(0)], 1, 5_000)
+        .await
+        .expect("warm produce p0");
+    router
+        .produce(TOPIC, 1, vec![record(0)], 1, 5_000)
+        .await
+        .expect("warm produce p1");
+    let (b1_warm, b2_warm) = (b1.connections(), b2.connections());
+
+    // Broker 1 rejects the next produce with NOT_LEADER; metadata still
+    // names it leader, so the router refreshes, backs off and retries there.
+    b1.set_mode(ProduceMode::NotLeaderRemaining(1)).await;
+    router
+        .produce(TOPIC, 0, vec![record(1)], 1, 5_000)
+        .await
+        .expect("produce after NOT_LEADER should succeed on retry");
+    router
+        .produce(TOPIC, 1, vec![record(1)], 1, 5_000)
+        .await
+        .expect("produce p1 after broker1 NOT_LEADER");
+
+    assert_eq!(
+        (b1.connections(), b2.connections()),
+        (b1_warm, b2_warm),
+        "NOT_LEADER must not rebuild any pool (broker1 {}->{}, broker2 {}->{})",
+        b1_warm,
+        b1.connections(),
+        b2_warm,
+        b2.connections()
+    );
+
+    b1.shutdown().await;
+    b2.shutdown().await;
+}
+
 /// Opening the advisory Kafka breaker must not pause the healthy partition.
 #[tokio::test]
 async fn open_breaker_does_not_pause_other_partitions() {
@@ -396,8 +476,14 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
     let b2 = BrokerMock::start(2, peers.clone()).await;
     *peers.lock().await = vec![(1, b1.addr), (2, b2.addr)];
 
-    // Partition 0 (broker 1) fails terminally; partition 1 keeps producing.
-    b1.set_mode(ProduceMode::BrokerError).await;
+    // Partition 0 (broker 1) fails terminally — but only after partition 1
+    // (broker 2) has produced at least once, otherwise the engine can return
+    // the partition-0 error before broker 2 saw any traffic and the "healthy
+    // partition produced" assertion below races the scheduler.
+    b1.set_mode(ProduceMode::BrokerErrorAfterPeerProduced(
+        b2.produce_count.clone(),
+    ))
+    .await;
 
     let tmp = TempDir::new().unwrap();
     let backup_id = "issue-197-restore";
