@@ -218,10 +218,11 @@ fn offset_mapping_add_detailed() {
     let key = "orders/0";
     assert!(mapping.detailed_mappings.contains_key(key));
 
-    let pairs = &mapping.detailed_mappings[key];
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(pairs[0].source_offset, 100);
-    assert_eq!(pairs[0].target_offset, 0);
+    let runs = &mapping.detailed_mappings[key];
+    assert_eq!(runs.record_count(), 2);
+    let first = runs.iter_pairs().next().unwrap();
+    assert_eq!(first.source_offset, 100);
+    assert_eq!(first.target_offset, 0);
 }
 
 #[test]
