@@ -469,10 +469,10 @@ async fn test_evidence_report_generation_and_signing() {
     // Test ECDSA signing roundtrip
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::VerifyingKey;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate();
     let verifying_key = VerifyingKey::from(&signing_key);
     let private_pem = signing_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)

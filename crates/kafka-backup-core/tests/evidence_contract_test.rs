@@ -8,7 +8,7 @@
 //! blank-`report_sha256` bug that motivated the issue.
 
 use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
 use kafka_backup_core::evidence::{
@@ -23,7 +23,7 @@ use kafka_backup_core::validation::config::{
 use kafka_backup_core::validation::{CheckOutcome, ValidationResult, ValidationSummary};
 
 fn test_keypair_files(dir: &std::path::Path) -> (String, String, String) {
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate();
     let verifying_key = VerifyingKey::from(&signing_key);
     let private_pem = signing_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
