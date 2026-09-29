@@ -677,16 +677,36 @@ pub struct PartitionRestoreReport {
     pub records_tombstoned_by_filter: u64,
 }
 
+/// Current on-disk format of the offset-mapping report (`format_version`).
+///
+/// - 1 (implicit, pre-0.24): `detailed_mappings` held one `OffsetPair` per
+///   restored record.
+/// - 2: `detailed_mappings` holds [`OffsetRuns`] — contiguous runs of
+///   records whose source→target mapping is a constant shift. Version-1
+///   reports still deserialize (pairs are folded into runs on load).
+pub const OFFSET_MAPPING_FORMAT_VERSION: u32 = 2;
+
+fn legacy_offset_mapping_format_version() -> u32 {
+    1
+}
+
 /// Offset mapping for consumer group reset
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OffsetMapping {
+    /// Report format version — see [`OFFSET_MAPPING_FORMAT_VERSION`].
+    #[serde(default = "legacy_offset_mapping_format_version")]
+    pub format_version: u32,
+
     /// Mapping entries: topic/partition -> offset info
     pub entries: std::collections::HashMap<String, OffsetMappingEntry>,
 
-    /// Detailed per-record offset mappings (for exact offset lookup)
-    /// Key: "topic/partition", Value: Vec of (source_offset, target_offset, timestamp)
-    #[serde(default)]
-    pub detailed_mappings: std::collections::HashMap<String, Vec<OffsetPair>>,
+    /// Per-record source→target offset mapping, stored as runs (see
+    /// [`OffsetRuns`]): memory is proportional to the number of
+    /// discontinuities (produce batches that did not land contiguously,
+    /// filtered records, resumed segments), not to the number of records.
+    /// Key: "topic/partition".
+    #[serde(default, deserialize_with = "deserialize_detailed_mappings")]
+    pub detailed_mappings: std::collections::HashMap<String, OffsetRuns>,
 
     /// Consumer group offsets from source cluster (if backed up)
     #[serde(default)]
@@ -714,6 +734,290 @@ pub struct OffsetPair {
     pub target_offset: i64,
     /// Record timestamp
     pub timestamp: i64,
+}
+
+/// A contiguous run of restored records whose source→target mapping is a
+/// constant shift: `source_start + i ↦ target_start + i` for `i < len`.
+///
+/// A normal restore of one partition is a handful of runs — one per stretch
+/// of produce batches that landed contiguously on the target — instead of one
+/// entry per record (24 bytes × records; ~32 GB at 1.35 billion records, all
+/// of it appended under one mutex; issue #197).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffsetRun {
+    /// First source offset covered by the run.
+    pub source_start: i64,
+    /// Target offset of `source_start`.
+    pub target_start: i64,
+    /// Number of records in the run (`> 0`).
+    pub len: u64,
+    /// Earliest record timestamp in the run.
+    pub first_timestamp: i64,
+    /// Latest record timestamp in the run.
+    pub last_timestamp: i64,
+}
+
+impl OffsetRun {
+    fn from_pair(p: &OffsetPair) -> Self {
+        Self {
+            source_start: p.source_offset,
+            target_start: p.target_offset,
+            len: 1,
+            first_timestamp: p.timestamp,
+            last_timestamp: p.timestamp,
+        }
+    }
+
+    /// One past the last source offset in the run.
+    pub fn source_end(&self) -> i64 {
+        self.source_start + self.len as i64
+    }
+
+    /// Whether `source` is one of the run's records.
+    pub fn contains(&self, source: i64) -> bool {
+        source >= self.source_start && source < self.source_end()
+    }
+
+    /// Target offset for `source`: exact inside the run, "last record plus
+    /// delta" beyond its end (the nearest-lower-record rule the per-record
+    /// lookup used).
+    pub fn target_for(&self, source: i64) -> i64 {
+        self.target_start + (source - self.source_start)
+    }
+
+    /// Whether `run` starts exactly where this one ends with the same shift.
+    fn can_absorb(&self, run: &OffsetRun) -> bool {
+        run.source_start == self.source_end()
+            && run.target_start == self.target_start + self.len as i64
+    }
+
+    fn absorb(&mut self, run: &OffsetRun) {
+        self.len += run.len;
+        self.first_timestamp = self.first_timestamp.min(run.first_timestamp);
+        self.last_timestamp = self.last_timestamp.max(run.last_timestamp);
+    }
+
+    /// The part of the run starting at `source` (which must be inside it).
+    fn tail_from(&self, source: i64) -> OffsetRun {
+        let skip = source - self.source_start;
+        OffsetRun {
+            source_start: source,
+            target_start: self.target_start + skip,
+            len: self.len - skip as u64,
+            first_timestamp: self.first_timestamp,
+            last_timestamp: self.last_timestamp,
+        }
+    }
+}
+
+/// Sorted, non-overlapping [`OffsetRun`]s for one partition.
+///
+/// Appending in source-offset order (the restore's normal case) is O(1) and
+/// merges into the last run whenever the shift is unchanged. Out-of-order
+/// inserts (a record filter mapping a segment's dropped records after its
+/// survivors) are placed by binary search. A source offset that is already
+/// covered — a segment re-produced after a checkpoint resume — keeps its
+/// first mapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OffsetRuns {
+    runs: Vec<OffsetRun>,
+}
+
+impl OffsetRuns {
+    /// The runs, sorted by `source_start`, non-overlapping.
+    pub fn runs(&self) -> &[OffsetRun] {
+        &self.runs
+    }
+
+    /// Number of runs (the memory footprint), not records.
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Number of records covered.
+    pub fn record_count(&self) -> u64 {
+        self.runs.iter().map(|r| r.len).sum()
+    }
+
+    /// Add one record mapping.
+    pub fn push(&mut self, pair: &OffsetPair) {
+        self.push_run(OffsetRun::from_pair(pair));
+    }
+
+    /// Add many record mappings (any order).
+    pub fn extend<'a>(&mut self, pairs: impl IntoIterator<Item = &'a OffsetPair>) {
+        for p in pairs {
+            self.push(p);
+        }
+    }
+
+    /// Merge a whole run, keeping the list sorted and non-overlapping.
+    /// Overlap with existing runs is trimmed away (first mapping wins).
+    pub fn push_run(&mut self, mut run: OffsetRun) {
+        if run.len == 0 {
+            return;
+        }
+        // Fast path: absorb into / append after the tail.
+        match self.runs.last_mut() {
+            None => {
+                self.runs.push(run);
+                return;
+            }
+            Some(last) if last.can_absorb(&run) => {
+                last.absorb(&run);
+                return;
+            }
+            Some(last) if run.source_start >= last.source_end() => {
+                self.runs.push(run);
+                return;
+            }
+            Some(_) => {}
+        }
+
+        // Out-of-order: `idx` = number of runs starting at or before `run`.
+        let idx = self
+            .runs
+            .partition_point(|r| r.source_start <= run.source_start);
+
+        // Trim the front against the previous run (first mapping wins).
+        if idx > 0 {
+            let prev = self.runs[idx - 1];
+            if prev.source_end() > run.source_start {
+                if prev.source_end() >= run.source_end() {
+                    return; // entirely covered already
+                }
+                run = run.tail_from(prev.source_end());
+            }
+        }
+        // Split against the next run: keep the part before it, and re-insert
+        // whatever extends beyond it (it may span several existing runs).
+        let mut rest = None;
+        if let Some(next) = self.runs.get(idx).copied() {
+            if run.source_end() > next.source_start {
+                if run.source_end() > next.source_end() {
+                    rest = Some(run.tail_from(next.source_end()));
+                }
+                // `next.source_start > run.source_start` here (equal starts
+                // sort before `idx`), so at least one record is kept.
+                run.len = (next.source_start - run.source_start) as u64;
+            }
+        }
+        // Absorb into the previous run if the shift continues, else insert;
+        // then close a gap with the next run if the shift continues there.
+        if idx > 0 && self.runs[idx - 1].can_absorb(&run) {
+            self.runs[idx - 1].absorb(&run);
+            if idx < self.runs.len() {
+                let next = self.runs[idx];
+                if self.runs[idx - 1].can_absorb(&next) {
+                    self.runs[idx - 1].absorb(&next);
+                    self.runs.remove(idx);
+                }
+            }
+        } else if self
+            .runs
+            .get(idx)
+            .map(|next| run.can_absorb(next))
+            .unwrap_or(false)
+        {
+            let next = self.runs[idx];
+            run.absorb(&next);
+            self.runs[idx] = run;
+        } else {
+            self.runs.insert(idx, run);
+        }
+        if let Some(rest) = rest {
+            self.push_run(rest);
+        }
+    }
+
+    /// Target offset for `source`: exact when a run covers it, otherwise the
+    /// nearest lower run's last record plus the delta (the same rule the
+    /// per-record mapping used). `None` when no run starts at or below
+    /// `source`.
+    pub fn lookup(&self, source: i64) -> Option<i64> {
+        let idx = self.runs.partition_point(|r| r.source_start <= source);
+        idx.checked_sub(1).map(|i| self.runs[i].target_for(source))
+    }
+
+    /// Whether `source` is exactly one of the mapped records.
+    pub fn contains(&self, source: i64) -> bool {
+        let idx = self.runs.partition_point(|r| r.source_start <= source);
+        idx.checked_sub(1)
+            .map(|i| self.runs[i].contains(source))
+            .unwrap_or(false)
+    }
+
+    /// `(source, target)` of the first record at or after `timestamp`,
+    /// interpolated within a run by timestamp position; falls back to the
+    /// last mapped record. Approximate within a run.
+    pub fn nearest_by_timestamp(&self, timestamp: i64) -> Option<(i64, i64)> {
+        for r in &self.runs {
+            if r.last_timestamp >= timestamp {
+                if r.first_timestamp >= timestamp || r.len == 1 {
+                    return Some((r.source_start, r.target_start));
+                }
+                // Assume evenly spaced timestamps and round up: "the first
+                // record at or after the timestamp".
+                let span = (r.last_timestamp - r.first_timestamp).max(1) as f64;
+                let pos = ((timestamp - r.first_timestamp) as f64 / span * (r.len - 1) as f64)
+                    .ceil()
+                    .clamp(0.0, (r.len - 1) as f64) as i64;
+                return Some((r.source_start + pos, r.target_start + pos));
+            }
+        }
+        self.runs
+            .last()
+            .map(|r| (r.source_end() - 1, r.target_for(r.source_end() - 1)))
+    }
+
+    /// Expand back into per-record pairs (timestamps are the run's
+    /// `first_timestamp`; intended for tests and small reports).
+    pub fn iter_pairs(&self) -> impl Iterator<Item = OffsetPair> + '_ {
+        self.runs.iter().flat_map(|r| {
+            (0..r.len as i64).map(move |i| OffsetPair {
+                source_offset: r.source_start + i,
+                target_offset: r.target_start + i,
+                timestamp: r.first_timestamp,
+            })
+        })
+    }
+}
+
+/// Accept both the version-2 run form and the version-1 per-record list.
+fn deserialize_detailed_mappings<'de, D>(
+    deserializer: D,
+) -> std::result::Result<std::collections::HashMap<String, OffsetRuns>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RunsOrPairs {
+        Runs(Vec<OffsetRun>),
+        Pairs(Vec<OffsetPair>),
+    }
+    let raw: std::collections::HashMap<String, RunsOrPairs> =
+        Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let mut runs = OffsetRuns::default();
+            match v {
+                RunsOrPairs::Runs(rs) => {
+                    for r in rs {
+                        runs.push_run(r);
+                    }
+                }
+                RunsOrPairs::Pairs(ps) => runs.extend(ps.iter()),
+            }
+            (k, runs)
+        })
+        .collect())
 }
 
 /// Consumer group offset state
@@ -763,10 +1067,17 @@ impl ConsumerGroupOffsets {
     }
 }
 
+impl Default for OffsetMapping {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OffsetMapping {
     /// Create a new empty offset mapping
     pub fn new() -> Self {
         Self {
+            format_version: OFFSET_MAPPING_FORMAT_VERSION,
             entries: std::collections::HashMap::new(),
             detailed_mappings: std::collections::HashMap::new(),
             consumer_groups: std::collections::HashMap::new(),
@@ -826,11 +1137,8 @@ impl OffsetMapping {
     /// during restore so concurrent partitions do not serialize on the
     /// mapping mutex per record (issue #197).
     ///
-    /// The per-partition list stays sorted by `source_offset` — the invariant
-    /// [`Self::lookup_target_offset`]'s binary search relies on — regardless
-    /// of the order pairs arrive in. Only the tail that overlaps the new batch
-    /// is re-sorted, so appending in offset order (the common case) moves
-    /// nothing.
+    /// Pairs are folded into [`OffsetRuns`] in any order; appending in offset
+    /// order (the common case) extends the last run in place.
     pub fn add_detailed_batch(&mut self, topic: &str, partition: i32, pairs: Vec<OffsetPair>) {
         if pairs.is_empty() {
             return;
@@ -874,22 +1182,54 @@ impl OffsetMapping {
             );
         }
 
+        self.detailed_mappings
+            .entry(key)
+            .or_default()
+            .extend(pairs.iter());
+    }
+
+    /// Merge a partition's runs collected locally by a restore task (one
+    /// lock acquisition per partition instead of one per batch). The range
+    /// entry is updated from the runs' extremes.
+    pub fn merge_runs(&mut self, topic: &str, partition: i32, runs: OffsetRuns) {
+        let (Some(first), Some(last)) = (runs.runs().first().copied(), runs.runs().last().copied())
+        else {
+            return;
+        };
+        let min_ts = runs
+            .runs()
+            .iter()
+            .map(|r| r.first_timestamp)
+            .min()
+            .unwrap_or(0);
+        let max_ts = runs
+            .runs()
+            .iter()
+            .map(|r| r.last_timestamp)
+            .max()
+            .unwrap_or(0);
+        self.update_range(
+            topic,
+            partition,
+            first.source_start,
+            Some(first.target_start),
+            min_ts,
+        );
+        self.update_range(
+            topic,
+            partition,
+            last.source_end() - 1,
+            Some(last.target_for(last.source_end() - 1)),
+            max_ts,
+        );
+        let key = format!("{}/{}", topic, partition);
         let entry = self.detailed_mappings.entry(key).or_default();
-        // Entries are only added through this method, so `entry` is sorted and
-        // `partition_point` is valid: `start` is where the batch's smallest
-        // offset belongs. When a record filter maps a segment's dropped
-        // records after that segment's survivors, the overlapping tail is
-        // bounded by one segment — never the partition's full history.
-        let start = entry.partition_point(|p| p.source_offset < min_pair.source_offset);
-        let old_len = entry.len();
-        entry.reserve(pairs.len());
-        entry.extend(pairs);
-        let appended_in_order = start == old_len
-            && entry[old_len..]
-                .windows(2)
-                .all(|w| w[0].source_offset <= w[1].source_offset);
-        if !appended_in_order {
-            entry[start..].sort_by_key(|p| p.source_offset);
+        if entry.is_empty() {
+            *entry = runs;
+        } else {
+            for r in runs.runs() {
+                entry.push_run(*r);
+            }
         }
     }
 
@@ -933,24 +1273,13 @@ impl OffsetMapping {
     ) -> Option<i64> {
         let key = format!("{}/{}", topic, partition);
 
-        // First try detailed mapping for exact match
-        if let Some(detailed) = self.detailed_mappings.get(&key) {
-            // Binary search for the offset
-            if let Ok(idx) = detailed.binary_search_by_key(&source_offset, |p| p.source_offset) {
-                return Some(detailed[idx].target_offset);
-            }
-
-            // Find nearest offset that's <= source_offset
-            let nearest = detailed
-                .iter()
-                .filter(|p| p.source_offset <= source_offset)
-                .max_by_key(|p| p.source_offset);
-
-            if let Some(nearest) = nearest {
-                // Calculate offset delta
-                let delta = source_offset - nearest.source_offset;
-                return Some(nearest.target_offset + delta);
-            }
+        // Exact inside a run; nearest lower record plus delta otherwise.
+        if let Some(target) = self
+            .detailed_mappings
+            .get(&key)
+            .and_then(|runs| runs.lookup(source_offset))
+        {
+            return Some(target);
         }
 
         // Fall back to range-based interpolation
@@ -983,24 +1312,9 @@ impl OffsetMapping {
     ) -> Option<(i64, i64)> {
         let key = format!("{}/{}", topic, partition);
 
-        if let Some(detailed) = self.detailed_mappings.get(&key) {
-            // Find the first offset with timestamp >= requested timestamp
-            let nearest = detailed
-                .iter()
-                .filter(|p| p.timestamp >= timestamp)
-                .min_by_key(|p| p.timestamp);
-
-            if let Some(pair) = nearest {
-                return Some((pair.source_offset, pair.target_offset));
-            }
-
-            // If no exact match, return the last offset
-            if let Some(last) = detailed.last() {
-                return Some((last.source_offset, last.target_offset));
-            }
-        }
-
-        None
+        self.detailed_mappings
+            .get(&key)
+            .and_then(|runs| runs.nearest_by_timestamp(timestamp))
     }
 
     /// Add consumer group offset from source cluster
@@ -1087,8 +1401,16 @@ impl OffsetMapping {
         entries
     }
 
-    /// Get total number of detailed offset pairs
+    /// Number of records with an exact source→target mapping.
     pub fn detailed_mapping_count(&self) -> usize {
+        self.detailed_mappings
+            .values()
+            .map(|v| v.record_count() as usize)
+            .sum()
+    }
+
+    /// Number of runs held across all partitions (the memory footprint).
+    pub fn detailed_run_count(&self) -> usize {
         self.detailed_mappings.values().map(|v| v.len()).sum()
     }
 
@@ -1452,8 +1774,8 @@ mod tests {
         );
         let key = "orders/0";
         assert_eq!(
-            per_record.detailed_mappings[key].len(),
-            batched.detailed_mappings[key].len()
+            per_record.detailed_mappings[key].record_count(),
+            batched.detailed_mappings[key].record_count()
         );
         let pe = &per_record.entries[key];
         let be = &batched.entries[key];
@@ -1489,7 +1811,7 @@ mod tests {
         mapping.add_detailed("orders", 0, 8, 105, 1_700_000_000_008);
 
         let offsets: Vec<i64> = mapping.detailed_mappings["orders/0"]
-            .iter()
+            .iter_pairs()
             .map(|p| p.source_offset)
             .collect();
         assert_eq!(offsets, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1558,9 +1880,188 @@ mod tests {
         mapping.add_detailed_batch("orders", 0, pairs(&[(10, 500), (11, 501)]));
         mapping.add_detailed_batch("orders", 0, pairs(&[(12, 502), (13, 503)]));
         let detailed = &mapping.detailed_mappings["orders/0"];
-        let offsets: Vec<i64> = detailed.iter().map(|p| p.source_offset).collect();
+        let offsets: Vec<i64> = detailed.iter_pairs().map(|p| p.source_offset).collect();
         assert_eq!(offsets, vec![10, 11, 12, 13]);
-        assert_eq!(detailed[3].target_offset, 503);
+        assert_eq!(detailed.lookup(13), Some(503));
+        // Two contiguous batches with the same shift fold into one run.
+        assert_eq!(detailed.len(), 1);
+    }
+
+    fn run(source_start: i64, target_start: i64, len: u64) -> OffsetRun {
+        OffsetRun {
+            source_start,
+            target_start,
+            len,
+            first_timestamp: 1_700_000_000_000 + source_start,
+            last_timestamp: 1_700_000_000_000 + source_start + len as i64 - 1,
+        }
+    }
+
+    #[test]
+    fn offset_runs_split_only_on_shift_change() {
+        let mut runs = OffsetRuns::default();
+        // Batch 1 lands at 100.., batch 2 contiguous, batch 3 after a gap on
+        // the target (someone else produced in between).
+        runs.extend(pairs(&[(0, 100), (1, 101), (2, 102)]).iter());
+        runs.extend(pairs(&[(3, 103), (4, 104)]).iter());
+        runs.extend(pairs(&[(5, 205), (6, 206)]).iter());
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs.record_count(), 7);
+        assert_eq!(runs.runs()[0], run(0, 100, 5));
+        assert_eq!(runs.runs()[1], run(5, 205, 2));
+        // Exact inside; nearest-lower-plus-delta beyond the end; none before.
+        assert_eq!(runs.lookup(4), Some(104));
+        assert_eq!(runs.lookup(6), Some(206));
+        assert_eq!(runs.lookup(9), Some(209));
+        assert_eq!(runs.lookup(-1), None);
+        assert!(runs.contains(4) && !runs.contains(9));
+    }
+
+    #[test]
+    fn offset_runs_out_of_order_insert_keeps_sorted_and_merges() {
+        let mut runs = OffsetRuns::default();
+        runs.extend(pairs(&[(10, 500), (12, 502)]).iter());
+        // The missing middle record arrives later with the same shift: the
+        // three fold into one run.
+        runs.push(&pairs(&[(11, 501)])[0]);
+        assert_eq!(runs.runs(), &[run(10, 500, 3)]);
+        // A record before everything with a different shift is inserted at
+        // the front.
+        runs.push(&pairs(&[(3, 90)])[0]);
+        assert_eq!(runs.runs(), &[run(3, 90, 1), run(10, 500, 3)]);
+    }
+
+    #[test]
+    fn offset_runs_duplicate_source_keeps_first_mapping() {
+        // A segment re-produced after a checkpoint resume maps the same
+        // source offsets again, now at higher target offsets.
+        let mut runs = OffsetRuns::default();
+        runs.extend(pairs(&[(0, 100), (1, 101), (2, 102)]).iter());
+        runs.extend(pairs(&[(1, 201), (2, 202), (3, 203)]).iter());
+        assert_eq!(runs.lookup(1), Some(101));
+        assert_eq!(runs.lookup(2), Some(102));
+        assert_eq!(runs.lookup(3), Some(203));
+        assert_eq!(runs.record_count(), 4);
+        // Whole-run overlap on both sides is trimmed too.
+        runs.push_run(run(-2, 50, 8)); // covers -2..6, overlaps 0..4
+        assert_eq!(runs.lookup(-2), Some(50));
+        assert_eq!(runs.lookup(0), Some(100));
+        assert_eq!(runs.lookup(3), Some(203));
+        assert_eq!(runs.lookup(4), Some(56));
+        assert_eq!(runs.record_count(), 8);
+    }
+
+    #[test]
+    fn offset_runs_lookup_matches_per_record_semantics() {
+        // Random discontinuous data: compare with the old per-record rule
+        // (exact match, else nearest lower record plus delta).
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut src = 0i64;
+        let mut tgt = 1_000i64;
+        let mut list = Vec::new();
+        for _ in 0..2_000 {
+            src += 1 + (next() % 3) as i64; // gaps in source offsets
+            tgt += 1 + if next() % 10 == 0 {
+                (next() % 50) as i64
+            } else {
+                0
+            };
+            list.push((src, tgt));
+        }
+        let mut runs = OffsetRuns::default();
+        runs.extend(pairs(&list).iter());
+        assert!(
+            runs.len() < list.len(),
+            "runs={} records={}",
+            runs.len(),
+            list.len()
+        );
+        for q in -5..src + 5 {
+            let expected = list
+                .iter()
+                .filter(|(s, _)| *s <= q)
+                .max_by_key(|(s, _)| *s)
+                .map(|(s, t)| t + (q - s));
+            assert_eq!(runs.lookup(q), expected, "source {q}");
+        }
+    }
+
+    #[test]
+    fn offset_runs_ten_million_sequential_records_are_one_run() {
+        let mut runs = OffsetRuns::default();
+        for i in 0..10_000_000i64 {
+            runs.push(&OffsetPair {
+                source_offset: i,
+                target_offset: 5_000 + i,
+                timestamp: 1_700_000_000_000 + i,
+            });
+        }
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs.record_count(), 10_000_000);
+        assert_eq!(runs.lookup(9_999_999), Some(5_000 + 9_999_999));
+        assert_eq!(runs.runs()[0].last_timestamp, 1_700_000_000_000 + 9_999_999);
+    }
+
+    #[test]
+    fn offset_mapping_report_round_trips_and_reads_legacy_pairs() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed_batch("orders", 0, pairs(&[(0, 100), (1, 101), (5, 200)]));
+        let json = serde_json::to_string(&mapping).unwrap();
+        assert!(json.contains("\"format_version\":2"));
+        assert!(json.contains("\"source_start\":0"));
+        let back: OffsetMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.format_version, OFFSET_MAPPING_FORMAT_VERSION);
+        assert_eq!(
+            back.detailed_mappings["orders/0"],
+            mapping.detailed_mappings["orders/0"]
+        );
+        assert_eq!(back.lookup_target_offset("orders", 0, 1), Some(101));
+
+        // A version-1 report (one pair per record, no format_version) still
+        // loads, folded into runs.
+        let legacy = r#"{
+            "entries": {},
+            "detailed_mappings": {
+                "orders/0": [
+                    {"source_offset": 0, "target_offset": 100, "timestamp": 1},
+                    {"source_offset": 1, "target_offset": 101, "timestamp": 2},
+                    {"source_offset": 5, "target_offset": 200, "timestamp": 3}
+                ]
+            }
+        }"#;
+        let old: OffsetMapping = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.format_version, 1);
+        assert_eq!(old.detailed_mappings["orders/0"].len(), 2);
+        assert_eq!(old.detailed_mapping_count(), 3);
+        assert_eq!(old.lookup_target_offset("orders", 0, 5), Some(200));
+        assert_eq!(old.lookup_target_offset("orders", 0, 3), Some(103));
+    }
+
+    #[test]
+    fn merge_runs_updates_range_and_folds_into_existing() {
+        let mut mapping = OffsetMapping::new();
+        let mut a = OffsetRuns::default();
+        a.extend(pairs(&[(0, 100), (1, 101)]).iter());
+        mapping.merge_runs("orders", 0, a);
+        let mut b = OffsetRuns::default();
+        b.extend(pairs(&[(2, 102), (3, 103)]).iter());
+        mapping.merge_runs("orders", 0, b);
+        assert_eq!(mapping.detailed_mappings["orders/0"].len(), 1);
+        assert_eq!(mapping.detailed_mapping_count(), 4);
+        let e = &mapping.entries["orders/0"];
+        assert_eq!((e.source_first_offset, e.source_last_offset), (0, 3));
+        assert_eq!(
+            (e.target_first_offset, e.target_last_offset),
+            (Some(100), Some(103))
+        );
+        assert_eq!(e.first_timestamp, 1_700_000_000_000);
+        assert_eq!(e.last_timestamp, 1_700_000_000_003);
     }
 
     #[test]

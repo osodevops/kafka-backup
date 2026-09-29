@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Restore offset mapping is stored as runs, not per record.** The
+  source→target mapping collected during a restore (used by Phase 3 consumer
+  group offset translation and the optional `offset_report`) used to keep one
+  24-byte entry per restored record in a `Vec` behind one mutex: ~32 GB for
+  the 1.35 billion records in #197, with every `Vec` growth copying gigabytes
+  while all partition tasks waited on the lock. It is now a list of
+  [`OffsetRuns`] per partition — `{source_start, target_start, len}` runs of
+  records whose mapping is a constant shift — so memory is proportional to
+  the number of discontinuities (produce batches that did not land
+  contiguously, filtered records, resumed segments), typically a few entries
+  per partition. Lookups keep the exact-or-nearest-lower-plus-delta
+  semantics. Each partition task folds its own runs locally and merges them
+  into the shared mapping once, so the produce path takes no shared lock.
+  ([#197](https://github.com/osodevops/kafka-backup/issues/197))
+- The offset-mapping report gains `format_version: 2`; `detailed_mappings`
+  now holds runs. Version-1 reports (per-record pairs, no `format_version`)
+  still load and are folded into runs.
+- **Breaking (library API):** `OffsetMapping::detailed_mappings` is
+  `HashMap<String, OffsetRuns>` (was `HashMap<String, Vec<OffsetPair>>`) and
+  `OffsetMapping` gains `format_version`. `OffsetMapping::merge_runs` and
+  `detailed_run_count` are new; `detailed_mapping_count` still returns the
+  number of mapped records. `get_nearest_offset_by_timestamp` is now
+  approximate within a run (timestamps assumed evenly spaced).
+
 ## [0.23.0] - 2026-09-29
 
 ### Added

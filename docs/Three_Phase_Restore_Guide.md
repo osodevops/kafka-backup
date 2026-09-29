@@ -277,10 +277,12 @@ For production DR scenarios, use **header-based** strategy:
 
 ## Offset Mapping Report Format
 
-The offset mapping report contains:
+The offset mapping report contains (`format_version` 2, v0.24.0+; version-1
+reports with one `detailed_mappings` entry per record are still read):
 
 ```json
 {
+  "format_version": 2,
   "entries": {
     "orders/0": {
       "topic": "orders",
@@ -295,8 +297,8 @@ The offset mapping report contains:
   },
   "detailed_mappings": {
     "orders/0": [
-      { "source_offset": 0, "target_offset": 5000, "timestamp": 1700000000000 },
-      { "source_offset": 1, "target_offset": 5001, "timestamp": 1700000001000 }
+      { "source_start": 0, "target_start": 5000, "len": 1001,
+        "first_timestamp": 1700000000000, "last_timestamp": 1700001000000 }
     ]
   },
   "consumer_groups": {
@@ -317,6 +319,14 @@ The offset mapping report contains:
   "created_at": 1700002000000
 }
 ```
+
+`detailed_mappings` holds **runs**: `source_start + i` maps to
+`target_start + i` for `i < len`. A restore whose produce batches land
+contiguously on the target is one run per partition however many records it
+has; a new run starts only where the shift changes — the target partition
+already held data, records were dropped by a filter or time window, or a
+segment was re-produced after a resume. Lookups are exact inside a run and
+"last record plus delta" beyond it.
 
 ## Safety Guarantees
 

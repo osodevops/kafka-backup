@@ -1730,6 +1730,11 @@ impl RestorePartitionContext {
         let mut first_timestamp = i64::MAX;
         let mut last_timestamp = i64::MIN;
 
+        // Source→target mapping for this partition, accumulated locally as
+        // runs (no shared lock on the produce path) and merged into the
+        // shared mapping once the partition is done (issue #197).
+        let mut partition_runs = crate::manifest::OffsetRuns::default();
+
         // Process each segment
         for segment in segments {
             // Skip if already completed
@@ -1900,11 +1905,7 @@ impl RestorePartitionContext {
                             record_idx,
                             batch.len()
                         );
-                        self.offset_mapping.lock().await.add_detailed_batch(
-                            &self.target_topic,
-                            self.target_partition,
-                            batch_pairs,
-                        );
+                        partition_runs.extend(batch_pairs.iter());
                     }
                     Err(e) => {
                         self.kafka_cb.record_failure();
@@ -1936,11 +1937,7 @@ impl RestorePartitionContext {
                         timestamp: ts,
                     })
                     .collect();
-                self.offset_mapping.lock().await.add_detailed_batch(
-                    &self.target_topic,
-                    self.target_partition,
-                    pairs,
-                );
+                partition_runs.extend(pairs.iter());
             }
 
             total_bytes += batch_bytes;
@@ -1948,6 +1945,21 @@ impl RestorePartitionContext {
 
             // Mark segment as completed
             self.mark_segment_completed(&segment.key).await;
+        }
+
+        if !partition_runs.is_empty() {
+            debug!(
+                "{}:{}: offset mapping folded into {} run(s) for {} records",
+                self.target_topic,
+                self.target_partition,
+                partition_runs.len(),
+                partition_runs.record_count()
+            );
+            self.offset_mapping.lock().await.merge_runs(
+                &self.target_topic,
+                self.target_partition,
+                partition_runs,
+            );
         }
 
         info!(
