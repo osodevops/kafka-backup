@@ -426,8 +426,12 @@ The Kafka circuit breaker is **advisory**: the engines record successes and
 failures and log state transitions (`[kafka] Circuit opening after N failures`),
 but they do **not** block produce/fetch requests when the breaker is Open.
 Transient connection and leadership errors are retried by the partition
-leader router (up to 5 connection retries / 20 NOT_LEADER retries) before a
-partition fails. Use `enabled: false` to keep the breaker permanently Closed
+leader router before a partition fails: connection errors (reset, EOF,
+timeout, refused) are retried with linear back-off (500 ms steps, capped at
+5 s) and leader-unavailable errors (NOT_LEADER_FOR_PARTITION,
+LEADER_NOT_AVAILABLE, or metadata reporting no leader during an election /
+rolling restart) are waited out with back-off (250 ms → 2 s), both within
+one 120 s budget per request. Use `enabled: false` to keep the breaker permanently Closed
 (no `Circuit opening` / `Circuit closing` log lines; `kafka_circuit_state()`
 always reports `Closed`), or raise `failure_threshold` / lower
 `reset_timeout_ms` to change when it opens.

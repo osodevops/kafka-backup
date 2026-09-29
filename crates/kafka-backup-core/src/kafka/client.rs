@@ -21,6 +21,12 @@ use tracing::{debug, trace, warn};
 /// If the broker's receive buffer is full for this long, something is wrong.
 pub const WRITE_TIMEOUT_SECS: u64 = 10;
 
+/// Client-side deadline for establishing a TCP connection (and, for TLS, the
+/// handshake). Without it a SYN to a paused or partitioned broker waits for
+/// the OS default (over a minute on most systems) before the router's retry
+/// loop can react (issue #201).
+pub const CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Client-side deadline for receiving a broker response.
 /// Restore produces default to acks=all with a 30s broker-side timeout, so this
 /// must stay above that ceiling or slow replicated writes are misclassified as
@@ -141,13 +147,19 @@ impl KafkaClient {
     }
 
     async fn try_connect(&self, server: &str) -> Result<ConnectionStream> {
-        let tcp_stream =
-            TcpStream::connect(server)
-                .await
-                .map_err(|e| KafkaError::ConnectionFailed {
-                    broker: server.to_string(),
-                    message: e.to_string(),
-                })?;
+        let tcp_stream = timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(server),
+        )
+        .await
+        .map_err(|_| KafkaError::ConnectionFailed {
+            broker: server.to_string(),
+            message: format!("connect timed out after {}s", CONNECT_TIMEOUT_SECS),
+        })?
+        .map_err(|e| KafkaError::ConnectionFailed {
+            broker: server.to_string(),
+            message: e.to_string(),
+        })?;
 
         // Configure TCP socket options (keepalive, nodelay)
         self.configure_socket(&tcp_stream, server)?;
@@ -176,13 +188,19 @@ impl KafkaClient {
                 }
             })?;
 
-            let tls_stream = connector
-                .connect(server_name, tcp_stream)
-                .await
-                .map_err(|e| KafkaError::ConnectionFailed {
-                    broker: server.to_string(),
-                    message: format!("TLS handshake failed: {}", e),
-                })?;
+            let tls_stream = timeout(
+                Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                connector.connect(server_name, tcp_stream),
+            )
+            .await
+            .map_err(|_| KafkaError::ConnectionFailed {
+                broker: server.to_string(),
+                message: format!("TLS handshake timed out after {}s", CONNECT_TIMEOUT_SECS),
+            })?
+            .map_err(|e| KafkaError::ConnectionFailed {
+                broker: server.to_string(),
+                message: format!("TLS handshake failed: {}", e),
+            })?;
 
             debug!("TLS connection established to {}", server);
             Ok(ConnectionStream::Tls(Box::new(tls_stream)))

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A partition that momentarily has **no leader** — metadata `leader_id = -1`
+  / LEADER_NOT_AVAILABLE during a leader election, a rolling restart, or while
+  a partition's only replica is down — no longer fails the run with
+  `Unknown broker ID: -1`. The router never caches a negative leader and
+  produce / fetch / get_offsets wait for a leader with back-off (250 ms → 2 s).
+  A broker that is **hard-killed** (no controlled shutdown, so the client only
+  sees EOF and then "connection refused" until the controller fences it) is
+  handled the same way: a refused or timed-out *new* connection is now a
+  retriable connection error, retried with back-off (500 ms → 5 s) while the
+  partition leader is refreshed between attempts so a moved or re-elected
+  leader is picked up. Both classes share one 120 s budget per request
+  (previously 5 connection attempts ≈ 7.5 s, shorter than KRaft's 9 s broker
+  session timeout). TCP connect and TLS handshake also get a 10 s client-side
+  deadline instead of the OS default.
+  ([#201](https://github.com/osodevops/kafka-backup/issues/201))
+
 ## [0.23.0] - 2026-09-29
 
 ### Added
