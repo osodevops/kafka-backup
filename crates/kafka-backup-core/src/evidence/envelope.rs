@@ -351,11 +351,11 @@ pub fn verify_evidence(
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     fn test_keypair() -> (String, String) {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let verifying_key = VerifyingKey::from(&signing_key);
         (
             signing_key
