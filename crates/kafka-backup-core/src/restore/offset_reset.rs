@@ -150,7 +150,8 @@ pub struct RestoreTopicMapping {
 
 impl RestoreTopicMapping {
     /// `topic_mapping` / `partition_mapping` as in [`RestoreOptions`];
-    /// `repartitioned` names the source topics restored with repartitioning.
+    /// `repartitioned` names the *target* topics restored with
+    /// repartitioning (the keys of [`RestoreOptions::repartitioning`]).
     pub fn new(
         topic_mapping: HashMap<String, String>,
         partition_mapping: HashMap<i32, i32>,
@@ -179,14 +180,14 @@ impl RestoreTopicMapping {
     /// space (e.g. from an earlier restore) and translating them again would
     /// plan a second, wrong commit for the same partition.
     pub fn target(&self, topic: &str, partition: i32) -> Option<(String, i32)> {
-        if self.repartitioned.contains(topic) {
-            return None;
-        }
         let target_topic = match self.topic_mapping.get(topic) {
             Some(target) => target.clone(),
             None if self.topic_mapping.values().any(|target| target == topic) => return None,
             None => topic.to_string(),
         };
+        if self.repartitioned.contains(&target_topic) {
+            return None;
+        }
         let target_partition = self
             .partition_mapping
             .get(&partition)
@@ -1226,10 +1227,11 @@ mod tests {
     fn repartitioned_topics_are_left_out_of_the_plan() {
         let mut mapping = OffsetMapping::new();
         mapping.add_detailed("orders-wide", 0, 10, 10, 1_700_000_000_000);
+        // Repartitioning is keyed by the target topic, like the engine does.
         let restore = RestoreTopicMapping::new(
             HashMap::from([("orders".to_string(), "orders-wide".to_string())]),
             HashMap::new(),
-            ["orders".to_string()],
+            ["orders-wide".to_string()],
         );
 
         let (plan, complete) =
@@ -1294,5 +1296,25 @@ mod tests {
         assert_eq!(restore.target("b", 0), None, "rename target");
         assert_eq!(restore.target("c", 0), None, "repartitioned");
         assert_eq!(restore.target("d", 3), Some(("d".to_string(), 3)));
+    }
+
+    #[test]
+    fn repartitioning_is_matched_on_the_translated_target_topic() {
+        let options = RestoreOptions {
+            topic_mapping: HashMap::from([("orders".to_string(), "orders-wide".to_string())]),
+            repartitioning: HashMap::from([(
+                "orders-wide".to_string(),
+                crate::config::TopicRepartitioning {
+                    strategy: crate::config::RepartitioningStrategy::Murmur2,
+                    target_partitions: 12,
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RestoreTopicMapping::from_restore_options(&options).target("orders", 0),
+            None
+        );
     }
 }
