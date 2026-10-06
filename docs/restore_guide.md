@@ -642,6 +642,14 @@ How it is applied:
    generates the offset reset plan from that mapping and commits the
    translated offsets to the target — once. A `Consumer Group Offset Reset
    (Phase 3)` summary is printed with the groups, partitions and any errors.
+   With explicit `consumer_groups`, the groups' committed offsets are read
+   from the target cluster (useful when source and target are the same
+   cluster, or the offsets were migrated) and each one is translated through
+   `topic_mapping` / `partition_mapping`: a commit on `orders:0` restored as
+   `orders-restored:0` is committed on `orders-restored:0`, in that topic's
+   offset space. Commits already on a topic the restore renamed *into*, and
+   repartitioned topics, are left unchanged. Groups from the snapshot
+   (`auto_consumer_groups`) are translated the same way.
 3. If any commit fails the command **exits non-zero** even though the data
    restore succeeded, so automation notices. The most common failure is
    `error code 25 (UNKNOWN_MEMBER_ID …)`: the group still has active
