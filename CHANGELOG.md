@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.2] - 2026-10-06
+
+### Fixed
+- `offset-rollback` (`snapshot` / `list` / `show` / `rollback` / `verify` /
+  `delete`), `show-offset-mapping`, `offset-reset` (`plan` / `execute` /
+  `script`), `offset-reset-bulk` and `status --path` now honour storage URLs
+  (`s3://`, `file://`, `azure://`, `gcs://`) in `--path`. They used to treat
+  the URL as a relative local directory: `offset-rollback snapshot --path
+  s3://bucket/prefix` reported success but wrote to `./s3:/bucket/prefix`
+  (lost when the container exited), and `list` / `status` then reported "No
+  offset snapshots found" / "Manifest: Not found" with exit 0. Bare local
+  paths are unchanged. ([#174](https://github.com/osodevops/kafka-backup/issues/174))
+- `--path` values that look like storage URLs but can't be honoured now fail
+  before any Kafka I/O instead of falling back to a local directory: unknown
+  schemes ("Unknown storage scheme"), `memory://`, an `s3://` / `gcs://` URL
+  with no bucket, an empty path, and a known scheme with a mangled separator
+  such as `s3:/bucket` (with a "did you mean s3://bucket" hint).
+  ([#174](https://github.com/osodevops/kafka-backup/issues/174))
+- The CLI test suite (`kafka-backup-cli`, a binary-only crate skipped by
+  `cargo test --lib`) now runs in CI, plus a MinIO round trip for
+  `--path s3://`.
+
+### Changed
+- The "Created S3/Azure/GCS backend" log line is now `debug` (it was `info`,
+  which the CLI writes to stdout and would have corrupted `--format json`
+  output from the commands above). The S3 line includes the endpoint
+  object_store will actually use (`AWS_ENDPOINT_URL_S3` > `AWS_ENDPOINT_URL` /
+  `endpoint`, else "AWS default"); run with `-v` to see it.
+- `--help` for every `--path` resolved this way lists the accepted forms,
+  including `?endpoint=` for MinIO / Ceph RGW. "No offset snapshots found"
+  now says where it looked, and the rollback hint quotes `--path`.
+
 ## [0.23.1] - 2026-10-06
 
 ### Fixed
