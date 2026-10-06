@@ -233,6 +233,11 @@ This makes OSO Kafka Backup the highest‑leverage choice for teams that need re
 
 ## CLI Reference
 
+`--path` takes a local directory or a storage URL: `file:///abs/path`,
+`s3://bucket/prefix` (for MinIO/Ceph add `?endpoint=http://host:9000&region=us-east-1`,
+or set `AWS_ENDPOINT_URL` and `AWS_ALLOW_HTTP=true`), `azure://account.blob.core.windows.net/container`
+or `gcs://bucket`. Credentials come from the usual `AWS_*` / `AZURE_*` / `GOOGLE_*` environment variables.
+
 ```bash
 # Backup & restore
 kafka-backup backup --config backup.yaml

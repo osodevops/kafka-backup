@@ -342,7 +342,7 @@ kafka-backup offset-reset-bulk [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--backup-id`, `-b` | Yes | Backup ID with offset mapping |
 | `--groups`, `-g` | Yes | Consumer groups (comma-separated) |
 | `--bootstrap-servers` | Yes | Kafka brokers (comma-separated) |
@@ -361,7 +361,7 @@ kafka-backup offset-rollback snapshot [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--groups`, `-g` | Yes | Consumer groups (comma-separated) |
 | `--bootstrap-servers` | Yes | Kafka brokers (comma-separated) |
 | `--description`, `-d` | No | Snapshot description |
@@ -378,7 +378,7 @@ kafka-backup offset-rollback list [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--format`, `-f` | No | Output format: text, json |
 
 ### offset-rollback show
@@ -391,7 +391,7 @@ kafka-backup offset-rollback show [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--snapshot-id`, `-s` | Yes | Snapshot ID to show |
 | `--format`, `-f` | No | Output format: text, json |
 
@@ -405,7 +405,7 @@ kafka-backup offset-rollback rollback [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--snapshot-id`, `-s` | Yes | Snapshot ID to rollback to |
 | `--bootstrap-servers` | Yes | Kafka brokers (comma-separated) |
 | `--security-protocol` | No | Security protocol |
@@ -422,7 +422,7 @@ kafka-backup offset-rollback verify [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--snapshot-id`, `-s` | Yes | Snapshot ID to verify against |
 | `--bootstrap-servers` | Yes | Kafka brokers (comma-separated) |
 | `--security-protocol` | No | Security protocol |
@@ -438,7 +438,7 @@ kafka-backup offset-rollback delete [OPTIONS]
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--path`, `-p` | Yes | Path to storage location |
+| `--path`, `-p` | Yes | Storage location: local directory, `file:///abs/path`, `s3://bucket/prefix` (MinIO/Ceph: `?endpoint=http://host:9000&region=...`), `azure://...` or `gcs://bucket` |
 | `--snapshot-id`, `-s` | Yes | Snapshot ID to delete |
 
 ---
