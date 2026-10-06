@@ -5,13 +5,50 @@ use kafka_backup_core::storage::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Schemes `StorageBackendConfig::from_url` understands.
+const STORAGE_SCHEMES: &[&str] = &["s3", "s3a", "azure", "az", "gcs", "gs", "file", "memory"];
+
+/// Resolve a user-supplied `--path`: a storage URL (`s3://`, `azure://`,
+/// `gcs://`, `file://`) or a local directory.
+///
+/// Anything that looks like a storage URL but can't be honoured is an error,
+/// never a relative directory: writing `./s3:/bucket/...` and reporting
+/// success is how #174 lost offset snapshots.
 // The single sanctioned FilesystemBackend construction for user-supplied
 // paths; clippy.toml disallows it everywhere else in this crate (#174).
 #[allow(clippy::disallowed_methods)]
 pub fn backend_from_path(path: &str) -> Result<Arc<dyn StorageBackend>> {
+    if path.is_empty() {
+        bail!("--path is empty");
+    }
+
     if path.contains("://") {
         let config = StorageBackendConfig::from_url(path)?;
+        match &config {
+            StorageBackendConfig::Memory => bail!(
+                "memory:// is not supported for --path: in-memory storage is discarded when the command exits"
+            ),
+            StorageBackendConfig::S3 { bucket, .. } | StorageBackendConfig::Gcs { bucket, .. }
+                if bucket.is_empty() =>
+            {
+                bail!("--path {path} has no bucket name")
+            }
+            _ => {}
+        }
         return Ok(create_backend(&config)?);
+    }
+
+    if let Some((scheme, rest)) = path.split_once(':') {
+        let scheme = scheme.to_ascii_lowercase();
+        if STORAGE_SCHEMES.contains(&scheme.as_str()) {
+            let rest = rest.trim_start_matches('/');
+            let suggestion = if scheme == "file" {
+                format!("file:///{rest}")
+            } else {
+                format!("{scheme}://{rest}")
+            };
+            bail!("--path {path} is not a valid storage URL; did you mean {suggestion}?");
+        }
     }
 
     Ok(Arc::new(FilesystemBackend::new(PathBuf::from(path))))

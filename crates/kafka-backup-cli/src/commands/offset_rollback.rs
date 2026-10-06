@@ -107,7 +107,7 @@ pub async fn create_snapshot(
             println!();
             println!("To rollback to this snapshot, run:");
             println!(
-                "  kafka-backup offset-rollback rollback --path {} --snapshot-id {}",
+                "  kafka-backup offset-rollback rollback --path '{}' --snapshot-id {}",
                 path, snapshot_id
             );
         }
@@ -131,7 +131,7 @@ pub async fn list_snapshots(path: &str, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Text => {
             if snapshots.is_empty() {
-                println!("No offset snapshots found.");
+                println!("No offset snapshots found at {}.", path);
                 return Ok(());
             }
 
