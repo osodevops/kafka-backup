@@ -52,14 +52,20 @@ mod tests {
 
     fn rejection(path: &str) -> String {
         match backend_from_path(path) {
-            Ok(b) => panic!("{path:?} should be rejected, got {} backend", b.backend_name()),
+            Ok(b) => panic!(
+                "{path:?} should be rejected, got {} backend",
+                b.backend_name()
+            ),
             Err(e) => format!("{e:#}"),
         }
     }
 
     #[test]
     fn bare_absolute_path_uses_filesystem_backend() {
-        assert_eq!(backend_kind("/var/lib/kafka-backup/snapshots"), "filesystem");
+        assert_eq!(
+            backend_kind("/var/lib/kafka-backup/snapshots"),
+            "filesystem"
+        );
     }
 
     #[test]
@@ -80,7 +86,10 @@ mod tests {
         assert_eq!(backend.backend_name(), "filesystem");
 
         backend
-            .put("offset-snapshots/x/metadata.json", Bytes::from_static(b"{}"))
+            .put(
+                "offset-snapshots/x/metadata.json",
+                Bytes::from_static(b"{}"),
+            )
             .await
             .unwrap();
         assert!(dir.path().join("offset-snapshots/x/metadata.json").exists());
@@ -118,7 +127,12 @@ mod tests {
     // relative directory and written to locally - the #174 failure mode.
     #[test]
     fn known_scheme_missing_double_slash_is_rejected() {
-        for path in ["s3:/bucket/prefix", "s3:bucket", "gcs:/bucket", "file:/tmp/x"] {
+        for path in [
+            "s3:/bucket/prefix",
+            "s3:bucket",
+            "gcs:/bucket",
+            "file:/tmp/x",
+        ] {
             let err = rejection(path);
             assert!(err.contains("did you mean"), "{path}: {err}");
         }

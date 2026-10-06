@@ -1,0 +1,7 @@
+# Every `--path` must go through commands::storage_path::backend_from_path so
+# storage URLs are honoured instead of becoming a relative local directory
+# (issue #174). Crate-local: kafka-backup-core constructs FilesystemBackend
+# legitimately.
+disallowed-methods = [
+    { path = "kafka_backup_core::storage::FilesystemBackend::new", reason = "resolve --path with commands::storage_path::backend_from_path so s3://, file://, azure:// and gcs:// are honoured (#174)" },
+]
