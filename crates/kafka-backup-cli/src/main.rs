@@ -6,6 +6,13 @@ mod commands;
 
 use commands::security_args::SecurityCliArgs;
 
+/// `--path` help for every subcommand that resolves it with
+/// `commands::storage_path::backend_from_path`.
+const STORAGE_PATH_HELP: &str = "Storage location: a local directory, file:///abs/path, \
+s3://bucket/prefix (S3-compatible stores: append ?endpoint=http://host:9000&region=...), \
+azure://account.blob.core.windows.net/container or gcs://bucket. \
+Credentials come from AWS_*, AZURE_* or GOOGLE_* environment variables";
+
 #[derive(Parser)]
 #[command(name = "kafka-backup")]
 #[command(about = "High-performance Kafka backup and restore with point-in-time recovery")]
@@ -52,8 +59,7 @@ enum Commands {
 
     /// List available backups in a storage location
     List {
-        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Specific backup ID to show details for
@@ -67,8 +73,7 @@ enum Commands {
         Static:  --path and --backup-id to inspect a completed backup\n  \
         Live:    --config to monitor a running backup (add --watch for continuous refresh)")]
     Status {
-        /// Path to the storage location (for inspecting a completed backup)
-        #[arg(short, long, conflicts_with = "config")]
+        #[arg(short, long, help = STORAGE_PATH_HELP, conflicts_with = "config")]
         path: Option<String>,
 
         /// Backup ID to show status for (for inspecting a completed backup)
@@ -101,8 +106,7 @@ enum Commands {
         #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
         config: Option<String>,
 
-        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long, requires = "backup_id")]
+        #[arg(short, long, help = STORAGE_PATH_HELP, requires = "backup_id")]
         path: Option<String>,
 
         /// Backup ID to validate
@@ -125,8 +129,7 @@ enum Commands {
         #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
         config: Option<String>,
 
-        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long, requires = "backup_id")]
+        #[arg(short, long, help = STORAGE_PATH_HELP, requires = "backup_id")]
         path: Option<String>,
 
         /// Backup ID to prune
@@ -171,8 +174,7 @@ enum Commands {
         #[arg(short, long, conflicts_with_all = ["path", "backup_id"])]
         config: Option<String>,
 
-        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long, requires = "backup_id")]
+        #[arg(short, long, help = STORAGE_PATH_HELP, requires = "backup_id")]
         path: Option<String>,
 
         /// Backup ID to describe
@@ -197,8 +199,7 @@ enum Commands {
 
     /// Show source-to-target offset mapping from a completed restore
     ShowOffsetMapping {
-        /// Storage path (local path or s3://bucket/prefix, azure://..., gcs://...)
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Backup ID to show offset mapping for
@@ -232,8 +233,7 @@ enum Commands {
 
     /// Reset consumer group offsets in parallel after a restore (~50x faster than sequential)
     OffsetResetBulk {
-        /// Storage path containing the offset mapping from a completed restore
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Backup ID with offset mapping
@@ -297,8 +297,7 @@ enum Commands {
 enum OffsetRollbackAction {
     /// Create a snapshot of current consumer group offsets
     Snapshot {
-        /// Path to the storage location for snapshots
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Consumer groups to snapshot (comma-separated)
@@ -323,8 +322,7 @@ enum OffsetRollbackAction {
 
     /// List available offset snapshots
     List {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Output format (text, json)
@@ -334,8 +332,7 @@ enum OffsetRollbackAction {
 
     /// Show details of a specific snapshot
     Show {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Snapshot ID to show
@@ -349,8 +346,7 @@ enum OffsetRollbackAction {
 
     /// Rollback offsets to a previous snapshot
     Rollback {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Snapshot ID to rollback to
@@ -375,8 +371,7 @@ enum OffsetRollbackAction {
 
     /// Verify current offsets match a snapshot
     Verify {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Snapshot ID to verify against
@@ -397,8 +392,7 @@ enum OffsetRollbackAction {
 
     /// Delete a snapshot
     Delete {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Snapshot ID to delete
@@ -411,8 +405,7 @@ enum OffsetRollbackAction {
 enum OffsetResetAction {
     /// Generate an offset reset plan from a restore's offset mapping
     Plan {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Backup ID to generate plan for
@@ -438,8 +431,7 @@ enum OffsetResetAction {
 
     /// Execute an offset reset plan
     Execute {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Backup ID with offset mapping
@@ -460,8 +452,7 @@ enum OffsetResetAction {
 
     /// Generate a shell script for manual offset reset
     Script {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Backup ID with offset mapping
