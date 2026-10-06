@@ -6,7 +6,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{ObjectMetadata, StorageBackend};
 use crate::error::StorageError;
@@ -146,7 +146,7 @@ impl AzureBackend {
             )))
         })?;
 
-        info!(
+        debug!(
             "Created Azure backend for account: {}, container: {}, prefix: {:?}, endpoint: {:?}",
             config.account_name, config.container_name, config.prefix, config.endpoint
         );

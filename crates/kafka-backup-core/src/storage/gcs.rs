@@ -6,7 +6,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{ObjectMetadata, StorageBackend};
 use crate::error::StorageError;
@@ -51,7 +51,7 @@ impl GcsBackend {
             )))
         })?;
 
-        info!(
+        debug!(
             "Created GCS backend for bucket: {}, prefix: {:?}",
             config.bucket, config.prefix
         );
