@@ -14,9 +14,9 @@ use kafka_backup_core::restore::offset_rollback::{
     OffsetSnapshotStorage, RollbackResult, RollbackStatus, StorageBackendSnapshotStore,
     VerificationResult,
 };
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
-use std::sync::Arc;
 use tracing::info;
+
+use super::storage_path::backend_from_path;
 
 /// Output format for rollback reports
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +34,12 @@ impl From<&str> for OutputFormat {
     }
 }
 
+/// Snapshot store at `--path`: a local directory or a storage URL
+/// (`s3://`, `file://`, `azure://`, `gcs://`) (#174).
+fn open_snapshot_store(path: &str) -> Result<StorageBackendSnapshotStore> {
+    Ok(StorageBackendSnapshotStore::new(backend_from_path(path)?))
+}
+
 /// Create a snapshot of current consumer group offsets
 pub async fn create_snapshot(
     path: &str,
@@ -43,9 +49,8 @@ pub async fn create_snapshot(
     security: SecurityConfig,
     format: OutputFormat,
 ) -> Result<()> {
-    // Create storage backend and snapshot store
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    // Resolve storage before touching Kafka so a bad --path fails fast
+    let snapshot_store = open_snapshot_store(path)?;
 
     // Create Kafka client
     let kafka_config = KafkaConfig {
@@ -102,7 +107,7 @@ pub async fn create_snapshot(
             println!();
             println!("To rollback to this snapshot, run:");
             println!(
-                "  kafka-backup offset-rollback rollback --path {} --snapshot-id {}",
+                "  kafka-backup offset-rollback rollback --path '{}' --snapshot-id {}",
                 path, snapshot_id
             );
         }
@@ -113,8 +118,7 @@ pub async fn create_snapshot(
 
 /// List all available offset snapshots
 pub async fn list_snapshots(path: &str, format: OutputFormat) -> Result<()> {
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    let snapshot_store = open_snapshot_store(path)?;
 
     let snapshots = snapshot_store
         .list_snapshots()
@@ -127,7 +131,7 @@ pub async fn list_snapshots(path: &str, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Text => {
             if snapshots.is_empty() {
-                println!("No offset snapshots found.");
+                println!("No offset snapshots found at {}.", path);
                 return Ok(());
             }
 
@@ -167,8 +171,7 @@ pub async fn list_snapshots(path: &str, format: OutputFormat) -> Result<()> {
 
 /// Show details of a specific snapshot
 pub async fn show_snapshot(path: &str, snapshot_id: &str, format: OutputFormat) -> Result<()> {
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    let snapshot_store = open_snapshot_store(path)?;
 
     let snapshot = snapshot_store
         .load_snapshot(snapshot_id)
@@ -196,8 +199,7 @@ pub async fn execute_rollback(
     verify: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    let snapshot_store = open_snapshot_store(path)?;
 
     // Load snapshot
     let snapshot = snapshot_store
@@ -286,8 +288,7 @@ pub async fn verify_snapshot(
     security: SecurityConfig,
     format: OutputFormat,
 ) -> Result<()> {
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    let snapshot_store = open_snapshot_store(path)?;
 
     // Load snapshot
     let snapshot = snapshot_store
@@ -333,8 +334,7 @@ pub async fn verify_snapshot(
 
 /// Delete a snapshot
 pub async fn delete_snapshot(path: &str, snapshot_id: &str) -> Result<()> {
-    let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(path.into()));
-    let snapshot_store = StorageBackendSnapshotStore::new(backend);
+    let snapshot_store = open_snapshot_store(path)?;
 
     // Verify snapshot exists
     if !snapshot_store.exists(snapshot_id).await? {

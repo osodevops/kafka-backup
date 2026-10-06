@@ -1,10 +1,10 @@
 use anyhow::Result;
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::{BackupManifest, OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use std::path::PathBuf;
 use tracing::info;
 
 use super::status_watch;
+use super::storage_path::backend_from_path;
 
 /// Main entry point for the status command.
 ///
@@ -49,7 +49,7 @@ pub async fn run(
 async fn run_static(path: &str, backup_id: &str, db_path: Option<&str>) -> Result<()> {
     info!("Getting status for backup: {}", backup_id);
 
-    let storage = FilesystemBackend::new(PathBuf::from(path));
+    let storage = backend_from_path(path)?;
 
     // Load manifest
     let manifest_key = format!("{}/manifest.json", backup_id);

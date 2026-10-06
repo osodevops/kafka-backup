@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{ObjectMetadata, StorageBackend};
 use crate::error::StorageError;
@@ -91,6 +91,14 @@ impl S3Backend {
             builder = builder.with_allow_http(true);
         }
 
+        // The endpoint object_store will actually use (AWS_ENDPOINT_URL_S3 beats
+        // AWS_ENDPOINT_URL / `endpoint`), so a request silently going to AWS
+        // instead of MinIO/Ceph shows up in the debug log.
+        let endpoint = builder
+            .get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+            .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint))
+            .unwrap_or_else(|| "AWS default".to_string());
+
         let store = builder.build().map_err(|e| {
             Error::Storage(StorageError::Backend(format!(
                 "Failed to create S3 client: {}",
@@ -98,9 +106,9 @@ impl S3Backend {
             )))
         })?;
 
-        info!(
-            "Created S3 backend for bucket: {}, prefix: {:?}",
-            config.bucket, config.prefix
+        debug!(
+            "Created S3 backend for bucket: {}, prefix: {:?}, endpoint: {}",
+            config.bucket, config.prefix, endpoint
         );
 
         Ok(Self {
