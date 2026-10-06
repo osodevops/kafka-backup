@@ -19,7 +19,7 @@ pub use offset_automation::{
 };
 pub use offset_reset::{
     GroupResetPlan, GroupResetResult, OffsetResetExecutor, OffsetResetPlan, OffsetResetPlanBuilder,
-    OffsetResetReport, OffsetResetStrategy, PartitionResetPlan,
+    OffsetResetReport, OffsetResetStrategy, PartitionResetPlan, RestoreTopicMapping,
 };
 pub use offset_rollback::{
     reset_offsets_with_rollback, rollback_offset_reset, snapshot_current_offsets, verify_rollback,

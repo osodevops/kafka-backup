@@ -56,6 +56,7 @@ use crate::{Error, Result};
 use super::engine::RestoreEngine;
 use super::offset_reset::{
     OffsetResetExecutor, OffsetResetPlan, OffsetResetReport, OffsetResetStrategy,
+    RestoreTopicMapping,
 };
 use super::preflight::{self, HeaderPreflightReport};
 
@@ -368,7 +369,9 @@ impl ThreePhaseRestore {
             OffsetResetExecutor::new_offline(vec![])
         };
 
+        let restore_options = self.config.restore.clone().unwrap_or_default();
         executor
+            .with_restore_mapping(RestoreTopicMapping::from_restore_options(&restore_options))
             .generate_plan(offset_mapping, consumer_groups, strategy)
             .await
     }

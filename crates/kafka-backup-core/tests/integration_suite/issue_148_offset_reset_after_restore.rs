@@ -288,6 +288,81 @@ async fn test_restore_without_reset_flags_leaves_consumer_offsets_alone() {
     assert!(committed(&client, TARGET_TOPIC).await.is_empty());
 }
 
+/// Issue #214 — explicit `consumer_groups` + `reset_consumer_offsets` (no
+/// snapshot): Phase 3 reads the group's committed offsets from the cluster,
+/// which name the *source* topic, while the engine keys the offset mapping by
+/// the *target* topic it produced to. The commits must be translated through
+/// `topic_mapping` and land on the restored topic — previously Phase 3 logged
+/// "No target offset mapping … skipping" and reset nothing.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_explicit_consumer_groups_are_reset_on_the_mapped_topic() {
+    let cluster = KafkaTestCluster::start().await.expect("start Kafka");
+    cluster
+        .wait_for_ready(Duration::from_secs(30))
+        .await
+        .expect("Kafka ready");
+    let bs = cluster.bootstrap_servers.clone();
+
+    cluster
+        .create_topic(SOURCE_TOPIC, 60)
+        .await
+        .expect("create source topic");
+    let client = cluster.create_client();
+    client.connect().await.expect("connect");
+    let commits: Vec<(String, i32, i64, Option<String>)> = SOURCE_COMMITS
+        .iter()
+        .map(|(p, o)| (SOURCE_TOPIC.to_string(), *p, *o, None))
+        .collect();
+    seed_group_offsets(&bs, &commits).await;
+    sleep(Duration::from_secs(1)).await;
+    let source_before = committed(&client, SOURCE_TOPIC).await;
+    assert_eq!(source_before.len(), 3, "seeded offsets: {source_before:?}");
+
+    let storage = create_temp_storage();
+    let engine = BackupEngine::new(backup_config(&bs, storage.path().to_path_buf()))
+        .await
+        .expect("backup engine");
+    tokio::time::timeout(Duration::from_secs(60), engine.run())
+        .await
+        .expect("backup timed out")
+        .expect("backup");
+
+    let mut config = restore_config(&bs, storage.path().to_path_buf(), false);
+    {
+        let restore = config.restore.as_mut().unwrap();
+        restore.consumer_groups = vec![GROUP.to_string()];
+        restore.reset_consumer_offsets = true;
+    }
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(90),
+        ThreePhaseRestore::new(config)
+            .expect("orchestrator")
+            .run_all_phases(),
+    )
+    .await
+    .expect("three-phase restore timed out")
+    .expect("three-phase restore");
+    assert_eq!(report.restore_report.records_restored, 60);
+    let phase3 = report
+        .offset_reset_report
+        .as_ref()
+        .expect("Phase 3 must apply the explicit group");
+    assert!(phase3.errors.is_empty(), "{:?}", phase3.errors);
+    assert_eq!(
+        phase3.partitions_reset, 3,
+        "every committed partition is reset"
+    );
+    sleep(Duration::from_secs(1)).await;
+
+    // Empty target topic: translated offsets equal the source offsets, and
+    // they land on the restored topic; the source topic is untouched.
+    let expected: HashMap<i32, i64> = SOURCE_COMMITS.iter().copied().collect();
+    assert_eq!(committed(&client, TARGET_TOPIC).await, expected);
+    assert_eq!(committed(&client, SOURCE_TOPIC).await, source_before);
+}
+
 fn orchestrator_restore_options(bs: &str, storage: PathBuf) -> RestoreOptions {
     restore_config(bs, storage, true).restore.unwrap()
 }

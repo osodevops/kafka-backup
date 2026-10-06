@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.1] - 2026-10-06
+
+### Fixed
+- Phase 3 offset reset with explicit `consumer_groups` now honours
+  `topic_mapping` / `partition_mapping`. The groups' committed offsets name
+  the source topic, but the restore keys its offset mapping by the target
+  topic it produced to, so every lookup missed ("No target offset mapping …
+  skipping") and nothing was reset; each commit is now translated and
+  applied on the restored topic. Commits already on a rename target (target
+  offset space) and repartitioned topics are left alone. The
+  `auto_consumer_groups` path was not affected.
+  ([#214](https://github.com/osodevops/kafka-backup/issues/214))
+
+### Added
+- `restore::RestoreTopicMapping` and
+  `OffsetResetExecutor::with_restore_mapping` to translate committed source
+  offsets for library callers that build their own executor.
+
 ## [0.23.0] - 2026-09-29
 
 ### Added

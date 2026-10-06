@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::kafka::{commit_offsets, fetch_offsets, KafkaClient, PartitionLeaderRouter};
+use crate::config::RestoreOptions;
+use crate::kafka::{
+    commit_offsets, fetch_offsets, CommittedOffset, KafkaClient, PartitionLeaderRouter,
+};
 #[cfg(test)]
 use crate::manifest::ConsumerGroupOffset;
 use crate::manifest::{ConsumerGroupOffsets, OffsetMapping};
@@ -131,6 +134,115 @@ pub enum OffsetResetStrategy {
     DryRun,
 }
 
+/// Where a restore wrote each source topic/partition.
+///
+/// A consumer group's committed offsets, read from the cluster, name the
+/// *source* topic and partition, while the restore engine keys its offset
+/// mapping by the *target* topic and partition it produced to. Phase 3 uses
+/// this to translate one into the other (issue #214). The default is the
+/// identity: nothing renamed, nothing repartitioned.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreTopicMapping {
+    topic_mapping: HashMap<String, String>,
+    partition_mapping: HashMap<i32, i32>,
+    repartitioned: std::collections::HashSet<String>,
+}
+
+impl RestoreTopicMapping {
+    /// `topic_mapping` / `partition_mapping` as in [`RestoreOptions`];
+    /// `repartitioned` names the *target* topics restored with
+    /// repartitioning (the keys of [`RestoreOptions::repartitioning`]).
+    pub fn new(
+        topic_mapping: HashMap<String, String>,
+        partition_mapping: HashMap<i32, i32>,
+        repartitioned: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            topic_mapping,
+            partition_mapping,
+            repartitioned: repartitioned.into_iter().collect(),
+        }
+    }
+
+    /// The mapping a restore with these options applied.
+    pub fn from_restore_options(options: &RestoreOptions) -> Self {
+        Self::new(
+            options.topic_mapping.clone(),
+            options.partition_mapping.clone(),
+            options.repartitioning.keys().cloned(),
+        )
+    }
+
+    /// Target topic and partition for a committed offset on the source
+    /// `topic` / `partition`, or `None` when it must not be translated:
+    /// a repartitioned topic (no source→target offset mapping exists), or a
+    /// topic the restore renamed *into* — commits there are already in target
+    /// space (e.g. from an earlier restore) and translating them again would
+    /// plan a second, wrong commit for the same partition.
+    pub fn target(&self, topic: &str, partition: i32) -> Option<(String, i32)> {
+        let target_topic = match self.topic_mapping.get(topic) {
+            Some(target) => target.clone(),
+            None if self.topic_mapping.values().any(|target| target == topic) => return None,
+            None => topic.to_string(),
+        };
+        if self.repartitioned.contains(&target_topic) {
+            return None;
+        }
+        let target_partition = self
+            .partition_mapping
+            .get(&partition)
+            .copied()
+            .unwrap_or(partition);
+        Some((target_topic, target_partition))
+    }
+}
+
+/// Plan entries for a group's committed offsets as read from the cluster.
+/// Returns the entries and whether every translatable commit was mapped.
+fn plan_from_committed_offsets(
+    offset_mapping: &OffsetMapping,
+    restore_mapping: &RestoreTopicMapping,
+    group_id: &str,
+    committed: Vec<CommittedOffset>,
+) -> (Vec<PartitionResetPlan>, bool) {
+    let mut partitions = Vec::new();
+    let mut complete = true;
+
+    for offset in committed {
+        if offset.error_code != 0 {
+            continue;
+        }
+        let Some((topic, partition)) = restore_mapping.target(&offset.topic, offset.partition)
+        else {
+            debug!(
+                "Not translating {}:{}:{} - repartitioned or already a restore target topic",
+                group_id, offset.topic, offset.partition
+            );
+            continue;
+        };
+
+        if let Some(target) = offset_mapping.lookup_target_offset(&topic, partition, offset.offset)
+        {
+            partitions.push(PartitionResetPlan {
+                topic,
+                partition,
+                source_offset: offset.offset,
+                target_offset: target,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                metadata: offset.metadata,
+            });
+        } else {
+            warn!(
+                "No target offset mapping for {}:{}:{} (restored as {}:{}) - skipping",
+                group_id, offset.topic, offset.partition, topic, partition
+            );
+            complete = false;
+        }
+    }
+
+    (partitions, complete)
+}
+
 /// Offset reset executor
 pub struct OffsetResetExecutor {
     /// Target Kafka client
@@ -141,6 +253,9 @@ pub struct OffsetResetExecutor {
 
     /// Bootstrap servers for shell script generation
     bootstrap_servers: Vec<String>,
+
+    /// Translates committed source offsets to the restored topics
+    restore_mapping: RestoreTopicMapping,
 }
 
 #[async_trait::async_trait]
@@ -190,6 +305,7 @@ impl OffsetResetExecutor {
             client: Some(Arc::clone(&client)),
             committer: Some(Arc::new(ClientOffsetCommitter { client })),
             bootstrap_servers,
+            restore_mapping: RestoreTopicMapping::default(),
         }
     }
 
@@ -202,6 +318,7 @@ impl OffsetResetExecutor {
             client: None,
             committer: Some(Arc::new(RouterOffsetCommitter { router })),
             bootstrap_servers,
+            restore_mapping: RestoreTopicMapping::default(),
         }
     }
 
@@ -211,7 +328,16 @@ impl OffsetResetExecutor {
             client: None,
             committer: None,
             bootstrap_servers,
+            restore_mapping: RestoreTopicMapping::default(),
         }
+    }
+
+    /// Translate the group offsets this executor fetches from the cluster
+    /// through the topic/partition mapping of the restore that produced the
+    /// offset mapping (issue #214).
+    pub fn with_restore_mapping(mut self, restore_mapping: RestoreTopicMapping) -> Self {
+        self.restore_mapping = restore_mapping;
+        self
     }
 
     /// Generate an offset reset plan from an offset mapping
@@ -295,33 +421,17 @@ impl OffsetResetExecutor {
                 }
             }
         } else if let Some(client) = &self.client {
-            // Fetch current offsets from source cluster and calculate target offsets
+            // Fetch the group's committed offsets and translate them to the
+            // restored topics' offset space
             let committed = fetch_offsets(client, group_id, None).await?;
-
-            for offset in committed {
-                if offset.error_code == 0 {
-                    if let Some(target) = offset_mapping.lookup_target_offset(
-                        &offset.topic,
-                        offset.partition,
-                        offset.offset,
-                    ) {
-                        partitions.push(PartitionResetPlan {
-                            topic: offset.topic,
-                            partition: offset.partition,
-                            source_offset: offset.offset,
-                            target_offset: target,
-                            timestamp: chrono::Utc::now().timestamp_millis(),
-                            metadata: offset.metadata,
-                        });
-                    } else {
-                        warn!(
-                            "No target offset mapping for {}:{}:{} - skipping",
-                            group_id, offset.topic, offset.partition
-                        );
-                        complete = false;
-                    }
-                }
-            }
+            let (planned, all_mapped) = plan_from_committed_offsets(
+                offset_mapping,
+                &self.restore_mapping,
+                group_id,
+                committed,
+            );
+            partitions = planned;
+            complete = all_mapped;
         }
 
         let partition_count = partitions.len();
@@ -896,6 +1006,7 @@ mod tests {
             client: None,
             committer: Some(committer.clone()),
             bootstrap_servers: vec!["kafka:9092".to_string()],
+            restore_mapping: RestoreTopicMapping::default(),
         };
 
         let plan = OffsetResetPlan {
@@ -972,6 +1083,7 @@ mod tests {
             client: None,
             committer: Some(std::sync::Arc::new(RejectingCommitter(25))),
             bootstrap_servers: vec!["kafka:9092".to_string()],
+            restore_mapping: RestoreTopicMapping::default(),
         };
         let plan = OffsetResetPlan {
             groups: vec![GroupResetPlan {
@@ -1014,5 +1126,195 @@ mod tests {
         assert!(describe_offset_commit_error(3).contains("UNKNOWN_TOPIC_OR_PARTITION"));
         assert!(describe_offset_commit_error(30).contains("GROUP_AUTHORIZATION_FAILED"));
         assert_eq!(describe_offset_commit_error(999), "error code 999");
+    }
+
+    // ---- issue #214: committed offsets read from the cluster carry the
+    // source topic/partition; the restore engine keys the mapping by the
+    // target topic/partition it produced to.
+
+    fn commit(topic: &str, partition: i32, offset: i64) -> CommittedOffset {
+        CommittedOffset {
+            topic: topic.to_string(),
+            partition,
+            offset,
+            metadata: Some("m".to_string()),
+            error_code: 0,
+        }
+    }
+
+    fn renamed(source: &str, target: &str) -> RestoreTopicMapping {
+        RestoreTopicMapping::new(
+            HashMap::from([(source.to_string(), target.to_string())]),
+            HashMap::new(),
+            [],
+        )
+    }
+
+    fn plan_tuples(plan: &[PartitionResetPlan]) -> Vec<(String, i32, i64, i64)> {
+        let mut tuples: Vec<_> = plan
+            .iter()
+            .map(|p| {
+                (
+                    p.topic.clone(),
+                    p.partition,
+                    p.source_offset,
+                    p.target_offset,
+                )
+            })
+            .collect();
+        tuples.sort();
+        tuples
+    }
+
+    #[test]
+    fn committed_source_offsets_are_translated_through_topic_mapping() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders-restored", 0, 120, 7, 1_700_000_000_000);
+
+        let (plan, complete) = plan_from_committed_offsets(
+            &mapping,
+            &renamed("orders", "orders-restored"),
+            "orders-app",
+            vec![commit("orders", 0, 120)],
+        );
+
+        assert!(complete);
+        assert_eq!(
+            plan_tuples(&plan),
+            vec![("orders-restored".to_string(), 0, 120, 7)],
+            "commit lands on the restored topic, translated to its offset space"
+        );
+        assert_eq!(plan[0].metadata.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn committed_source_offsets_are_translated_through_partition_mapping() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders", 5, 40, 3, 1_700_000_000_000);
+        let restore = RestoreTopicMapping::new(HashMap::new(), HashMap::from([(2, 5)]), []);
+
+        let (plan, complete) =
+            plan_from_committed_offsets(&mapping, &restore, "app", vec![commit("orders", 2, 40)]);
+
+        assert!(complete);
+        assert_eq!(plan_tuples(&plan), vec![("orders".to_string(), 5, 40, 3)]);
+    }
+
+    #[test]
+    fn commits_already_on_a_rename_target_are_not_translated_again() {
+        // A previous restore (or consumer) already committed on the target
+        // topic: that offset is in target space, so feeding it through the
+        // mapping would double-translate it and plan two commits for one
+        // partition.
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders-restored", 0, 120, 7, 1_700_000_000_000);
+
+        let (plan, complete) = plan_from_committed_offsets(
+            &mapping,
+            &renamed("orders", "orders-restored"),
+            "orders-app",
+            vec![commit("orders", 0, 120), commit("orders-restored", 0, 7)],
+        );
+
+        assert!(complete);
+        assert_eq!(
+            plan_tuples(&plan),
+            vec![("orders-restored".to_string(), 0, 120, 7)]
+        );
+    }
+
+    #[test]
+    fn repartitioned_topics_are_left_out_of_the_plan() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders-wide", 0, 10, 10, 1_700_000_000_000);
+        // Repartitioning is keyed by the target topic, like the engine does.
+        let restore = RestoreTopicMapping::new(
+            HashMap::from([("orders".to_string(), "orders-wide".to_string())]),
+            HashMap::new(),
+            ["orders-wide".to_string()],
+        );
+
+        let (plan, complete) =
+            plan_from_committed_offsets(&mapping, &restore, "app", vec![commit("orders", 0, 10)]);
+
+        assert!(
+            plan.is_empty(),
+            "no source->target mapping exists for repartitioned data"
+        );
+        assert!(
+            complete,
+            "an expected skip does not make the plan incomplete"
+        );
+    }
+
+    #[test]
+    fn identity_restore_keeps_previous_lookup_and_reports_unmapped_topics() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders", 0, 100, 5100, 1_700_000_000_000);
+
+        let (plan, complete) = plan_from_committed_offsets(
+            &mapping,
+            &RestoreTopicMapping::default(),
+            "app",
+            vec![
+                commit("orders", 0, 100),
+                commit("payments", 0, 9),
+                CommittedOffset {
+                    error_code: 3,
+                    ..commit("orders", 1, 1)
+                },
+            ],
+        );
+
+        assert_eq!(
+            plan_tuples(&plan),
+            vec![("orders".to_string(), 0, 100, 5100)]
+        );
+        assert!(
+            !complete,
+            "payments was not restored, so the plan is incomplete"
+        );
+    }
+
+    #[test]
+    fn restore_topic_mapping_reads_restore_options() {
+        let options = RestoreOptions {
+            topic_mapping: HashMap::from([("a".to_string(), "b".to_string())]),
+            partition_mapping: HashMap::from([(0, 1)]),
+            repartitioning: HashMap::from([(
+                "c".to_string(),
+                crate::config::TopicRepartitioning {
+                    strategy: crate::config::RepartitioningStrategy::Murmur2,
+                    target_partitions: 8,
+                },
+            )]),
+            ..Default::default()
+        };
+        let restore = RestoreTopicMapping::from_restore_options(&options);
+
+        assert_eq!(restore.target("a", 0), Some(("b".to_string(), 1)));
+        assert_eq!(restore.target("b", 0), None, "rename target");
+        assert_eq!(restore.target("c", 0), None, "repartitioned");
+        assert_eq!(restore.target("d", 3), Some(("d".to_string(), 3)));
+    }
+
+    #[test]
+    fn repartitioning_is_matched_on_the_translated_target_topic() {
+        let options = RestoreOptions {
+            topic_mapping: HashMap::from([("orders".to_string(), "orders-wide".to_string())]),
+            repartitioning: HashMap::from([(
+                "orders-wide".to_string(),
+                crate::config::TopicRepartitioning {
+                    strategy: crate::config::RepartitioningStrategy::Murmur2,
+                    target_partitions: 12,
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RestoreTopicMapping::from_restore_options(&options).target("orders", 0),
+            None
+        );
     }
 }

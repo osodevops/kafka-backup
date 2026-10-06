@@ -195,6 +195,9 @@ async fn serve_metadata_and_fetch(
                 write_response(&mut stream, api_key, api_version, correlation_id, &resp).await;
             }
             ApiKey::Fetch => {
+                // `fetch_update` is deprecated (renamed `try_update`) on newer
+                // stables, but `try_update` is missing on older ones.
+                #[allow(deprecated)]
                 let kill_this = fetch_kills_left
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok();
