@@ -14,8 +14,10 @@ use kafka_backup_core::restore::offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
     OffsetMapping as BulkOffsetMapping,
 };
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
+use kafka_backup_core::storage::StorageBackend;
 use tracing::{info, warn};
+
+use super::storage_path::backend_from_path;
 
 /// Output format for bulk offset reset reports
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,10 +47,10 @@ pub async fn execute_bulk(
     security: SecurityConfig,
     format: OutputFormat,
 ) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
+    let storage = backend_from_path(path)?;
 
     // Load offset mapping from restore report
-    let mapping = load_offset_mapping(&storage, backup_id)
+    let mapping = load_offset_mapping(storage.as_ref(), backup_id)
         .await
         .context("Failed to load offset mapping")?;
 
@@ -165,7 +167,7 @@ fn build_bulk_offset_mappings(
 
 /// Load offset mapping from storage
 async fn load_offset_mapping(
-    storage: &FilesystemBackend,
+    storage: &dyn StorageBackend,
     backup_id: &str,
 ) -> Result<OffsetMapping> {
     // First try to load from restore report (has actual source->target mapping)

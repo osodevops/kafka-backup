@@ -13,8 +13,10 @@ use kafka_backup_core::manifest::OffsetMapping;
 use kafka_backup_core::restore::offset_reset::{
     OffsetResetExecutor, OffsetResetPlan, OffsetResetStrategy,
 };
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
+use kafka_backup_core::storage::StorageBackend;
 use tracing::{info, warn};
+
+use super::storage_path::backend_from_path;
 
 /// Output format for offset reset operations
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,10 +47,10 @@ pub async fn generate_plan(
     dry_run: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
+    let storage = backend_from_path(path)?;
 
     // Try to load offset mapping from restore report first
-    let mapping = load_offset_mapping(&storage, backup_id).await?;
+    let mapping = load_offset_mapping(storage.as_ref(), backup_id).await?;
 
     info!(
         "Loaded offset mapping with {} entries",
@@ -81,8 +83,8 @@ pub async fn execute_plan(
     bootstrap_servers: &[String],
     security: SecurityConfig,
 ) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
-    let mapping = load_offset_mapping(&storage, backup_id).await?;
+    let storage = backend_from_path(path)?;
+    let mapping = load_offset_mapping(storage.as_ref(), backup_id).await?;
 
     info!(
         "Loaded offset mapping with {} entries",
@@ -134,8 +136,8 @@ pub async fn generate_script(
     bootstrap_servers: &[String],
     output_path: Option<&str>,
 ) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
-    let mapping = load_offset_mapping(&storage, backup_id).await?;
+    let storage = backend_from_path(path)?;
+    let mapping = load_offset_mapping(storage.as_ref(), backup_id).await?;
 
     let executor = OffsetResetExecutor::new_offline(bootstrap_servers.to_vec());
 
@@ -166,7 +168,7 @@ pub async fn generate_script(
 
 /// Load offset mapping from storage
 async fn load_offset_mapping(
-    storage: &FilesystemBackend,
+    storage: &dyn StorageBackend,
     backup_id: &str,
 ) -> Result<OffsetMapping> {
     // First try to load from restore report (has actual source->target mapping)

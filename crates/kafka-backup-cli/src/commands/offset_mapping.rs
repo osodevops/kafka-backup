@@ -1,11 +1,12 @@
 use anyhow::Result;
 use kafka_backup_core::manifest::OffsetMapping;
-use kafka_backup_core::storage::{FilesystemBackend, StorageBackend};
 use kafka_backup_core::BackupManifest;
 use tracing::info;
 
+use super::storage_path::backend_from_path;
+
 pub async fn run(path: &str, backup_id: &str, format: &str) -> Result<()> {
-    let storage = FilesystemBackend::new(path.into());
+    let storage = backend_from_path(path)?;
 
     info!("Loading backup manifest: {}", backup_id);
     let manifest_key = format!("{}/manifest.json", backup_id);
