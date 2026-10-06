@@ -31,7 +31,10 @@ mod file_url {
         sb.seed(&snapshot_fixture(SNAP, "issue-174"));
 
         let cwd = sb.fresh_cwd();
-        let run = kb(&cwd, &["offset-rollback", "list", "--path", &sb.store_url()]);
+        let run = kb(
+            &cwd,
+            &["offset-rollback", "list", "--path", &sb.store_url()],
+        );
         assert!(run.success(), "{}", run.text());
         assert!(run.stdout.contains(SNAP), "{}", run.text());
         assert!(run.stdout.contains("Total: 1 snapshots"), "{}", run.text());
@@ -172,7 +175,11 @@ mod file_url {
             ],
         );
         assert!(run.success(), "{}", run.text());
-        assert!(run.stdout.contains("deleted successfully"), "{}", run.text());
+        assert!(
+            run.stdout.contains("deleted successfully"),
+            "{}",
+            run.text()
+        );
         assert!(!sb.store_has(&format!("offset-snapshots/{SNAP}/snapshot.json")));
         assert!(!sb.store_has(&format!("offset-snapshots/{SNAP}/metadata.json")));
         assert_cwd_untouched(&cwd, "offset-rollback delete");
@@ -321,7 +328,11 @@ mod file_url {
             ],
         );
         assert!(!run.success(), "{}", run.text());
-        assert!(run.stderr.contains("No available brokers"), "{}", run.text());
+        assert!(
+            run.stderr.contains("No available brokers"),
+            "{}",
+            run.text()
+        );
         assert!(!run.stderr.contains("Object not found"), "{}", run.text());
         assert_cwd_untouched(&cwd, "offset-reset execute");
     }
@@ -405,7 +416,11 @@ mod file_url {
             ],
         );
         assert!(run.success(), "{}", run.text());
-        assert!(!run.stdout.contains("Manifest: Not found"), "{}", run.text());
+        assert!(
+            !run.stdout.contains("Manifest: Not found"),
+            "{}",
+            run.text()
+        );
         assert!(run.stdout.contains("Topics: 1"), "{}", run.text());
         assert!(run.stdout.contains("Segment Files: 1"), "{}", run.text());
         assert_cwd_untouched(&cwd, "status");
@@ -421,24 +436,133 @@ mod fail_fast {
         let script = root.join("reset.sh").display().to_string();
         let report = root.join("report.json").display().to_string();
         let rows: Vec<Vec<&str>> = vec![
-            vec!["offset-rollback", "snapshot", "--path", path, "--bootstrap-servers", DEAD_KAFKA],
+            vec![
+                "offset-rollback",
+                "snapshot",
+                "--path",
+                path,
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
             vec!["offset-rollback", "list", "--path", path],
-            vec!["offset-rollback", "show", "--path", path, "--snapshot-id", SNAP],
-            vec!["offset-rollback", "rollback", "--path", path, "--snapshot-id", SNAP, "--bootstrap-servers", DEAD_KAFKA],
-            vec!["offset-rollback", "verify", "--path", path, "--snapshot-id", SNAP, "--bootstrap-servers", DEAD_KAFKA],
-            vec!["offset-rollback", "delete", "--path", path, "--snapshot-id", SNAP],
+            vec![
+                "offset-rollback",
+                "show",
+                "--path",
+                path,
+                "--snapshot-id",
+                SNAP,
+            ],
+            vec![
+                "offset-rollback",
+                "rollback",
+                "--path",
+                path,
+                "--snapshot-id",
+                SNAP,
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
+            vec![
+                "offset-rollback",
+                "verify",
+                "--path",
+                path,
+                "--snapshot-id",
+                SNAP,
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
+            vec![
+                "offset-rollback",
+                "delete",
+                "--path",
+                path,
+                "--snapshot-id",
+                SNAP,
+            ],
             vec!["show-offset-mapping", "--path", path, "--backup-id", BACKUP],
-            vec!["offset-reset", "plan", "--path", path, "--backup-id", BACKUP, "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA],
-            vec!["offset-reset", "execute", "--path", path, "--backup-id", BACKUP, "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA],
-            vec!["offset-reset", "script", "--path", path, "--backup-id", BACKUP, "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA, "--output", &script],
-            vec!["offset-reset-bulk", "--path", path, "--backup-id", BACKUP, "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA],
-            vec!["status", "--path", path, "--backup-id", BACKUP, "--db-path", &db],
+            vec![
+                "offset-reset",
+                "plan",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g1",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
+            vec![
+                "offset-reset",
+                "execute",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g1",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
+            vec![
+                "offset-reset",
+                "script",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g1",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+                "--output",
+                &script,
+            ],
+            vec![
+                "offset-reset-bulk",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g1",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
+            ],
+            vec![
+                "status",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--db-path",
+                &db,
+            ],
             vec!["list", "--path", path],
             vec!["describe", "--path", path, "--backup-id", BACKUP],
             vec!["validate", "--path", path, "--backup-id", BACKUP],
-            vec!["prune", "--path", path, "--backup-id", BACKUP, "--older-than", "30d"],
+            vec![
+                "prune",
+                "--path",
+                path,
+                "--backup-id",
+                BACKUP,
+                "--older-than",
+                "30d",
+            ],
             vec!["validation", "evidence-list", "--path", path],
-            vec!["validation", "evidence-get", "--path", path, "--report-id", "r1", "--output", &report],
+            vec![
+                "validation",
+                "evidence-get",
+                "--path",
+                path,
+                "--report-id",
+                "r1",
+                "--output",
+                &report,
+            ],
         ];
         rows.into_iter()
             .map(|r| r.into_iter().map(String::from).collect())
@@ -521,21 +645,50 @@ mod back_compat {
         let commands: Vec<(Vec<&str>, &str)> = vec![
             (vec!["offset-rollback", "list", "--path", &path], SNAP),
             (
-                vec!["offset-rollback", "show", "--path", &path, "--snapshot-id", SNAP],
+                vec![
+                    "offset-rollback",
+                    "show",
+                    "--path",
+                    &path,
+                    "--snapshot-id",
+                    SNAP,
+                ],
                 SNAP,
             ),
             (
-                vec!["status", "--path", &path, "--backup-id", BACKUP, "--db-path", &db],
+                vec![
+                    "status",
+                    "--path",
+                    &path,
+                    "--backup-id",
+                    BACKUP,
+                    "--db-path",
+                    &db,
+                ],
                 "Topics: 1",
             ),
             (
-                vec!["show-offset-mapping", "--path", &path, "--backup-id", BACKUP],
+                vec![
+                    "show-offset-mapping",
+                    "--path",
+                    &path,
+                    "--backup-id",
+                    BACKUP,
+                ],
                 "orders",
             ),
             (
                 vec![
-                    "offset-reset", "plan", "--path", &path, "--backup-id", BACKUP,
-                    "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA,
+                    "offset-reset",
+                    "plan",
+                    "--path",
+                    &path,
+                    "--backup-id",
+                    BACKUP,
+                    "--groups",
+                    "g1",
+                    "--bootstrap-servers",
+                    DEAD_KAFKA,
                 ],
                 "g1",
             ),
@@ -650,7 +803,10 @@ mod s3_stub {
         let lines = s3.request_lines();
         for file in ["snapshot.json", "metadata.json"] {
             let want = format!("PUT /{BUCKET_PREFIX}/offset-snapshots/{id}/{file}");
-            assert!(lines.contains(&want), "missing `{want}`; requests: {lines:#?}");
+            assert!(
+                lines.contains(&want),
+                "missing `{want}`; requests: {lines:#?}"
+            );
         }
         assert!(
             s3.requests().iter().all(|r| r.sigv4),
@@ -724,13 +880,18 @@ mod s3_stub {
         );
         assert!(run.success(), "{}", run.text());
         let lines = s3.request_lines();
-        for want in [
-            format!("HEAD /{BUCKET_PREFIX}/offset-snapshots/{SNAP}/snapshot.json"),
-            format!("DELETE /{BUCKET_PREFIX}/offset-snapshots/{SNAP}/snapshot.json"),
-            format!("DELETE /{BUCKET_PREFIX}/offset-snapshots/{SNAP}/metadata.json"),
-        ] {
-            assert!(lines.contains(&want), "missing `{want}`; requests: {lines:#?}");
-        }
+        let exists = format!("HEAD /{BUCKET_PREFIX}/offset-snapshots/{SNAP}/snapshot.json");
+        assert!(
+            lines.contains(&exists),
+            "missing `{exists}`; requests: {lines:#?}"
+        );
+        // object_store deletes via the bulk DeleteObjects API on the bucket
+        assert!(
+            s3.requests()
+                .iter()
+                .any(|r| r.method == "POST" && r.path == "/kb-test" && r.query.contains("delete")),
+            "no DeleteObjects request: {lines:#?}"
+        );
         assert!(s3.keys().is_empty(), "{:?}", s3.keys());
         assert_cwd_untouched(&cwd, "offset-rollback delete from s3://");
     }
@@ -790,8 +951,16 @@ mod s3_stub {
         let run = kb_env(
             &sb.fresh_cwd(),
             &[
-                "offset-reset", "plan", "--path", &url, "--backup-id", BACKUP,
-                "--groups", "g1", "--bootstrap-servers", DEAD_KAFKA,
+                "offset-reset",
+                "plan",
+                "--path",
+                &url,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g1",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
             ],
             &CREDS,
         );
@@ -810,8 +979,15 @@ mod s3_stub {
         let run = kb_env(
             &sb.fresh_cwd(),
             &[
-                "offset-reset-bulk", "--path", &url, "--backup-id", BACKUP,
-                "--groups", "g-not-in-mapping", "--bootstrap-servers", DEAD_KAFKA,
+                "offset-reset-bulk",
+                "--path",
+                &url,
+                "--backup-id",
+                BACKUP,
+                "--groups",
+                "g-not-in-mapping",
+                "--bootstrap-servers",
+                DEAD_KAFKA,
             ],
             &CREDS,
         );
@@ -820,7 +996,15 @@ mod s3_stub {
         let db = sb.root.join("offsets.db").display().to_string();
         let run = kb_env(
             &sb.fresh_cwd(),
-            &["status", "--path", &url, "--backup-id", BACKUP, "--db-path", &db],
+            &[
+                "status",
+                "--path",
+                &url,
+                "--backup-id",
+                BACKUP,
+                "--db-path",
+                &db,
+            ],
             &CREDS,
         );
         assert!(run.stdout.contains("Topics: 1"), "{}", run.text());
@@ -892,9 +1076,8 @@ mod minio {
     use kafka_backup_core::storage::{create_backend, StorageBackendConfig};
 
     fn required(name: &str) -> String {
-        std::env::var(name).unwrap_or_else(|_| {
-            panic!("{name} must be set to run this test (see the module docs)")
-        })
+        std::env::var(name)
+            .unwrap_or_else(|_| panic!("{name} must be set to run this test (see the module docs)"))
     }
 
     /// Keys under `offset-snapshots/`, read independently of the CLI.
@@ -936,8 +1119,14 @@ mod minio {
         };
 
         let run = step(&[
-            "offset-rollback", "snapshot", "--path", &url,
-            "--bootstrap-servers", &sink.addr, "--description", "issue-174 e2e",
+            "offset-rollback",
+            "snapshot",
+            "--path",
+            &url,
+            "--bootstrap-servers",
+            &sink.addr,
+            "--description",
+            "issue-174 e2e",
         ]);
         assert!(run.success(), "{}", run.text());
         let id = snapshot_id_from(&run);
@@ -951,32 +1140,66 @@ mod minio {
         assert!(run.stdout.contains(&id), "{}", run.text());
 
         let run = step(&[
-            "offset-rollback", "show", "--path", &url, "--snapshot-id", &id, "--format", "json",
+            "offset-rollback",
+            "show",
+            "--path",
+            &url,
+            "--snapshot-id",
+            &id,
+            "--format",
+            "json",
         ]);
         assert!(run.success(), "{}", run.text());
         assert_eq!(json_stdout(&run)["description"], "issue-174 e2e");
 
         let run = step(&[
-            "offset-rollback", "verify", "--path", &url, "--snapshot-id", &id,
-            "--bootstrap-servers", &sink.addr,
+            "offset-rollback",
+            "verify",
+            "--path",
+            &url,
+            "--snapshot-id",
+            &id,
+            "--bootstrap-servers",
+            &sink.addr,
         ]);
         assert!(run.success(), "{}", run.text());
         assert!(run.stdout.contains("VERIFIED"), "{}", run.text());
 
         let run = step(&[
-            "offset-rollback", "rollback", "--path", &url, "--snapshot-id", &id,
-            "--bootstrap-servers", &sink.addr,
+            "offset-rollback",
+            "rollback",
+            "--path",
+            &url,
+            "--snapshot-id",
+            &id,
+            "--bootstrap-servers",
+            &sink.addr,
         ]);
         assert!(run.success(), "{}", run.text());
         assert!(
-            run.stdout.contains(&format!("Rolling back to snapshot: {id}")),
+            run.stdout
+                .contains(&format!("Rolling back to snapshot: {id}")),
             "{}",
             run.text()
         );
 
-        let run = step(&["offset-rollback", "delete", "--path", &url, "--snapshot-id", &id]);
+        let run = step(&[
+            "offset-rollback",
+            "delete",
+            "--path",
+            &url,
+            "--snapshot-id",
+            &id,
+        ]);
         assert!(run.success(), "{}", run.text());
-        let run = step(&["offset-rollback", "delete", "--path", &url, "--snapshot-id", &id]);
+        let run = step(&[
+            "offset-rollback",
+            "delete",
+            "--path",
+            &url,
+            "--snapshot-id",
+            &id,
+        ]);
         assert!(!run.success(), "{}", run.text());
         assert!(run.stderr.contains("not found"), "{}", run.text());
 

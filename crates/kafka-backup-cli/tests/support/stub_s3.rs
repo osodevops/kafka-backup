@@ -1,7 +1,7 @@
-//! A recording stub of the S3 REST API: just enough PUT / GET / HEAD / DELETE
-//! / ListObjectsV2 for object_store 0.14 to complete a request, so tests can
-//! assert that `--path s3://...` really sends requests to the S3 endpoint with
-//! the right bucket and prefix. It is not an S3 implementation; S3 semantics
+//! A recording stub of the S3 REST API: just enough PUT / GET / HEAD / DELETE /
+//! DeleteObjects / ListObjectsV2 for object_store 0.14 to complete a request,
+//! so tests can assert that `--path s3://...` really sends requests to the S3
+//! endpoint with the right bucket and prefix. It is not an S3 implementation; S3 semantics
 //! are covered by the MinIO round-trip test.
 //!
 //! It never answers 5xx: object_store retries those for up to ~3 minutes.
@@ -198,7 +198,12 @@ fn handle(stream: TcpStream, state: &State) -> std::io::Result<()> {
     match (method.as_str(), key.is_empty()) {
         ("GET", true) if query_param(&query, "list-type") == Some("2") => {
             if state.deny_list.load(Ordering::SeqCst) {
-                respond(&mut stream, "403 Forbidden", &[], &error_xml("AccessDenied"));
+                respond(
+                    &mut stream,
+                    "403 Forbidden",
+                    &[],
+                    &error_xml("AccessDenied"),
+                );
                 return Ok(());
             }
             let prefix = query_param(&query, "prefix").unwrap_or_default();
@@ -257,7 +262,36 @@ fn handle(stream: TcpStream, state: &State) -> std::io::Result<()> {
             state.objects.lock().unwrap().remove(&object_key);
             respond(&mut stream, "204 No Content", &[], b"");
         }
-        _ => respond(&mut stream, "400 Bad Request", &[], &error_xml("BadRequest")),
+        // DeleteObjects: object_store 0.14 deletes through this bulk API.
+        ("POST", true)
+            if query
+                .split('&')
+                .any(|kv| kv == "delete" || kv.starts_with("delete=")) =>
+        {
+            let body = String::from_utf8_lossy(&body);
+            let mut deleted = String::new();
+            let mut objects = state.objects.lock().unwrap();
+            for chunk in body.split("<Key>").skip(1) {
+                let key = chunk.split("</Key>").next().unwrap_or_default();
+                objects.remove(&format!("{bucket}/{key}"));
+                deleted.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
+            }
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{deleted}</DeleteResult>"
+            );
+            respond(
+                &mut stream,
+                "200 OK",
+                &[("Content-Type", "application/xml".into())],
+                xml.as_bytes(),
+            );
+        }
+        _ => respond(
+            &mut stream,
+            "400 Bad Request",
+            &[],
+            &error_xml("BadRequest"),
+        ),
     }
     Ok(())
 }
