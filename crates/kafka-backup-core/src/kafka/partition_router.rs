@@ -20,11 +20,6 @@ use super::metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
 use super::{FetchResponse, KafkaClient, ProduceResponse};
 use crate::manifest::BackupRecord;
 
-const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
-const COORDINATOR_NOT_AVAILABLE: i16 = 15;
-const NOT_COORDINATOR: i16 = 16;
-const MAX_COORDINATOR_RETRIES: u32 = 12;
-
 /// Routes Kafka requests to the correct partition leader broker.
 ///
 /// This router maintains:
@@ -791,11 +786,11 @@ impl PartitionLeaderRouter {
     /// In KRaft mode, each broker is group coordinator for a subset of consumer
     /// groups (those whose `__consumer_offsets` partition it leads). Sending
     /// `OffsetFetch` to the bootstrap broker only returns offsets for groups
-    /// coordinated by that broker; all others return `NOT_COORDINATOR` (error 16)
-    /// or an empty response.
+    /// coordinated by that broker; all others return `NOT_COORDINATOR` (error 16).
     ///
     /// This method lists groups per-broker and fetches their offsets from the same
-    /// broker, ensuring complete coverage across all coordinators.
+    /// broker, ensuring complete coverage across all coordinators. A group whose
+    /// coordinator moved in between is followed by `fetch_offsets`.
     ///
     /// Returns a map: `group_id → Vec<CommittedOffset>`.
     pub async fn fetch_group_offsets_all_coordinators(
@@ -825,9 +820,9 @@ impl PartitionLeaderRouter {
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
-                                    debug!(
-                                        "fetch_offsets for group {} on broker {}: {}",
-                                        g.group_id, broker_id, e
+                                    warn!(
+                                        "Skipping group {}: fetching its offsets failed: {}",
+                                        g.group_id, e
                                     );
                                 }
                             }
@@ -891,80 +886,15 @@ impl PartitionLeaderRouter {
 
     /// Commit offsets for a consumer group through that group's coordinator.
     ///
-    /// `OffsetCommit` must be sent to the broker that coordinates the group. A
-    /// bootstrap broker may not coordinate the group, and committing there can
-    /// return coordinator errors in multi-broker KRaft clusters.
+    /// `OffsetCommit` must be sent to the broker that coordinates the group;
+    /// [`super::consumer_groups::commit_offsets`] locates it and retries while
+    /// the coordinator loads or moves.
     pub async fn commit_group_offsets(
         &self,
         group_id: &str,
         offsets: &[(String, i32, i64, Option<String>)],
     ) -> Result<Vec<(String, i32, i16)>> {
-        for attempt in 1..=MAX_COORDINATOR_RETRIES {
-            let coordinator = match super::consumer_groups::find_group_coordinator(
-                &self.bootstrap_client,
-                group_id,
-            )
-            .await
-            {
-                Ok(coordinator) => coordinator,
-                Err(e)
-                    if is_transient_coordinator_error(&e) && attempt < MAX_COORDINATOR_RETRIES =>
-                {
-                    let backoff = coordinator_backoff(attempt);
-                    warn!(
-                            "FindCoordinator for group {} returned transient error on attempt {}/{}; retrying after {:?}: {}",
-                            group_id, attempt, MAX_COORDINATOR_RETRIES, backoff, e
-                        );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            {
-                let mut brokers = self.broker_metadata.write().await;
-                brokers
-                    .entry(coordinator.node_id)
-                    .or_insert_with(|| BrokerMetadata {
-                        node_id: coordinator.node_id,
-                        host: coordinator.host.clone(),
-                        port: coordinator.port,
-                        rack: None,
-                    });
-            }
-
-            let client = match self.get_broker_connection(coordinator.node_id).await {
-                Ok(client) => client,
-                Err(e) => {
-                    warn!(
-                        "Failed to connect to coordinator broker {} for group {}: {}; refreshing metadata",
-                        coordinator.node_id, group_id, e
-                    );
-                    self.refresh_metadata().await?;
-                    self.get_broker_connection(coordinator.node_id).await?
-                }
-            };
-
-            let results =
-                super::consumer_groups::commit_offsets(&client, group_id, offsets).await?;
-            if has_transient_coordinator_commit_error(&results) && attempt < MAX_COORDINATOR_RETRIES
-            {
-                let backoff = coordinator_backoff(attempt);
-                warn!(
-                    "OffsetCommit for group {} returned transient coordinator error on attempt {}/{}; retrying after {:?}",
-                    group_id, attempt, MAX_COORDINATOR_RETRIES, backoff
-                );
-                self.refresh_metadata().await?;
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-
-            return Ok(results);
-        }
-
-        Err(KafkaError::Timeout(format!(
-            "coordinator for group {group_id} was not ready after {MAX_COORDINATOR_RETRIES} attempts"
-        ))
-        .into())
+        super::consumer_groups::commit_offsets(&self.bootstrap_client, group_id, offsets).await
     }
 
     /// Delete records from a topic by advancing the log-start-offset to `before_offset`.
@@ -1136,29 +1066,6 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
     }
 }
 
-fn is_transient_coordinator_error(error: &crate::Error) -> bool {
-    matches!(
-        error,
-        crate::Error::Kafka(KafkaError::BrokerError {
-            code: COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR,
-            ..
-        })
-    )
-}
-
-fn has_transient_coordinator_commit_error(results: &[(String, i32, i16)]) -> bool {
-    results.iter().any(|(_, _, code)| {
-        matches!(
-            *code,
-            COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR
-        )
-    })
-}
-
-fn coordinator_backoff(attempt: u32) -> Duration {
-    Duration::from_millis((250 * attempt as u64).min(2_000))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,38 +1104,5 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped.get(&1), Some(&vec![(0, 10), (2, 30)]));
         assert_eq!(grouped.get(&2), Some(&vec![(1, 20)]));
-    }
-
-    #[test]
-    fn transient_coordinator_errors_are_retryable() {
-        for code in [
-            COORDINATOR_LOAD_IN_PROGRESS,
-            COORDINATOR_NOT_AVAILABLE,
-            NOT_COORDINATOR,
-        ] {
-            let error = crate::Error::Kafka(KafkaError::BrokerError {
-                code,
-                message: "coordinator transient".to_string(),
-            });
-            assert!(is_transient_coordinator_error(&error));
-        }
-
-        let fatal = crate::Error::Kafka(KafkaError::BrokerError {
-            code: 30,
-            message: "group authorization failed".to_string(),
-        });
-        assert!(!is_transient_coordinator_error(&fatal));
-    }
-
-    #[test]
-    fn transient_commit_partition_errors_are_retryable() {
-        let results = vec![
-            ("orders".to_string(), 0, 0),
-            ("orders".to_string(), 1, COORDINATOR_NOT_AVAILABLE),
-        ];
-        assert!(has_transient_coordinator_commit_error(&results));
-
-        let fatal = vec![("orders".to_string(), 0, 30)];
-        assert!(!has_transient_coordinator_commit_error(&fatal));
     }
 }
