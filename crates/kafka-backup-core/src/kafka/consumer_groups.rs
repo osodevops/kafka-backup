@@ -6,6 +6,10 @@
 //! - OffsetFetch: Get committed offsets for a group
 //! - OffsetCommit: Commit offsets for a group
 //! - ListOffsetsForTimes: Find offsets by timestamp
+//!
+//! OffsetFetch and OffsetCommit are routed to the group's coordinator (see
+//! [`send_to_group_coordinator`]); the other requests go to the broker the
+//! client is connected to.
 
 use kafka_protocol::messages::{
     ApiKey, DescribeGroupsRequest, DescribeGroupsResponse, FindCoordinatorRequest,
@@ -13,13 +17,22 @@ use kafka_protocol::messages::{
     ListOffsetsResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
     OffsetFetchResponse, TopicName,
 };
-use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use super::KafkaClient;
 use crate::error::KafkaError;
 use crate::Result;
+
+const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+const NOT_COORDINATOR: i16 = 16;
+
+/// Attempts a group-scoped request gets to reach a ready coordinator.
+const MAX_COORDINATOR_ATTEMPTS: u32 = 12;
 
 /// Consumer group metadata
 #[derive(Debug, Clone)]
@@ -186,7 +199,12 @@ pub async fn describe_groups(
     Ok(descriptions)
 }
 
-/// Fetch committed offsets for a consumer group
+/// Fetch committed offsets for a consumer group from its coordinator.
+///
+/// Fails on a group-level error (e.g. GROUP_AUTHORIZATION_FAILED, or a
+/// coordinator that stays unavailable); an `Ok` with no offsets means the
+/// group has none committed. Partition-level errors are returned in
+/// [`CommittedOffset::error_code`].
 pub async fn fetch_offsets(
     client: &KafkaClient,
     group_id: &str,
@@ -213,7 +231,27 @@ pub async fn fetch_offsets(
             .with_topics(None)
     };
 
-    let response: OffsetFetchResponse = client.send_request(ApiKey::OffsetFetch, request).await?;
+    let response: OffsetFetchResponse = send_to_group_coordinator(
+        client,
+        group_id,
+        ApiKey::OffsetFetch,
+        request,
+        offset_fetch_coordinator_error,
+    )
+    .await?;
+
+    // A group-level error comes with no topics; reading it as "no committed
+    // offsets" silently drops the group (#224).
+    if response.error_code != 0 {
+        return Err(KafkaError::BrokerError {
+            code: response.error_code,
+            message: format!(
+                "OffsetFetch for group {group_id} failed with error code {}",
+                response.error_code
+            ),
+        }
+        .into());
+    }
 
     let mut offsets = Vec::new();
 
@@ -343,7 +381,9 @@ fn group_coordinator_from_response(
     })
 }
 
-/// Commit offsets for a consumer group
+/// Commit offsets for a consumer group on its coordinator.
+///
+/// Returns `(topic, partition, error_code)` for every committed partition.
 pub async fn commit_offsets(
     client: &KafkaClient,
     group_id: &str,
@@ -382,7 +422,14 @@ pub async fn commit_offsets(
         .with_group_id(GroupId(StrBytes::from_string(group_id.to_string())))
         .with_topics(topics);
 
-    let response: OffsetCommitResponse = client.send_request(ApiKey::OffsetCommit, request).await?;
+    let response: OffsetCommitResponse = send_to_group_coordinator(
+        client,
+        group_id,
+        ApiKey::OffsetCommit,
+        request,
+        offset_commit_coordinator_error,
+    )
+    .await?;
 
     let mut results = Vec::new();
     for topic in response.topics {
@@ -405,6 +452,167 @@ pub async fn commit_offsets(
 
     debug!("Committed {} offsets for group {}", results.len(), group_id);
     Ok(results)
+}
+
+/// Send a group-scoped request (OffsetFetch, OffsetCommit) to the group's
+/// coordinator.
+///
+/// The request goes to `client` first, so nothing extra happens when that
+/// broker coordinates the group. Any other broker answers with
+/// NOT_COORDINATOR; we then look the coordinator up with FindCoordinator and
+/// send the request there over a cached connection, retrying with backoff
+/// while the coordinator loads (same coordinator) or moves (fresh lookup).
+///
+/// `coordinator_error` returns the response's coordinator error code, if
+/// any. The last attempt's response is returned as is, for the caller to
+/// surface its error codes.
+async fn send_to_group_coordinator<Req, Resp>(
+    client: &KafkaClient,
+    group_id: &str,
+    api_key: ApiKey,
+    request: Req,
+    coordinator_error: fn(&Resp) -> Option<i16>,
+) -> Result<Resp>
+where
+    Req: Encodable + Default + Clone,
+    Resp: Decodable + Default,
+{
+    // `None` while the request is still going to `client` itself.
+    let mut coordinator: Option<(i32, Arc<KafkaClient>)> = None;
+    let mut relocate = false;
+
+    for attempt in 1..=MAX_COORDINATOR_ATTEMPTS {
+        let last_attempt = attempt == MAX_COORDINATOR_ATTEMPTS;
+
+        if relocate {
+            match locate_group_coordinator(client, group_id).await {
+                Ok(found) => {
+                    coordinator = Some(found);
+                    relocate = false;
+                }
+                Err(e) if is_transient_coordinator_error(&e) && !last_attempt => {
+                    let backoff = coordinator_backoff(attempt);
+                    warn!(
+                        "FindCoordinator for group {} failed on attempt {}/{}; retrying after {:?}: {}",
+                        group_id, attempt, MAX_COORDINATOR_ATTEMPTS, backoff, e
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let target = coordinator.as_ref().map_or(client, |(_, c)| c.as_ref());
+        let response: Resp = match target.send_request(api_key, request.clone()).await {
+            Ok(response) => response,
+            // The coordinator connection failed even after send_request's
+            // reconnect: the broker may be gone, so look the group up again.
+            Err(e)
+                if coordinator.is_some()
+                    && super::connection_error::is_connection_error(&e)
+                    && !last_attempt =>
+            {
+                if let Some((node_id, _)) = coordinator.take() {
+                    client.forget_coordinator_connection(node_id).await;
+                }
+                let backoff = coordinator_backoff(attempt);
+                warn!(
+                    "{:?} to the coordinator of group {} failed on attempt {}/{}; retrying after {:?}: {}",
+                    api_key, group_id, attempt, MAX_COORDINATOR_ATTEMPTS, backoff, e
+                );
+                tokio::time::sleep(backoff).await;
+                relocate = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let code = match coordinator_error(&response) {
+            Some(code) if !last_attempt => code,
+            _ => return Ok(response),
+        };
+        if code != COORDINATOR_LOAD_IN_PROGRESS {
+            relocate = true;
+        }
+        if coordinator.is_none() && relocate {
+            // The broker we were given is not the coordinator: just route.
+            debug!(
+                "{:?} for group {} needs its coordinator (error code {})",
+                api_key, group_id, code
+            );
+            continue;
+        }
+        let backoff = coordinator_backoff(attempt);
+        warn!(
+            "{:?} for group {} returned coordinator error code {} on attempt {}/{}; retrying after {:?}",
+            api_key, group_id, code, attempt, MAX_COORDINATOR_ATTEMPTS, backoff
+        );
+        tokio::time::sleep(backoff).await;
+    }
+
+    unreachable!("the last attempt always returns")
+}
+
+/// Find the coordinator of `group_id` and connect to it.
+async fn locate_group_coordinator(
+    client: &KafkaClient,
+    group_id: &str,
+) -> Result<(i32, Arc<KafkaClient>)> {
+    let coordinator = find_group_coordinator(client, group_id).await?;
+    if coordinator.node_id < 0 {
+        return Err(KafkaError::BrokerError {
+            code: COORDINATOR_NOT_AVAILABLE,
+            message: format!("FindCoordinator returned no coordinator for group {group_id}"),
+        }
+        .into());
+    }
+    let addr = format!("{}:{}", coordinator.host, coordinator.port);
+    let connection = client
+        .coordinator_connection(coordinator.node_id, &addr)
+        .await?;
+    Ok((coordinator.node_id, connection))
+}
+
+fn is_coordinator_error_code(code: i16) -> bool {
+    matches!(
+        code,
+        COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR
+    )
+}
+
+/// Whether `error` is a coordinator error worth retrying.
+fn is_transient_coordinator_error(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Kafka(KafkaError::BrokerError { code, .. }) if is_coordinator_error_code(*code)
+    )
+}
+
+fn coordinator_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((250 * attempt as u64).min(2_000))
+}
+
+/// OffsetFetch v2+ reports coordinator errors at the top level; v0/v1 on
+/// every partition.
+fn offset_fetch_coordinator_error(response: &OffsetFetchResponse) -> Option<i16> {
+    std::iter::once(response.error_code)
+        .chain(
+            response
+                .topics
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(|p| p.error_code)),
+        )
+        .find(|code| is_coordinator_error_code(*code))
+}
+
+/// OffsetCommit reports coordinator errors on every partition.
+fn offset_commit_coordinator_error(response: &OffsetCommitResponse) -> Option<i16> {
+    response
+        .topics
+        .iter()
+        .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+        .find(|code| is_coordinator_error_code(*code))
 }
 
 /// Find offsets by timestamp
@@ -511,5 +719,75 @@ mod tests {
         assert_eq!(coordinator.node_id, 2);
         assert_eq!(coordinator.host, "broker-2");
         assert_eq!(coordinator.port, 9093);
+    }
+
+    #[test]
+    fn transient_coordinator_errors_are_retryable() {
+        for code in [
+            COORDINATOR_LOAD_IN_PROGRESS,
+            COORDINATOR_NOT_AVAILABLE,
+            NOT_COORDINATOR,
+        ] {
+            let error = crate::Error::Kafka(KafkaError::BrokerError {
+                code,
+                message: "coordinator transient".to_string(),
+            });
+            assert!(is_transient_coordinator_error(&error));
+        }
+
+        let fatal = crate::Error::Kafka(KafkaError::BrokerError {
+            code: 30,
+            message: "group authorization failed".to_string(),
+        });
+        assert!(!is_transient_coordinator_error(&fatal));
+    }
+
+    #[test]
+    fn offset_fetch_coordinator_error_reads_top_level_and_partitions() {
+        use kafka_protocol::messages::offset_fetch_response::{
+            OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        };
+
+        let top_level = OffsetFetchResponse::default().with_error_code(NOT_COORDINATOR);
+        assert_eq!(
+            offset_fetch_coordinator_error(&top_level),
+            Some(NOT_COORDINATOR)
+        );
+
+        // v0/v1 brokers put the coordinator error on every partition.
+        let per_partition =
+            OffsetFetchResponse::default().with_topics(vec![OffsetFetchResponseTopic::default()
+                .with_partitions(vec![OffsetFetchResponsePartition::default()
+                    .with_error_code(COORDINATOR_LOAD_IN_PROGRESS)])]);
+        assert_eq!(
+            offset_fetch_coordinator_error(&per_partition),
+            Some(COORDINATOR_LOAD_IN_PROGRESS)
+        );
+
+        let denied = OffsetFetchResponse::default().with_error_code(30);
+        assert_eq!(offset_fetch_coordinator_error(&denied), None);
+    }
+
+    #[test]
+    fn offset_commit_coordinator_error_reads_partitions() {
+        use kafka_protocol::messages::offset_commit_response::{
+            OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        };
+
+        let response = |codes: &[i16]| {
+            OffsetCommitResponse::default().with_topics(vec![OffsetCommitResponseTopic::default()
+                .with_partitions(
+                    codes
+                        .iter()
+                        .map(|c| OffsetCommitResponsePartition::default().with_error_code(*c))
+                        .collect(),
+                )])
+        };
+
+        assert_eq!(
+            offset_commit_coordinator_error(&response(&[0, COORDINATOR_NOT_AVAILABLE])),
+            Some(COORDINATOR_NOT_AVAILABLE)
+        );
+        assert_eq!(offset_commit_coordinator_error(&response(&[0, 30])), None);
     }
 }

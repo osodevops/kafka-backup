@@ -338,6 +338,9 @@ impl OffsetSnapshotStorage for StorageBackendSnapshotStore {
 ///
 /// This function fetches the currently committed offsets for each consumer group
 /// from Kafka and creates a snapshot that can be used for rollback.
+///
+/// Fails if any group's offsets cannot be read: recording such a group as
+/// having no offsets would make a rollback to this snapshot restore nothing.
 pub async fn snapshot_current_offsets(
     client: &KafkaClient,
     group_ids: &[String],
@@ -350,47 +353,37 @@ pub async fn snapshot_current_offsets(
     for group_id in group_ids {
         debug!("Fetching offsets for group {}", group_id);
 
-        match fetch_offsets(client, group_id, None).await {
-            Ok(committed_offsets) => {
-                let mut offsets: HashMap<String, HashMap<i32, PartitionOffsetState>> =
-                    HashMap::new();
-                let mut partition_count = 0;
+        let committed_offsets = fetch_offsets(client, group_id, None)
+            .await
+            .inspect_err(|e| error!("Failed to fetch offsets for group {}: {}", group_id, e))?;
 
-                for committed in committed_offsets {
-                    if committed.error_code == 0 {
-                        offsets.entry(committed.topic.clone()).or_default().insert(
-                            committed.partition,
-                            PartitionOffsetState {
-                                offset: committed.offset,
-                                metadata: committed.metadata,
-                                timestamp: None,
-                            },
-                        );
-                        partition_count += 1;
-                    }
-                }
+        let mut offsets: HashMap<String, HashMap<i32, PartitionOffsetState>> = HashMap::new();
+        let mut partition_count = 0;
 
-                snapshot.add_group(GroupOffsetState {
-                    group_id: group_id.clone(),
-                    offsets,
-                    partition_count,
-                });
-
-                debug!(
-                    "Captured {} partitions for group {}",
-                    partition_count, group_id
+        for committed in committed_offsets {
+            if committed.error_code == 0 {
+                offsets.entry(committed.topic.clone()).or_default().insert(
+                    committed.partition,
+                    PartitionOffsetState {
+                        offset: committed.offset,
+                        metadata: committed.metadata,
+                        timestamp: None,
+                    },
                 );
-            }
-            Err(e) => {
-                warn!("Failed to fetch offsets for group {}: {}", group_id, e);
-                // Add empty state to indicate the group was processed but had no offsets
-                snapshot.add_group(GroupOffsetState {
-                    group_id: group_id.clone(),
-                    offsets: HashMap::new(),
-                    partition_count: 0,
-                });
+                partition_count += 1;
             }
         }
+
+        snapshot.add_group(GroupOffsetState {
+            group_id: group_id.clone(),
+            offsets,
+            partition_count,
+        });
+
+        debug!(
+            "Captured {} partitions for group {}",
+            partition_count, group_id
+        );
     }
 
     info!(

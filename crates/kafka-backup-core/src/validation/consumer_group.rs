@@ -35,10 +35,9 @@ impl ValidationCheck for ConsumerGroupOffsetCheck {
     async fn run(&self, ctx: &ValidationContext) -> Result<ValidationResult> {
         let start = Instant::now();
 
-        // List all consumer groups on the restored cluster.
-        // ListGroups/OffsetFetch are forwarded by the broker to the group
-        // coordinator, so partition-leader routing is not needed here.
-        let groups = consumer_groups::list_groups(ctx.target_client.bootstrap_client()).await?;
+        // List all consumer groups on the restored cluster. Each broker lists
+        // only the groups it coordinates, so ask every broker (#224).
+        let groups = ctx.target_client.list_groups_all_brokers_strict().await?;
 
         let group_ids: Vec<String> =
             if self.config.verify_all_groups || self.config.groups.is_empty() {

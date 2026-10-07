@@ -1,9 +1,12 @@
 //! `snapshot-groups` command — snapshot consumer group offsets for backed-up topics.
 //!
 //! Queries every broker for consumer groups (KRaft-safe), fetches their committed
-//! offsets, filters to groups that have offsets on backed-up topics, and saves the
-//! result to `{backup_id}/consumer-groups-snapshot.json` in the configured storage
-//! backend.
+//! offsets from each group's coordinator, filters to groups that have offsets on
+//! backed-up topics, and saves the result to
+//! `{backup_id}/consumer-groups-snapshot.json` in the configured storage backend.
+//!
+//! If any group cannot be read the command fails and leaves the previous
+//! snapshot in place, rather than saving one that silently lacks groups (#224).
 //!
 //! The snapshot can be loaded automatically at restore time via
 //! `auto_consumer_groups: true` in the restore configuration.
@@ -12,7 +15,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde::Serialize;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use kafka_backup_core::{
     config::Mode,
@@ -78,16 +81,23 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     // List all consumer groups across ALL brokers (KRaft: each broker is coordinator
     // only for a subset of groups — must query all brokers to get the full list)
-    let all_groups = router.list_groups_all_brokers().await?;
+    let all_groups = router.list_groups_all_brokers_strict().await.map_err(|e| {
+        anyhow!(
+            "Failed to list consumer groups on every broker ({}); \
+             not saving an incomplete snapshot",
+            e
+        )
+    })?;
     info!(
         "Found {} consumer groups across all brokers",
         all_groups.len()
     );
 
-    // Use bootstrap client for OffsetFetch (broker routes to correct coordinator)
+    // fetch_offsets routes each OffsetFetch to the group's coordinator
     let bootstrap_client = router.bootstrap_client();
 
     let mut snapshot_groups: Vec<GroupEntry> = Vec::new();
+    let mut failed_groups: Vec<String> = Vec::new();
 
     for group in &all_groups {
         let group_id = &group.group_id;
@@ -95,7 +105,8 @@ pub async fn run(config_path: &str) -> Result<()> {
         let committed = match fetch_offsets(bootstrap_client, group_id, None).await {
             Ok(c) => c,
             Err(e) => {
-                warn!("Failed to fetch offsets for group {}: {}", group_id, e);
+                error!("Failed to fetch offsets for group {}: {}", group_id, e);
+                failed_groups.push(group_id.clone());
                 continue;
             }
         };
@@ -107,7 +118,7 @@ pub async fn run(config_path: &str) -> Result<()> {
 
         let mut offsets_by_topic: HashMap<String, HashMap<String, i64>> = HashMap::new();
         for co in &committed {
-            if backed_topics.contains(&co.topic) && co.offset >= 0 {
+            if backed_topics.contains(&co.topic) && co.error_code == 0 && co.offset >= 0 {
                 offsets_by_topic
                     .entry(co.topic.clone())
                     .or_default()
@@ -132,6 +143,16 @@ pub async fn run(config_path: &str) -> Result<()> {
             group_id: group_id.clone(),
             offsets: offsets_by_topic,
         });
+    }
+
+    if !failed_groups.is_empty() {
+        anyhow::bail!(
+            "could not read offsets for {} of {} consumer groups ({}); \
+             not saving an incomplete snapshot",
+            failed_groups.len(),
+            all_groups.len(),
+            failed_groups.join(", ")
+        );
     }
 
     info!(

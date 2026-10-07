@@ -631,6 +631,12 @@ restore:
   auto_consumer_groups: true   # implies reset_consumer_offsets
 ```
 
+`kafka-backup snapshot-groups --config backup.yaml` lists the groups on every
+broker and reads each group's offsets from its coordinator, so one bootstrap
+server is enough. If a broker cannot be listed or a group's offsets cannot be
+read, it exits non-zero and leaves the previous snapshot in place rather than
+saving one that is missing groups; re-run it once the cluster is healthy.
+
 **WARNING**: This modifies `__consumer_offsets` on the target cluster. Only use with explicit understanding of the implications.
 
 How it is applied:

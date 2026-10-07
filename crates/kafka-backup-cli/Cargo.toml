@@ -48,6 +48,8 @@ sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# In-process mock brokers for the snapshot-groups tests (issue #224)
+kafka-protocol.workspace = true
 
 [features]
 default = []

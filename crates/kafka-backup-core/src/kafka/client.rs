@@ -55,7 +55,15 @@ pub struct KafkaClient {
     /// (spawned from `sasl_plugin_auth`) can share the same monotonic
     /// counter as the main client.
     pub(super) correlation_id: Arc<AtomicI32>,
+
+    /// Connections to consumer-group coordinators. Group-scoped requests must
+    /// reach the group's coordinator, which is usually not the broker this
+    /// client is connected to (#224).
+    coordinators: Arc<Mutex<CoordinatorConnections>>,
 }
+
+/// Coordinator node id -> (address, client).
+type CoordinatorConnections = HashMap<i32, (String, Arc<KafkaClient>)>;
 
 /// A stream that can be either plain TCP or TLS-wrapped
 pub(super) enum ConnectionStream {
@@ -100,11 +108,40 @@ impl KafkaClient {
             brokers: Arc::new(Mutex::new(HashMap::new())),
             topics: Arc::new(Mutex::new(HashMap::new())),
             correlation_id: Arc::new(AtomicI32::new(1)),
+            coordinators: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(super) fn config_clone(&self) -> KafkaConfig {
         self.config.clone()
+    }
+
+    /// Connection to group coordinator `node_id` at `addr`, reusing the
+    /// cached one while the coordinator's address is unchanged.
+    pub(super) async fn coordinator_connection(
+        &self,
+        node_id: i32,
+        addr: &str,
+    ) -> Result<Arc<KafkaClient>> {
+        let mut coordinators = self.coordinators.lock().await;
+        if let Some((cached_addr, client)) = coordinators.get(&node_id) {
+            if cached_addr == addr {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut config = self.config.clone();
+        config.bootstrap_servers = vec![addr.to_string()];
+        let client = Arc::new(KafkaClient::new(config));
+        client.connect().await?;
+        debug!("Connected to group coordinator {} at {}", node_id, addr);
+        coordinators.insert(node_id, (addr.to_string(), client.clone()));
+        Ok(client)
+    }
+
+    /// Drop the cached connection to coordinator `node_id`.
+    pub(super) async fn forget_coordinator_connection(&self, node_id: i32) {
+        self.coordinators.lock().await.remove(&node_id);
     }
 
     /// Connect to the Kafka cluster
