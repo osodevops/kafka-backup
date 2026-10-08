@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod commands;
@@ -360,8 +360,14 @@ enum OffsetRollbackAction {
         #[command(flatten)]
         security: SecurityCliArgs,
 
-        /// Verify offsets after rollback
-        #[arg(long, default_value = "true")]
+        /// Verify offsets after rollback (`--verify false` to skip)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
         verify: bool,
 
         /// Output format (text, json)
@@ -424,8 +430,14 @@ enum OffsetResetAction {
         #[arg(short, long, default_value = "text")]
         format: String,
 
-        /// Dry run mode (preview only, no changes)
-        #[arg(long, default_value = "true")]
+        /// Dry run mode (preview only, no changes; `--dry-run false` to turn off)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
         dry_run: bool,
     },
 

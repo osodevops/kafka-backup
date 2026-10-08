@@ -409,7 +409,7 @@ kafka-backup offset-rollback rollback [OPTIONS]
 | `--snapshot-id`, `-s` | Yes | Snapshot ID to rollback to |
 | `--bootstrap-servers` | Yes | Kafka brokers (comma-separated) |
 | `--security-protocol` | No | Security protocol |
-| `--verify` | No | Verify after rollback (default: true) |
+| `--verify` | No | Verify after rollback (default: true; `--verify false` to skip) |
 | `--format`, `-f` | No | Output format: text, json |
 
 ### offset-rollback verify
