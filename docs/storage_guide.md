@@ -567,17 +567,30 @@ services:
       - minio
       - kafka
 
+  # minio/minio was deleted from Docker Hub (Sept 2026). The Chainguard build
+  # runs as uid 65532; root keeps volumes created by the old image writable.
   minio:
-    image: minio/minio
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+    command: ["server", "/data", "--console-address", ":9001"]
     volumes:
       - minio-data:/data
+
+  # Create the bucket (the image's entrypoint is mc)
+  minio-setup:
+    image: cgr.dev/chainguard/minio-client:latest
+    environment:
+      MC_HOST_local: http://minioadmin:minioadmin@minio:9000
+    command: ["mb", "--ignore-existing", "local/kafka-backups"]
+    restart: on-failure
+    depends_on:
+      - minio
 
 volumes:
   minio-data:
