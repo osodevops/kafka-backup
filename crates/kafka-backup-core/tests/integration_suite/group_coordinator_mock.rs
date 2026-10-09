@@ -65,6 +65,9 @@ pub struct ClusterState {
     pub offset_fetches: Vec<(i32, String)>,
     /// (broker id, group) for every OffsetCommit received.
     pub offset_commits: Vec<(i32, String)>,
+    /// Offsets a live consumer of the group commits straight after every
+    /// accepted OffsetCommit, overwriting it.
+    pub racing_commits: HashMap<String, BTreeMap<(String, i32), i64>>,
 }
 
 pub struct MockCluster {
@@ -165,6 +168,19 @@ impl MockCluster {
             .entry(group.to_string())
             .or_default()
             .insert((topic.to_string(), partition), offset);
+    }
+
+    /// Model a live consumer that commits `offsets` straight after every
+    /// OffsetCommit the group's coordinator accepts, so the commit doesn't
+    /// stick.
+    pub fn race_commits(&self, group: &str, offsets: &[(&str, i32, i64)]) {
+        self.state.lock().unwrap().racing_commits.insert(
+            group.to_string(),
+            offsets
+                .iter()
+                .map(|(t, p, o)| ((t.to_string(), *p), *o))
+                .collect(),
+        );
     }
 
     pub fn committed(&self, group: &str) -> BTreeMap<(String, i32), i64> {
@@ -407,6 +423,11 @@ fn offset_commit(
                 .with_name(topic.name.clone())
                 .with_partitions(partitions),
         );
+    }
+    if code == 0 {
+        if let Some(racing) = state.racing_commits.get(&group).cloned() {
+            state.offsets.entry(group).or_default().extend(racing);
+        }
     }
     OffsetCommitResponse::default().with_topics(topics)
 }

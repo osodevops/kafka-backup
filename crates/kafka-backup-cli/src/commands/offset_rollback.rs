@@ -249,6 +249,7 @@ pub async fn execute_rollback(
 
     // Check status before outputting (since result may be moved in JSON case)
     let failed = result.status == RollbackStatus::Failed;
+    let mismatched = verification.as_ref().is_some_and(|v| !v.verified);
 
     // Output result
     match format {
@@ -275,6 +276,9 @@ pub async fn execute_rollback(
 
     if failed {
         anyhow::bail!("Rollback failed");
+    }
+    if mismatched {
+        anyhow::bail!("Verification failed - offsets do not match snapshot");
     }
 
     Ok(())
