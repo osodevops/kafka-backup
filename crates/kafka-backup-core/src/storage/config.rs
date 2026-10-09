@@ -117,6 +117,45 @@ pub(crate) fn implied_allow_http(endpoint: Option<&str>, explicit: bool) -> bool
     explicit || endpoint.is_some_and(|e| e.starts_with("http://"))
 }
 
+/// The local directory a `file://` URL names (#221).
+///
+/// `Url::to_file_path` percent-decodes (`my%20backups` → `my backups`) and
+/// maps `file:///C:/x` to `C:\x` on Windows. Only local URLs are accepted:
+/// a host used to be dropped silently, so `file://tmp/backups` meant
+/// `/backups`. A query or fragment, an empty or root path, and NUL bytes are
+/// rejected rather than ignored.
+fn file_url_to_path(parsed: &url::Url, raw: &str) -> crate::Result<PathBuf> {
+    let err = |msg: String| crate::Error::Config(format!("Invalid file URL {raw}: {msg}"));
+
+    // `localhost` is normalised to "no host" by the parser.
+    if let Some(host) = parsed.host_str() {
+        return Err(err(format!(
+            "host \"{host}\" is not supported; use file:///{host}{} (three slashes) for \
+             an absolute path, or pass a relative path without file://",
+            parsed.path()
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(err(
+            "a file URL takes no query string or fragment; percent-encode '?' as %3F and \
+             '#' as %23 in directory names"
+                .to_string(),
+        ));
+    }
+    let path = parsed
+        .to_file_path()
+        .map_err(|()| err("not a local path".to_string()))?;
+    if path.parent().is_none() {
+        return Err(err(
+            "no directory given (it would mean the filesystem root)".to_string(),
+        ));
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(err("the path contains a NUL byte (%00)".to_string()));
+    }
+    Ok(path)
+}
+
 impl StorageBackendConfig {
     /// Parse configuration from a URL string
     ///
@@ -124,7 +163,8 @@ impl StorageBackendConfig {
     /// - `s3://bucket-name?region=us-east-1`
     /// - `azure://container@account.blob.core.windows.net`
     /// - `gcs://bucket-name`
-    /// - `file:///path/to/data`
+    /// - `file:///path/to/data` (percent-decoded; host must be empty or
+    ///   `localhost`)
     /// - `memory://`
     pub fn from_url(url: &str) -> crate::Result<Self> {
         let parsed = url::Url::parse(url)
@@ -210,7 +250,7 @@ impl StorageBackendConfig {
                 })
             }
             "file" => Ok(Self::Filesystem {
-                path: PathBuf::from(parsed.path()),
+                path: file_url_to_path(&parsed, url)?,
             }),
             "memory" => Ok(Self::Memory),
             scheme => Err(crate::Error::Config(format!(
@@ -277,6 +317,127 @@ mod tests {
             }
             _ => panic!("Expected Filesystem config"),
         }
+    }
+
+    fn file_path(url: &str) -> PathBuf {
+        match StorageBackendConfig::from_url(url) {
+            Ok(StorageBackendConfig::Filesystem { path }) => path,
+            other => panic!("{url}: expected a filesystem config, got {other:?}"),
+        }
+    }
+
+    fn file_error(url: &str) -> String {
+        match StorageBackendConfig::from_url(url) {
+            Err(e) => e.to_string(),
+            Ok(config) => panic!("{url}: should be rejected, got {config:?}"),
+        }
+    }
+
+    /// #221: `file://` URLs are percent-decoded like any URL.
+    #[cfg(unix)]
+    #[test]
+    fn file_url_is_percent_decoded() {
+        assert_eq!(
+            file_path("file:///tmp/my%20backups"),
+            PathBuf::from("/tmp/my backups")
+        );
+        assert_eq!(
+            file_path("file:///data/caf%C3%A9/b%C3%BCro"),
+            PathBuf::from("/data/café/büro")
+        );
+        // Non-UTF-8 bytes are legal in Unix paths.
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            file_path("file:///tmp/%FF").as_os_str().as_bytes(),
+            b"/tmp/\xFF"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_url_accepts_localhost_and_the_one_slash_form() {
+        for url in [
+            "file://localhost/var/kafka-backups",
+            "file://LOCALHOST/var/kafka-backups",
+            "file:/var/kafka-backups",
+            "file:///var/kafka-backups/",
+            "file:///var/x/../kafka-backups",
+        ] {
+            let path = file_path(url);
+            assert_eq!(
+                path.components().collect::<Vec<_>>(),
+                PathBuf::from("/var/kafka-backups")
+                    .components()
+                    .collect::<Vec<_>>(),
+                "{url}"
+            );
+        }
+    }
+
+    /// #221: a host used to be dropped silently, so `file://tmp/backups`
+    /// (meaning /tmp/backups) became `/backups`, and a remote host read the
+    /// local disk.
+    #[test]
+    fn file_url_rejects_a_host() {
+        let err = file_error("file://tmp/backups");
+        assert!(err.contains("host \"tmp\""), "{err}");
+        assert!(
+            err.contains("file:///tmp/backups"),
+            "suggests three slashes: {err}"
+        );
+        let err = file_error("file://nfs-server/exports/kafka");
+        assert!(err.contains("nfs-server"), "{err}");
+    }
+
+    #[test]
+    fn file_url_rejects_query_and_fragment() {
+        for url in [
+            "file:///tmp/x?region=us-east-1",
+            "file:///tmp/x#y",
+            "file:///tmp/x?",
+        ] {
+            let err = file_error(url);
+            assert!(
+                err.contains("query") || err.contains("fragment"),
+                "{url}: {err}"
+            );
+        }
+        // An encoded `?` / `#` is part of the directory name.
+        #[cfg(unix)]
+        assert_eq!(
+            file_path("file:///tmp/a%3Fb%23c"),
+            PathBuf::from("/tmp/a?b#c")
+        );
+    }
+
+    /// `file://` with no path (e.g. `file://$BACKUP_DIR` with the variable
+    /// unset) must not mean the filesystem root.
+    #[test]
+    fn file_url_rejects_an_empty_or_root_path() {
+        for url in [
+            "file://",
+            "file:///",
+            "file://localhost",
+            "file://localhost/",
+        ] {
+            let err = file_error(url);
+            assert!(err.contains("no directory"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn file_url_rejects_nul_bytes() {
+        let err = file_error("file:///tmp/a%00b");
+        assert!(err.contains("NUL"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_url_drive_letter_is_a_windows_path() {
+        assert_eq!(
+            file_path("file:///C:/backups"),
+            PathBuf::from(r"C:\backups")
+        );
     }
 
     #[test]
