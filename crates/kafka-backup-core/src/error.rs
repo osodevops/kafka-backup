@@ -134,6 +134,14 @@ pub enum KafkaError {
     PrivateKeyLoad { path: String, message: String },
 }
 
+impl Error {
+    /// True only when the object is known not to exist. A permission,
+    /// network or other storage failure is not "missing" (#218).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::Storage(StorageError::NotFound(_)))
+    }
+}
+
 /// Storage-specific errors
 #[derive(Error, Debug)]
 pub enum StorageError {

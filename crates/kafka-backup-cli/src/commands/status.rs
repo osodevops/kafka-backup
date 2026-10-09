@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kafka_backup_core::{BackupManifest, OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use std::path::PathBuf;
 use tracing::info;
@@ -53,12 +53,18 @@ async fn run_static(path: &str, backup_id: &str, db_path: Option<&str>) -> Resul
 
     // Load manifest
     let manifest_key = format!("{}/manifest.json", backup_id);
-    let manifest_data = storage.get(&manifest_key).await;
-
-    let manifest: Option<BackupManifest> = match manifest_data {
-        Ok(data) => serde_json::from_slice(&data).ok(),
-        Err(_) => None,
-    };
+    // Only a missing manifest is "Not found"; a 403 or network error is
+    // reported with its cause (#218).
+    let manifest: Option<BackupManifest> =
+        match kafka_backup_core::storage::get_if_exists(storage.as_ref(), &manifest_key)
+            .await
+            .with_context(|| format!("reading {manifest_key}"))?
+        {
+            Some(data) => Some(
+                serde_json::from_slice(&data).with_context(|| format!("parsing {manifest_key}"))?,
+            ),
+            None => None,
+        };
 
     // Load offset store if db_path provided
     let offset_store = if let Some(db) = db_path {

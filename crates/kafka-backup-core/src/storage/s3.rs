@@ -126,6 +126,18 @@ impl S3Backend {
     }
 }
 
+/// Map an object_store error for `key`. A missing key is
+/// `StorageError::NotFound`, as on the other backends, so callers can tell
+/// "missing" from "failed" (403, network, 5xx) (#218).
+fn s3_error(op: &str, key: &str, e: object_store::Error) -> Error {
+    match e {
+        object_store::Error::NotFound { .. } => {
+            Error::Storage(StorageError::NotFound(key.to_string()))
+        }
+        e => Error::Storage(StorageError::Backend(format!("S3 {op} failed: {e}"))),
+    }
+}
+
 #[async_trait]
 impl StorageBackend for S3Backend {
     fn backend_name(&self) -> &str {
@@ -148,10 +160,11 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 GET: {}", path);
 
-        let result =
-            self.store.get(&path).await.map_err(|e| {
-                Error::Storage(StorageError::Backend(format!("S3 GET failed: {}", e)))
-            })?;
+        let result = self
+            .store
+            .get(&path)
+            .await
+            .map_err(|e| s3_error("GET", key, e))?;
 
         let bytes = result.bytes().await.map_err(|e| {
             Error::Storage(StorageError::Backend(format!(
@@ -226,10 +239,11 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 HEAD (size): {}", path);
 
-        let meta =
-            self.store.head(&path).await.map_err(|e| {
-                Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e)))
-            })?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| s3_error("HEAD", key, e))?;
 
         Ok(meta.size as u64)
     }
@@ -238,10 +252,11 @@ impl StorageBackend for S3Backend {
         let path = self.full_path(key);
         debug!("S3 HEAD: {}", path);
 
-        let meta =
-            self.store.head(&path).await.map_err(|e| {
-                Error::Storage(StorageError::Backend(format!("S3 HEAD failed: {}", e)))
-            })?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| s3_error("HEAD", key, e))?;
 
         Ok(ObjectMetadata {
             size: meta.size as u64,
@@ -258,7 +273,7 @@ impl StorageBackend for S3Backend {
         self.store
             .copy(&src_path, &dest_path)
             .await
-            .map_err(|e| Error::Storage(StorageError::Backend(format!("S3 COPY failed: {}", e))))?;
+            .map_err(|e| s3_error("COPY", src, e))?;
 
         Ok(())
     }
@@ -267,6 +282,40 @@ impl StorageBackend for S3Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #218: a missing key is NotFound; anything else (403, network) is not.
+    #[test]
+    fn s3_error_maps_only_not_found_to_not_found() {
+        let missing = object_store::Error::NotFound {
+            path: "b/manifest.json".to_string(),
+            source: "404 NoSuchKey".into(),
+        };
+        let err = s3_error("GET", "b/manifest.json", missing);
+        assert!(err.is_not_found());
+        assert_eq!(
+            err.to_string(),
+            "Storage error: Object not found: b/manifest.json"
+        );
+
+        for other in [
+            object_store::Error::PermissionDenied {
+                path: "b/manifest.json".to_string(),
+                source: "403 AccessDenied".into(),
+            },
+            object_store::Error::Unauthenticated {
+                path: "b/manifest.json".to_string(),
+                source: "401".into(),
+            },
+            object_store::Error::Generic {
+                store: "S3",
+                source: "connection refused".into(),
+            },
+        ] {
+            let err = s3_error("GET", "b/manifest.json", other);
+            assert!(!err.is_not_found(), "{err}");
+            assert!(err.to_string().contains("S3 GET failed"), "{err}");
+        }
+    }
 
     // Note: These tests require actual S3 or MinIO to run
     // They are ignored by default

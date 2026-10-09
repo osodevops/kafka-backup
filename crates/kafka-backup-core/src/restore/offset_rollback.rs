@@ -291,17 +291,17 @@ impl OffsetSnapshotStorage for StorageBackendSnapshotStore {
         // Find all metadata.json files
         for key in keys {
             if key.ends_with("/metadata.json") {
-                match self.backend.get(&key).await {
-                    Ok(data) => {
+                // Deleted since the listing: skip. Any other read error is
+                // returned, not reported as "no snapshots" (#218).
+                match crate::storage::get_if_exists(self.backend.as_ref(), &key).await? {
+                    Some(data) => {
                         if let Ok(metadata) =
                             serde_json::from_slice::<OffsetSnapshotMetadata>(&data)
                         {
                             snapshots.push(metadata);
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to read snapshot metadata {}: {}", key, e);
-                    }
+                    None => debug!("Snapshot metadata {} disappeared during listing", key),
                 }
             }
         }
@@ -886,6 +886,29 @@ fn generate_snapshot_id() -> String {
 mod tests {
     use super::*;
     use crate::storage::MemoryBackend;
+
+    /// #218: an unreadable snapshot's metadata used to be skipped with a
+    /// warning, so `offset-rollback list` could report "No offset snapshots
+    /// found" while every snapshot was there but unreadable.
+    #[tokio::test]
+    async fn list_snapshots_fails_when_metadata_is_unreadable() {
+        let storage = Arc::new(crate::storage::testing::FaultyStorage::new());
+        let store = StorageBackendSnapshotStore::new(storage.clone());
+        let snapshot = OffsetSnapshot::new(vec!["localhost:9092".to_string()]);
+        store.save_snapshot(&snapshot).await.unwrap();
+        assert_eq!(store.list_snapshots().await.unwrap().len(), 1);
+
+        storage.deny_reads("metadata.json");
+        assert!(store.list_snapshots().await.is_err());
+
+        // Deleted between LIST and GET: skipped, not an error.
+        storage.heal();
+        storage.fail_reads(
+            "metadata.json",
+            crate::error::StorageError::NotFound(String::new()),
+        );
+        assert!(store.list_snapshots().await.unwrap().is_empty());
+    }
 
     #[test]
     fn test_offset_snapshot_creation() {

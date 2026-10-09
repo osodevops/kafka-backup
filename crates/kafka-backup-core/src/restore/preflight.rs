@@ -118,7 +118,8 @@ pub struct PartitionHeaderCoverage {
 /// `auto_consumer_groups`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotCheck {
-    /// `present`, `missing`, or `invalid`.
+    /// `present`, `missing`, `invalid`, or `unreadable` (it exists, or may
+    /// exist, but reading it failed, e.g. 403 or a network error).
     pub state: String,
     /// Number of consumer groups in the snapshot (when present).
     pub groups: usize,
@@ -419,8 +420,14 @@ async fn check_consumer_group_snapshot(
                 detail: format!("{key}: {e}"),
             },
         },
-        Err(e) => SnapshotCheck {
+        Err(e) if e.is_not_found() => SnapshotCheck {
             state: "missing".to_string(),
+            groups: 0,
+            offsets: 0,
+            detail: format!("{key}: {e}"),
+        },
+        Err(e) => SnapshotCheck {
+            state: "unreadable".to_string(),
             groups: 0,
             offsets: 0,
             detail: format!("{key}: {e}"),
@@ -466,6 +473,11 @@ fn evaluate(
                 "auto_consumer_groups requires the consumer-groups snapshot but it is absent \
                  ({}). Re-run the backup with consumer-group snapshotting, run the \
                  snapshot-groups command, or disable auto_consumer_groups.",
+                snapshot.detail
+            )),
+            "unreadable" => report.errors.push(format!(
+                "auto_consumer_groups requires the consumer-groups snapshot but it cannot be \
+                 read ({}). Check the storage credentials and permissions.",
                 snapshot.detail
             )),
             _ => report.errors.push(format!(
@@ -690,6 +702,27 @@ fn push_example(problems: &mut Vec<String>, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #218: a snapshot that exists but can't be read (403, network) is not
+    /// "missing" — that state tells the user to re-run the backup.
+    #[tokio::test]
+    async fn unreadable_consumer_group_snapshot_is_not_missing() {
+        let storage = crate::storage::testing::FaultyStorage::new();
+        let missing = check_consumer_group_snapshot(&storage, "b").await;
+        assert_eq!(missing.state, "missing");
+
+        storage
+            .put(
+                "b/consumer-groups-snapshot.json",
+                bytes::Bytes::from_static(br#"{"snapshot_time": 1, "groups": []}"#),
+            )
+            .await
+            .unwrap();
+        storage.deny_reads("consumer-groups-snapshot.json");
+        let check = check_consumer_group_snapshot(&storage, "b").await;
+        assert_eq!(check.state, "unreadable");
+        assert!(check.detail.contains("403"), "{}", check.detail);
+    }
 
     fn coverage(
         scanned: u64,

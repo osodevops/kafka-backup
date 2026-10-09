@@ -6,14 +6,14 @@
 //! - Executing offset resets
 //! - Generating shell scripts for manual execution
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kafka_backup_core::config::{KafkaConfig, SecurityConfig};
 use kafka_backup_core::kafka::KafkaClient;
 use kafka_backup_core::manifest::OffsetMapping;
 use kafka_backup_core::restore::offset_reset::{
     OffsetResetExecutor, OffsetResetPlan, OffsetResetStrategy,
 };
-use kafka_backup_core::storage::StorageBackend;
+use kafka_backup_core::storage::{get_if_exists, StorageBackend};
 use tracing::{info, warn};
 
 use super::storage_path::backend_from_path;
@@ -172,8 +172,14 @@ async fn load_offset_mapping(
     backup_id: &str,
 ) -> Result<OffsetMapping> {
     // First try to load from restore report (has actual source->target mapping)
+    // Each source falls through to the next only when it doesn't exist; an
+    // unreadable one (403, network) is an error, not a reason to use a
+    // different mapping (#218).
     let restore_report_key = format!("{}/restore-report.json", backup_id);
-    if let Ok(data) = storage.get(&restore_report_key).await {
+    if let Some(data) = get_if_exists(storage, &restore_report_key)
+        .await
+        .with_context(|| format!("reading {restore_report_key}"))?
+    {
         let report: kafka_backup_core::manifest::RestoreReport = serde_json::from_slice(&data)?;
         info!("Loaded offset mapping from restore report");
         return Ok(report.offset_mapping);
@@ -181,7 +187,10 @@ async fn load_offset_mapping(
 
     // Fall back to offset-mapping.json if it exists
     let mapping_key = format!("{}/offset-mapping.json", backup_id);
-    if let Ok(data) = storage.get(&mapping_key).await {
+    if let Some(data) = get_if_exists(storage, &mapping_key)
+        .await
+        .with_context(|| format!("reading {mapping_key}"))?
+    {
         let mapping: OffsetMapping = serde_json::from_slice(&data)?;
         info!("Loaded offset mapping from offset-mapping.json");
         return Ok(mapping);

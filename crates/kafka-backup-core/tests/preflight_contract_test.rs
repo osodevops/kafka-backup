@@ -644,6 +644,54 @@ async fn time_window_limits_the_scan_to_restorable_segments() {
 // Consumer-groups snapshot requirements
 // ---------------------------------------------------------------------------
 
+/// #218: a snapshot that exists but can't be read is "unreadable", not
+/// "missing" (whose advice is to re-run the backup).
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_consumer_group_snapshot_is_not_reported_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let seg = write_binary_segment(dir.path(), 0, 0, 10, true).await;
+    let manifest = write_manifest(
+        dir.path(),
+        vec![PartitionBackup {
+            partition_id: 0,
+            segments: vec![seg],
+            gaps: Vec::new(),
+            pruned: Vec::new(),
+        }],
+    );
+    write_consumer_group_snapshot(dir.path(), r#"{"snapshot_time": 1, "groups": []}"#);
+    let path = dir
+        .path()
+        .join(BACKUP_ID)
+        .join("consumer-groups-snapshot.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        eprintln!("running as root: file permissions are not enforced, skipping");
+        return;
+    }
+
+    let options = RestoreOptions {
+        auto_consumer_groups: true,
+        ..RestoreOptions::default()
+    };
+    let report = scan(dir.path(), &manifest, &options, HeaderPreflightMode::Auto).await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(!report.passed);
+    assert_eq!(
+        report.consumer_group_snapshot.as_ref().unwrap().state,
+        "unreadable"
+    );
+    assert!(
+        report.errors.iter().any(|e| e.contains("cannot be read")),
+        "{:?}",
+        report.errors
+    );
+}
+
 #[tokio::test]
 async fn auto_consumer_groups_requires_snapshot() {
     let dir = TempDir::new().unwrap();
