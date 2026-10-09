@@ -71,7 +71,7 @@ object_store = { version = "0.14", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 
 # Metrics
-prometheus-client = "0.24"
+prometheus-client = "0.25"
 
 # HTTP server
 hyper = { version = "1.9", features = ["server", "http1"] }
