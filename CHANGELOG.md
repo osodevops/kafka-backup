@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.8] - 2026-10-09
+
+### Fixed
+- Storage errors no longer read as "missing"
+  ([#218](https://github.com/osodevops/kafka-backup/issues/218)). Only a
+  real not-found falls through; a 403, network failure or 5xx after retries
+  is returned with its cause. Two of these lost data:
+  - **Backup manifest:** each save merges with the stored `manifest.json`.
+    A failed read (e.g. S3 403) was treated as "no manifest yet", so the
+    save replaced the manifest with only the current run's topics and
+    segments, orphaning every earlier segment while the backup reported
+    success. The save now fails and leaves the stored manifest alone.
+  - **Consumer-group snapshot:** the guard that keeps an existing
+    `consumer-groups-snapshot.json` from being replaced by an empty one
+    read a failed existence check as "no snapshot", and overwrote it. The
+    (non-fatal) snapshot step now fails instead.
+  - `status` printed "Manifest: Not found" for an unreadable or unparseable
+    manifest; it now reports the error.
+  - `offset-reset` / `offset-reset-bulk` fell back from an unreadable
+    `restore-report.json` to `offset-mapping.json` (or the manifest's
+    source offsets) without saying why; they now fail.
+  - `prune` treated an unreadable `offsets.db` as absent, planning without
+    resume positions or the liveness check; it now fails.
+  - `offset-rollback list` skipped snapshots whose metadata couldn't be
+    read; it now fails.
+  - Retention reports a failed manifest read (non-fatal) instead of skipping
+    silently.
+  - The Phase 1 preflight reports an unreadable consumer-groups snapshot as
+    `unreadable` ("check the storage credentials") instead of `missing`
+    ("re-run the backup").
+- The S3 backend reports a missing key as `StorageError::NotFound` (it was
+  `Backend("S3 GET failed: … not found")`), like the filesystem, memory,
+  Azure and GCS backends.
+
+### Added
+- `Error::is_not_found()` and `storage::get_if_exists()`.
+
 ## [0.23.7] - 2026-10-09
 
 ### Fixed

@@ -55,7 +55,13 @@ pub async fn run(
     let mut resume: HashMap<(String, i32), i64> = HashMap::new();
     let mut newest_checkpoint_ms: Option<i64> = None;
     let mut job_status: Option<String> = None;
-    if storage.exists(&offsets_key).await.unwrap_or(false) {
+    // Unknown is not "absent": without offsets.db the plan can't see resume
+    // positions or tell that a backup is live (#218).
+    if storage
+        .exists(&offsets_key)
+        .await
+        .with_context(|| format!("checking {offsets_key}"))?
+    {
         let tmp = std::env::temp_dir().join(format!(
             "kafka-backup-prune-{}-{}",
             std::process::id(),

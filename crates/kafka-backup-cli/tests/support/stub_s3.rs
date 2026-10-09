@@ -30,6 +30,8 @@ struct State {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
     log: Mutex<Vec<Req>>,
     deny_list: AtomicBool,
+    /// GET / HEAD of a key ending in one of these answers 403 AccessDenied.
+    deny_get: Mutex<Vec<String>>,
 }
 
 pub struct StubS3 {
@@ -99,6 +101,12 @@ impl StubS3 {
     /// Answer ListObjectsV2 with 403 AccessDenied.
     pub fn deny_list(&self) {
         self.state.deny_list.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer GET / HEAD of any key ending in `suffix` with 403 AccessDenied,
+    /// whether or not the object exists (like S3 without s3:GetObject).
+    pub fn deny_get(&self, suffix: &str) {
+        self.state.deny_get.lock().unwrap().push(suffix.to_string());
     }
 }
 
@@ -234,6 +242,21 @@ fn handle(stream: TcpStream, state: &State) -> std::io::Result<()> {
             objects.insert(object_key, body);
             let etag = format!("\"e{}\"", objects.len());
             respond(&mut stream, "200 OK", &[("ETag", etag)], b"");
+        }
+        ("GET", false) | ("HEAD", false)
+            if state
+                .deny_get
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|suffix| object_key.ends_with(suffix.as_str())) =>
+        {
+            let body = if method == "GET" {
+                error_xml("AccessDenied")
+            } else {
+                Vec::new()
+            };
+            respond(&mut stream, "403 Forbidden", &[], &body);
         }
         ("GET", false) | ("HEAD", false) => {
             let found = state.objects.lock().unwrap().get(&object_key).cloned();

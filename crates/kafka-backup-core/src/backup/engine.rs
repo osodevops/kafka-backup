@@ -652,11 +652,12 @@ impl BackupEngine {
 
         // Load the merged manifest that save_manifest() just wrote.
         let key = format!("{}/manifest.json", self.config.backup_id);
-        let stored: BackupManifest = match self.storage.get(&key).await {
-            Ok(data) => serde_json::from_slice(&data)
-                .map_err(|e| Error::Config(format!("retention: manifest unparseable: {e}")))?,
-            Err(_) => return Ok(()), // nothing persisted yet
-        };
+        let stored: BackupManifest =
+            match crate::storage::get_if_exists(self.storage.as_ref(), &key).await? {
+                Some(data) => serde_json::from_slice(&data)
+                    .map_err(|e| Error::Config(format!("retention: manifest unparseable: {e}")))?,
+                None => return Ok(()), // nothing persisted yet
+            };
 
         let plan = super::prune::plan_prune(
             &stored,
@@ -965,7 +966,9 @@ impl BackupEngine {
         // If no previous snapshot exists, write the empty one (first-time setup).
         if snapshot_groups.is_empty() {
             let key = format!("{}/consumer-groups-snapshot.json", self.config.backup_id);
-            if self.storage.exists(&key).await.unwrap_or(false) {
+            // An error here fails the (non-fatal) snapshot step rather than
+            // reading as "no snapshot yet" and overwriting it (#218).
+            if self.storage.exists(&key).await? {
                 debug!("Consumer group snapshot: no groups with committed offsets, preserving existing snapshot");
                 return Ok(());
             }
@@ -1655,16 +1658,18 @@ async fn save_manifest_snapshot(
 ) -> Result<()> {
     let key = format!("{}/manifest.json", backup_id);
 
-    // Load existing manifest and merge; fall back to current-only on any error.
-    let merged = match storage.get(&key).await {
-        Ok(data) => match serde_json::from_slice::<BackupManifest>(&data) {
+    // Merge with the stored manifest. Only a missing one means "first
+    // write": a failed read (403, network, 5xx after retries) must fail the
+    // save, or this run's manifest would replace every earlier run's (#218).
+    let merged = match crate::storage::get_if_exists(storage, &key).await? {
+        Some(data) => match serde_json::from_slice::<BackupManifest>(&data) {
             Ok(existing) => merge_manifests(existing, current),
             Err(e) => {
                 warn!("Existing manifest is unparseable, overwriting: {}", e);
                 current
             }
         },
-        Err(_) => current, // First write — no manifest yet.
+        None => current,
     };
 
     let manifest_json = serde_json::to_string_pretty(&merged)?;
@@ -3000,5 +3005,52 @@ mod tests {
             cleared.missing_topics.is_empty(),
             "a clean pass clears the record"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #218: only a missing manifest is a first write. Any other read error
+    // (S3 403, network, 5xx after retries) used to fall through to "write
+    // this run's manifest", replacing every earlier run's segments.
+    // ------------------------------------------------------------------
+
+    fn manifest_with(topic: &str) -> BackupManifest {
+        let mut manifest = BackupManifest::new("b".to_string());
+        manifest.topics.push(make_topic(topic, Some(1), Vec::new()));
+        manifest
+    }
+
+    async fn stored_topics(storage: &crate::storage::testing::FaultyStorage) -> Vec<String> {
+        storage.heal();
+        let data = storage.get("b/manifest.json").await.unwrap();
+        let stored: BackupManifest = serde_json::from_slice(&data).unwrap();
+        stored.topics.into_iter().map(|t| t.name).collect()
+    }
+
+    #[tokio::test]
+    async fn manifest_read_error_does_not_overwrite_the_stored_manifest() {
+        let storage = crate::storage::testing::FaultyStorage::new();
+        save_manifest_snapshot(&storage, "b", manifest_with("alpha"))
+            .await
+            .unwrap();
+
+        storage.deny_reads("b/manifest.json");
+        let puts = storage.puts().len();
+        let result = save_manifest_snapshot(&storage, "b", manifest_with("beta")).await;
+
+        assert!(result.is_err(), "a failed manifest read must fail the save");
+        assert_eq!(storage.puts().len(), puts, "no PUT after a failed read");
+        assert_eq!(stored_topics(&storage).await, vec!["alpha"]);
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_is_a_first_write_and_existing_one_merges() {
+        let storage = crate::storage::testing::FaultyStorage::new();
+        save_manifest_snapshot(&storage, "b", manifest_with("alpha"))
+            .await
+            .unwrap();
+        save_manifest_snapshot(&storage, "b", manifest_with("beta"))
+            .await
+            .unwrap();
+        assert_eq!(stored_topics(&storage).await, vec!["alpha", "beta"]);
     }
 }

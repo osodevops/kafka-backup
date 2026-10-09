@@ -17,6 +17,9 @@ mod gcs;
 mod memory;
 mod s3;
 
+#[cfg(test)]
+pub(crate) mod testing;
+
 pub use azure::{AzureBackend, AzureConfig};
 pub use backend::{ObjectMetadata, StorageBackend};
 pub use config::StorageBackendConfig;
@@ -26,7 +29,18 @@ pub use memory::MemoryBackend;
 pub use s3::{S3Backend, S3Config};
 
 use crate::Result;
+use bytes::Bytes;
 use std::sync::Arc;
+
+/// `get`, with a missing object as `None`. Every other error is returned:
+/// a 403 or a network failure must not read as "absent" (#218).
+pub async fn get_if_exists(storage: &dyn StorageBackend, key: &str) -> Result<Option<Bytes>> {
+    match storage.get(key).await {
+        Ok(data) => Ok(Some(data)),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 
 /// Create a storage backend from the new configuration enum.
 ///
