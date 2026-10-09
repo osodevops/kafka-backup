@@ -33,29 +33,37 @@ services:
       KAFKA_LOG_DIRS: /tmp/kafka-logs
       AUTO_CREATE_TOPICS_ENABLE: "false"
 
-  # Topic setup helper
+  # Topic setup helper (bitnami/kafka images were withdrawn; same image as the broker)
   kafka-setup:
-    image: bitnami/kafka:3.7.1
+    image: apache/kafka:3.7.1
     hostname: kafka-setup
     networks:
       - kafka-net
     depends_on:
       - kafka-broker-1
     restart: on-failure
-    command: >
-      bash -c 'echo "Waiting for Kafka to be ready..." &&
-      sleep 10 &&
-      echo "Creating test topics..." &&
-      kafka-topics.sh --create --if-not-exists --bootstrap-server kafka-broker-1:9092 --partitions 3 --replication-factor 1 --topic test-topic &&
-      kafka-topics.sh --create --if-not-exists --bootstrap-server kafka-broker-1:9092 --partitions 3 --replication-factor 1 --topic orders &&
-      kafka-topics.sh --create --if-not-exists --bootstrap-server kafka-broker-1:9092 --partitions 3 --replication-factor 1 --topic payments &&
-      echo "Topics created successfully"'
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-broker-1:9092 --list >/dev/null 2>&1; do
+          echo "Waiting for Kafka to be ready..."
+          sleep 2
+        done
+        for topic in test-topic orders payments; do
+          /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka-broker-1:9092 \
+            --partitions 3 --replication-factor 1 --topic "$$topic"
+        done
+        echo "Topics created successfully"
 
-  # MinIO (S3-compatible storage)
+  # MinIO (S3-compatible storage). minio/minio was deleted from Docker Hub
+  # (Sept 2026) and quay.io/minio no longer allows anonymous pulls.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     hostname: minio
     container_name: minio
+    # The Chainguard image runs as uid 65532; root keeps existing minio-data
+    # volumes (created by the old image as root) writable.
+    user: "0:0"
     networks:
       - kafka-net
     ports:
@@ -64,25 +72,28 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      MC_HOST_local: http://minioadmin:minioadmin@localhost:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     volumes:
       - minio-data:/data
 
-  # MinIO bucket setup
+  # MinIO bucket setup (the image's entrypoint is mc)
   minio-setup:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio-client:latest
     networks:
       - kafka-net
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     restart: on-failure
-    entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb local/kafka-backups --ignore-existing;
-      echo 'Bucket created';
-      "
+    environment:
+      MC_HOST_local: http://minioadmin:minioadmin@minio:9000
+    command: ["mb", "--ignore-existing", "local/kafka-backups"]
 
   # Kafka Backup CLI
   kafka-backup:
@@ -92,10 +103,17 @@ services:
     networks:
       - kafka-net
     environment:
+      # Not read by kafka-backup itself; configs can use it as ${KAFKA_BROKERS}.
       KAFKA_BROKERS: kafka-broker-1:9092
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadmin
+      # `--config` runs take the S3 endpoint from the YAML (storage.endpoint:
+      # http://minio:9000, path_style: true, allow_http: true). `--path s3://...`
+      # commands (list, describe, validate, offset-rollback, ...) read these
+      # standard AWS_* variables; without them they go to real AWS.
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
       RUST_LOG: info
     depends_on:
       - kafka-broker-1

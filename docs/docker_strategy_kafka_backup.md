@@ -385,6 +385,9 @@ DOCKER_PASSWORD = "your PAT token from hub.docker.com"
 
 ### For Development (Optional)
 
+The repo's own [`docker-compose.yml`](../docker-compose.yml) is a working
+version of this (KRaft broker, MinIO, bucket and topic setup).
+
 ```yaml
 version: '3.9'
 
@@ -411,16 +414,29 @@ services:
     ports:
       - "2181:2181"
 
-  # S3 local (minio for testing)
+  # S3 local (minio for testing). minio/minio was deleted from Docker Hub
+  # (Sept 2026); the Chainguard build runs as uid 65532, so run it as root
+  # when reusing volumes created by the old image.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "9000:9000"
       - "9001:9001"
-    command: server /data --console-address ":9001"
+    command: ["server", "/data", "--console-address", ":9001"]
+
+  # Create the bucket (the image's entrypoint is mc; there is no shell to wrap)
+  minio-setup:
+    image: cgr.dev/chainguard/minio-client:latest
+    environment:
+      MC_HOST_local: http://minioadmin:minioadmin@minio:9000
+    command: ["mb", "--ignore-existing", "local/kafka-backups"]
+    restart: on-failure
+    depends_on:
+      - minio
 
   # OSO Kafka Backup CLI (for testing)
   kafka-backup:
@@ -429,10 +445,14 @@ services:
       dockerfile: Dockerfile
     command: backup --help  # Override CMD for testing
     environment:
-      KAFKA_BROKERS: kafka:29092
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadmin
+      # `--config` runs take the endpoint from the YAML (storage.endpoint:
+      # http://minio:9000, path_style: true, allow_http: true); `--path s3://`
+      # commands read the standard AWS_* variables.
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
       RUST_LOG: debug
     depends_on:
       - kafka
@@ -662,7 +682,6 @@ docker run --rm kafka-backup:dev --help
 docker run --rm \
   -v $(pwd)/config.yaml:/config.yaml \
   -v $(pwd)/backups:/backups \
-  -e KAFKA_BROKERS=localhost:9092 \
   kafka-backup:dev backup --config /config.yaml
 
 # Push to Docker Hub
