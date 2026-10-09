@@ -505,8 +505,7 @@ enum ValidationAction {
 
     /// List evidence reports in storage
     EvidenceList {
-        /// Path to the storage location (e.g. s3://bucket/prefix)
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Maximum number of reports to show
@@ -516,8 +515,7 @@ enum ValidationAction {
 
     /// Download an evidence report
     EvidenceGet {
-        /// Path to the storage location
-        #[arg(short, long)]
+        #[arg(short, long, help = STORAGE_PATH_HELP)]
         path: String,
 
         /// Report ID to download
@@ -991,5 +989,31 @@ mod tests {
     #[test]
     fn plan_dry_run_accepts_an_optional_bool() {
         check("--dry-run", plan_dry_run);
+    }
+
+    /// Every `--path` is resolved by `storage_path::backend_from_path`
+    /// (clippy.toml enforces that), so every `--path` help must list the
+    /// forms it accepts. A hand-maintained list of subcommands missed
+    /// `validation evidence-list` / `evidence-get` (#219).
+    #[test]
+    fn every_path_arg_documents_the_storage_forms() {
+        fn walk(cmd: &clap::Command, name: &str, missing: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if arg.get_long() == Some("path")
+                    && arg.get_help().map(|h| h.to_string()).as_deref() != Some(STORAGE_PATH_HELP)
+                {
+                    missing.push(name.to_string());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{name} {}", sub.get_name()), missing);
+            }
+        }
+        let mut missing = Vec::new();
+        walk(&Cli::command(), "kafka-backup", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "--path without STORAGE_PATH_HELP: {missing:?}"
+        );
     }
 }

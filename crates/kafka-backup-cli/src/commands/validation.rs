@@ -21,6 +21,8 @@ use kafka_backup_core::validation::config::ValidationConfig;
 use kafka_backup_core::validation::context::ValidationContext;
 use kafka_backup_core::validation::{CheckOutcome, ValidationRunner};
 
+use super::storage_path::backend_from_path;
+
 /// Execute a full validation run: load manifest, connect to target, run checks, generate evidence.
 pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str>) -> Result<()> {
     let config_data = std::fs::read_to_string(config_path)
@@ -158,8 +160,7 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
 
 /// List evidence reports in storage.
 pub async fn evidence_list(path: &str, limit: usize) -> Result<()> {
-    let storage_config = kafka_backup_core::storage::StorageBackendConfig::from_url(path)?;
-    let storage = create_backend(&storage_config)?;
+    let storage = backend_from_path(path)?;
 
     let reports = kafka_backup_core::evidence::storage::list_evidence_reports(
         storage.as_ref(),
@@ -182,8 +183,7 @@ pub async fn evidence_list(path: &str, limit: usize) -> Result<()> {
 
 /// Download an evidence report from storage.
 pub async fn evidence_get(path: &str, report_id: &str, format: &str, output: &str) -> Result<()> {
-    let storage_config = kafka_backup_core::storage::StorageBackendConfig::from_url(path)?;
-    let storage = create_backend(&storage_config)?;
+    let storage = backend_from_path(path)?;
 
     let ext = match format {
         "pdf" => "pdf",

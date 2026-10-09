@@ -1080,7 +1080,9 @@ mod minio {
             .unwrap_or_else(|_| panic!("{name} must be set to run this test (see the module docs)"))
     }
 
-    /// Keys under `offset-snapshots/`, read independently of the CLI.
+    /// Keys under `offset-snapshots/`, read independently of the CLI (so
+    /// deliberately not through `backend_from_path`).
+    #[allow(clippy::disallowed_methods)]
     fn remote_snapshot_keys(url: &str) -> Vec<String> {
         let backend = create_backend(&StorageBackendConfig::from_url(url).unwrap()).unwrap();
         tokio::runtime::Runtime::new()
