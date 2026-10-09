@@ -527,7 +527,7 @@ storage:
 | S3 | `s3://bucket/prefix?region=us-east-1&endpoint=http://host:9000&path_style=true&allow_http=true` — an `endpoint=http://…` implies `allow_http=true` (and path-style); pass `allow_http=false` to override |
 | Azure | `azure://account.blob.core.windows.net/container` |
 | GCS | `gcs://bucket` or `gs://bucket` |
-| Filesystem | `file:///path/to/storage` |
+| Filesystem | `file:///path/to/storage` (three slashes; percent-encode spaces as `%20`, `#` as `%23`). The host must be empty or `localhost`, so `file://dir` is an error. A plain path (`/path/to/storage`, `./backups`) works too |
 | Memory | `memory://` |
 
 ---

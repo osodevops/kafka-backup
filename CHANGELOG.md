@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.7] - 2026-10-09
+
+### Fixed
+- `file://` storage URLs (`--path file://…`, `StorageBackendConfig::from_url`)
+  are percent-decoded and must name a local directory
+  ([#221](https://github.com/osodevops/kafka-backup/issues/221)):
+  - `file:///tmp/my%20backups` is now `/tmp/my backups`. It was read
+    literally, so `list` / `describe` reported no backups and writes went to
+    a directory named `my%20backups`.
+  - A host is rejected with a hint instead of being dropped:
+    `file://tmp/backups` used to mean `/backups`, and
+    `file://nfs-server/share` read the local `/share`. `localhost` is still
+    accepted.
+  - `file:///C:/backups` is `C:\backups` on Windows (it was `/C:/backups`).
+  - `file://`, `file:///` and `file://localhost` are rejected rather than
+    meaning the filesystem root (e.g. `file://$DIR` with `DIR` unset). A
+    query string, fragment or `%00` is rejected rather than ignored.
+
 ## [0.23.6] - 2026-10-09
 
 ### Fixed
