@@ -4,4 +4,5 @@
 # legitimately.
 disallowed-methods = [
     { path = "kafka_backup_core::storage::FilesystemBackend::new", reason = "resolve --path with commands::storage_path::backend_from_path so s3://, file://, azure:// and gcs:// are honoured (#174)" },
+    { path = "kafka_backup_core::storage::StorageBackendConfig::from_url", reason = "resolve --path with commands::storage_path::backend_from_path so bare local paths work and the fail-fast checks apply (#219)" },
 ]

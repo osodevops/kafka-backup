@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.6] - 2026-10-09
+
+### Fixed
+- `validation evidence-list` and `validation evidence-get` accept bare local
+  paths (`--path /data/evidence`, `--path ./evidence`). They parsed `--path`
+  as a URL and failed with "Invalid storage URL: relative URL without a
+  base". They now resolve `--path` like every other command, so the #174
+  checks apply too: `memory://`, a missing bucket and typos such as
+  `s3:/bucket` fail immediately instead of listing an empty store or
+  spending seconds on AWS instance metadata. `--help` lists the accepted
+  forms. ([#219](https://github.com/osodevops/kafka-backup/issues/219))
+- A unit test now checks that every `--path` argument documents the accepted
+  forms, and clippy rejects `StorageBackendConfig::from_url` in the CLI
+  outside `storage_path`, so a new command can't skip the shared resolver.
+
 ## [0.23.5] - 2026-10-09
 
 ### Fixed
