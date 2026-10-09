@@ -430,7 +430,8 @@ enum OffsetResetAction {
         #[arg(short, long, default_value = "text")]
         format: String,
 
-        /// Dry run mode (preview only, no changes; `--dry-run false` to turn off)
+        /// Label the plan a dry run (`--dry-run false` labels it manual). `plan`
+        /// never changes offsets either way; apply a plan with `offset-reset execute`
         #[arg(
             long,
             default_value_t = true,
@@ -853,4 +854,142 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{error::ErrorKind, ArgAction, CommandFactory};
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// Issue #220: clap 4 derive makes a `bool` field a `SetTrue` flag, so a
+    /// `default_value = "true"` on it is a flag that can never be turned off
+    /// (and `--flag false` is rejected). Same for `SetFalse` defaulting to
+    /// false. Declare such options with `ArgAction::Set` instead.
+    #[test]
+    fn no_flag_is_stuck_at_its_default() {
+        fn walk(cmd: &clap::Command, path: &str, stuck: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let stuck_value = match arg.get_action() {
+                    ArgAction::SetTrue => "true",
+                    ArgAction::SetFalse => "false",
+                    _ => continue,
+                };
+                if arg.get_default_values().iter().any(|v| v == stuck_value) {
+                    stuck.push(format!("{path} --{}", arg.get_long().unwrap_or("?")));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), stuck);
+            }
+        }
+
+        let mut stuck = Vec::new();
+        walk(&Cli::command(), "kafka-backup", &mut stuck);
+        assert!(
+            stuck.is_empty(),
+            "flags that can never be turned off: {stuck:?}"
+        );
+    }
+
+    fn rollback_verify(extra: &[&str]) -> std::result::Result<bool, clap::Error> {
+        let args = ["kafka-backup", "offset-rollback", "rollback"]
+            .into_iter()
+            .chain(["--path", "/tmp/p", "--snapshot-id", "s"])
+            .chain(extra.iter().copied());
+        match Cli::try_parse_from(args)?.command {
+            Commands::OffsetRollback {
+                action: OffsetRollbackAction::Rollback { verify, format, .. },
+            } => {
+                // A value-taking `--verify` must not swallow the next option.
+                if extra.contains(&"-f") || extra.contains(&"--format") {
+                    assert_eq!(format, "json", "{extra:?} lost --format");
+                }
+                Ok(verify)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn plan_dry_run(extra: &[&str]) -> std::result::Result<bool, clap::Error> {
+        let args = ["kafka-backup", "offset-reset", "plan"]
+            .into_iter()
+            .chain(["--path", "/tmp/p", "--backup-id", "b"])
+            .chain(extra.iter().copied());
+        match Cli::try_parse_from(args)?.command {
+            Commands::OffsetReset {
+                action:
+                    OffsetResetAction::Plan {
+                        dry_run, format, ..
+                    },
+            } => {
+                if extra.contains(&"-f") || extra.contains(&"--format") {
+                    assert_eq!(format, "json", "{extra:?} lost --format");
+                }
+                Ok(dry_run)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Shared table for both flags: (extra args with `FLAG` as placeholder,
+    /// expected value).
+    const ACCEPTED: &[(&[&str], bool)] = &[
+        (&[], true),
+        (&["FLAG"], true),
+        (&["FLAG", "true"], true),
+        (&["FLAG=true"], true),
+        (&["FLAG", "false"], false),
+        (&["FLAG=false"], false),
+        // Bare flag followed by another option keeps the default-missing
+        // value and leaves the option alone.
+        (&["FLAG", "-f", "json"], true),
+        (&["FLAG", "--format", "json"], true),
+        (&["FLAG", "false", "-f", "json"], false),
+        (&["-f", "json", "FLAG"], true),
+        (&["-f", "json", "FLAG", "false"], false),
+    ];
+
+    const REJECTED: &[(&[&str], ErrorKind)] = &[
+        (&["FLAG", "maybe"], ErrorKind::InvalidValue),
+        (&["FLAG=maybe"], ErrorKind::InvalidValue),
+        (&["FLAG="], ErrorKind::InvalidValue),
+        // Repeating the flag was an error before #220 and still is: no
+        // silent last-one-wins.
+        (&["FLAG", "FLAG=false"], ErrorKind::ArgumentConflict),
+        (&["FLAG=false", "FLAG"], ErrorKind::ArgumentConflict),
+    ];
+
+    fn check(flag: &'static str, parse: fn(&[&str]) -> std::result::Result<bool, clap::Error>) {
+        for (args, expected) in ACCEPTED {
+            let args: Vec<String> = args.iter().map(|a| a.replace("FLAG", flag)).collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match parse(&args) {
+                Ok(v) => assert_eq!(v, *expected, "{args:?}"),
+                Err(e) => panic!("{args:?} should parse, got: {e}"),
+            }
+        }
+        for (args, kind) in REJECTED {
+            let args: Vec<String> = args.iter().map(|a| a.replace("FLAG", flag)).collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match parse(&args) {
+                Ok(v) => panic!("{args:?} should be rejected, parsed as {v}"),
+                Err(e) => assert_eq!(e.kind(), *kind, "{args:?}: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_verify_accepts_an_optional_bool() {
+        check("--verify", rollback_verify);
+    }
+
+    #[test]
+    fn plan_dry_run_accepts_an_optional_bool() {
+        check("--dry-run", plan_dry_run);
+    }
 }

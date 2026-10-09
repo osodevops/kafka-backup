@@ -309,9 +309,13 @@ fn print_plan_text(plan: &OffsetResetPlan) {
 
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
 
+    // `plan` never commits offsets, whatever `--dry-run` says.
+    println!();
     if plan.dry_run {
-        println!();
         println!("⚠️  This is a DRY RUN. No changes were made.");
-        println!("   Run with --execute to apply these changes.");
+    } else {
+        println!("No changes were made. This plan is for manual review.");
     }
+    println!("   Apply it with `kafka-backup offset-reset execute`, or run the");
+    println!("   kafka-consumer-groups.sh commands from `--format shell-script`.");
 }

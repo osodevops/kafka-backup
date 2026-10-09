@@ -65,7 +65,7 @@ fn write_manifest(root: &Path) {
     .unwrap();
 }
 
-async fn plan_dry_run(root: &Path, flag: &[&str]) -> bool {
+async fn plan(root: &Path, extra: &[&str]) -> Output {
     let path = root.to_str().unwrap();
     let mut args = vec![
         "offset-reset",
@@ -78,11 +78,15 @@ async fn plan_dry_run(root: &Path, flag: &[&str]) -> bool {
         GROUP,
         "--bootstrap-servers",
         "localhost:9092",
-        "--format",
-        "json",
     ];
-    args.extend_from_slice(flag);
-    let plan = stdout_json(&kafka_backup(&args).await, &format!("plan {flag:?}"));
+    args.extend_from_slice(extra);
+    kafka_backup(&args).await
+}
+
+async fn plan_dry_run(root: &Path, flag: &[&str]) -> bool {
+    let mut extra = vec!["--format", "json"];
+    extra.extend_from_slice(flag);
+    let plan = stdout_json(&plan(root, &extra).await, &format!("plan {flag:?}"));
     plan["dry_run"].as_bool().expect("plan has a dry_run field")
 }
 
@@ -100,6 +104,30 @@ async fn offset_reset_plan_dry_run_can_be_turned_off() {
     // Explicitly off, in both spellings.
     assert!(!plan_dry_run(dir.path(), &["--dry-run", "false"]).await);
     assert!(!plan_dry_run(dir.path(), &["--dry-run=false"]).await);
+}
+
+/// `plan` never changes offsets, dry run or not. With `--dry-run false` the
+/// text output used to drop its only "no changes were made" line, and the
+/// dry-run hint pointed at a `--execute` flag `plan` doesn't have.
+#[tokio::test]
+async fn offset_reset_plan_text_says_nothing_was_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path());
+
+    for flag in [&[][..], &["--dry-run", "false"]] {
+        let out = plan(dir.path(), flag).await;
+        assert!(out.status.success(), "plan {flag:?} failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("No changes were made"), "{flag:?}:\n{text}");
+        assert!(
+            text.contains("kafka-backup offset-reset execute"),
+            "{flag:?} should point at the execute subcommand:\n{text}"
+        );
+        assert!(
+            !text.contains("--execute"),
+            "{flag:?} points at a flag `plan` doesn't have:\n{text}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -203,4 +231,67 @@ async fn offset_rollback_verify_can_be_turned_off() {
         assert_eq!(cluster.committed(GROUP)[&(TOPIC.to_string(), 0)], 42);
         cluster.set_offset(GROUP, TOPIC, 0, 100);
     }
+}
+
+/// A `--verify` that finds the rollback didn't stick must fail the command,
+/// like `offset-rollback verify` does; it used to print MISMATCH and exit 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offset_rollback_verify_mismatch_fails_the_command() {
+    let cluster = MockCluster::start(1).await;
+    cluster.add_group(GROUP, 1, &[(TOPIC, 0, 42)]);
+    let bootstrap = cluster.addr(1);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    let id = create_snapshot(path, &bootstrap).await;
+    // A consumer still running commits its own position over the rollback.
+    cluster.race_commits(GROUP, &[(TOPIC, 0, 100)]);
+
+    for format in ["text", "json"] {
+        let out = kafka_backup(&[
+            "offset-rollback",
+            "rollback",
+            "--path",
+            path,
+            "--snapshot-id",
+            &id,
+            "--bootstrap-servers",
+            &bootstrap,
+            "--format",
+            format,
+        ])
+        .await;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{format}: a failed verification must fail the command:\n{stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains("Verification failed"),
+            "{format}: unexpected error: {stderr}"
+        );
+        if format == "json" {
+            // The report is still printed for automation to inspect.
+            let start = stdout.find('{').expect("JSON on stdout");
+            let report: Value = serde_json::from_str(&stdout[start..]).unwrap();
+            assert_eq!(report["verification"]["verified"], false);
+        }
+    }
+
+    // With verification off nothing checks, so the command succeeds.
+    let out = kafka_backup(&[
+        "offset-rollback",
+        "rollback",
+        "--path",
+        path,
+        "--snapshot-id",
+        &id,
+        "--bootstrap-servers",
+        &bootstrap,
+        "--verify",
+        "false",
+    ])
+    .await;
+    assert!(out.status.success(), "--verify false should not fail");
 }

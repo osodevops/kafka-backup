@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.4] - 2026-10-09
+
+### Fixed
+- `offset-rollback rollback --verify` and `offset-reset plan --dry-run` can
+  now be turned off. Both default to true but were declared as plain flags,
+  so they were always true and `--verify false` / `--verify true` failed with
+  "unexpected argument". They now take an optional value: omitting the flag
+  or passing it bare still means `true`; `--verify false` / `--verify=false`
+  (and the same for `--dry-run`) turn it off. Any other value is rejected.
+  ([#220](https://github.com/osodevops/kafka-backup/issues/220))
+- `offset-rollback rollback` now exits non-zero ("Verification failed -
+  offsets do not match snapshot") when its post-rollback verification finds
+  offsets that don't match the snapshot, e.g. a consumer still running
+  committed over the rollback. It used to print MISMATCH and exit 0, so
+  scripts couldn't tell; `offset-rollback verify` already failed this way.
+  The report is still printed first (`--format json` included).
+- `offset-reset plan` text output always says no changes were made (a
+  `--dry-run false` plan used to print nothing after the table) and points
+  at `offset-reset execute` instead of a `--execute` flag `plan` doesn't
+  have.
+
+## [0.23.3] - 2026-10-07
+
+### Fixed
+- OffsetFetch / OffsetCommit go to the consumer group's coordinator. On a
+  multi-broker cluster, NOT_COORDINATOR from a non-coordinating broker read
+  as "no committed offsets", so `snapshot-groups` saved only the groups the
+  first bootstrap broker coordinated, and offset-rollback, offset-reset and
+  the consumer-group validation check lost groups the same way.
+  `snapshot-groups` now fails, keeping the previous snapshot, if any group
+  can't be read. ([#224](https://github.com/osodevops/kafka-backup/issues/224))
+
 ## [0.23.2] - 2026-10-06
 
 ### Fixed
