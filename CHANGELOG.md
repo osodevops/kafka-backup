@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.5] - 2026-10-09
+
+### Fixed
+- `offset-rollback show` (text format) no longer panics on long topic
+  names. Each offset row was padded with `usize` arithmetic, so a topic name
+  longer than about 50 characters (fewer with large offsets), e.g. a Kafka
+  Streams changelog topic, crashed with "attempt to subtract with overflow"
+  (debug) or "capacity overflow" (release). Rows too long for the box now
+  run past its right border. The other rows of the box line up again, and
+  groups, topics and partitions are listed in sorted order.
+  ([#223](https://github.com/osodevops/kafka-backup/issues/223))
+
 ## [0.23.4] - 2026-10-09
 
 ### Fixed

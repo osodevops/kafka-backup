@@ -358,47 +358,75 @@ pub async fn delete_snapshot(path: &str, snapshot_id: &str) -> Result<()> {
 // Helper Functions
 // ============================================================================
 
-fn print_snapshot_details(snapshot: &OffsetSnapshot) {
-    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                           OFFSET SNAPSHOT DETAILS                            ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!("║ Snapshot ID: {:<64} ║", snapshot.snapshot_id);
-    println!(
-        "║ Created:     {:<64} ║",
-        snapshot.created_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    println!("║ Groups:      {:<64} ║", snapshot.group_offsets.len());
-    println!("║ Offsets:     {:<64} ║", snapshot.total_offsets());
+/// Width between the `║` borders of the text boxes.
+const BOX_INNER_WIDTH: usize = 78;
+
+/// One box row: `content` padded to the box width. Content that doesn't fit
+/// (long topic or group names) runs past the right border instead of being
+/// cut off (#223).
+fn box_row(content: &str) -> String {
+    format!("║{content:<BOX_INNER_WIDTH$}║")
+}
+
+fn snapshot_details_lines(snapshot: &OffsetSnapshot) -> Vec<String> {
+    let top = format!("╔{}╗", "═".repeat(BOX_INNER_WIDTH));
+    let rule = format!("╠{}╣", "═".repeat(BOX_INNER_WIDTH));
+    let thin = format!("╟{}╢", "─".repeat(BOX_INNER_WIDTH));
+    let bottom = format!("╚{}╝", "═".repeat(BOX_INNER_WIDTH));
+
+    let mut lines = vec![
+        top,
+        box_row(&format!("{:^BOX_INNER_WIDTH$}", "OFFSET SNAPSHOT DETAILS")),
+        rule.clone(),
+        box_row(&format!(" Snapshot ID: {}", snapshot.snapshot_id)),
+        box_row(&format!(
+            " Created:     {}",
+            snapshot.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        )),
+        box_row(&format!(" Groups:      {}", snapshot.group_offsets.len())),
+        box_row(&format!(" Offsets:     {}", snapshot.total_offsets())),
+    ];
     if let Some(ref desc) = snapshot.description {
-        println!("║ Description: {:<64} ║", desc);
+        lines.push(box_row(&format!(" Description: {desc}")));
     }
     if let Some(ref restore_id) = snapshot.restore_id {
-        println!("║ Restore ID:  {:<64} ║", restore_id);
+        lines.push(box_row(&format!(" Restore ID:  {restore_id}")));
     }
-    println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!("║ Consumer Groups                                                              ║");
-    println!("╟──────────────────────────────────────────────────────────────────────────────╢");
+    lines.push(rule);
+    lines.push(box_row(" Consumer Groups"));
+    lines.push(thin);
 
-    for (group_id, state) in &snapshot.group_offsets {
-        println!("║ Group: {:<71} ║", group_id);
-        println!("║   Partitions: {:<63} ║", state.partition_count);
+    let mut groups: Vec<_> = snapshot.group_offsets.iter().collect();
+    groups.sort_by_key(|(group_id, _)| *group_id);
+    for (group_id, state) in groups {
+        lines.push(box_row(&format!(" Group: {group_id}")));
+        lines.push(box_row(&format!(
+            "   Partitions: {}",
+            state.partition_count
+        )));
 
-        for (topic, partitions) in &state.offsets {
+        let mut topics: Vec<_> = state.offsets.iter().collect();
+        topics.sort_by_key(|(topic, _)| *topic);
+        for (topic, partitions) in topics {
+            let mut partitions: Vec<_> = partitions.iter().collect();
+            partitions.sort_by_key(|(partition, _)| **partition);
             for (partition, offset_state) in partitions {
-                println!(
-                    "║     {}:{} -> offset {}{}",
-                    topic,
-                    partition,
-                    offset_state.offset,
-                    " ".repeat(
-                        78 - 12 - topic.len() - 10 - format!("{}", offset_state.offset).len()
-                    ) + "║"
-                );
+                lines.push(box_row(&format!(
+                    "     {topic}:{partition} -> offset {}",
+                    offset_state.offset
+                )));
             }
         }
     }
 
-    println!("╚══════════════════════════════════════════════════════════════════════════════╝");
+    lines.push(bottom);
+    lines
+}
+
+fn print_snapshot_details(snapshot: &OffsetSnapshot) {
+    for line in snapshot_details_lines(snapshot) {
+        println!("{line}");
+    }
 }
 
 fn print_rollback_result(result: &RollbackResult) {
@@ -468,6 +496,57 @@ fn print_verification_result(result: &VerificationResult) {
                 "  - {}:{}:{} expected {} but found {}",
                 m.group_id, m.topic, m.partition, m.expected_offset, m.actual_offset
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kafka_backup_core::restore::offset_rollback::{GroupOffsetState, PartitionOffsetState};
+    use std::collections::HashMap;
+
+    fn snapshot(topic: &str, offset: i64) -> OffsetSnapshot {
+        let partition = PartitionOffsetState {
+            offset,
+            metadata: None,
+            timestamp: None,
+        };
+        let group = GroupOffsetState {
+            group_id: "g".to_string(),
+            offsets: HashMap::from([(topic.to_string(), HashMap::from([(0, partition)]))]),
+            partition_count: 1,
+        };
+        OffsetSnapshot {
+            snapshot_id: "s".to_string(),
+            created_at: chrono::Utc::now(),
+            group_offsets: HashMap::from([("g".to_string(), group)]),
+            restore_id: None,
+            cluster_id: None,
+            bootstrap_servers: vec![],
+            description: None,
+        }
+    }
+
+    /// #223: every topic length up to Kafka's 249-character limit, with
+    /// negative (no committed offset), small and maximum offsets.
+    #[test]
+    fn snapshot_details_never_panic_and_fit_when_possible() {
+        for len in 0..=249 {
+            for offset in [-1, 0, 42, i64::MAX] {
+                let topic = "t".repeat(len);
+                let lines = snapshot_details_lines(&snapshot(&topic, offset));
+                let row = lines
+                    .iter()
+                    .find(|l| l.contains(" -> offset "))
+                    .expect("offset row");
+                assert!(row.contains(&format!("{topic}:0 -> offset {offset}")));
+                assert!(row.starts_with('║') && row.ends_with('║'), "{row}");
+                let content = row.chars().count() - 2;
+                if format!("     {topic}:0 -> offset {offset}").len() <= BOX_INNER_WIDTH {
+                    assert_eq!(content, BOX_INNER_WIDTH, "short row not padded: {row}");
+                }
+            }
         }
     }
 }
