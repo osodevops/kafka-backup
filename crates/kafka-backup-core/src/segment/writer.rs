@@ -49,6 +49,21 @@ pub struct SealedSegment {
     end_offset: i64,
     start_timestamp: i64,
     end_timestamp: i64,
+    covered_start: i64,
+    covered_end: i64,
+}
+
+impl SealedSegment {
+    /// Storage key the segment will be written to.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Source offsets this segment accounts for, inclusive (see
+    /// [`SegmentMetadata::covered_start_offset`]).
+    pub fn covered(&self) -> (i64, i64) {
+        (self.covered_start, self.covered_end)
+    }
 }
 
 /// Compresses and uploads [`SealedSegment`]s. Cheap to clone; holds only
@@ -154,8 +169,8 @@ impl SegmentFlusher {
             compressed_size: compressed_size as u64,
             sha256,
             uploaded_at,
-            covered_start_offset: None,
-            covered_end_offset: None,
+            covered_start_offset: Some(sealed.covered_start),
+            covered_end_offset: Some(sealed.covered_end),
         };
 
         info!(
@@ -195,6 +210,11 @@ pub struct SegmentWriter {
     segment_start_time: Option<std::time::Instant>,
     /// Uncompressed size counter
     uncompressed_bytes: u64,
+    /// First source offset not yet accounted for by a sealed segment.
+    coverage_start: Option<i64>,
+    /// Highest source offset passed so far (records added or fetch position
+    /// advanced via [`extend_coverage`](SegmentWriter::extend_coverage)).
+    coverage_end: Option<i64>,
 }
 
 impl SegmentWriter {
@@ -229,11 +249,76 @@ impl SegmentWriter {
             end_timestamp: None,
             segment_start_time: None,
             uncompressed_bytes: 0,
+            coverage_start: None,
+            coverage_end: None,
         }
+    }
+
+    /// Start tracking the source offsets the next segments account for.
+    ///
+    /// `first_uncovered` is the first offset no listed interval accounts for
+    /// yet; `covered_through` the highest offset already accounted for (at
+    /// least `first_uncovered - 1`; higher when a coverage-only advance
+    /// followed the last segment). Without this call coverage starts at the
+    /// first record added.
+    pub fn begin_coverage(&mut self, first_uncovered: i64, covered_through: i64) {
+        self.coverage_start = Some(first_uncovered);
+        self.coverage_end = Some(covered_through.max(first_uncovered - 1));
+    }
+
+    /// Record that the fetch position has passed `last_offset` (inclusive):
+    /// every offset up to it has either been added or held no record
+    /// (compacted away, a transaction marker). Call after adding a fetch's
+    /// records, never before. Ignored until coverage has started.
+    pub fn extend_coverage(&mut self, last_offset: i64) {
+        if self.coverage_start.is_some() {
+            self.coverage_end = Some(
+                self.coverage_end
+                    .map_or(last_offset, |e| e.max(last_offset)),
+            );
+        }
+    }
+
+    /// First source offset the next sealed segment will account for.
+    pub fn coverage_start(&self) -> Option<i64> {
+        self.coverage_start
+    }
+
+    /// When no record is buffered but the fetch position has advanced past
+    /// the last sealed segment, the inclusive range covered since — a
+    /// coverage-only advance. Not consumed: the next sealed segment's covered
+    /// range still starts at the same offset, keeping intervals contiguous.
+    pub fn uncovered_tail(&self) -> Option<(i64, i64)> {
+        if self.record_count > 0 {
+            return None;
+        }
+        match (self.coverage_start, self.coverage_end) {
+            (Some(start), Some(end)) if end >= start => Some((start, end)),
+            _ => None,
+        }
+    }
+
+    /// Move coverage past a range accounted for elsewhere (a recorded gap
+    /// ending before `offset`). Only meaningful with no records buffered.
+    pub fn skip_coverage_to(&mut self, offset: i64) {
+        debug_assert_eq!(
+            self.record_count, 0,
+            "skip_coverage_to with buffered records"
+        );
+        self.coverage_start = Some(offset);
+        self.coverage_end = Some(offset - 1);
     }
 
     /// Add a record to the current segment
     pub fn add_record(&mut self, record: BinaryRecord) -> Result<()> {
+        if self.coverage_start.is_none() {
+            self.coverage_start = Some(record.offset);
+        }
+        self.coverage_end = Some(
+            self.coverage_end
+                .map_or(record.offset, |e| e.max(record.offset)),
+        );
+
         // Update metadata
         if self.start_offset.is_none() {
             self.start_offset = Some(record.offset);
@@ -317,16 +402,28 @@ impl SegmentWriter {
             return None;
         }
 
+        let start_offset = self.start_offset.unwrap_or(-1);
+        let end_offset = self.end_offset.unwrap_or(-1);
+        // Coverage reaches from the first unaccounted offset to the fetch
+        // position, and never less than the records it holds.
+        let covered_start = self
+            .coverage_start
+            .map_or(start_offset, |c| c.min(start_offset));
+        let covered_end = self.coverage_end.map_or(end_offset, |c| c.max(end_offset));
         let sealed = SealedSegment {
             key: key.to_string(),
             buffer: std::mem::replace(&mut self.buffer, BytesMut::with_capacity(1024 * 1024)),
             record_count: self.record_count,
-            start_offset: self.start_offset.unwrap_or(-1),
-            end_offset: self.end_offset.unwrap_or(-1),
+            start_offset,
+            end_offset,
             start_timestamp: self.start_timestamp.unwrap_or(0),
             end_timestamp: self.end_timestamp.unwrap_or(0),
+            covered_start,
+            covered_end,
         };
         self.reset();
+        self.coverage_start = Some(covered_end + 1);
+        self.coverage_end = Some(covered_end);
         Some(sealed)
     }
 
@@ -341,7 +438,8 @@ impl SegmentWriter {
         }
     }
 
-    /// Reset writer state without writing
+    /// Reset the buffered segment without writing (coverage tracking is
+    /// kept).
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.record_count = 0;
@@ -462,6 +560,121 @@ mod tests {
 
         // Verify file exists
         assert!(storage.exists("test-segment.bin").await.unwrap());
+    }
+
+    fn rec(offset: i64) -> BinaryRecord {
+        BinaryRecord {
+            timestamp: 1_000 + offset,
+            offset,
+            key: None,
+            value: Some(Bytes::from("v")),
+            headers: vec![],
+        }
+    }
+
+    fn memory_writer() -> SegmentWriter {
+        SegmentWriter::new(
+            SegmentWriterConfig::default(),
+            Arc::new(crate::storage::MemoryBackend::new()),
+            Arc::new(PerformanceMetrics::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn covered_range_defaults_to_the_record_range() {
+        let mut writer = memory_writer();
+        for o in 5..10 {
+            writer.add_record(rec(o)).unwrap();
+        }
+        let meta = writer.flush("k").await.unwrap().unwrap();
+        assert_eq!((meta.start_offset, meta.end_offset), (5, 9));
+        assert_eq!(meta.covered_start_offset, Some(5));
+        assert_eq!(meta.covered_end_offset, Some(9));
+    }
+
+    #[tokio::test]
+    async fn covered_range_spans_holes_before_and_after_the_records() {
+        let mut writer = memory_writer();
+        // Fetch from 100: 100..=104 were compacted away, 150..=159 are
+        // markers; the fetch position afterwards is 160.
+        writer.begin_coverage(100, 99);
+        for o in 105..150 {
+            writer.add_record(rec(o)).unwrap();
+        }
+        writer.extend_coverage(159);
+        let meta = writer.flush("k").await.unwrap().unwrap();
+        assert_eq!((meta.start_offset, meta.end_offset), (105, 149));
+        assert_eq!(
+            (meta.covered_start_offset, meta.covered_end_offset),
+            (Some(100), Some(159))
+        );
+        // The next segment starts right after.
+        assert_eq!(writer.coverage_start(), Some(160));
+    }
+
+    #[test]
+    fn rotation_mid_batch_splits_coverage_at_the_last_record() {
+        let mut writer = memory_writer();
+        writer.begin_coverage(0, -1);
+        for o in 0..10 {
+            writer.add_record(rec(o)).unwrap();
+        }
+        // Rotation inside the batch: the rest of the batch goes to the next
+        // segment, so this one covers only up to its last record.
+        let first = writer.seal("a").unwrap();
+        for o in 10..20 {
+            writer.add_record(rec(o)).unwrap();
+        }
+        writer.extend_coverage(24);
+        let second = writer.seal("b").unwrap();
+        assert_eq!(first.covered(), (0, 9));
+        assert_eq!(second.covered(), (10, 24));
+    }
+
+    #[test]
+    fn uncovered_tail_is_reported_but_absorbed_by_the_next_segment() {
+        let mut writer = memory_writer();
+        writer.begin_coverage(0, -1);
+        writer.add_record(rec(0)).unwrap();
+        assert_eq!(writer.uncovered_tail(), None, "records are buffered");
+        let _ = writer.seal("a").unwrap();
+        assert_eq!(writer.uncovered_tail(), None, "nothing past the seal yet");
+
+        // An all-compacted fetch advances the position with no record.
+        writer.extend_coverage(30);
+        assert_eq!(writer.uncovered_tail(), Some((1, 30)));
+        // Reporting does not consume: the next segment still covers it, so
+        // the manifest's intervals stay contiguous.
+        assert_eq!(writer.uncovered_tail(), Some((1, 30)));
+        writer.add_record(rec(31)).unwrap();
+        assert_eq!(writer.uncovered_tail(), None);
+        assert_eq!(writer.seal("b").unwrap().covered(), (1, 31));
+    }
+
+    #[test]
+    fn resumed_coverage_can_start_below_the_fetch_position() {
+        // The previous run ended on a coverage-only advance through 59 after
+        // its last segment (..=49): resume fetching at 60, but the first new
+        // segment's covered range starts at 50.
+        let mut writer = memory_writer();
+        writer.begin_coverage(50, 59);
+        assert_eq!(writer.uncovered_tail(), Some((50, 59)));
+        writer.add_record(rec(60)).unwrap();
+        assert_eq!(writer.seal("a").unwrap().covered(), (50, 60));
+    }
+
+    #[test]
+    fn skip_coverage_moves_past_a_gap() {
+        let mut writer = memory_writer();
+        writer.begin_coverage(10, 9);
+        writer.extend_coverage(14);
+        // [10, 15) was compacted; [15, 40) is a retention gap recorded
+        // separately starting at coverage_start.
+        assert_eq!(writer.coverage_start(), Some(10));
+        writer.skip_coverage_to(40);
+        assert_eq!(writer.uncovered_tail(), None);
+        writer.add_record(rec(40)).unwrap();
+        assert_eq!(writer.seal("a").unwrap().covered(), (40, 40));
     }
 
     #[tokio::test]
