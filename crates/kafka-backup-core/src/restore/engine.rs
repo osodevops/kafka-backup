@@ -1730,15 +1730,16 @@ impl RestorePartitionContext {
         let mut first_timestamp = i64::MAX;
         let mut last_timestamp = i64::MIN;
 
-        // Process each segment
-        for segment in segments {
+        // Process each segment, in source-offset order
+        let mut overlap = super::helpers::OverlapGuard::default();
+        for segment in super::helpers::segments_in_offset_order(segments) {
             // Skip if already completed
             if completed_segments.contains(&segment.key) {
                 debug!("Skipping completed segment: {}", segment.key);
                 continue;
             }
 
-            let records = match self.read_segment(segment).await {
+            let mut records = match self.read_segment(segment).await {
                 Ok(r) => {
                     self.storage_cb.record_success();
                     self.health.mark_healthy("storage");
@@ -1751,6 +1752,17 @@ impl RestorePartitionContext {
                     return Err(e);
                 }
             };
+
+            // A legacy manifest can list overlapping segments: never
+            // produce a source offset twice.
+            let overlapping = overlap.skip_restored(&mut records);
+            if overlapping > 0 {
+                warn!(
+                    "{}:{}: skipped {} record(s) in {} already restored from an overlapping \
+                     segment",
+                    self.source_topic, self.source_partition, overlapping, segment.key
+                );
+            }
 
             // Filter records by time window
             let filtered_records = self.filter_records_by_time(records);

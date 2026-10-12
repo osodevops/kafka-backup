@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{RepartitioningStrategy, RestoreOptions, TopicRepartitioning};
@@ -308,7 +308,10 @@ async fn run_reader(
             .unwrap_or_default()
     };
 
-    for segment in filtered_segments {
+    // Source-offset order, never producing an offset twice when a legacy
+    // manifest lists overlapping segments.
+    let mut overlap = helpers::OverlapGuard::default();
+    for segment in helpers::segments_in_offset_order(filtered_segments) {
         // Abort if a writer has failed
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -319,7 +322,7 @@ async fn run_reader(
             continue;
         }
 
-        let records = match helpers::read_segment(storage, segment).await {
+        let mut records = match helpers::read_segment(storage, segment).await {
             Ok(r) => {
                 storage_cb.record_success();
                 health.mark_healthy("storage");
@@ -331,6 +334,14 @@ async fn run_reader(
                 return Err(e);
             }
         };
+
+        let overlapping = overlap.skip_restored(&mut records);
+        if overlapping > 0 {
+            warn!(
+                "{}:{}: skipped {} record(s) in {} already restored from an overlapping segment",
+                source_topic, source_partition, overlapping, segment.key
+            );
+        }
 
         let filtered = helpers::filter_records_by_time(records, options);
 
