@@ -99,7 +99,7 @@ enum Commands {
 
     /// Validate a backup's integrity (checksums, segment counts, manifests)
     #[command(
-        after_help = "Examples:\n  kafka-backup validate --config backup.yaml\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
+        after_help = "Examples:\n  kafka-backup validate --config backup.yaml\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep\n  kafka-backup validate --config backup.yaml --verify-sha256"
     )]
     Validate {
         /// Path to the backup configuration file (storage + backup_id come from it)
@@ -113,9 +113,16 @@ enum Commands {
         #[arg(short, long, requires = "path")]
         backup_id: Option<String>,
 
-        /// Perform deep validation (read and verify each segment)
+        /// Deep validation: read every segment, verify its SHA-256, decode it
+        /// and check record count and offsets, and check that each
+        /// partition's offsets are contiguous (no unrecorded holes)
         #[arg(long, default_value = "false")]
         deep: bool,
+
+        /// Read every segment and verify its SHA-256 against the manifest
+        /// without decoding it (faster than --deep), plus the contiguity check
+        #[arg(long = "verify-sha256", default_value = "false")]
+        verify_sha256: bool,
     },
 
     /// Delete aged/oversized segments from a backup set, recording the
@@ -601,12 +608,14 @@ async fn main() -> Result<()> {
             path,
             backup_id,
             deep,
+            verify_sha256,
         } => {
             commands::validate::run(
                 config.as_deref(),
                 path.as_deref(),
                 backup_id.as_deref(),
                 deep,
+                verify_sha256,
             )
             .await?;
         }
