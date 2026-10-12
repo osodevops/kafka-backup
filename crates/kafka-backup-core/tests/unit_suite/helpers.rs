@@ -98,6 +98,8 @@ pub fn create_segment_metadata(
         uncompressed_size: 4096,
         sha256: String::new(),
         uploaded_at: 0,
+        covered_start_offset: None,
+        covered_end_offset: None,
     }
 }
 

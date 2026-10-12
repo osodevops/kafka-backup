@@ -154,6 +154,8 @@ impl SegmentFlusher {
             compressed_size: compressed_size as u64,
             sha256,
             uploaded_at,
+            covered_start_offset: None,
+            covered_end_offset: None,
         };
 
         info!(

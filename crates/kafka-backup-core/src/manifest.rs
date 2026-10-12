@@ -169,6 +169,7 @@ impl TopicBackup {
                 segments: Vec::new(),
                 gaps: Vec::new(),
                 pruned: Vec::new(),
+                covered_through: None,
             });
         }
         self.partitions
@@ -202,12 +203,49 @@ pub struct PartitionBackup {
     /// `start_offset`; omitted from JSON when empty (absent before 0.21).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<PrunedRange>,
+
+    /// Highest source offset this backup has accounted for (inclusive),
+    /// including a tail that holds no record — trailing transaction markers
+    /// or compacted-away offsets after the last segment. Only ever advanced
+    /// after the segments (or gaps) covering everything up to it were
+    /// written and listed, so it is a safe resume point.
+    ///
+    /// Absent from manifests written before 0.24 (reads as `None`; the
+    /// segments' own ranges then give the reach — see [`reach`](Self::reach)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_through: Option<i64>,
 }
 
 impl PartitionBackup {
     /// Get the last offset backed up for this partition
     pub fn last_offset(&self) -> Option<i64> {
         self.segments.iter().map(|s| s.end_offset).max()
+    }
+
+    /// The durable reach of this partition: the highest source offset that
+    /// is accounted for by the manifest — inside a listed segment's covered
+    /// range, a recorded [`OffsetGap`], a [`PrunedRange`], or
+    /// [`covered_through`](Self::covered_through). A backup resumes at
+    /// `reach + 1`. `None` when the partition accounts for nothing yet.
+    pub fn reach(&self) -> Option<i64> {
+        let explicit = self.explicit_reach();
+        match (explicit, self.covered_through) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Like [`reach`](Self::reach) but over the explicit intervals only
+    /// (segments, gaps, pruned ranges), ignoring `covered_through`. A new
+    /// run starts its first segment's covered range here + 1 so the
+    /// intervals stay contiguous even when the previous run ended on a
+    /// coverage-only advance.
+    pub fn explicit_reach(&self) -> Option<i64> {
+        let segments = self.segments.iter().map(SegmentMetadata::covered_end);
+        // OffsetGap.end_offset is exclusive; PrunedRange.end_offset inclusive.
+        let gaps = self.gaps.iter().map(|g| g.end_offset - 1);
+        let pruned = self.pruned.iter().map(|p| p.end_offset);
+        segments.chain(gaps).chain(pruned).max()
     }
 
     /// Add a new segment
@@ -247,6 +285,9 @@ impl PartitionBackup {
 
 /// A contiguous range of offsets deliberately deleted from a backup by
 /// retention (`kafka-backup prune` or `backup.retention`).
+///
+/// The bounds are the pruned segments' covered ranges (since 0.24; their
+/// first and last record offsets before that).
 ///
 /// The segments covering `[start_offset, end_offset]` were captured and then
 /// removed on purpose; the range is recorded so `describe`/`validate` can
@@ -341,12 +382,18 @@ pub enum OffsetGapReason {
     /// its log start offset had advanced past it: the records were deleted by
     /// retention or `DeleteRecords` before the backup reached them.
     OffsetOutOfRange,
+    /// A checkpoint written by an older version claimed these offsets were
+    /// backed up, but no listed segment holds them (they were buffered or
+    /// uploaded but never recorded in a saved manifest). The backup went
+    /// back to re-read them and the source had already deleted them.
+    ResumeBeyondDurable,
 }
 
 impl std::fmt::Display for OffsetGapReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OffsetGapReason::OffsetOutOfRange => write!(f, "offset_out_of_range"),
+            OffsetGapReason::ResumeBeyondDurable => write!(f, "resume_beyond_durable"),
         }
     }
 }
@@ -391,9 +438,39 @@ pub struct SegmentMetadata {
     /// `end_timestamp` (which is producer record time) when present.
     #[serde(default)]
     pub uploaded_at: i64,
+
+    /// First source offset this segment accounts for (inclusive). Can be
+    /// below `start_offset` when the offsets before the first record held
+    /// no record (compacted away, transaction markers). `None` for segments
+    /// written before 0.24: `start_offset` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_start_offset: Option<i64>,
+
+    /// Last source offset this segment accounts for (inclusive) — the fetch
+    /// position when it was sealed, minus one. Can be above `end_offset`
+    /// for the same reasons. `None` before 0.24: `end_offset` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_end_offset: Option<i64>,
 }
 
 impl SegmentMetadata {
+    /// First offset accounted for by this segment (see
+    /// [`covered_start_offset`](Self::covered_start_offset)).
+    pub fn covered_start(&self) -> i64 {
+        self.covered_start_offset.unwrap_or(self.start_offset)
+    }
+
+    /// Last offset accounted for by this segment (see
+    /// [`covered_end_offset`](Self::covered_end_offset)).
+    pub fn covered_end(&self) -> i64 {
+        self.covered_end_offset.unwrap_or(self.end_offset)
+    }
+
+    /// Whether the segment records its covered range (written by 0.24+).
+    pub fn has_covered_range(&self) -> bool {
+        self.covered_start_offset.is_some() && self.covered_end_offset.is_some()
+    }
+
     /// Check if this segment overlaps with a time window
     pub fn overlaps_time_window(&self, start: Option<i64>, end: Option<i64>) -> bool {
         let segment_start = self.start_timestamp;
@@ -1757,6 +1834,7 @@ mod tests {
             segments: Vec::new(),
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
         };
         let json = serde_json::to_string(&partition).unwrap();
         assert!(!json.contains("pruned"), "{json}");
@@ -1769,6 +1847,7 @@ mod tests {
             segments: Vec::new(),
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
         };
         partition.add_pruned(pruned_range(20, 29));
         partition.add_pruned(pruned_range(0, 19));
@@ -1836,6 +1915,238 @@ mod tests {
         assert!(manifest.topics[0].partitions[0].gaps.is_empty());
         assert_eq!(manifest.total_gaps(), 0);
         assert_eq!(manifest.gaps().count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Covered ranges and the durable reach (checkpoint durability)
+    // ------------------------------------------------------------------
+
+    fn segment(start: i64, end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            key: format!("b/topics/t/partition=0/segment-{start:020}.bin.zst"),
+            start_offset: start,
+            end_offset: end,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            record_count: end - start + 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            sha256: String::new(),
+            uploaded_at: 0,
+            covered_start_offset: None,
+            covered_end_offset: None,
+        }
+    }
+
+    fn covered(start: i64, end: i64, covered_start: i64, covered_end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            covered_start_offset: Some(covered_start),
+            covered_end_offset: Some(covered_end),
+            ..segment(start, end)
+        }
+    }
+
+    fn empty_partition() -> PartitionBackup {
+        PartitionBackup {
+            partition_id: 0,
+            segments: Vec::new(),
+            gaps: Vec::new(),
+            pruned: Vec::new(),
+            covered_through: None,
+        }
+    }
+
+    #[test]
+    fn legacy_segment_covers_its_record_range() {
+        let seg = segment(10, 19);
+        assert_eq!(seg.covered_start(), 10);
+        assert_eq!(seg.covered_end(), 19);
+        assert!(!seg.has_covered_range());
+
+        // Compaction hole before the first record and markers after the last.
+        let seg = covered(12, 19, 10, 24);
+        assert_eq!(seg.covered_start(), 10);
+        assert_eq!(seg.covered_end(), 24);
+        assert!(seg.has_covered_range());
+    }
+
+    #[test]
+    fn reach_is_none_for_an_empty_partition() {
+        assert_eq!(empty_partition().reach(), None);
+        assert_eq!(empty_partition().explicit_reach(), None);
+    }
+
+    #[test]
+    fn reach_takes_the_highest_accounted_offset() {
+        let mut part = empty_partition();
+        part.segments.push(segment(0, 9));
+        assert_eq!(part.reach(), Some(9));
+
+        // A covered end beyond the last record (trailing markers / compaction).
+        part.segments.push(covered(10, 19, 10, 29));
+        assert_eq!(part.reach(), Some(29));
+
+        // An OffsetGap is end-exclusive: [30, 50) accounts through 49.
+        part.add_gap(gap(30, 50));
+        assert_eq!(part.reach(), Some(49));
+
+        // A coverage-only advance with no segment.
+        part.covered_through = Some(60);
+        assert_eq!(part.reach(), Some(60));
+        // ...is not an explicit interval (validate cannot see what it covered).
+        assert_eq!(part.explicit_reach(), Some(49));
+    }
+
+    #[test]
+    fn reach_counts_pruned_ranges_inclusive() {
+        let mut part = empty_partition();
+        part.add_pruned(pruned_range(0, 99));
+        assert_eq!(part.reach(), Some(99));
+        part.segments.push(segment(100, 149));
+        assert_eq!(part.reach(), Some(149));
+    }
+
+    #[test]
+    fn reach_is_the_max_even_with_overlapping_legacy_segments() {
+        // A legacy manifest can list overlapping segments (a key rewritten on
+        // resume with different boundaries). Reach is still the maximum.
+        let mut part = empty_partition();
+        part.segments.push(segment(0, 199));
+        part.segments.push(segment(100, 149));
+        assert_eq!(part.reach(), Some(199));
+    }
+
+    #[test]
+    fn covered_fields_are_omitted_when_unset() {
+        let json = serde_json::to_string(&segment(0, 9)).unwrap();
+        assert!(!json.contains("covered_"), "{json}");
+        let json = serde_json::to_string(&empty_partition()).unwrap();
+        assert!(!json.contains("covered_through"), "{json}");
+    }
+
+    #[test]
+    fn covered_fields_round_trip() {
+        let seg = covered(12, 19, 10, 24);
+        let back: SegmentMetadata =
+            serde_json::from_str(&serde_json::to_string(&seg).unwrap()).unwrap();
+        assert_eq!(back.covered_start_offset, Some(10));
+        assert_eq!(back.covered_end_offset, Some(24));
+
+        let mut part = empty_partition();
+        part.covered_through = Some(42);
+        let back: PartitionBackup =
+            serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
+        assert_eq!(back.covered_through, Some(42));
+    }
+
+    #[test]
+    fn manifest_written_before_covered_ranges_existed_still_parses() {
+        // A 0.23 manifest: no covered_* on segments, no covered_through.
+        let legacy = r#"{
+            "backup_id": "b",
+            "created_at": 1700000000000,
+            "compression": "zstd",
+            "topics": [{
+                "name": "t",
+                "partitions": [{
+                    "partition_id": 0,
+                    "segments": [{
+                        "key": "b/topics/t/partition=0/segment-00000000000000000000.bin.zst",
+                        "start_offset": 0,
+                        "end_offset": 9,
+                        "start_timestamp": 1,
+                        "end_timestamp": 2,
+                        "record_count": 10,
+                        "sha256": "ab",
+                        "uploaded_at": 5
+                    }]
+                }]
+            }]
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(legacy).unwrap();
+        let part = &manifest.topics[0].partitions[0];
+        assert_eq!(part.covered_through, None);
+        assert_eq!(part.segments[0].covered_start_offset, None);
+        assert_eq!(part.segments[0].covered_end(), 9);
+        assert_eq!(part.reach(), Some(9));
+    }
+
+    /// Older binaries (0.23 and earlier) must still read manifests written
+    /// with covered ranges: the structs never set `deny_unknown_fields`, so
+    /// the new keys are ignored. `OldSegment` / `OldPartition` mirror the
+    /// 0.23 field set exactly.
+    #[test]
+    fn manifest_with_covered_ranges_parses_with_the_old_field_set() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldSegment {
+            key: String,
+            start_offset: i64,
+            end_offset: i64,
+            start_timestamp: i64,
+            end_timestamp: i64,
+            record_count: i64,
+            #[serde(default)]
+            uncompressed_size: u64,
+            #[serde(default)]
+            compressed_size: u64,
+            #[serde(default)]
+            sha256: String,
+            #[serde(default)]
+            uploaded_at: i64,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldPartition {
+            partition_id: i32,
+            segments: Vec<OldSegment>,
+            #[serde(default)]
+            gaps: Vec<OffsetGap>,
+            #[serde(default)]
+            pruned: Vec<PrunedRange>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldTopic {
+            name: String,
+            partitions: Vec<OldPartition>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldManifest {
+            backup_id: String,
+            created_at: i64,
+            topics: Vec<OldTopic>,
+        }
+
+        let mut manifest = BackupManifest::new("b".to_string());
+        let part = manifest.get_or_create_topic("t").get_or_create_partition(0);
+        part.add_segment(covered(12, 19, 10, 24));
+        part.covered_through = Some(30);
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("covered_end_offset"), "{json}");
+        assert!(json.contains("covered_through"), "{json}");
+
+        let old: OldManifest = serde_json::from_str(&json).unwrap();
+        let seg = &old.topics[0].partitions[0].segments[0];
+        assert_eq!((seg.start_offset, seg.end_offset), (12, 19));
+        assert_eq!(seg.record_count, 8);
+    }
+
+    #[test]
+    fn resume_beyond_durable_gap_reason_round_trips() {
+        let gap = OffsetGap {
+            reason: OffsetGapReason::ResumeBeyondDurable,
+            ..gap(10, 20)
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        assert!(json.contains("\"resume_beyond_durable\""), "{json}");
+        let back: OffsetGap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reason, OffsetGapReason::ResumeBeyondDurable);
+        assert_eq!(
+            OffsetGapReason::ResumeBeyondDurable.to_string(),
+            "resume_beyond_durable"
+        );
     }
 
     #[test]

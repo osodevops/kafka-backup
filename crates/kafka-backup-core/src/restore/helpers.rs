@@ -304,6 +304,8 @@ mod tests {
                 compressed_size: 0,
                 sha256: String::new(),
                 uploaded_at: 0,
+                covered_start_offset: None,
+                covered_end_offset: None,
             };
 
             let out = read_segment(&storage, &segment)

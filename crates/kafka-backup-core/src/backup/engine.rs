@@ -1690,7 +1690,7 @@ async fn save_manifest_snapshot(
 ///   - Partitions only in current  → appended
 ///   - Partitions in both: segments deduplicated by (key, start_offset); existing wins on
 ///     conflict. Output sorted by start_offset. Offset gaps are unioned, deduplicated by
-///     start_offset.
+///     start_offset. `covered_through` is the maximum of the two sides.
 fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> BackupManifest {
     use std::collections::HashMap as HM;
 
@@ -1764,6 +1764,13 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                     for gap in cur_part.gaps {
                         ex_part.add_gap(gap);
                     }
+                    // Coverage only ever moves forward: a stale in-memory
+                    // value must not pull the stored reach back.
+                    ex_part.covered_through =
+                        match (ex_part.covered_through, cur_part.covered_through) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
                 } else {
                     ex_topic.partitions.push(cur_part);
                 }
@@ -2412,6 +2419,8 @@ mod tests {
             compressed_size: 0,
             sha256: String::new(),
             uploaded_at: 0,
+            covered_start_offset: None,
+            covered_end_offset: None,
         }
     }
 
@@ -2421,6 +2430,7 @@ mod tests {
             segments,
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
         }
     }
 
@@ -2918,6 +2928,30 @@ mod tests {
         let (topic, partition, gap) = merged.gaps().next().unwrap();
         assert_eq!((topic, partition), ("orders", 1));
         assert_eq!(gap, &make_gap(0, 50));
+    }
+
+    #[test]
+    fn merge_keeps_the_highest_covered_through() {
+        let with_coverage = |covered: Option<i64>| {
+            let mut part = make_partition(0, vec![make_segment("seg-a", 0, 9)]);
+            part.covered_through = covered;
+            let mut m = BackupManifest::new("test".to_string());
+            m.topics.push(make_topic("orders", Some(1), vec![part]));
+            m
+        };
+
+        let merged = merge_manifests(with_coverage(Some(20)), with_coverage(Some(30)));
+        assert_eq!(merged.topics[0].partitions[0].covered_through, Some(30));
+
+        // A stale in-memory value never moves the stored one backwards.
+        let merged = merge_manifests(with_coverage(Some(30)), with_coverage(Some(20)));
+        assert_eq!(merged.topics[0].partitions[0].covered_through, Some(30));
+
+        // A legacy side without the field keeps the other side's value.
+        let merged = merge_manifests(with_coverage(None), with_coverage(Some(25)));
+        assert_eq!(merged.topics[0].partitions[0].covered_through, Some(25));
+        let merged = merge_manifests(with_coverage(Some(25)), with_coverage(None));
+        assert_eq!(merged.topics[0].partitions[0].covered_through, Some(25));
     }
 
     #[test]
