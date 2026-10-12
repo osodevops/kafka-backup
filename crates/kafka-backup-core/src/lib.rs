@@ -3,6 +3,23 @@
 //! This crate provides the core functionality for backing up and restoring
 //! Kafka topics to/from various storage backends.
 
+/// Fault-injection point for the chaos suite. Compiles to nothing unless the
+/// `failpoints` feature is enabled. With it, a `return(msg)` action makes the
+/// enclosing function return `Err(Error::Io(..))`; a callback action runs
+/// the callback and continues (used to simulate a crash at this point).
+macro_rules! failpoint {
+    ($name:literal) => {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!($name, |msg: Option<String>| {
+            Err($crate::Error::Io(std::io::Error::other(format!(
+                "failpoint {}: {}",
+                $name,
+                msg.unwrap_or_default()
+            ))))
+        });
+    };
+}
+
 pub mod backup;
 pub mod circuit_breaker;
 pub mod compression;

@@ -131,6 +131,7 @@ impl SegmentFlusher {
 
         // Write to storage
         self.storage.put(&sealed.key, Bytes::from(segment)).await?;
+        failpoint!("backup::segment_put::after");
 
         // Update legacy metrics
         self.metrics

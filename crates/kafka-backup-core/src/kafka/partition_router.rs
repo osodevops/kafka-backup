@@ -1066,6 +1066,42 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
     }
 }
 
+/// The two partition reads the backup fetch loop needs, behind a trait so
+/// the loop can be driven by a scripted source in tests.
+#[async_trait::async_trait]
+pub(crate) trait PartitionFetcher: Send + Sync {
+    /// Fetch records from `offset`; returns the records and the next offset
+    /// to fetch (past any trailing offsets that held no record).
+    async fn fetch_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+    ) -> Result<(Vec<BackupRecord>, i64)>;
+
+    /// `(log start offset, high watermark)`.
+    async fn partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)>;
+}
+
+#[async_trait::async_trait]
+impl PartitionFetcher for PartitionLeaderRouter {
+    async fn fetch_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+    ) -> Result<(Vec<BackupRecord>, i64)> {
+        let response = self.fetch(topic, partition, offset, max_bytes).await?;
+        Ok((response.records, response.next_offset))
+    }
+
+    async fn partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
+        self.get_offsets(topic, partition).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
