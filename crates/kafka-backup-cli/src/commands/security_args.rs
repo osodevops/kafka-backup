@@ -35,8 +35,9 @@ pub struct SecurityCliArgs {
     #[arg(long)]
     pub security_protocol: Option<String>,
 
-    /// SASL mechanism (PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI).
-    /// Required when security_protocol is SASL_*.
+    /// SASL mechanism (PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI,
+    /// OAUTHBEARER). Required when security_protocol is SASL_*.
+    /// OAUTHBEARER needs Kafka Backup Enterprise (licence feature `oauth`).
     #[arg(long, env = "KAFKA_SASL_MECHANISM")]
     pub sasl_mechanism: Option<String>,
 
@@ -141,9 +142,10 @@ fn parse_sasl_mechanism(
         "SCRAM-SHA256" | "SCRAM-SHA-256" => Ok(Some(SaslMechanism::ScramSha256)),
         "SCRAM-SHA512" | "SCRAM-SHA-512" => Ok(Some(SaslMechanism::ScramSha512)),
         "GSSAPI" => Ok(Some(SaslMechanism::Gssapi)),
+        "OAUTHBEARER" => Ok(Some(SaslMechanism::OAuthBearer)),
         other => Err(anyhow::anyhow!(
             "unsupported sasl_mechanism '{other}' — expected one of: \
-             PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI"
+             PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI, OAUTHBEARER"
         )),
     }
 }
@@ -199,6 +201,23 @@ mod tests {
         args.sasl_mechanism = Some("KERBEROS-V5".to_string());
         let err = args.into_security_config().unwrap_err();
         assert!(format!("{err}").contains("unsupported sasl_mechanism"));
+    }
+
+    #[test]
+    fn oauthbearer_parses_then_fails_clearly_without_enterprise() {
+        assert_eq!(
+            parse_sasl_mechanism(Some("oauthbearer"), SecurityProtocol::SaslSsl).unwrap(),
+            Some(SaslMechanism::OAuthBearer)
+        );
+        let mut args = default_args();
+        args.security_protocol = Some("SASL_SSL".to_string());
+        args.sasl_mechanism = Some("OAUTHBEARER".to_string());
+        let err = format!("{}", args.into_security_config().unwrap_err());
+        assert!(
+            err.contains("SASL OAUTHBEARER requires Kafka Backup Enterprise"),
+            "{err}"
+        );
+        assert!(!err.contains("unsupported sasl_mechanism"), "{err}");
     }
 
     #[cfg(feature = "gssapi")]

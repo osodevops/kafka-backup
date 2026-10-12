@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `sasl_mechanism: OAUTHBEARER` (`SaslMechanism::OAuthBearer`) now parses,
+  including `--sasl-mechanism OAUTHBEARER` on the offset commands. This
+  build ships no OAuth token provider. Without one installed, the command
+  fails with "SASL OAUTHBEARER requires Kafka Backup Enterprise (licence
+  feature `oauth`) or a custom SaslMechanismPlugin", where before the
+  config failed to parse.
+
+### Changed
+- Unknown keys under `source.security` and `target.security` are now an
+  error, not a warning. Example: `security.oauth`, which is rejected with
+  the hint "OAuth settings belong under enterprise.oauth (Kafka Backup
+  Enterprise)". A misspelt or misplaced security setting would otherwise
+  connect with different credentials than intended. Library callers can
+  use `Config::check_security_sections` on raw YAML.
+- **API (semver minor):** `SaslMechanism` is now `#[non_exhaustive]`.
+  Matches on it outside this crate need a wildcard arm.
+
+### Fixed
+- KIP-368 re-authentication tasks no longer pile up across reconnects.
+  Each connection carries a generation. A re-auth task exits when its
+  connection has been replaced, never re-authenticates or drops a newer
+  one, and is aborted when its connection is dropped. There is at most one
+  task per live connection. Before this fix, each reconnect left the
+  previous task running against the new connection.
+- A re-auth the broker rejects is pinned by a test to retire the
+  connection, so the next request reconnects with a full SASL handshake.
+  Example: "Cannot change principals during re-authentication".
+
 ## [0.23.8] - 2026-10-09
 
 ### Fixed

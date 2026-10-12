@@ -322,8 +322,12 @@ impl Default for ConnectionConfig {
 }
 
 /// SASL mechanism
+///
+/// `#[non_exhaustive]`: match on it with a wildcard arm, as more
+/// mechanisms may be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING-KEBAB-CASE")]
+#[non_exhaustive]
 pub enum SaslMechanism {
     Plain,
     ScramSha256,
@@ -334,7 +338,26 @@ pub enum SaslMechanism {
     /// CLI builds without the feature surface a clear runtime error when
     /// a config requests `GSSAPI`.
     Gssapi,
+    /// SASL/OAUTHBEARER (RFC 7628), e.g. Confluent Cloud OAuth. YAML
+    /// spelling `OAUTHBEARER`. This crate ships no token provider: a
+    /// [`SaslMechanismPlugin`](crate::kafka::SaslMechanismPlugin) must be
+    /// installed through `SecurityConfig::sasl_mechanism_plugin_factory`
+    /// (Kafka Backup Enterprise does this when its `oauth` licence feature
+    /// is enabled). Without one, authentication fails with an error that
+    /// says so.
+    #[serde(rename = "OAUTHBEARER")]
+    OAuthBearer,
 }
+
+/// Error raised when `sasl_mechanism: OAUTHBEARER` reaches authentication
+/// without a plugin factory.
+pub const OAUTHBEARER_REQUIRES_PLUGIN: &str = "SASL OAUTHBEARER requires Kafka Backup Enterprise \
+     (licence feature `oauth`) or a custom SaslMechanismPlugin";
+
+/// Hint for OAuth-looking keys found under `source.security` /
+/// `target.security`.
+pub const OAUTH_SETTINGS_HINT: &str =
+    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)";
 
 /// Topic selection configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1168,6 +1191,22 @@ pub fn default_produce_acks_pub() -> i16 {
     default_produce_acks()
 }
 
+/// YAML keys `SecurityConfig` accepts, derived from its serialized form so
+/// the list cannot drift from the struct (`sasl_mechanism_plugin_factory`
+/// is `#[serde(skip)]` and so is not one of them).
+fn security_config_keys() -> Vec<String> {
+    serde_yaml::to_value(SecurityConfig::default())
+        .ok()
+        .and_then(|v| {
+            v.as_mapping().map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Public accessor for integration tests that assert the default timeout value.
 pub fn default_produce_timeout_ms_pub() -> i32 {
     default_produce_timeout_ms()
@@ -1185,12 +1224,21 @@ impl Config {
     /// `fetch_max_bytez` would otherwise be silently dropped and the
     /// operator-provided or hand-written option would simply not apply.
     /// Callers should surface the returned paths as warnings.
+    ///
+    /// Unknown keys under `source.security` / `target.security` are an
+    /// error rather than a warning (see [`Self::check_security_sections`]).
     pub fn from_yaml_with_warnings(yaml: &str) -> crate::Result<(Self, Vec<String>)> {
         let mut ignored = Vec::new();
         let deserializer = serde_yaml::Deserializer::from_str(yaml);
         let config: Config =
             serde_ignored::deserialize(deserializer, |path| ignored.push(path.to_string()))
                 .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+
+        let mut raw: serde_yaml::Value = serde_yaml::from_str(yaml)
+            .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+        // Resolve `<<: *anchor` merge keys so they are not read as keys.
+        let _ = raw.apply_merge();
+        Self::check_security_sections(&raw)?;
 
         let ignored = ignored
             .into_iter()
@@ -1208,6 +1256,53 @@ impl Config {
             .collect();
 
         Ok((config, ignored))
+    }
+
+    /// Reject unknown keys under `source.security` and `target.security` in
+    /// a raw YAML config.
+    ///
+    /// Elsewhere an unknown key is only a warning, but a security block
+    /// with a misplaced or misspelt setting connects with different
+    /// credentials than the operator intended (or none), so it is an error.
+    /// OAuth-looking keys (for example `security.oauth`) get a hint that
+    /// those settings belong under `enterprise.oauth`. Every unknown key is
+    /// reported at once. Values of the wrong type are left to
+    /// deserialization to report.
+    pub fn check_security_sections(root: &serde_yaml::Value) -> crate::Result<()> {
+        let known = security_config_keys();
+        let mut problems = Vec::new();
+        for section in ["source", "target"] {
+            let Some(map) = root
+                .get(section)
+                .and_then(|s| s.get("security"))
+                .and_then(|s| s.as_mapping())
+            else {
+                continue;
+            };
+            for key in map.keys() {
+                let name = match key.as_str() {
+                    Some(name) => name.to_string(),
+                    None => serde_yaml::to_string(key)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                };
+                if known.contains(&name) {
+                    continue;
+                }
+                let hint = if name.to_ascii_lowercase().contains("oauth") {
+                    OAUTH_SETTINGS_HINT.to_string()
+                } else {
+                    format!("valid keys are {}", known.join(", "))
+                };
+                problems.push(format!("unknown key `{section}.security.{name}`: {hint}"));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::Error::Config(problems.join("; ")))
+        }
     }
 
     /// Keys that are accepted for backwards compatibility but have no effect
@@ -1675,6 +1770,135 @@ sasl_krb5_config_path: /etc/krb5.conf
             back.contains("sasl_mechanism: GSSAPI"),
             "expected GSSAPI spelling in:\n{back}"
         );
+    }
+
+    #[test]
+    fn test_security_config_oauthbearer_serde_roundtrip() {
+        let yaml = r#"
+security_protocol: SASL_SSL
+sasl_mechanism: OAUTHBEARER
+"#;
+        let cfg: SecurityConfig = serde_yaml::from_str(yaml).expect("deserialize OAUTHBEARER");
+        assert_eq!(cfg.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        let back = serde_yaml::to_string(&cfg).expect("serialize");
+        assert!(
+            back.contains("sasl_mechanism: OAUTHBEARER"),
+            "expected OAUTHBEARER spelling in:\n{back}"
+        );
+        // The automatic SCREAMING-KEBAB-CASE spelling must not be accepted.
+        assert!(serde_yaml::from_str::<SaslMechanism>("O-AUTH-BEARER").is_err());
+    }
+
+    const SECURITY_LINT_BASE: &str = r#"
+mode: backup
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+storage:
+  backend: filesystem
+  path: /tmp/lint
+"#;
+
+    #[test]
+    fn security_lint_accepts_known_keys() {
+        let yaml = r#"
+mode: restore
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA512
+    sasl_username: u
+    sasl_password: p
+    ssl_ca_location: /ca.pem
+    ssl_certificate_location: /c.pem
+    ssl_key_location: /k.pem
+    sasl_kerberos_service_name: kafka
+    sasl_keytab_path: /k.keytab
+    sasl_krb5_config_path: /krb5.conf
+target:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: filesystem
+  path: /tmp/lint
+enterprise:
+  oauth:
+    providers: {}
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).expect("valid config");
+        assert_eq!(
+            config.source.unwrap().security.sasl_mechanism,
+            Some(SaslMechanism::ScramSha512)
+        );
+        // `enterprise:` is not this crate's business: a warning, not an error.
+        assert!(warnings.iter().any(|w| w.starts_with("enterprise")));
+        Config::from_yaml_with_warnings(SECURITY_LINT_BASE).expect("OAUTHBEARER parses");
+    }
+
+    #[test]
+    fn security_lint_rejects_oauth_settings_with_enterprise_hint() {
+        let source_oauth = SECURITY_LINT_BASE.replace(
+            "    sasl_mechanism: OAUTHBEARER\n",
+            "    sasl_mechanism: OAUTHBEARER\n    oauth:\n      client_id: x\n",
+        );
+        let target_oauth = format!(
+            "{SECURITY_LINT_BASE}target:\n  bootstrap_servers: [\"localhost:9092\"]\n  \
+             security:\n    sasl_oauthbearer_token_endpoint_url: https://idp/token\n"
+        );
+        for (yaml, key) in [
+            (source_oauth, "source.security.oauth"),
+            (
+                target_oauth,
+                "target.security.sasl_oauthbearer_token_endpoint_url",
+            ),
+        ] {
+            let err = Config::from_yaml_with_warnings(&yaml)
+                .expect_err(&format!("{key} must be rejected"))
+                .to_string();
+            assert!(err.contains(key), "names the key: {err}");
+            assert!(
+                err.contains(
+                    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)"
+                ),
+                "hint: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_lint_rejects_typos_and_lists_valid_keys() {
+        let yaml = SECURITY_LINT_BASE.replace(
+            "    sasl_mechanism: OAUTHBEARER\n",
+            "    sasl_mechanism: OAUTHBEARER\n    sasl_pasword: oops\n",
+        );
+        let err = Config::from_yaml_with_warnings(&yaml)
+            .expect_err("typo under security must be rejected")
+            .to_string();
+        assert!(err.contains("source.security.sasl_pasword"), "{err}");
+        assert!(err.contains("sasl_password"), "lists valid keys: {err}");
+        assert!(!err.contains("enterprise.oauth"), "no OAuth hint: {err}");
+    }
+
+    #[test]
+    fn security_lint_ignores_other_sections_and_missing_security() {
+        // Unknown keys elsewhere stay warnings (existing behaviour).
+        let yaml = r#"
+mode: backup
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  not_security: 1
+storage:
+  backend: filesystem
+  path: /tmp/lint
+"#;
+        let (_, warnings) = Config::from_yaml_with_warnings(yaml).expect("no security block");
+        assert!(warnings.iter().any(|w| w == "source.not_security"));
+        assert!(Config::check_security_sections(&serde_yaml::Value::Null).is_ok());
     }
 
     #[test]
