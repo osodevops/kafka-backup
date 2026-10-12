@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Backup checkpoints could run ahead of the data actually backed up.**
+  The partition loop checkpointed each fetch as soon as its records reached
+  the in-memory segment buffer, before the segment was uploaded or listed in
+  a saved manifest. A crash, an upload failure, a fetch error, or a graceful
+  shutdown (which neither waited for partitions nor saved the manifest
+  before syncing `offsets.db`) could leave the checkpoint past records the
+  backup never stored, and the next run skipped them silently. Now:
+  - a partition's checkpoint is only set after the manifest save that lists
+    its data, and `offsets.db` is only uploaded after that manifest;
+  - a run resumes from the manifest (its reach + 1), beyond every listed
+    segment, so no listed segment object is ever rewritten (a resume could
+    previously rewrite `segment-{start}` with different boundaries while the
+    manifest kept the old entry);
+  - on a fetch error the records already fetched are written as a final
+    segment before the error is returned;
+  - on SIGTERM / Ctrl-C every partition stops fetching, writes its buffer
+    and records it within the new `backup.shutdown_grace_secs` (default 30),
+    and the manifest is saved before the checkpoints and job status;
+  - writing a segment key the manifest already lists fails loudly.
+- The stored `offsets.db` is preferred over a non-empty local database file
+  (which could be a stale leftover ahead of storage). A stale SQLite WAL is
+  never replayed onto the loaded copy.
+- Restore no longer produces a source offset twice when a manifest written
+  by an older version lists overlapping segments.
+- `validate --deep` verifies each segment's SHA-256 against the manifest,
+  and record-count, offset, checksum and size mismatches now fail the run
+  (exit status 1) instead of only being listed.
+
+### Changed
+- **One-time re-read after upgrading.** On the first run, a partition whose
+  `offsets.db` checkpoint (written by an older version) is ahead of the
+  manifest logs a warning and re-reads from the manifest's reach + 1. If
+  Kafka retention already deleted those offsets, an offset gap with the new
+  reason `resume_beyond_durable` is recorded.
+- The resume position comes from the manifest whether or not
+  `offset_storage` is configured: re-running a backup with an existing
+  `backup_id` continues incrementally instead of starting over and
+  overwriting segment objects. `offsets.db` is consulted only for partitions
+  the manifest does not know.
+- Checkpoints trail the manifest by at most `backup.sync_interval_secs`
+  (every cycle end, error and shutdown saves immediately).
+- A retention gap is recorded only after the records fetched before it are
+  stored. Pruned ranges span the pruned segments' covered ranges.
+- `validate` treats a size mismatch as corruption at every depth (when the
+  manifest records a size).
+
+### Added
+- Manifest: `SegmentMetadata.covered_start_offset` / `covered_end_offset`
+  and `PartitionBackup.covered_through` record the offsets a segment (or a
+  trailing range with no record — compacted away, transaction markers)
+  accounts for. Absent fields fall back to the segment's first/last offset;
+  older binaries ignore them. `PartitionBackup::reach()` /
+  `explicit_reach()`, `SegmentMetadata::covered_start()` / `covered_end()`.
+- `OffsetGapReason::ResumeBeyondDurable`.
+- `backup.shutdown_grace_secs`.
+- `validate --verify-sha256` (hash without decoding), and a contiguity
+  check with `--deep` / `--verify-sha256`: every offset must be in a
+  segment's covered range, a recorded gap or a pruned range (holes next to
+  pre-0.24 segments only warn).
+- `failpoints` feature on `kafka-backup-core` (the `fail` crate) and a chaos
+  test that crashes backups at random failpoints and checks the stored data
+  has no loss and no duplicates (`KAFKA_BACKUP_CHAOS_SEEDS`, default 10).
+- `SegmentWriter::begin_coverage` / `extend_coverage` / `uncovered_tail` /
+  `skip_coverage_to`; `FaultyStorage` put faults, latency and hooks (tests).
+
+### API
+- New public fields on `SegmentMetadata`, `PartitionBackup` and
+  `BackupOptions` break struct-literal construction (minor version bump).
+
 ## [0.23.8] - 2026-10-09
 
 ### Fixed

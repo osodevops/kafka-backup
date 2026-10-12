@@ -402,7 +402,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
 | `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
 | `checkpoint_interval_secs` | int | No | `5` | **Deprecated (0.22.0) — no effect.** Offsets are checkpointed at the end of every backup cycle; a warning is logged if set |
-| `sync_interval_secs` | int | No | `30` | How often the manifest and the offset store are synced to remote storage (`offset_storage.sync_interval_secs` overrides it for the offset store) |
+| `sync_interval_secs` | int | No | `30` | How often the manifest is saved during a run. Offset checkpoints only move after the manifest save that lists the data, so they lag by at most this interval (the end of every cycle, an error and shutdown always save). `offset_storage.sync_interval_secs` overrides how often `offsets.db` is uploaded |
+| `shutdown_grace_secs` | int | No | `30` | On SIGTERM / Ctrl-C, how long partitions get to stop fetching, write their buffered records as a final segment and record it in the manifest before they are aborted (an aborted partition loses nothing durable; it re-reads on the next run) |
 | `include_offset_headers` | bool | No | **`true`** | Add `x-original-offset` / `x-original-timestamp` headers to every archived record — see [Offset-tracking headers](#offset-tracking-headers) |
 | `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
 | `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
@@ -497,6 +498,50 @@ This ensures consistent "point-in-time" snapshots for disaster recovery, even wi
 
 > **Note:** `stop_at_current_offsets` is incompatible with `continuous: true`. Use snapshot mode for scheduled backups (CronJobs), and continuous mode for streaming replication.
 
+### Resume and checkpoints
+
+A backup resumes each partition from what the **manifest** says is stored,
+not from a separate checkpoint:
+
+- The manifest's *reach* for a partition is the highest source offset it
+  accounts for: inside a listed segment's covered range, a recorded gap, a
+  pruned range, or the partition's `covered_through`. A run resumes at
+  `reach + 1`, beyond every listed segment, so a listed segment is never
+  rewritten.
+- Since 0.24 each segment records `covered_start_offset` /
+  `covered_end_offset`: the source offsets it accounts for, including
+  offsets before its first record or after its last that held no record
+  (compacted away, transaction markers). `covered_through` on the partition
+  records such a trailing range when no segment follows it yet. Older
+  manifests without these fields still resume from their segments' first and
+  last offsets.
+- `offsets.db` (the offset store) only records checkpoints that a saved
+  manifest already justifies: a partition's checkpoint is written after the
+  manifest listing its data, and `offsets.db` is uploaded after that
+  manifest. It is consulted only for partitions the manifest does not know
+  (backups written by older versions), and the stored copy is preferred over
+  a local database file.
+- A crash, an upload failure or an aborted shutdown therefore costs at most
+  a re-read of what was not yet recorded in a saved manifest — never a
+  silent hole. On a fetch error the records already fetched are written as a
+  final segment before the run fails; on a graceful shutdown every partition
+  flushes within `shutdown_grace_secs`.
+
+**Upgrading from 0.23 or earlier.** Older versions could checkpoint offsets
+before the segment holding them was uploaded and listed. On the first run
+after upgrading, a partition whose `offsets.db` checkpoint is ahead of the
+manifest logs a warning (`offset checkpoint N is ahead of the manifest`) and
+re-reads from the manifest's reach + 1, once. If Kafka retention has already
+deleted those offsets, the range is recorded as an offset gap with reason
+`resume_beyond_durable`: it was never durably backed up. Segment objects
+that an older version uploaded but never listed are orphans and may be
+overwritten.
+
+Re-running a backup with an existing `backup_id` continues from the manifest
+even without `offset_storage` (it used to start over from `start_offset` and
+overwrite segment objects in place). Use a new `backup_id` for an
+independent full copy.
+
 ### Backup Retention
 
 Prune aged or oversized segments from this backup set at the end of every
@@ -526,7 +571,7 @@ the resume position is never pruned.
 #### Kafka retention deleting data before it is fetched
 
 The offsets a backup starts from are captured before the fetch happens — for
-every partition up front in snapshot mode, and from the checkpoint on resume.
+every partition up front in snapshot mode, and from the manifest on resume.
 With many partitions, bounded `max_concurrent_partitions`, or a long gap
 between runs, retention can delete those offsets before the partition's turn
 comes up. The broker then rejects the fetch with `OFFSET_OUT_OF_RANGE`.
@@ -547,7 +592,10 @@ log start offset, resumes from there, and records the skipped range as an
 ```
 
 Records inside a gap were deleted from the source before they could be
-fetched and cannot be recovered. `kafka-backup validate` and
+fetched and cannot be recovered. A gap with reason `resume_beyond_durable`
+covers offsets an older version checkpointed without ever listing them in a
+saved manifest, which the source had deleted by the time the backup went back
+for them (see [Resume and checkpoints](#resume-and-checkpoints)). `kafka-backup validate` and
 `kafka-backup describe` list recorded gaps, and the
 `kafka_backup_offset_gaps_total` / `kafka_backup_offsets_skipped_total`
 counters let you alert on them. If gaps appear regularly, raise
@@ -603,7 +651,9 @@ backup:
 
 ## Offset Storage Configuration
 
-Configuration for the local SQLite database used to track backup progress. When present, this enables resumable incremental backups in **any** mode (one-shot, snapshot, or continuous). For continuous mode, the offset store is created automatically even without this section.
+Configuration for the local SQLite database used to track backup progress. For continuous mode, the offset store is created automatically even without this section.
+
+Since 0.24 the resume position comes from the backup manifest (see [Resume and checkpoints](#resume-and-checkpoints)); the offset store holds checkpoints that trail the manifest, is used to resume partitions only for backups written by older versions, and records the job status that `prune` reads.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -1071,7 +1121,16 @@ kafka-backup validate --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 | `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
 | `--path` | Path to storage location (requires `--backup-id`) |
 | `--backup-id` | Backup identifier (requires `--path`) |
-| `--deep` | Perform deep validation |
+| `--deep` | Read every segment, verify its SHA-256 against the manifest (segments written since 0.21), decode it and check record count and offsets, and check each partition's contiguity |
+| `--verify-sha256` | Read every segment and verify its SHA-256 without decoding (faster than `--deep`), plus the contiguity check |
+
+Any missing segment, size mismatch (every mode), checksum, record-count or
+offset mismatch (`--deep`), or contiguity error exits with status 1. The
+contiguity check requires every offset between a partition's first and last
+accounted offset to lie in a segment's covered range, a recorded gap or a
+pruned range, and segments not to overlap; a hole or overlap next to a
+segment written before 0.24 (which records only its first and last record,
+so a compaction hole looks the same) is a warning, not a failure.
 
 ### Prune Command
 
