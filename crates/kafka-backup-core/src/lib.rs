@@ -37,9 +37,9 @@ pub use kafka::{
 pub use manifest::{
     BackupManifest, BackupRecord, ConsumerGroupOffset, ConsumerGroupOffsets, DryRunPartitionReport,
     DryRunRepartitioningInfo, DryRunReport, DryRunTopicReport, OffsetGap, OffsetGapReason,
-    OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup, PartitionRestoreReport,
-    RecordHeader, RestoreCheckpoint, RestoreReport, SegmentMetadata, TopicBackup,
-    TopicRestoreReport,
+    OffsetLookupPrecision, OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup,
+    PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport, SegmentMetadata,
+    TargetOffsetLookup, TopicBackup, TopicRestoreReport,
 };
 pub use metrics::{
     create_instrumented_backend, ErrorType, InstrumentedStorageBackend, MetricsReport,

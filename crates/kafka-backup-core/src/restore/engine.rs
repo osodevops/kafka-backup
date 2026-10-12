@@ -1837,11 +1837,10 @@ impl RestorePartitionContext {
                 })
                 .sum();
 
-            // Produce records in batches. When the filter dropped records,
-            // collect (source, target) pairs for the survivors so the dropped
-            // source offsets can be mapped exactly afterwards.
-            let mut survivor_pairs: Vec<(i64, i64)> = Vec::new();
-            let collect_survivors = !filter_outcome.dropped_records.is_empty();
+            // Produce records in batches. Records the filter dropped are not
+            // mapped: `OffsetMapping::resolve_target_offset` resolves a
+            // committed offset that points at one to the next restored
+            // record, as it does for any other gap.
             let batch_size = self.options.produce_batch_size;
             for batch in records_to_produce.chunks(batch_size) {
                 // Apply rate limiting if configured
@@ -1887,9 +1886,6 @@ impl RestorePartitionContext {
                                     target_offset,
                                     timestamp: record.timestamp,
                                 });
-                                if collect_survivors {
-                                    survivor_pairs.push((source_offset, target_offset));
-                                }
                                 record_idx += 1;
                             }
                         }
@@ -1917,30 +1913,6 @@ impl RestorePartitionContext {
                 total_records += batch.len() as u64;
                 self.metrics.record_records(batch.len() as u64);
                 self.health.record_records(batch.len() as u64);
-            }
-
-            // Keep the offset mapping exact for dropped records: a committed
-            // consumer offset pointing at a dropped record resolves to the
-            // next surviving record's target offset.
-            if collect_survivors {
-                survivor_pairs.sort_unstable_by_key(|&(src, _)| src);
-                let mapped = super::filter::map_dropped_offsets(
-                    &filter_outcome.dropped_records,
-                    &survivor_pairs,
-                );
-                let pairs: Vec<crate::manifest::OffsetPair> = mapped
-                    .into_iter()
-                    .map(|(src, target, ts)| crate::manifest::OffsetPair {
-                        source_offset: src,
-                        target_offset: target,
-                        timestamp: ts,
-                    })
-                    .collect();
-                self.offset_mapping.lock().await.add_detailed_batch(
-                    &self.target_topic,
-                    self.target_partition,
-                    pairs,
-                );
             }
 
             total_bytes += batch_bytes;
