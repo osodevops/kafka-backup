@@ -300,6 +300,17 @@ fn group_coordinator_from_response(
     group_id: &str,
     response: FindCoordinatorResponse,
 ) -> Result<GroupCoordinator> {
+    coordinator_from_response("group", group_id, response)
+}
+
+/// The coordinator for `key` in a FindCoordinator response (v0-v3 single
+/// coordinator, or the v4+ list). `kind` names the key in error messages
+/// ("group", "transactional id").
+pub(super) fn coordinator_from_response(
+    kind: &str,
+    key: &str,
+    response: FindCoordinatorResponse,
+) -> Result<GroupCoordinator> {
     if response.coordinators.is_empty() {
         if response.error_code != 0 {
             return Err(KafkaError::BrokerError {
@@ -309,7 +320,7 @@ fn group_coordinator_from_response(
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| {
                         format!(
-                            "FindCoordinator failed for group {group_id} with error code {}",
+                            "FindCoordinator failed for {kind} {key} with error code {}",
                             response.error_code
                         )
                     }),
@@ -325,7 +336,7 @@ fn group_coordinator_from_response(
 
     let mut fallback = None;
     for coordinator in response.coordinators {
-        let is_match = coordinator.key.as_str() == group_id;
+        let is_match = coordinator.key.as_str() == key;
         if fallback.is_none() {
             fallback = Some(coordinator.clone());
         }
@@ -340,7 +351,7 @@ fn group_coordinator_from_response(
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| {
                         format!(
-                            "FindCoordinator failed for group {group_id} with error code {}",
+                            "FindCoordinator failed for {kind} {key} with error code {}",
                             coordinator.error_code
                         )
                     }),
@@ -356,7 +367,7 @@ fn group_coordinator_from_response(
 
     let coordinator = fallback.ok_or_else(|| {
         KafkaError::Protocol(format!(
-            "FindCoordinator returned no coordinator for group {group_id}"
+            "FindCoordinator returned no coordinator for {kind} {key}"
         ))
     })?;
     if coordinator.error_code != 0 {
@@ -367,7 +378,7 @@ fn group_coordinator_from_response(
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| {
                     format!(
-                        "FindCoordinator failed for group {group_id} with error code {}",
+                        "FindCoordinator failed for {kind} {key} with error code {}",
                         coordinator.error_code
                     )
                 }),

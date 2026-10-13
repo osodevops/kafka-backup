@@ -11,6 +11,7 @@ mod produce;
 pub mod sasl;
 mod scram;
 pub mod tls;
+pub mod transactions;
 
 pub use admin::{
     create_topics, delete_records, describe_configs, incremental_alter_configs, ConfigChange,

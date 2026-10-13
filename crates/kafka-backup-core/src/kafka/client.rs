@@ -744,6 +744,13 @@ impl KafkaClient {
             ApiKey::DescribeAcls => 1,
             ApiKey::CreateAcls => 1,
             ApiKey::DeleteAcls => 1,
+            // Producer identity (KIP-98). InitProducerId v3 (Kafka 2.5+)
+            // carries the current producer id and epoch so an idempotent
+            // producer can bump its epoch (KIP-360). FindCoordinator v2
+            // above already takes key_type 1 (transaction coordinator).
+            ApiKey::InitProducerId => 3,
+            ApiKey::AddPartitionsToTxn => 1,
+            ApiKey::EndTxn => 1,
             _ => 0,
         }
     }
