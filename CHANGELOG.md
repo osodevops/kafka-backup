@@ -117,6 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by log lines and did not parse. All logs now go to stderr; stdout carries
   only command output. Text logs are coloured only when stderr is a
   terminal.
+- **`restore.rewrite_schema_ids` did nothing for repartitioned topics.** The
+  1:1 path rewrote Confluent schema IDs, but the repartition (fan-out) path
+  produced the source registry's IDs unchanged, so consumers of a
+  repartitioned topic resolved the wrong schemas on the target. Both paths
+  now apply the same rewrite.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -260,12 +265,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kafka_restore_partitions_completed_total` and
   `kafka_restore_errors_total{error_type}` (#173).
 
+- `restore.schema_id_rewrite_topics` (source topics the schema ID rewrite
+  applies to; all by default) and `restore.schema_id_rewrite_strict` (fail on
+  a framed key or value whose ID is not in `schema_id_mapping`, instead of
+  restoring it with the source ID). The restore report counts
+  `schema_ids_rewritten` / `schema_ids_unmapped` per topic; `restore` prints
+  them.
+
 ### API
 - `RestoreEngine::new_with_metrics(config, Option<Arc<PrometheusMetrics>>)`
   and `RestoreEngine::prometheus_metrics()`, as on `BackupEngine`;
   `ThreePhaseRestore::with_prometheus_metrics`.
 - `PrometheusMetrics::{inc_restore_bytes, inc_restore_partitions_completed,
   record_restore_error}` and `RestoreErrorLabels`.
+- `TopicRestoreReport::{schema_ids_rewritten, schema_ids_unmapped}` and
+  `RestoreOptions::{schema_id_rewrite_topics, schema_id_rewrite_strict}`
+  (new public fields: struct literals need them or `..Default::default()`).
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
 

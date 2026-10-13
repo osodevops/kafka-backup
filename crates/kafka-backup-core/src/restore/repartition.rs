@@ -167,6 +167,8 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
             bytes: 0,
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
+            schema_ids_rewritten: 0,
+            schema_ids_unmapped: 0,
         });
     }
 
@@ -190,6 +192,7 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
     // Topic-level filter counters, shared by all reader tasks.
     let filter_dropped = Arc::new(AtomicU64::new(0));
     let filter_tombstoned = Arc::new(AtomicU64::new(0));
+    let schema_ids = Arc::new(helpers::SchemaIdCounts::default());
 
     // Spawn N reader tasks
     let semaphore = Arc::new(Semaphore::new(options.max_concurrent_partitions));
@@ -205,6 +208,7 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
         let cancel = Arc::clone(&cancel);
         let filter_dropped = Arc::clone(&filter_dropped);
         let filter_tombstoned = Arc::clone(&filter_tombstoned);
+        let schema_ids = Arc::clone(&schema_ids);
         let storage = Arc::clone(&storage);
         let storage_cb = Arc::clone(&storage_cb);
         let health = Arc::clone(&health);
@@ -225,6 +229,7 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
                 &health,
                 &checkpoint,
                 &options,
+                &schema_ids,
                 &filter_dropped,
                 &filter_tombstoned,
                 &telemetry,
@@ -309,6 +314,7 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
         return Err(first_err);
     }
 
+    let (schema_ids_rewritten, schema_ids_unmapped) = schema_ids.finish(&topic_backup.name);
     Ok(TopicRestoreReport {
         source_topic: topic_backup.name.clone(),
         target_topic: target_topic.to_string(),
@@ -317,6 +323,8 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
         bytes: total_bytes,
         records_dropped_by_filter: filter_dropped.load(Ordering::Relaxed),
         records_tombstoned_by_filter: filter_tombstoned.load(Ordering::Relaxed),
+        schema_ids_rewritten,
+        schema_ids_unmapped,
     })
 }
 
@@ -334,6 +342,7 @@ async fn run_reader(
     health: &HealthCheck,
     checkpoint: &Mutex<Option<RestoreCheckpoint>>,
     options: &RestoreOptions,
+    schema_ids: &helpers::SchemaIdCounts,
     filter_dropped: &AtomicU64,
     filter_tombstoned: &AtomicU64,
     telemetry: &RestoreTelemetry,
@@ -410,7 +419,20 @@ async fn run_reader(
         }
 
         let stripped = helpers::strip_offset_headers(filtered, options);
-        let records_to_send = helpers::inject_offset_headers(stripped, source_partition, options);
+        let mut records_to_send =
+            helpers::inject_offset_headers(stripped, source_partition, options);
+        // Same rewrite as the 1:1 path. A strict-mode failure stops the
+        // other readers and the writers too.
+        if let Err(e) = helpers::rewrite_schema_ids(
+            &mut records_to_send,
+            source_topic,
+            source_partition,
+            options,
+            schema_ids,
+        ) {
+            cancel.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
 
         // Route each record through the partitioner
         for record in records_to_send {

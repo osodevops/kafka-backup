@@ -21,6 +21,7 @@
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
 //! - Read-committed backup of transactional topics (aborted records, markers,
 //!   the last stable offset), with a test-support transactional producer
+//! - Schema ID rewrite on the 1:1 and repartition restore paths (no Docker)
 //! - strimzi-backup-operator#57: snapshot progress gauges describe the current run
 
 pub mod azure_azurite;
@@ -52,6 +53,7 @@ pub mod sasl_oauth_tests;
 pub mod sasl_plugin_mock_tests;
 pub mod sasl_test_fixtures;
 pub mod sasl_tests;
+pub mod schema_id_rewrite_restore;
 pub mod snapshot_backup;
 pub mod tls_tests;
 pub mod transactional_producer;

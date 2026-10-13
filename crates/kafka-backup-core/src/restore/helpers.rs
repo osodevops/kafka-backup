@@ -3,7 +3,11 @@
 //! These functions are used by both the standard restore engine and the
 //! repartitioning fan-out module.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::compression::{decompress, detect_from_extension};
 use crate::config::{OffsetStrategy, RestoreOptions};
@@ -12,7 +16,7 @@ use crate::offset_headers;
 use crate::segment::format::{BinaryRecord, MAGIC_BYTES};
 use crate::segment::SegmentReader;
 use crate::storage::StorageBackend;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Read a segment from storage, handling both binary and legacy JSON formats.
 pub async fn read_segment(
@@ -184,6 +188,127 @@ impl OverlapGuard {
             self.last = Some(self.last.map_or(max, |last| last.max(max)));
         }
         (before - records.len()) as u64
+    }
+}
+
+/// Confluent schema IDs rewritten in one topic's keys and values, and keys
+/// and values that carried an ID absent from the mapping. Shared by the
+/// topic's partition tasks (1:1 path) or readers (repartition path).
+#[derive(Debug, Default)]
+pub(crate) struct SchemaIdCounts {
+    rewritten: AtomicU64,
+    unmapped: AtomicU64,
+}
+
+impl SchemaIdCounts {
+    fn add(&self, rewritten: u64, unmapped: u64) {
+        self.rewritten.fetch_add(rewritten, Ordering::Relaxed);
+        self.unmapped.fetch_add(unmapped, Ordering::Relaxed);
+    }
+
+    /// `(rewritten, unmapped)` for the topic's report, logged when non-zero.
+    pub(crate) fn finish(&self, source_topic: &str) -> (u64, u64) {
+        let rewritten = self.rewritten.load(Ordering::Relaxed);
+        let unmapped = self.unmapped.load(Ordering::Relaxed);
+        if rewritten > 0 {
+            info!("{source_topic}: rewrote {rewritten} Confluent schema ID(s)");
+        }
+        if unmapped > 0 {
+            warn!(
+                "{source_topic}: {unmapped} key(s)/value(s) start with the Confluent magic byte \
+                 but carry a schema ID absent from restore.schema_id_mapping; they were \
+                 restored unchanged (set restore.schema_id_rewrite_strict to fail instead)"
+            );
+        }
+        (rewritten, unmapped)
+    }
+}
+
+/// Whether `restore.rewrite_schema_ids` applies to `source_topic`: every
+/// topic, or those `schema_id_rewrite_topics` matches (glob, or regex with a
+/// `~` prefix).
+pub(crate) fn schema_id_rewrite_applies(options: &RestoreOptions, source_topic: &str) -> bool {
+    options.rewrite_schema_ids
+        && (options.schema_id_rewrite_topics.is_empty()
+            || options
+                .schema_id_rewrite_topics
+                .iter()
+                .any(|pattern| super::engine::pattern_match(pattern, source_topic)))
+}
+
+/// Rewrite the Confluent schema IDs of records about to be produced
+/// (`restore.rewrite_schema_ids`) and count them in `counts`.
+///
+/// Records of topics outside `schema_id_rewrite_topics` are left alone. A key
+/// or value with the magic byte and an ID absent from `schema_id_mapping` is
+/// left unchanged and counted, or, with `schema_id_rewrite_strict`, fails the
+/// restore before any record of the batch is produced.
+pub(crate) fn rewrite_schema_ids(
+    records: &mut [BackupRecord],
+    source_topic: &str,
+    source_partition: i32,
+    options: &RestoreOptions,
+    counts: &SchemaIdCounts,
+) -> Result<()> {
+    if !schema_id_rewrite_applies(options, source_topic) {
+        return Ok(());
+    }
+    let (mut rewritten, mut unmapped) = (0u64, 0u64);
+    for record in records.iter_mut() {
+        let offset = record.offset;
+        for (part, payload) in [
+            ("key", record.key.as_mut()),
+            ("value", record.value.as_mut()),
+        ] {
+            match rewrite_confluent_payload(payload, &options.schema_id_mapping) {
+                PayloadRewrite::NotFramed => {}
+                PayloadRewrite::Rewritten => rewritten += 1,
+                PayloadRewrite::Unmapped(id) if options.schema_id_rewrite_strict => {
+                    counts.add(rewritten, unmapped);
+                    return Err(Error::Validation(format!(
+                        "schema ID {id} in the {part} of {source_topic} partition \
+                         {source_partition} offset {offset} is not in restore.schema_id_mapping; \
+                         restore.schema_id_rewrite_strict refuses to produce it with the source \
+                         registry's ID"
+                    )));
+                }
+                PayloadRewrite::Unmapped(_) => unmapped += 1,
+            }
+        }
+    }
+    counts.add(rewritten, unmapped);
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadRewrite {
+    /// Null, shorter than 5 bytes, or no magic byte 0.
+    NotFramed,
+    Rewritten,
+    /// Magic byte 0 followed by this ID, absent from the mapping.
+    Unmapped(i32),
+}
+
+/// Rewrite the 4-byte schema ID following Confluent's magic byte. Avro, JSON
+/// Schema and Protobuf all share this five-byte prefix; any format-specific
+/// bytes after it are preserved verbatim.
+fn rewrite_confluent_payload(
+    payload: Option<&mut Vec<u8>>,
+    mapping: &HashMap<i32, i32>,
+) -> PayloadRewrite {
+    let Some(payload) = payload else {
+        return PayloadRewrite::NotFramed;
+    };
+    if payload.len() < 5 || payload[0] != 0 {
+        return PayloadRewrite::NotFramed;
+    }
+    let source_id = i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    match mapping.get(&source_id) {
+        Some(target_id) => {
+            payload[1..5].copy_from_slice(&target_id.to_be_bytes());
+            PayloadRewrite::Rewritten
+        }
+        None => PayloadRewrite::Unmapped(source_id),
     }
 }
 
@@ -598,5 +723,103 @@ mod tests {
         };
         let out = inject_offset_headers(vec![record], 0, &RestoreOptions::default());
         assert_eq!(out[0].headers, vec![header("trace-id", None)]);
+    }
+
+    fn record(key: Option<Vec<u8>>, value: Option<Vec<u8>>) -> BackupRecord {
+        BackupRecord {
+            key,
+            value,
+            headers: Vec::new(),
+            timestamp: 0,
+            offset: 3,
+        }
+    }
+
+    fn rewrite_options(mapping: &[(i32, i32)]) -> RestoreOptions {
+        RestoreOptions {
+            rewrite_schema_ids: true,
+            schema_id_mapping: mapping.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewrites_confluent_key_and_value_without_touching_payload() {
+        let mut records = vec![record(
+            Some(vec![0, 0, 0, 0, 7, 10]),
+            Some(vec![0, 0, 0, 0, 7, 20, 21]),
+        )];
+        let counts = SchemaIdCounts::default();
+        rewrite_schema_ids(&mut records, "t", 0, &rewrite_options(&[(7, 42)]), &counts).unwrap();
+        assert_eq!(records[0].key.as_deref(), Some(&[0, 0, 0, 0, 42, 10][..]));
+        assert_eq!(
+            records[0].value.as_deref(),
+            Some(&[0, 0, 0, 0, 42, 20, 21][..])
+        );
+        assert_eq!(counts.finish("t"), (2, 0));
+    }
+
+    #[test]
+    fn ignores_null_short_and_non_confluent_payloads_and_counts_unmapped() {
+        let mut records = vec![
+            record(None, Some(vec![0, 1, 2])),
+            record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8])),
+        ];
+        let original = records.clone();
+        let counts = SchemaIdCounts::default();
+        rewrite_schema_ids(&mut records, "t", 0, &rewrite_options(&[(7, 42)]), &counts).unwrap();
+        assert_eq!(records[0].key, original[0].key);
+        assert_eq!(records[0].value, original[0].value);
+        assert_eq!(records[1].key, original[1].key);
+        assert_eq!(records[1].value, original[1].value);
+        // Only `00 00 00 00 08` is framed, with an ID the mapping lacks.
+        assert_eq!(counts.finish("t"), (0, 1));
+    }
+
+    #[test]
+    fn rewrite_is_off_unless_enabled_and_scoped_by_topic_patterns() {
+        let framed = || vec![record(None, Some(vec![0, 0, 0, 0, 7, 1]))];
+        let counts = SchemaIdCounts::default();
+
+        let mut disabled = framed();
+        let mut options = rewrite_options(&[(7, 42)]);
+        options.rewrite_schema_ids = false;
+        rewrite_schema_ids(&mut disabled, "orders", 0, &options, &counts).unwrap();
+        assert_eq!(disabled[0].value, framed()[0].value);
+
+        options.rewrite_schema_ids = true;
+        options.schema_id_rewrite_topics = vec!["payments-*".into(), "~^orders-v\\d+$".into()];
+        assert!(!schema_id_rewrite_applies(&options, "orders"));
+        assert!(schema_id_rewrite_applies(&options, "payments-eu"));
+        assert!(schema_id_rewrite_applies(&options, "orders-v2"));
+
+        let mut outside = framed();
+        rewrite_schema_ids(&mut outside, "orders", 0, &options, &counts).unwrap();
+        assert_eq!(outside[0].value, framed()[0].value);
+        let mut inside = framed();
+        rewrite_schema_ids(&mut inside, "orders-v2", 0, &options, &counts).unwrap();
+        assert_eq!(inside[0].value.as_deref(), Some(&[0, 0, 0, 0, 42, 1][..]));
+        assert_eq!(counts.finish("t"), (1, 0));
+    }
+
+    #[test]
+    fn strict_mode_fails_on_an_unmapped_id_naming_the_record() {
+        let mut options = rewrite_options(&[(7, 42)]);
+        options.schema_id_rewrite_strict = true;
+        let counts = SchemaIdCounts::default();
+
+        // Mapped and non-framed payloads pass.
+        let mut ok = vec![record(Some(b"plain".to_vec()), Some(vec![0, 0, 0, 0, 7]))];
+        rewrite_schema_ids(&mut ok, "orders", 2, &options, &counts).unwrap();
+
+        let mut bad = vec![record(Some(vec![0, 0, 0, 1, 0, 9]), None)];
+        let err = rewrite_schema_ids(&mut bad, "orders", 2, &options, &counts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("schema ID 256 in the key of orders partition 2 offset 3"),
+            "{err}"
+        );
+        assert!(err.contains("restore.schema_id_mapping"), "{err}");
     }
 }

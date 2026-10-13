@@ -1099,6 +1099,38 @@ restore:
 
 > **Note:** The number of partitions for auto-created topics is determined from the backup manifest. If the source topic had 6 partitions, the target topic will be created with 6 partitions.
 
+### Schema ID Rewrite
+
+For records in the Confluent wire format (magic byte `0`, then a 4-byte
+schema ID) restored into a different Schema Registry, the restore can swap
+each source schema ID for the target registry's ID. Kafka Backup Enterprise
+fills `schema_id_mapping` from its Schema Registry restore; set it by hand
+otherwise.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `rewrite_schema_ids` | bool | No | `false` | Rewrite the schema ID of every framed key and value, on the 1:1 and the repartition path |
+| `schema_id_mapping` | map[int]int | No | `{}` | Source schema ID → target schema ID |
+| `schema_id_rewrite_topics` | list[string] | No | `[]` (all) | Source topics to rewrite (glob, or regex with a `~` prefix); others are restored unchanged |
+| `schema_id_rewrite_strict` | bool | No | `false` | Fail on a framed key or value whose ID is not in `schema_id_mapping`, naming the topic, partition and offset, instead of restoring it with the source ID |
+
+Only the 4 ID bytes change; the payload after them is produced byte for
+byte. The restore report counts, per topic, `schema_ids_rewritten` and
+`schema_ids_unmapped` (framed keys and values left unchanged because their
+ID is not in the mapping), and the CLI prints them. A raw payload that
+starts with a zero byte looks framed, so it can be counted as unmapped:
+enable `schema_id_rewrite_strict` only for topics whose keys and values are
+all Schema Registry framed (or never start with `0x00`), and use
+`schema_id_rewrite_topics` to leave other topics alone.
+
+```yaml
+restore:
+  rewrite_schema_ids: true
+  schema_id_mapping: {100001: 1, 100002: 2}
+  schema_id_rewrite_topics: ["orders-*", "payments"]
+  schema_id_rewrite_strict: true
+```
+
 ### Complete Restore Example
 
 ```yaml
