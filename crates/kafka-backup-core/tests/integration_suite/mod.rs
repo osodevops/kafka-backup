@@ -16,6 +16,7 @@
 //! - Issue #154: default offset headers are documented, logged, and strippable on restore
 //! - Issue #155: null header values survive backup and restore
 //! - Issue #167: backup.on_missing_topic warn/fail behaviour
+//! - Issue #173: restore Prometheus metrics and progress events (no Docker)
 //! - Issue #197: circuit-breaker config + scoped connection eviction
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
 //! - Read-committed backup of transactional topics (aborted records, markers,
@@ -32,6 +33,7 @@ pub mod issue_154_offset_headers;
 pub mod issue_155_null_header_value;
 pub mod issue_167_on_missing_topic;
 pub mod issue_169_retention;
+pub mod issue_173_restore_metrics;
 pub mod issue_197_broker_pause;
 pub mod issue_197_circuit_breaker;
 pub mod issue_224_group_coordinator;

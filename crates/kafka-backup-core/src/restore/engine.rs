@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use super::telemetry::{RestoreOutcome, RestorePlan, RestoreTelemetry};
+
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{
     Config, ExistingTopicConfigPolicy, IsolationLevel, Mode, OffsetStrategy, RestoreOptions,
@@ -19,11 +21,14 @@ use crate::manifest::{
     DryRunTopicReport, OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport,
     SegmentMetadata, TopicBackup, TopicRestoreReport,
 };
-use crate::metrics::PerformanceMetrics;
+use crate::metrics::{PerformanceMetrics, PrometheusMetrics};
 use crate::storage::{create_backend, StorageBackend};
 use crate::{Error, Result};
 
-/// Progress update sent during restore
+/// Progress update sent during restore (see
+/// [`RestoreEngine::progress_receiver`]): once the restore's totals are
+/// known, after the first produced batch, then at most every 5 seconds while
+/// records flow, and once at the end of the run.
 #[derive(Debug, Clone)]
 pub struct RestoreProgress {
     /// Current topic being restored
@@ -164,7 +169,8 @@ pub struct RestoreEngine {
     shutdown_tx: broadcast::Sender<()>,
     checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
     offset_mapping: Arc<Mutex<OffsetMapping>>,
-    progress_tx: broadcast::Sender<RestoreProgress>,
+    /// Restore metrics and the progress broadcast (issue #173).
+    telemetry: Arc<RestoreTelemetry>,
     target_config: Option<crate::config::KafkaConfig>,
 }
 
@@ -297,6 +303,17 @@ fn import_auto_consumer_group_snapshot_offsets(
 impl RestoreEngine {
     /// Create a new restore engine
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_with_metrics(config, None)
+    }
+
+    /// Create a new restore engine that records the `kafka_restore_*`
+    /// Prometheus metrics (records, bytes, partitions completed, errors,
+    /// duration, progress) in `prometheus_metrics`, labelled with the backup
+    /// id.
+    pub fn new_with_metrics(
+        config: Config,
+        prometheus_metrics: Option<Arc<PrometheusMetrics>>,
+    ) -> Result<Self> {
         config.validate()?;
 
         if config.mode != Mode::Restore {
@@ -340,7 +357,7 @@ impl RestoreEngine {
         }));
 
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (progress_tx, _) = broadcast::channel(100);
+        let telemetry = Arc::new(RestoreTelemetry::new(&config.backup_id, prometheus_metrics));
 
         Ok(Self {
             config,
@@ -353,7 +370,7 @@ impl RestoreEngine {
             shutdown_tx,
             checkpoint: Arc::new(Mutex::new(None)),
             offset_mapping: Arc::new(Mutex::new(OffsetMapping::new())),
-            progress_tx,
+            telemetry,
             target_config: Some(target_config),
         })
     }
@@ -365,7 +382,12 @@ impl RestoreEngine {
 
     /// Subscribe to progress updates
     pub fn progress_receiver(&self) -> broadcast::Receiver<RestoreProgress> {
-        self.progress_tx.subscribe()
+        self.telemetry.subscribe()
+    }
+
+    /// Get Prometheus metrics (if configured)
+    pub fn prometheus_metrics(&self) -> Option<Arc<PrometheusMetrics>> {
+        self.telemetry.prometheus()
     }
 
     /// Get a shutdown signal receiver
@@ -396,6 +418,7 @@ impl RestoreEngine {
     /// Run the restore process
     pub async fn run(&self) -> Result<RestoreReport> {
         self.health.job_started();
+        self.telemetry.start();
 
         let start_time = Instant::now();
         let start_timestamp = chrono::Utc::now().timestamp_millis();
@@ -406,6 +429,14 @@ impl RestoreEngine {
 
         let end_timestamp = chrono::Utc::now().timestamp_millis();
         let duration_ms = start_time.elapsed().as_millis() as u64;
+        self.telemetry.finish(
+            match &result {
+                Ok(report) if report.dry_run => RestoreOutcome::DryRun,
+                Ok(_) => RestoreOutcome::Success,
+                Err(e) => RestoreOutcome::Failure(e),
+            },
+            start_time.elapsed(),
+        );
 
         // Log final metrics
         let report = self.metrics.report();
@@ -826,6 +857,12 @@ impl RestoreEngine {
             });
         }
 
+        self.telemetry.plan(RestorePlan::new(
+            &topics_to_restore,
+            &restore_options,
+            self.checkpoint.lock().await.as_ref(),
+        ));
+
         // Auto-create topics if configured
         let newly_created_topics = if restore_options.create_topics {
             self.ensure_topics_exist(&topics_to_restore, &restore_options)
@@ -921,11 +958,13 @@ impl RestoreEngine {
                     total_records += report.records;
                     total_bytes += report.bytes;
                     topic_reports.push(report);
+                    self.telemetry.topic_completed();
                 }
                 Err(e) => {
                     error!("Error restoring topic {}: {}", topic_backup.name, e);
                     errors.push(format!("Topic {}: {}", topic_backup.name, e));
                     self.metrics.record_error();
+                    self.telemetry.record_error(&e);
 
                     if !self.health.is_operational() {
                         return Err(e);
@@ -1233,7 +1272,7 @@ impl RestoreEngine {
                 .clone()
                 .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
 
-            return super::repartition::restore_topic_repartitioned(
+            return super::repartition::restore_topic_repartitioned_with_telemetry(
                 topic_backup,
                 &target_topic,
                 repart_config,
@@ -1245,6 +1284,7 @@ impl RestoreEngine {
                 Arc::clone(&self.kafka_circuit_breaker),
                 Arc::clone(&self.storage_circuit_breaker),
                 Arc::clone(&self.checkpoint),
+                Arc::clone(&self.telemetry),
             )
             .await;
         }
@@ -1324,6 +1364,7 @@ impl RestoreEngine {
                 storage_cb: Arc::clone(&self.storage_circuit_breaker),
                 checkpoint: Arc::clone(&self.checkpoint),
                 offset_mapping: Arc::clone(&self.offset_mapping),
+                telemetry: Arc::clone(&self.telemetry),
             };
 
             handles.push(tokio::spawn(async move {
@@ -1344,6 +1385,7 @@ impl RestoreEngine {
             let report = handle.await.map_err(|e| {
                 Error::Io(std::io::Error::other(format!("Task join error: {}", e)))
             })??;
+            self.telemetry.partition_completed();
 
             total_records += report.records;
             total_bytes += report.bytes;
@@ -1685,6 +1727,7 @@ struct RestorePartitionContext {
     storage_cb: Arc<CircuitBreaker>,
     checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
     offset_mapping: Arc<Mutex<OffsetMapping>>,
+    telemetry: Arc<RestoreTelemetry>,
 }
 
 impl RestorePartitionContext {
@@ -1749,6 +1792,7 @@ impl RestorePartitionContext {
                 Ok(r) => {
                     self.storage_cb.record_success();
                     self.health.mark_healthy("storage");
+                    self.telemetry.segment_processed();
                     r
                 }
                 Err(e) => {
@@ -1931,6 +1975,8 @@ impl RestorePartitionContext {
                 total_records += batch.len() as u64;
                 self.metrics.record_records(batch.len() as u64);
                 self.health.record_records(batch.len() as u64);
+                self.telemetry
+                    .record_produced(&self.target_topic, self.target_partition, batch);
             }
 
             total_bytes += batch_bytes;

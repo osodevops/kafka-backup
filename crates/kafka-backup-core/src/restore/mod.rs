@@ -8,6 +8,7 @@ pub mod offset_reset;
 pub mod offset_rollback;
 pub mod preflight;
 pub mod repartition;
+mod telemetry;
 pub mod three_phase;
 
 pub use engine::{RestoreEngine, RestoreProgress};

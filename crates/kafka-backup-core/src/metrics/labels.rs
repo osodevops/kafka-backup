@@ -150,6 +150,22 @@ impl RestoreProgressLabels {
     }
 }
 
+/// Labels for restore error metrics.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RestoreErrorLabels {
+    pub restore_id: String,
+    pub error_type: String,
+}
+
+impl RestoreErrorLabels {
+    pub fn new(restore_id: impl Into<String>, error_type: ErrorType) -> Self {
+        Self {
+            restore_id: restore_id.into(),
+            error_type: error_type.as_str().to_string(),
+        }
+    }
+}
+
 /// Labels for operation duration metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DurationLabels {

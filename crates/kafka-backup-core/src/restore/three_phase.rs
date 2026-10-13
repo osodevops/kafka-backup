@@ -44,12 +44,15 @@
 //! let reset_report = orchestrator.apply_offset_reset(&reset_plan).await?;
 //! ```
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{Config, RestoreOptions};
 use crate::kafka::{KafkaClient, PartitionLeaderRouter};
 use crate::manifest::{BackupManifest, OffsetMapping, RestoreReport};
+use crate::metrics::PrometheusMetrics;
 use crate::storage::create_backend;
 use crate::{Error, Result};
 
@@ -64,6 +67,8 @@ use super::preflight::{self, HeaderPreflightReport};
 pub struct ThreePhaseRestore {
     /// Restore configuration
     config: Config,
+    /// Passed to the Phase 2 restore engine (issue #173).
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
 }
 
 /// Complete report for three-phase restore
@@ -126,7 +131,17 @@ impl OffsetResetPhaseOutcome {
 impl ThreePhaseRestore {
     /// Create a new three-phase restore orchestrator
     pub fn new(config: Config) -> Result<Self> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            prometheus_metrics: None,
+        })
+    }
+
+    /// Record the Phase 2 restore's `kafka_restore_*` metrics in
+    /// `prometheus_metrics` (see [`RestoreEngine::new_with_metrics`]).
+    pub fn with_prometheus_metrics(mut self, prometheus_metrics: Arc<PrometheusMetrics>) -> Self {
+        self.prometheus_metrics = Some(prometheus_metrics);
+        self
     }
 
     /// True if this restore configuration asks for consumer group offsets to
@@ -341,7 +356,7 @@ impl ThreePhaseRestore {
                 restore.header_preflight_external = true;
             }
         }
-        let engine = RestoreEngine::new(config)?;
+        let engine = RestoreEngine::new_with_metrics(config, self.prometheus_metrics.clone())?;
         engine.run().await
     }
 
