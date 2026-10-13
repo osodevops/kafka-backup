@@ -509,14 +509,50 @@ pub async fn describe_configs(
     Ok(out)
 }
 
-/// Apply incremental config changes. Returns an error if any resource fails.
-pub async fn incremental_alter_configs(
+/// Outcome of IncrementalAlterConfigs for one resource. The broker applies
+/// (or validates) each resource atomically: a failed resource is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChangeResult {
+    pub resource_type: ConfigResourceType,
+    pub resource_name: String,
+    /// `0` on success.
+    pub error_code: i16,
+    pub error_message: Option<String>,
+}
+
+impl ConfigChangeResult {
+    pub fn is_success(&self) -> bool {
+        self.error_code == 0
+    }
+
+    /// `error_code=40 (InvalidConfig): <broker message>`.
+    pub fn describe_error(&self) -> String {
+        let name = kafka_protocol::ResponseError::try_from_code(self.error_code)
+            .map(|e| format!(" ({e:?})"))
+            .unwrap_or_default();
+        format!(
+            "error_code={}{name}: {}",
+            self.error_code,
+            self.error_message.as_deref().unwrap_or("<no-message>")
+        )
+    }
+}
+
+/// Apply incremental config changes, or with `validate_only` only have the
+/// broker validate them, and return each resource's result instead of
+/// failing the whole request when one resource fails. A resource missing
+/// from the response is reported failed.
+pub async fn incremental_alter_configs_per_resource(
     client: &KafkaClient,
     changes: &[ConfigChange],
-) -> Result<()> {
+    validate_only: bool,
+) -> Result<Vec<ConfigChangeResult>> {
+    let changes: Vec<&ConfigChange> = changes.iter().filter(|c| !c.ops.is_empty()).collect();
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
     let resources: Vec<AlterConfigsResource> = changes
         .iter()
-        .filter(|change| !change.ops.is_empty())
         .map(|change| {
             let configs: Vec<AlterableConfig> = change
                 .ops
@@ -535,31 +571,68 @@ pub async fn incremental_alter_configs(
         })
         .collect();
 
-    if resources.is_empty() {
-        return Ok(());
-    }
-
     let request = IncrementalAlterConfigsRequest::default()
         .with_resources(resources)
-        .with_validate_only(false);
+        .with_validate_only(validate_only);
 
     let response: IncrementalAlterConfigsResponse = client
         .send_request(ApiKey::IncrementalAlterConfigs, request)
         .await?;
 
-    let failures: Vec<String> = response
-        .responses
+    Ok(per_resource_results(&changes, &response))
+}
+
+/// One result per requested resource, in request order.
+fn per_resource_results(
+    changes: &[&ConfigChange],
+    response: &IncrementalAlterConfigsResponse,
+) -> Vec<ConfigChangeResult> {
+    changes
+        .iter()
+        .map(|change| {
+            let found = response.responses.iter().find(|r| {
+                ConfigResourceType::from_wire(r.resource_type) == Some(change.resource_type)
+                    && r.resource_name.as_str() == change.resource_name
+            });
+            match found {
+                Some(r) => ConfigChangeResult {
+                    resource_type: change.resource_type,
+                    resource_name: change.resource_name.clone(),
+                    error_code: r.error_code,
+                    error_message: r.error_message.as_ref().map(|m| m.to_string()),
+                },
+                None => ConfigChangeResult {
+                    resource_type: change.resource_type,
+                    resource_name: change.resource_name.clone(),
+                    error_code: -1,
+                    error_message: Some(
+                        "no result for this resource in the IncrementalAlterConfigs response"
+                            .to_string(),
+                    ),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Apply incremental config changes. Returns an error if any resource fails
+/// (the other resources are applied); see
+/// [`incremental_alter_configs_per_resource`] for per-resource results.
+pub async fn incremental_alter_configs(
+    client: &KafkaClient,
+    changes: &[ConfigChange],
+) -> Result<()> {
+    let failures: Vec<String> = incremental_alter_configs_per_resource(client, changes, false)
+        .await?
         .into_iter()
-        .filter(|r| r.error_code != 0)
+        .filter(|r| !r.is_success())
         .map(|r| {
-            let msg = r
-                .error_message
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "<no-message>".to_string());
             format!(
                 "{}/{}: error_code={} message={}",
-                r.resource_type, r.resource_name, r.error_code, msg
+                r.resource_type.wire(),
+                r.resource_name,
+                r.error_code,
+                r.error_message.as_deref().unwrap_or("<no-message>")
             )
         })
         .collect();
@@ -721,6 +794,50 @@ mod tests {
         assert!(!result.is_success());
         assert!(!result.is_success_or_exists());
         assert!(!result.already_exists());
+    }
+
+    #[test]
+    fn incremental_alter_configs_results_are_per_resource() {
+        use kafka_protocol::messages::incremental_alter_configs_response::AlterConfigsResourceResponse;
+
+        let change = |name: &str| ConfigChange {
+            resource_type: ConfigResourceType::Topic,
+            resource_name: name.to_string(),
+            ops: vec![ConfigOp::Set {
+                name: "flush.ms".to_string(),
+                value: "1000".to_string(),
+            }],
+        };
+        let (ok, bad, missing) = (change("ok"), change("bad"), change("missing"));
+        let response = IncrementalAlterConfigsResponse::default().with_responses(vec![
+            AlterConfigsResourceResponse::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("bad"))
+                .with_error_code(40)
+                .with_error_message(Some(StrBytes::from_static_str(
+                    "Unknown topic config name: message.format.version",
+                ))),
+            AlterConfigsResourceResponse::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("ok"))
+                .with_error_code(0),
+        ]);
+
+        let results = per_resource_results(&[&ok, &bad, &missing], &response);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.resource_name.as_str())
+                .collect::<Vec<_>>(),
+            ["ok", "bad", "missing"]
+        );
+        assert!(results[0].is_success());
+        assert!(!results[1].is_success());
+        assert_eq!(
+            results[1].describe_error(),
+            "error_code=40 (InvalidConfig): Unknown topic config name: message.format.version"
+        );
+        assert!(!results[2].is_success(), "a missing result is a failure");
     }
 
     #[test]

@@ -940,6 +940,46 @@ pub enum ExistingTopicConfigPolicy {
     Fail,
 }
 
+/// What a restore does with captured topic configuration the target does not
+/// take as is (`restore.unsupported_config_policy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedConfigPolicy {
+    /// Restore without the keys the target does not report, reports
+    /// read-only or rejects, clamp values outside the `target_profile`
+    /// limits, and list both in the restore report.
+    #[default]
+    Skip,
+    /// Fail the restore, listing every such key, before any configuration
+    /// is changed.
+    Fail,
+}
+
+/// Known limits of a restore target platform (`restore.target_profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TargetProfile {
+    /// Confluent Cloud: replication factor 3 for created topics and the
+    /// documented topic-configuration ranges.
+    ConfluentCloud,
+}
+
+/// Confluent Cloud cluster type (`restore.target_cluster_type`); some
+/// `target_profile: confluent_cloud` limits depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetClusterType {
+    Basic,
+    Standard,
+    Enterprise,
+    Dedicated,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
 /// Restore-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOptions {
@@ -1109,6 +1149,29 @@ pub struct RestoreOptions {
     pub topic_config_overrides:
         std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
 
+    /// Topic configuration (captured or overridden) the target does not take
+    /// as is: keys its DescribeConfigs does not report or reports read-only,
+    /// keys it rejects (each probed on its own with `validate_only`), and
+    /// values outside the `target_profile` limits. `skip` (default) restores
+    /// the rest and lists them in the restore report; `fail` stops the
+    /// restore before any configuration is changed.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub unsupported_config_policy: UnsupportedConfigPolicy,
+
+    /// Known limits of the target platform: `confluent_cloud` creates topics
+    /// with replication factor 3 (unless `default_replication_factor` is set)
+    /// and clamps (or, with `unsupported_config_policy: fail`, rejects)
+    /// values outside Confluent Cloud's documented ranges. Which keys the
+    /// target accepts is always decided by probing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_profile: Option<TargetProfile>,
+
+    /// Confluent Cloud cluster type, for the limits that depend on it
+    /// (`max.message.bytes`, `max.compaction.lag.ms`). Unset: the most
+    /// permissive limit of any cluster type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cluster_type: Option<TargetClusterType>,
+
     /// Rewrite Confluent wire-format schema IDs in record keys and values.
     /// This is populated by the enterprise Schema Registry restore before the
     /// Kafka data phase; it is inert unless explicitly enabled.
@@ -1230,6 +1293,9 @@ impl Default for RestoreOptions {
             restore_topic_configs: default_restore_topic_configs(),
             existing_topic_config_policy: ExistingTopicConfigPolicy::default(),
             topic_config_overrides: Default::default(),
+            unsupported_config_policy: UnsupportedConfigPolicy::default(),
+            target_profile: None,
+            target_cluster_type: None,
             rewrite_schema_ids: false,
             schema_id_mapping: Default::default(),
             header_preflight: HeaderPreflightMode::default(),
@@ -1551,6 +1617,14 @@ impl RestoreOptions {
         if self.produce_batch_size == 0 {
             return Err(crate::Error::Config(
                 "produce_batch_size must be > 0".to_string(),
+            ));
+        }
+
+        if self.target_cluster_type.is_some()
+            && self.target_profile != Some(TargetProfile::ConfluentCloud)
+        {
+            return Err(crate::Error::Config(
+                "target_cluster_type needs target_profile: confluent_cloud".to_string(),
             ));
         }
 
@@ -2037,6 +2111,56 @@ connection:
             },
         );
         assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn topic_config_compat_options_parse_and_validate() {
+        let yaml = r#"
+unsupported_config_policy: fail
+target_profile: confluent_cloud
+target_cluster_type: standard
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            opts.unsupported_config_policy,
+            UnsupportedConfigPolicy::Fail
+        );
+        assert_eq!(opts.target_profile, Some(TargetProfile::ConfluentCloud));
+        assert_eq!(opts.target_cluster_type, Some(TargetClusterType::Standard));
+        opts.validate().unwrap();
+
+        let defaults = RestoreOptions::default();
+        assert_eq!(
+            defaults.unsupported_config_policy,
+            UnsupportedConfigPolicy::Skip
+        );
+        assert_eq!(defaults.target_profile, None);
+
+        let orphan = RestoreOptions {
+            target_cluster_type: Some(TargetClusterType::Dedicated),
+            ..Default::default()
+        };
+        let err = orphan.validate().unwrap_err().to_string();
+        assert!(err.contains("target_profile: confluent_cloud"), "{err}");
+
+        assert!(serde_yaml::from_str::<RestoreOptions>("target_profile: aws_msk").is_err());
+        assert!(
+            serde_yaml::from_str::<RestoreOptions>("unsupported_config_policy: ignore").is_err()
+        );
+    }
+
+    #[test]
+    fn topic_config_compat_defaults_do_not_change_the_serialized_options() {
+        // The restore checkpoint's config hash is taken over the serialized
+        // options: unset new fields must not change it.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        for key in [
+            "unsupported_config_policy",
+            "target_profile",
+            "target_cluster_type",
+        ] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
     }
 
     #[test]

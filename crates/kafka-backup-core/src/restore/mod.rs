@@ -9,6 +9,7 @@ pub mod offset_rollback;
 pub mod preflight;
 pub mod repartition;
 pub mod three_phase;
+mod topic_configs;
 
 pub use engine::{RestoreEngine, RestoreProgress};
 pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};

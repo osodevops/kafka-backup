@@ -786,6 +786,58 @@ pub struct RestoreReport {
     /// Name of the record filter that ran, when one was configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_filter: Option<String>,
+
+    /// Topic configuration keys left out of the restore
+    /// (`restore.unsupported_config_policy: skip`): not reported by the
+    /// target, read-only on it, or rejected by it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_configs_skipped: Vec<SkippedTopicConfig>,
+
+    /// Topic configuration values changed to fit the `restore.target_profile`
+    /// limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_configs_adjusted: Vec<AdjustedTopicConfig>,
+}
+
+/// Why a topic configuration key was not restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicConfigSkipReason {
+    /// The target's DescribeConfigs does not list the key (for example
+    /// `message.format.version` on Kafka 4.x).
+    NotReportedByTarget,
+    /// The target lists the key as read-only.
+    ReadOnly,
+    /// The target rejected the key (see `message`).
+    Rejected,
+}
+
+/// A topic configuration key the restore left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedTopicConfig {
+    /// Target topic.
+    pub topic: String,
+    pub name: String,
+    /// The value from the backup (or `topic_config_overrides`).
+    pub value: String,
+    pub reason: TopicConfigSkipReason,
+    /// The broker's error, for `rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A topic configuration value the restore changed to fit the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdjustedTopicConfig {
+    /// Target topic.
+    pub topic: String,
+    pub name: String,
+    /// The value from the backup (or `topic_config_overrides`).
+    pub value: String,
+    /// The value applied instead.
+    pub applied: String,
+    /// The limit, e.g. `Confluent Cloud allows 1 to 2`.
+    pub limit: String,
 }
 
 /// Per-topic restore report

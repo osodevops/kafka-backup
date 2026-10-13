@@ -58,6 +58,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     signal_task.abort(); // Clean up signal watcher if operation finished normally
 
     let report = result?;
+    print_topic_config_summary(&report);
 
     if let Some(orchestrator) = orchestrator {
         info!(
@@ -141,4 +142,31 @@ fn print_offset_reset_summary(outcome: &OffsetResetPhaseOutcome) {
         warn!("{}", w);
     }
     println!();
+}
+
+/// List the topic configuration that was not restored as captured.
+fn print_topic_config_summary(report: &kafka_backup_core::RestoreReport) {
+    use kafka_backup_core::manifest::TopicConfigSkipReason;
+
+    if report.topic_configs_skipped.is_empty() && report.topic_configs_adjusted.is_empty() {
+        return;
+    }
+    println!("Topic configuration not restored as captured:");
+    for s in &report.topic_configs_skipped {
+        let why = match s.reason {
+            TopicConfigSkipReason::NotReportedByTarget => "not reported by the target".to_string(),
+            TopicConfigSkipReason::ReadOnly => "read-only on the target".to_string(),
+            TopicConfigSkipReason::Rejected => format!(
+                "rejected: {}",
+                s.message.as_deref().unwrap_or("<no message>")
+            ),
+        };
+        println!("  {} {}={}: skipped ({why})", s.topic, s.name, s.value);
+    }
+    for a in &report.topic_configs_adjusted {
+        println!(
+            "  {} {}={}: applied as {} ({})",
+            a.topic, a.name, a.value, a.applied, a.limit
+        );
+    }
 }

@@ -736,6 +736,21 @@ impl PartitionLeaderRouter {
         super::incremental_alter_configs(self.bootstrap_client.as_ref(), changes).await
     }
 
+    /// Apply (or only validate) incremental configuration changes through the
+    /// bootstrap client, returning each resource's result.
+    pub async fn incremental_alter_configs_per_resource(
+        &self,
+        changes: &[super::ConfigChange],
+        validate_only: bool,
+    ) -> Result<Vec<super::ConfigChangeResult>> {
+        super::incremental_alter_configs_per_resource(
+            self.bootstrap_client.as_ref(),
+            changes,
+            validate_only,
+        )
+        .await
+    }
+
     /// Get metadata for a specific topic.
     pub async fn get_topic_metadata(&self, topic: &str) -> Result<TopicMetadata> {
         self.bootstrap_client.get_topic_metadata(topic).await
