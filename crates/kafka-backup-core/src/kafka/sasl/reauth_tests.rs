@@ -44,7 +44,13 @@ fn fast_timing() -> ReauthTiming {
 #[derive(Default)]
 struct MockState {
     connections: AtomicUsize,
+    /// `SaslHandshake`s that started an initial authentication.
     handshakes: AtomicUsize,
+    /// `SaslHandshake`s on an authenticated connection (KIP-368 re-auth).
+    reauth_handshakes: AtomicUsize,
+    /// `SaslAuthenticate`s refused because no `SaslHandshake` preceded
+    /// them on an authenticated connection.
+    illegal_state: AtomicUsize,
     /// Connection index of every `SaslAuthenticate`.
     authenticates: StdMutex<Vec<usize>>,
     /// Connection index of every `Metadata` request.
@@ -102,15 +108,34 @@ async fn serve(
     state: Arc<MockState>,
     reject: Arc<HashSet<usize>>,
 ) {
+    // Apache Kafka's per-connection SASL state: a re-authentication begins
+    // only with a SaslHandshake on the authenticated connection.
     let mut auths_here = 0usize;
+    let mut authenticated = false;
+    let mut handshake_pending = false;
     while let Some((api_key, version, correlation_id)) = read_request(&mut stream).await {
         match api_key {
             ApiKey::SaslHandshake => {
-                state.handshakes.fetch_add(1, Ordering::SeqCst);
+                if authenticated {
+                    state.reauth_handshakes.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    state.handshakes.fetch_add(1, Ordering::SeqCst);
+                }
+                handshake_pending = true;
                 let resp = SaslHandshakeResponse::default().with_error_code(0);
                 write_response(&mut stream, api_key, version, correlation_id, &resp).await;
             }
+            ApiKey::SaslAuthenticate if authenticated && !handshake_pending => {
+                state.illegal_state.fetch_add(1, Ordering::SeqCst);
+                let resp = SaslAuthenticateResponse::default()
+                    .with_error_code(34) // ILLEGAL_SASL_STATE
+                    .with_error_message(Some(StrBytes::from_static_str(
+                        "SaslAuthenticate request received after successful authentication",
+                    )));
+                write_response(&mut stream, api_key, version, correlation_id, &resp).await;
+            }
             ApiKey::SaslAuthenticate => {
+                handshake_pending = false;
                 state.authenticates.lock().unwrap().push(conn);
                 auths_here += 1;
                 let resp = if auths_here == 2 && reject.contains(&conn) {
@@ -122,6 +147,7 @@ async fn serve(
                                 .to_string(),
                         )))
                 } else {
+                    authenticated = true;
                     SaslAuthenticateResponse::default()
                         .with_error_code(0)
                         .with_session_lifetime_ms(LIFETIME_MS)
@@ -263,6 +289,10 @@ async fn reauth_task_count_stays_one_across_reconnects() {
         reauths == live_reauth_frames || reauths == live_reauth_frames + 1,
         "re-auths {reauths} vs live re-auth frames {live_reauth_frames}"
     );
+    // KIP-368: every re-auth began with a SaslHandshake, so the broker
+    // never refused one for being out of sequence.
+    assert!(mock.state.reauth_handshakes.load(Ordering::SeqCst) >= 1);
+    assert_eq!(mock.state.illegal_state.load(Ordering::SeqCst), 0);
 
     // Dropping the client drops the connection, which aborts the task.
     let live_tasks = client.live_reauth_tasks.clone();
@@ -303,6 +333,27 @@ async fn stale_generation_task_exits_without_reauthenticating() {
         "old connection never re-authenticated"
     );
     assert_eq!(client.live_reauth_tasks(), 1);
+    assert_eq!(mock.state.illegal_state.load(Ordering::SeqCst), 0);
+}
+
+/// A re-authentication starts with a `SaslHandshake` on the authenticated
+/// connection, as Apache Kafka requires; a bare `SaslAuthenticate` there is
+/// refused with ILLEGAL_SASL_STATE and the connection would be dropped.
+#[tokio::test]
+async fn reauth_starts_with_a_sasl_handshake() {
+    let mock = MockBroker::start(&[]).await;
+    let plugin = Arc::new(CountingPlugin::default());
+    let client = client(&mock, plugin.clone());
+    client.connect().await.expect("connect");
+    wait_until("three re-authentications", || mock.authenticates_on(0) >= 4).await;
+    assert!(mock.state.reauth_handshakes.load(Ordering::SeqCst) >= 3);
+    assert_eq!(mock.state.illegal_state.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        mock.state.connections.load(Ordering::SeqCst),
+        1,
+        "no reconnects"
+    );
+    assert!(client.current_connection_generation().await.is_some());
 }
 
 /// A re-auth the broker rejects ("Cannot change principals during

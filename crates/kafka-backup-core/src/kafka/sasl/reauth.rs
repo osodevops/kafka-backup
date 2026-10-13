@@ -16,9 +16,14 @@
 //!
 //! ## Wire protocol
 //!
-//! Per KIP-368, re-authentication sends **only** `SaslAuthenticate`
-//! frames; there is no fresh `SaslHandshake`. The mechanism is already
-//! bound to the connection from the initial handshake.
+//! Per KIP-368, a re-authentication repeats the SASL exchange on the
+//! authenticated connection: a `SaslHandshake` (v1, the same mechanism)
+//! followed by the `SaslAuthenticate` rounds. The broker only begins a
+//! re-authentication when it receives that `SaslHandshake`; a bare
+//! `SaslAuthenticate` on an authenticated connection is refused with
+//! `ILLEGAL_SASL_STATE` ("SaslAuthenticate request received after
+//! successful authentication"). This matches the Java client
+//! (`SaslClientAuthenticator`, re-authentication skips only ApiVersions).
 //!
 //! ## Lifecycle
 //!
@@ -46,7 +51,10 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kafka_protocol::messages::{ApiKey, SaslAuthenticateRequest, SaslAuthenticateResponse};
+use kafka_protocol::messages::{
+    ApiKey, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse,
+};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 use tracing::{debug, trace, warn};
@@ -58,6 +66,10 @@ use crate::kafka::client::{encode_kafka_request, send_rpc_on_stream, BrokerConne
 /// initial handshake path in `KafkaClient::sasl_plugin_auth` (v2 per
 /// KIP-368, which carries `session_lifetime_ms` on the response).
 const SASL_AUTHENTICATE_VERSION: i16 = 2;
+
+/// `SaslHandshake` wire version for re-authentication (v1: the
+/// handshake is followed by `SaslAuthenticate` requests).
+const SASL_HANDSHAKE_VERSION: i16 = 1;
 
 /// When to re-authenticate, relative to the broker-advertised session
 /// lifetime. Production uses [`ReauthTiming::DEFAULT`]; tests shorten
@@ -278,13 +290,39 @@ async fn reauth_once(
     result.map(ReauthResult::Reauthenticated)
 }
 
-/// The `SaslAuthenticate` rounds of one re-auth, on a locked connection.
+/// One re-auth on a locked connection: `SaslHandshake`, then the
+/// `SaslAuthenticate` rounds.
 async fn reauth_exchange(
     conn: &mut BrokerConnection,
     correlation_id: &AtomicI32,
     plugin: &SaslMechanismPluginHandle,
     mut payload: Vec<u8>,
 ) -> Result<i64, String> {
+    let mechanism = plugin.mechanism_name().to_string();
+    let handshake = SaslHandshakeRequest::default().with_mechanism(mechanism.clone().into());
+    let buf = encode_kafka_request(
+        correlation_id,
+        ApiKey::SaslHandshake,
+        SASL_HANDSHAKE_VERSION,
+        &handshake,
+    )
+    .map_err(|e| format!("encode SaslHandshake: {}", e))?;
+    let response: SaslHandshakeResponse = send_rpc_on_stream(
+        &mut conn.stream,
+        ApiKey::SaslHandshake,
+        SASL_HANDSHAKE_VERSION,
+        &buf,
+    )
+    .await
+    .map_err(|e| format!("SaslHandshake RPC: {}", e))?;
+    if response.error_code != 0 {
+        let offered: Vec<String> = response.mechanisms.iter().map(|m| m.to_string()).collect();
+        return Err(format!(
+            "SaslHandshake for re-authentication with {} failed (error code {}; broker offers {:?})",
+            mechanism, response.error_code, offered
+        ));
+    }
+
     loop {
         let req = SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(payload.clone()));
         let buf = encode_kafka_request(
