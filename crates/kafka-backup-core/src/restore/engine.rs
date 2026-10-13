@@ -2706,6 +2706,36 @@ mod tests {
     use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetStrategy};
     use std::collections::HashMap;
 
+    /// A restore checkpoint is only resumed when its config hash matches.
+    /// The values below are what kafka-backup 0.23.8 computes: the options
+    /// added in 0.24 (batch bytes, idempotent producer, checkpoint storage,
+    /// restore id, topic-config compatibility, schema-ID rewrite scope) must
+    /// not change the hash while they keep their defaults, or an upgrade
+    /// would restart (and duplicate) every interrupted restore.
+    #[test]
+    fn restore_config_hash_matches_0_23_for_options_at_their_defaults() {
+        assert_eq!(
+            restore_config_hash(&RestoreOptions::default()),
+            "d64786ecf4db4764e2eb8751c4d6794e5381c6e0c8e639c136a9d88b3920d6b2"
+        );
+
+        let mut options = RestoreOptions::default();
+        options.topic_mapping.insert("a".into(), "b".into());
+        options.checkpoint_state = Some("/tmp/cp.json".into());
+        options.produce_batch_size = 500;
+        assert_eq!(
+            restore_config_hash(&options),
+            "cadb9095317612a38c112d8c18cfcb7acfc242df63dc8e77187a45fee21e6217"
+        );
+
+        // A 0.24 option away from its default changes the hash.
+        options.idempotent_producer = false;
+        assert_ne!(
+            restore_config_hash(&options),
+            "cadb9095317612a38c112d8c18cfcb7acfc242df63dc8e77187a45fee21e6217"
+        );
+    }
+
     #[test]
     fn decode_i64_header_handles_binary_string_and_null() {
         assert_eq!(

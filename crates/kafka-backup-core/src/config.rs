@@ -1079,7 +1079,10 @@ pub struct RestoreOptions {
     /// size, whichever comes first; it is further capped below the target
     /// topic's `max.message.bytes`. A single record larger than the batch
     /// cap is sent in a batch of its own.
-    #[serde(default = "default_produce_max_batch_bytes")]
+    #[serde(
+        default = "default_produce_max_batch_bytes",
+        skip_serializing_if = "is_default_produce_max_batch_bytes"
+    )]
     pub produce_max_batch_bytes: usize,
 
     /// Producer acknowledgement level sent to the broker.
@@ -1101,7 +1104,10 @@ pub struct RestoreOptions {
     /// cluster denies or does not support idempotence (Kafka before 2.5,
     /// no IdempotentWrite/Write permission), the restore logs a warning,
     /// records it in the report and produces without a producer id.
-    #[serde(default = "default_idempotent_producer")]
+    #[serde(
+        default = "default_idempotent_producer",
+        skip_serializing_if = "is_default_idempotent_producer"
+    )]
     pub idempotent_producer: bool,
 
     /// Broker-side produce timeout in milliseconds (default: 30 000).
@@ -1127,13 +1133,13 @@ pub struct RestoreOptions {
     /// `checkpoint_state` file), `remote` (backup storage, at
     /// `{backup_id}/restore-checkpoints/{restore_id}.json`, so a restarted
     /// pod without the local file resumes) or `both`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub checkpoint_storage: RestoreCheckpointStorage,
 
     /// Names the remote checkpoint. Default: derived from the backup id,
     /// the target bootstrap servers and the restore configuration, so a
     /// re-run of the same restore finds its checkpoint.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_id: Option<String>,
 
     /// Consumer groups to reset offsets for (requires reset_consumer_offsets)
@@ -1400,6 +1406,17 @@ fn default_produce_max_batch_bytes() -> usize {
 
 fn default_idempotent_producer() -> bool {
     true
+}
+
+// Options added in 0.24 are left out of the serialized options at their
+// defaults: the restore checkpoint's config hash is taken over them, and a
+// checkpoint written by an earlier release must keep its hash.
+fn is_default_produce_max_batch_bytes(value: &usize) -> bool {
+    *value == default_produce_max_batch_bytes()
+}
+
+fn is_default_idempotent_producer(value: &bool) -> bool {
+    *value == default_idempotent_producer()
 }
 
 fn default_produce_acks() -> i16 {
@@ -2337,6 +2354,110 @@ schema_id_rewrite_strict: true
         let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
         assert!(!json.contains("schema_id_rewrite_topics"), "{json}");
         assert!(!json.contains("schema_id_rewrite_strict"), "{json}");
+    }
+
+    /// The restore checkpoint's config hash is taken over the serialized
+    /// options. Every option added in 0.24 is left out at its default, so the
+    /// serialized defaults are exactly the 0.23.x keys, in the 0.23.x order,
+    /// and a checkpoint written by 0.23.x is still resumed after an upgrade.
+    /// A non-default value is serialized, so changing it starts over.
+    #[test]
+    fn options_added_in_0_24_are_not_serialized_at_their_defaults() {
+        const KEYS_0_23: &[&str] = &[
+            "time_window_start",
+            "time_window_end",
+            "source_partitions",
+            "partition_mapping",
+            "topic_mapping",
+            "consumer_group_strategy",
+            "dry_run",
+            "include_original_offset_header",
+            "strip_offset_headers",
+            "rate_limit_records_per_sec",
+            "rate_limit_bytes_per_sec",
+            "max_concurrent_partitions",
+            "produce_batch_size",
+            "produce_acks",
+            "produce_timeout_ms",
+            "checkpoint_state",
+            "checkpoint_interval_secs",
+            "consumer_groups",
+            "reset_consumer_offsets",
+            "offset_report",
+            "create_topics",
+            "default_replication_factor",
+            "repartitioning",
+            "purge_topics",
+            "auto_consumer_groups",
+            "restore_topic_configs",
+            "existing_topic_config_policy",
+            "topic_config_overrides",
+            "rewrite_schema_ids",
+            "schema_id_mapping",
+            "header_preflight",
+            "dry_run_check_segments",
+            "circuit_breaker",
+        ];
+        // Top-level keys in serialized order (a YAML mapping keeps it).
+        let top_level_keys = |opts: &RestoreOptions| -> Vec<String> {
+            serde_yaml::to_value(opts)
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(top_level_keys(&RestoreOptions::default()), KEYS_0_23);
+        // Deserialising the 0.23.x form yields the 0.24 defaults.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        let back: RestoreOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert!(back.idempotent_producer);
+        assert_eq!(
+            back.produce_max_batch_bytes,
+            default_produce_max_batch_bytes()
+        );
+        assert_eq!(back.checkpoint_storage, RestoreCheckpointStorage::Local);
+
+        // Each 0.24 option, set away from its default, is serialized.
+        type Tweak = fn(&mut RestoreOptions);
+        let tweaks: Vec<(&str, Tweak)> = vec![
+            ("produce_max_batch_bytes", |o| {
+                o.produce_max_batch_bytes = 4096
+            }),
+            ("idempotent_producer", |o| o.idempotent_producer = false),
+            ("checkpoint_storage", |o| {
+                o.checkpoint_storage = RestoreCheckpointStorage::Remote
+            }),
+            ("restore_id", |o| o.restore_id = Some("orders-dr".into())),
+            ("unsupported_config_policy", |o| {
+                o.unsupported_config_policy = UnsupportedConfigPolicy::Fail
+            }),
+            ("target_profile", |o| {
+                o.target_profile = Some(TargetProfile::ConfluentCloud)
+            }),
+            ("target_cluster_type", |o| {
+                o.target_cluster_type = Some(TargetClusterType::Dedicated)
+            }),
+            ("schema_id_rewrite_topics", |o| {
+                o.schema_id_rewrite_topics = vec!["orders".into()]
+            }),
+            ("schema_id_rewrite_strict", |o| {
+                o.schema_id_rewrite_strict = true
+            }),
+        ];
+        for (key, tweak) in tweaks {
+            let mut opts = RestoreOptions::default();
+            tweak(&mut opts);
+            let keys = top_level_keys(&opts);
+            assert!(
+                keys.iter().any(|k| k == key),
+                "{key} not serialized: {keys:?}"
+            );
+            assert_eq!(keys.len(), KEYS_0_23.len() + 1, "{key}: {keys:?}");
+        }
     }
 
     #[test]
