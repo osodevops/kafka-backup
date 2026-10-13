@@ -17,7 +17,7 @@ use crate::kafka::{
 };
 #[cfg(test)]
 use crate::manifest::ConsumerGroupOffset;
-use crate::manifest::{ConsumerGroupOffsets, OffsetMapping};
+use crate::manifest::{ConsumerGroupOffsets, OffsetLookupPrecision, OffsetMapping};
 use crate::Result;
 
 /// Offset reset plan for consumer groups
@@ -81,6 +81,44 @@ pub struct PartitionResetPlan {
 
     /// Optional commit metadata
     pub metadata: Option<String>,
+
+    /// `true` when `target_offset` was linearly interpolated because the
+    /// offset mapping has no per-record entries for this partition. Such an
+    /// offset is approximate (gaps in the restored offsets make it land early
+    /// or late); check it before applying. Omitted from JSON when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
+}
+
+impl PartitionResetPlan {
+    /// Whether `target_offset` is exact (from the per-record mapping or
+    /// supplied directly) rather than interpolated.
+    pub fn is_exact(&self) -> bool {
+        !self.approximate
+    }
+}
+
+/// `true` when a lookup on `topic`/`partition` can only interpolate.
+fn interpolated(offset_mapping: &OffsetMapping, topic: &str, partition: i32) -> bool {
+    offset_mapping.lookup_precision(topic, partition) == Some(OffsetLookupPrecision::Interpolated)
+}
+
+/// Warn once per group when any of its planned offsets are approximate.
+fn warn_if_approximate(group_id: &str, partitions: &[PartitionResetPlan]) {
+    let approximate: Vec<String> = partitions
+        .iter()
+        .filter(|p| p.approximate)
+        .map(|p| format!("{}:{}", p.topic, p.partition))
+        .collect();
+    if !approximate.is_empty() {
+        warn!(
+            "Offset reset plan for group {}: {} partition(s) use interpolated (approximate) \
+             target offsets because the offset mapping has no per-record entries for them: {}",
+            group_id,
+            approximate.len(),
+            approximate.join(", ")
+        );
+    }
 }
 
 /// Result of executing an offset reset plan
@@ -221,15 +259,16 @@ fn plan_from_committed_offsets(
             continue;
         };
 
-        if let Some(target) = offset_mapping.lookup_target_offset(&topic, partition, offset.offset)
+        if let Some(found) = offset_mapping.resolve_target_offset(&topic, partition, offset.offset)
         {
             partitions.push(PartitionResetPlan {
                 topic,
                 partition,
                 source_offset: offset.offset,
-                target_offset: target,
+                target_offset: found.target_offset,
                 timestamp: chrono::Utc::now().timestamp_millis(),
                 metadata: offset.metadata,
+                approximate: !found.is_exact(),
             });
         } else {
             warn!(
@@ -387,6 +426,9 @@ impl OffsetResetExecutor {
             for (topic, topic_offsets) in &group_offsets.offsets {
                 for (partition, offset_info) in topic_offsets {
                     if let Some(target_offset) = offset_info.target_offset {
+                        // Precomputed from this mapping (e.g. snapshot groups
+                        // at the end of the restore): approximate exactly
+                        // when the mapping could only interpolate here.
                         partitions.push(PartitionResetPlan {
                             topic: topic.clone(),
                             partition: *partition,
@@ -394,10 +436,11 @@ impl OffsetResetExecutor {
                             target_offset,
                             timestamp: offset_info.timestamp,
                             metadata: offset_info.metadata.clone(),
+                            approximate: interpolated(offset_mapping, topic, *partition),
                         });
                     } else {
                         // Try to calculate target offset from detailed mapping
-                        if let Some(target) = offset_mapping.lookup_target_offset(
+                        if let Some(found) = offset_mapping.resolve_target_offset(
                             topic,
                             *partition,
                             offset_info.source_offset,
@@ -406,9 +449,10 @@ impl OffsetResetExecutor {
                                 topic: topic.clone(),
                                 partition: *partition,
                                 source_offset: offset_info.source_offset,
-                                target_offset: target,
+                                target_offset: found.target_offset,
                                 timestamp: offset_info.timestamp,
                                 metadata: offset_info.metadata.clone(),
+                                approximate: !found.is_exact(),
                             });
                         } else {
                             warn!(
@@ -434,6 +478,7 @@ impl OffsetResetExecutor {
             complete = all_mapped;
         }
 
+        warn_if_approximate(group_id, &partitions);
         let partition_count = partitions.len();
 
         Ok(GroupResetPlan {
@@ -610,6 +655,12 @@ impl OffsetResetExecutor {
                         "# Partition {}: source_offset={} -> target_offset={} (timestamp={})\n",
                         p.partition, p.source_offset, p.target_offset, p.timestamp
                     ));
+                    if p.approximate {
+                        script.push_str(
+                            "# APPROXIMATE: interpolated, no per-record offset mapping for this \
+                             partition; verify before executing\n",
+                        );
+                    }
 
                     script.push_str(&format!(
                         "kafka-consumer-groups.sh --bootstrap-server {} \\\n",
@@ -710,15 +761,18 @@ impl OffsetResetPlanBuilder {
 
             for (topic, topic_offsets) in group_offsets.offsets {
                 for (partition, offset_info) in topic_offsets {
-                    let target_offset = offset_info.target_offset.or_else(|| {
-                        self.offset_mapping.lookup_target_offset(
-                            &topic,
-                            partition,
-                            offset_info.source_offset,
-                        )
-                    });
+                    let target_offset = match offset_info.target_offset {
+                        Some(target) => Some((
+                            target,
+                            interpolated(&self.offset_mapping, &topic, partition),
+                        )),
+                        None => self
+                            .offset_mapping
+                            .resolve_target_offset(&topic, partition, offset_info.source_offset)
+                            .map(|found| (found.target_offset, !found.is_exact())),
+                    };
 
-                    if let Some(target) = target_offset {
+                    if let Some((target, approximate)) = target_offset {
                         partitions.push(PartitionResetPlan {
                             topic: topic.clone(),
                             partition,
@@ -726,6 +780,7 @@ impl OffsetResetPlanBuilder {
                             target_offset: target,
                             timestamp: offset_info.timestamp,
                             metadata: offset_info.metadata,
+                            approximate,
                         });
                     } else {
                         complete = false;
@@ -733,6 +788,7 @@ impl OffsetResetPlanBuilder {
                 }
             }
 
+            warn_if_approximate(&group_id, &partitions);
             let partition_count = partitions.len();
             groups.push(GroupResetPlan {
                 group_id,
@@ -824,6 +880,7 @@ mod tests {
                     target_offset: 200,
                     timestamp: 1000,
                     metadata: None,
+                    approximate: false,
                 }],
                 partition_count: 1,
                 complete: true,
@@ -858,6 +915,7 @@ mod tests {
                         target_offset: 5100,
                         timestamp: 1700000000000,
                         metadata: None,
+                        approximate: false,
                     },
                     PartitionResetPlan {
                         topic: "orders".to_string(),
@@ -866,6 +924,7 @@ mod tests {
                         target_offset: 5200,
                         timestamp: 1700000001000,
                         metadata: None,
+                        approximate: false,
                     },
                 ],
                 partition_count: 2,
@@ -932,6 +991,103 @@ mod tests {
         assert_eq!(plan.groups[0].partitions[0].source_offset, 101);
         assert_eq!(plan.groups[0].partitions[0].target_offset, 5101);
         assert!(plan.groups[0].complete);
+    }
+
+    fn group_at(source_offset: i64, target_offset: Option<i64>) -> ConsumerGroupOffsets {
+        let mut group_offsets = ConsumerGroupOffsets::new("order-processor");
+        group_offsets.add_offset(
+            "orders",
+            0,
+            ConsumerGroupOffset {
+                source_offset,
+                target_offset,
+                timestamp: 1700000001000,
+                metadata: None,
+            },
+        );
+        group_offsets
+    }
+
+    fn range_only_mapping() -> OffsetMapping {
+        let mut mapping = OffsetMapping::new();
+        mapping.add("orders", 0, 0, Some(5000), 1);
+        mapping.update_range("orders", 0, 100, Some(5100), 2);
+        mapping
+    }
+
+    #[test]
+    fn plan_flags_interpolated_offsets_as_approximate() {
+        let plan = OffsetResetPlanBuilder::new(range_only_mapping())
+            .add_consumer_group(group_at(50, None))
+            .build(OffsetResetStrategy::Auto);
+        let p = &plan.groups[0].partitions[0];
+        assert_eq!(p.target_offset, 5050);
+        assert!(p.approximate);
+        assert!(!p.is_exact());
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["groups"][0]["partitions"][0]["approximate"], true);
+
+        let script = OffsetResetExecutor::new_offline(vec![]).generate_shell_script(&plan);
+        assert!(script.contains("# APPROXIMATE"), "{script}");
+    }
+
+    #[test]
+    fn plan_flags_precomputed_offsets_from_a_range_only_mapping() {
+        // Snapshot groups get their target offset precomputed from the same
+        // mapping; with no per-record entries that number is interpolated.
+        let plan = OffsetResetPlanBuilder::new(range_only_mapping())
+            .add_consumer_group(group_at(50, Some(5050)))
+            .build(OffsetResetStrategy::Auto);
+        assert!(plan.groups[0].partitions[0].approximate);
+    }
+
+    #[tokio::test]
+    async fn generated_plan_flags_interpolated_offsets_as_approximate() {
+        let mut mapping = range_only_mapping();
+        mapping.add_consumer_group_offset("order-processor", "orders", 0, 50, 1, None);
+        let plan = OffsetResetExecutor::new_offline(vec![])
+            .generate_plan(
+                &mapping,
+                &["order-processor".to_string()],
+                OffsetResetStrategy::DryRun,
+            )
+            .await
+            .unwrap();
+        let p = &plan.groups[0].partitions[0];
+        assert_eq!(p.target_offset, 5050);
+        assert!(p.approximate);
+    }
+
+    #[test]
+    fn exact_offsets_are_not_flagged_and_keep_the_json_shape() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders", 0, 100, 5100, 1);
+        mapping.add_detailed("orders", 0, 105, 5101, 2);
+        let plan = OffsetResetPlanBuilder::new(mapping)
+            .add_consumer_group(group_at(102, None))
+            .build(OffsetResetStrategy::Auto);
+        let p = &plan.groups[0].partitions[0];
+        // Source 102 was not restored (gap): resume on source 105.
+        assert_eq!(p.target_offset, 5101);
+        assert!(!p.approximate);
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert!(json["groups"][0]["partitions"][0]
+            .get("approximate")
+            .is_none());
+
+        // Plans written before the flag existed still load.
+        let mut legacy = json.clone();
+        legacy["groups"][0]["partitions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("approximate");
+        let back: OffsetResetPlan = serde_json::from_value(legacy).unwrap();
+        assert!(!back.groups[0].partitions[0].approximate);
+
+        let script = OffsetResetExecutor::new_offline(vec![]).generate_shell_script(&plan);
+        assert!(!script.contains("APPROXIMATE"));
     }
 
     #[test]
@@ -1020,6 +1176,7 @@ mod tests {
                         target_offset: 30,
                         timestamp: 1000,
                         metadata: None,
+                        approximate: false,
                     },
                     PartitionResetPlan {
                         topic: "orders".to_string(),
@@ -1028,6 +1185,7 @@ mod tests {
                         target_offset: 42,
                         timestamp: 1000,
                         metadata: Some("snapshot".to_string()),
+                        approximate: false,
                     },
                 ],
                 partition_count: 2,
@@ -1095,6 +1253,7 @@ mod tests {
                     target_offset: 43,
                     timestamp: 1000,
                     metadata: None,
+                    approximate: false,
                 }],
                 partition_count: 1,
                 complete: true,

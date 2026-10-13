@@ -318,6 +318,35 @@ The offset mapping report contains:
 }
 ```
 
+### How committed offsets are translated
+
+A committed offset `S` means "the next record to read is `S`". Phase 3
+translates it to the target offset of the **first restored record whose source
+offset is `S` or later**. When every restored record precedes `S` (the group
+had consumed everything that was restored), it translates to one past the last
+restored record, the target partition's log end.
+
+This is exact whatever left gaps in the restored source offsets: compaction
+holes, records dropped by a record filter, records outside a PITR window,
+transaction markers or aborted records, or retention. A group committed inside
+or just past a gap resumes on the next record it has not consumed; it is never
+moved past one. If a segment was restored twice (a resumed restore), the
+earliest copy is used, so nothing is skipped.
+
+Before this fix a committed offset without an exact match was translated as
+"nearest lower restored record + the difference", which overshot after any gap
+and made the group skip records it had never consumed.
+
+Records dropped by a record filter are not written to `detailed_mappings`;
+they need no entry.
+
+**Approximate offsets.** Without per-record entries for a partition (a mapping
+that only has the `entries` range, for example one built by hand), the target
+offset is linearly interpolated over the range and is approximate. The reset
+plan marks such partitions with `"approximate": true` in JSON, `~` in the text
+output and an `# APPROXIMATE` comment in `--format shell-script`, and a warning
+is logged. Check those offsets before applying the plan.
+
 ## Safety Guarantees
 
 - **No data loss**: Records are restored with full fidelity — see [Record Fidelity](restore_guide.md#record-fidelity) for exactly what is preserved (null vs empty header values from v0.18.0) and the one known limitation (duplicate header keys, [#156](https://github.com/osodevops/kafka-backup/issues/156))

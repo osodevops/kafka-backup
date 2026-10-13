@@ -782,6 +782,39 @@ pub struct OffsetMapping {
     pub created_at: i64,
 }
 
+/// How [`OffsetMapping::resolve_target_offset`] derived a target offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OffsetLookupPrecision {
+    /// From the per-record mapping: the target offset of the first restored
+    /// record at or after the source offset (one past the last restored
+    /// record when there is none). Exact for every kind of gap in the
+    /// restored source offsets.
+    Exact,
+    /// No per-record mapping for the partition, so the target offset was
+    /// linearly interpolated over the restored offset range. Approximate:
+    /// any gap inside the range makes it land early or late.
+    Interpolated,
+}
+
+/// A target offset found by [`OffsetMapping::resolve_target_offset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TargetOffsetLookup {
+    /// Offset on the target partition a consumer should resume from.
+    pub target_offset: i64,
+    /// Whether `target_offset` is exact or interpolated.
+    pub precision: OffsetLookupPrecision,
+}
+
+impl TargetOffsetLookup {
+    /// `true` when the offset came from the per-record mapping.
+    pub fn is_exact(&self) -> bool {
+        self.precision == OffsetLookupPrecision::Exact
+    }
+}
+
 /// Individual offset pair for detailed mapping
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OffsetPair {
@@ -1000,55 +1033,110 @@ impl OffsetMapping {
         }
     }
 
-    /// Lookup target offset for a given source offset
-    /// Uses detailed mappings for exact lookup, falls back to linear interpolation
+    /// Translate a committed source offset to the target offset a consumer
+    /// should resume from, saying whether the answer is exact.
+    ///
+    /// A committed offset `S` means "the next record to read is `S`". With a
+    /// per-record mapping the answer is the target offset of the first
+    /// restored record whose source offset is `>= S`, or one past the last
+    /// restored record when every restored record precedes `S` (the group had
+    /// consumed everything that was restored). That is the number of
+    /// restored records preceding `S` counted from the first target offset,
+    /// so it stays exact whatever made the restored source offsets
+    /// non-contiguous: compaction holes, records dropped by a record filter,
+    /// transaction markers and aborted records, or retention. It never
+    /// resumes a group past a record it has not consumed. When the same
+    /// source offset was restored twice (a segment re-produced after a
+    /// resumed restore) the earliest copy is used, so nothing is skipped.
+    ///
+    /// Without a per-record mapping for the partition the target offset is
+    /// linearly interpolated over the restored range and reported as
+    /// [`OffsetLookupPrecision::Interpolated`], with a warning: gaps inside
+    /// the range make it land early or late. Offsets outside the range clamp
+    /// to the first target offset or one past the last.
+    ///
+    /// Returns `None` when the partition has no target offsets at all.
+    pub fn resolve_target_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        source_offset: i64,
+    ) -> Option<TargetOffsetLookup> {
+        let key = format!("{}/{}", topic, partition);
+
+        // Per-record mapping. Kept sorted by source offset (stable for equal
+        // source offsets) by `add_detailed_batch`, so this is a binary search.
+        if let Some(detailed) = self.detailed_mappings.get(&key).filter(|d| !d.is_empty()) {
+            let idx = detailed.partition_point(|p| p.source_offset < source_offset);
+            let target_offset = match detailed.get(idx) {
+                Some(next) => next.target_offset,
+                None => detailed[detailed.len() - 1].target_offset + 1,
+            };
+            return Some(TargetOffsetLookup {
+                target_offset,
+                precision: OffsetLookupPrecision::Exact,
+            });
+        }
+
+        // Approximate fallback: linear interpolation over the range.
+        let entry = self.entries.get(&key)?;
+        let (Some(target_first), Some(target_last)) =
+            (entry.target_first_offset, entry.target_last_offset)
+        else {
+            return None;
+        };
+        let target_offset = if source_offset <= entry.source_first_offset {
+            target_first
+        } else if source_offset > entry.source_last_offset {
+            target_last + 1
+        } else {
+            let source_range = (entry.source_last_offset - entry.source_first_offset) as f64;
+            let position = (source_offset - entry.source_first_offset) as f64 / source_range;
+            target_first + (position * (target_last - target_first) as f64).floor() as i64
+        };
+        tracing::warn!(
+            "Offset mapping for {}:{} has no per-record entries; source offset {} \
+             maps to target offset {} by linear interpolation, which is approximate \
+             when the restored offsets have gaps",
+            topic,
+            partition,
+            source_offset,
+            target_offset
+        );
+        Some(TargetOffsetLookup {
+            target_offset,
+            precision: OffsetLookupPrecision::Interpolated,
+        })
+    }
+
+    /// Precision a lookup on this partition would have: `Exact` with a
+    /// per-record mapping, `Interpolated` with only a range that has target
+    /// offsets, `None` when there are no target offsets for it.
+    pub fn lookup_precision(&self, topic: &str, partition: i32) -> Option<OffsetLookupPrecision> {
+        let key = format!("{}/{}", topic, partition);
+        if self
+            .detailed_mappings
+            .get(&key)
+            .is_some_and(|d| !d.is_empty())
+        {
+            return Some(OffsetLookupPrecision::Exact);
+        }
+        let entry = self.entries.get(&key)?;
+        (entry.target_first_offset.is_some() && entry.target_last_offset.is_some())
+            .then_some(OffsetLookupPrecision::Interpolated)
+    }
+
+    /// Target offset for a committed source offset; see
+    /// [`Self::resolve_target_offset`], which also says whether the result
+    /// is exact or interpolated.
     pub fn lookup_target_offset(
         &self,
         topic: &str,
         partition: i32,
         source_offset: i64,
     ) -> Option<i64> {
-        let key = format!("{}/{}", topic, partition);
-
-        // First try detailed mapping for exact match
-        if let Some(detailed) = self.detailed_mappings.get(&key) {
-            // Binary search for the offset
-            if let Ok(idx) = detailed.binary_search_by_key(&source_offset, |p| p.source_offset) {
-                return Some(detailed[idx].target_offset);
-            }
-
-            // Find nearest offset that's <= source_offset
-            let nearest = detailed
-                .iter()
-                .filter(|p| p.source_offset <= source_offset)
-                .max_by_key(|p| p.source_offset);
-
-            if let Some(nearest) = nearest {
-                // Calculate offset delta
-                let delta = source_offset - nearest.source_offset;
-                return Some(nearest.target_offset + delta);
-            }
-        }
-
-        // Fall back to range-based interpolation
-        if let Some(entry) = self.entries.get(&key) {
-            if let (Some(target_first), Some(target_last)) =
-                (entry.target_first_offset, entry.target_last_offset)
-            {
-                // Linear interpolation within the range
-                let source_range = entry.source_last_offset - entry.source_first_offset;
-                if source_range > 0 {
-                    let target_range = target_last - target_first;
-                    let position =
-                        (source_offset - entry.source_first_offset) as f64 / source_range as f64;
-                    return Some(target_first + (position * target_range as f64) as i64);
-                } else {
-                    return Some(target_first);
-                }
-            }
-        }
-
-        None
+        self.resolve_target_offset(topic, partition, source_offset)
+            .map(|found| found.target_offset)
     }
 
     /// Find the nearest offset by timestamp
@@ -1362,9 +1450,10 @@ mod tests {
         let target = mapping.lookup_target_offset("orders", 0, 1);
         assert_eq!(target, Some(5001));
 
-        // Offset beyond range extrapolates from nearest (999 - 2 + 5002 = 5999)
+        // Offset beyond the restored range resumes one past the last
+        // restored record (never extrapolated past the target's log end)
         let target = mapping.lookup_target_offset("orders", 0, 999);
-        assert_eq!(target, Some(5999));
+        assert_eq!(target, Some(5003));
 
         // Non-existent topic/partition returns None
         let target = mapping.lookup_target_offset("unknown", 0, 1);
@@ -1731,6 +1820,234 @@ mod tests {
         let e = m.entries.get("t/0").unwrap();
         assert_eq!(e.target_first_offset, Some(5000));
         assert_eq!(e.target_last_offset, Some(5099));
+    }
+
+    // ------------------------------------------------------------------
+    // Source -> target lookup across gaps
+    //
+    // A committed consumer offset S means "the next record to read is S".
+    // On the target, that is the first restored record whose source offset
+    // is >= S; when every restored record is below S, it is one past the
+    // last restored record. Equivalently: target base + the number of
+    // restored records that precede S. Gaps in the restored source offsets
+    // (compaction holes, record-filter drops, transaction markers, aborted
+    // records) must never push the result past a record the group has not
+    // consumed yet.
+    // ------------------------------------------------------------------
+
+    /// Simulate a restore: `restored` source offsets (ascending) are produced
+    /// densely to the target starting at `base`, recorded the way the restore
+    /// engine records them (one `add_detailed_batch` per produce batch).
+    fn restore_sim(restored: &[i64], base: i64, batch: usize) -> OffsetMapping {
+        let mut m = OffsetMapping::new();
+        let pairs: Vec<OffsetPair> = restored
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| OffsetPair {
+                source_offset: s,
+                target_offset: base + i as i64,
+                timestamp: 1_700_000_000_000 + s,
+            })
+            .collect();
+        for chunk in pairs.chunks(batch.max(1)) {
+            m.add_detailed_batch("t", 0, chunk.to_vec());
+        }
+        m
+    }
+
+    /// Ground truth: the target offset a consumer committed at source `s`
+    /// must resume from.
+    fn expected_target(restored: &[i64], base: i64, s: i64) -> i64 {
+        base + restored.iter().filter(|&&r| r < s).count() as i64
+    }
+
+    #[test]
+    fn lookup_inside_compaction_gap_resumes_at_next_restored_record() {
+        // Source 0..=4 and 10..=14 restored; 5..=9 compacted away.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        // Inside the hole: the next record to read is source 10 = target 5.
+        // The old nearest-lower + delta rule gave 4 + 3 = 7, skipping
+        // source 10 and 11.
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 9), Some(5));
+    }
+
+    #[test]
+    fn lookup_at_gap_start_resumes_at_next_restored_record() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 5), Some(5));
+    }
+
+    #[test]
+    fn lookup_right_after_gap_is_exact() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 11), Some(6));
+    }
+
+    #[test]
+    fn lookup_at_end_of_log_is_one_past_last_restored_record() {
+        // Group fully caught up: committed offset = source high watermark.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 100, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 15), Some(110));
+    }
+
+    #[test]
+    fn lookup_beyond_end_does_not_overshoot_the_restored_log() {
+        // Records 15..=19 existed on the source (e.g. aborted transaction
+        // + marker, or produced after the snapshot) but were not restored.
+        // The old rule gave 109 + (20 - 14) = 115: five offsets past the
+        // target's log end.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 100, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(110));
+        assert_eq!(m.lookup_target_offset("t", 0, 1_000_000), Some(110));
+    }
+
+    #[test]
+    fn lookup_before_first_restored_record_starts_at_first_target() {
+        // Retention purged 0..=49 before the backup; group committed at 10.
+        let restored: Vec<i64> = (50..60).collect();
+        let m = restore_sim(&restored, 7, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(7));
+        assert_eq!(m.lookup_target_offset("t", 0, 50), Some(7));
+    }
+
+    #[test]
+    fn lookup_counts_preceding_records_across_many_compacted_holes() {
+        // Deterministic pseudo-random survivors (~40% kept) over 0..500,
+        // recorded in uneven produce batches.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut restored = Vec::new();
+        for s in 0..500i64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if (state >> 33) % 10 < 4 {
+                restored.push(s);
+            }
+        }
+        assert!(restored.len() > 100);
+        let m = restore_sim(&restored, 42, 7);
+        for s in -1..=505i64 {
+            assert_eq!(
+                m.lookup_target_offset("t", 0, s),
+                Some(expected_target(&restored, 42, s)),
+                "source offset {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_record_filter_drops_resume_at_next_survivor() {
+        // Source 0..=9; a record filter dropped 3, 4 and the tail 8, 9.
+        // Dropped offsets are simply absent from the mapping.
+        let restored = vec![0, 1, 2, 5, 6, 7];
+        let m = restore_sim(&restored, 0, 2);
+        assert_eq!(m.lookup_target_offset("t", 0, 3), Some(3)); // source 5
+        assert_eq!(m.lookup_target_offset("t", 0, 4), Some(3));
+        assert_eq!(m.lookup_target_offset("t", 0, 5), Some(3));
+        assert_eq!(m.lookup_target_offset("t", 0, 8), Some(6)); // log end
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(6)); // HW
+    }
+
+    #[test]
+    fn lookup_reports_exact_precision_for_record_mappings() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        let found = m.resolve_target_offset("t", 0, 7).unwrap();
+        assert_eq!(found.target_offset, 5);
+        assert_eq!(found.precision, OffsetLookupPrecision::Exact);
+        assert!(found.is_exact());
+        assert_eq!(
+            m.lookup_precision("t", 0),
+            Some(OffsetLookupPrecision::Exact)
+        );
+    }
+
+    #[test]
+    fn lookup_without_record_mappings_interpolates_and_says_so() {
+        // Range-only mapping (e.g. built by hand, or a migration seed map):
+        // the only option left is an approximation.
+        let mut m = OffsetMapping::new();
+        m.add("t", 0, 0, Some(5000), 1);
+        m.update_range("t", 0, 100, Some(5100), 2);
+
+        let mid = m.resolve_target_offset("t", 0, 50).unwrap();
+        assert_eq!(mid.target_offset, 5050);
+        assert_eq!(mid.precision, OffsetLookupPrecision::Interpolated);
+        assert!(!mid.is_exact());
+        assert_eq!(
+            m.lookup_precision("t", 0),
+            Some(OffsetLookupPrecision::Interpolated)
+        );
+
+        // Never extrapolated outside the restored range: before the first
+        // restored record -> first target; past the last -> one past it.
+        assert_eq!(m.lookup_target_offset("t", 0, -5), Some(5000));
+        assert_eq!(m.lookup_target_offset("t", 0, 0), Some(5000));
+        assert_eq!(m.lookup_target_offset("t", 0, 100), Some(5100));
+        assert_eq!(m.lookup_target_offset("t", 0, 101), Some(5101));
+        assert_eq!(m.lookup_target_offset("t", 0, 10_000), Some(5101));
+    }
+
+    #[test]
+    fn lookup_record_mappings_win_over_the_range() {
+        // Both exist for the partition (the normal restore case): the
+        // record-level answer is used, never the interpolation.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 3);
+        assert!(m.entries.contains_key("t/0"));
+        // Interpolation over source 0..=14 -> target 0..=9 would give 4 for
+        // source 7 (rounded down); the exact answer is 5.
+        let found = m.resolve_target_offset("t", 0, 7).unwrap();
+        assert_eq!(found.target_offset, 5);
+        assert_eq!(found.precision, OffsetLookupPrecision::Exact);
+    }
+
+    #[test]
+    fn lookup_unknown_partition_is_none() {
+        let m = restore_sim(&[0, 1, 2], 0, 10);
+        assert_eq!(m.resolve_target_offset("t", 1, 0), None);
+        assert_eq!(m.resolve_target_offset("other", 0, 0), None);
+        assert_eq!(m.lookup_precision("t", 1), None);
+
+        // Range without target offsets (built from a manifest only).
+        let mut ranged = OffsetMapping::new();
+        ranged.add("t", 0, 0, None, 1);
+        ranged.update_range("t", 0, 10, None, 2);
+        assert_eq!(ranged.lookup_target_offset("t", 0, 5), None);
+        assert_eq!(ranged.lookup_precision("t", 0), None);
+    }
+
+    #[test]
+    fn lookup_after_resume_reproduced_segment_does_not_skip() {
+        // Source 0..=9 -> target 0..=9, then a resumed restore re-produced
+        // source 5..=9 (target 10..=14) before continuing with 10..=19
+        // (target 15..=24). Resuming a group at source 7 must not skip
+        // anything: the earliest copy is used.
+        let mut m = OffsetMapping::new();
+        let batch = |range: std::ops::Range<i64>, base: i64| -> Vec<OffsetPair> {
+            range
+                .clone()
+                .enumerate()
+                .map(|(i, s)| OffsetPair {
+                    source_offset: s,
+                    target_offset: base + i as i64,
+                    timestamp: s,
+                })
+                .collect()
+        };
+        m.add_detailed_batch("t", 0, batch(0..10, 0));
+        m.add_detailed_batch("t", 0, batch(5..10, 10));
+        m.add_detailed_batch("t", 0, batch(10..20, 15));
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(7));
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(15));
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(25));
     }
 
     // ------------------------------------------------------------------

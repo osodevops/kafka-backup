@@ -43,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `validate --deep` verifies each segment's SHA-256 against the manifest,
   and record-count, offset, checksum and size mismatches now fail the run
   (exit status 1) instead of only being listed.
+- Three-phase restore no longer resumes consumer groups past records they
+  have not consumed when the restored source offsets have gaps. A committed
+  offset with no exact match in the offset mapping was translated as
+  "nearest lower restored record + the difference", which overshoots after any
+  gap: compaction holes, records dropped by a record filter, transaction
+  markers, aborted records. Groups committed inside or after a gap skipped
+  records, and a group at the high watermark after a dropped tail was
+  committed past the target's log end.
+  `OffsetMapping::lookup_target_offset` now returns the target offset of the
+  first restored record at or after the committed offset, or one past the
+  last restored record. This is exact for every kind of gap. With duplicate
+  source offsets (a resumed restore) the earliest copy is used.
+- The restore engine no longer writes offset-mapping entries for records a
+  record filter dropped. The lookup no longer needs them, and an entry for a
+  dropped tail record put the end-of-log answer one past the log end.
 
 ### Changed
 - **One-time re-read after upgrading.** On the first run, a partition whose
@@ -61,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored. Pruned ranges span the pruned segments' covered ranges.
 - `validate` treats a size mismatch as corruption at every depth (when the
   manifest records a size).
+- Linear interpolation, the fallback when there are no per-record entries,
+  now clamps to the restored range. Before the first restored record it gives
+  the first target offset; past the last, it gives one past the last.
+- `restore::filter::map_dropped_offsets` is deprecated (unused by the engine).
+- **API (semver minor):** `PartitionResetPlan` gains the public field
+  `approximate`. Struct literals must set it (`approximate: false`).
 
 ### Added
 - Manifest: `SegmentMetadata.covered_start_offset` / `covered_end_offset`
@@ -80,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has no loss and no duplicates (`KAFKA_BACKUP_CHAOS_SEEDS`, default 10).
 - `SegmentWriter::begin_coverage` / `extend_coverage` / `uncovered_tail` /
   `skip_coverage_to`; `FaultyStorage` put faults, latency and hooks (tests).
+- `OffsetMapping::resolve_target_offset` returns the target offset together
+  with an `OffsetLookupPrecision` (`Exact` or `Interpolated`).
+  `OffsetMapping::lookup_precision` reports which one a partition supports.
+- `PartitionResetPlan.approximate` marks an offset that was interpolated
+  because the mapping has no per-record entries for that partition. It appears
+  as `"approximate": true` in JSON (omitted when `false`), `~` in the
+  `offset-reset plan` text output and an `# APPROXIMATE` comment in the shell
+  script, and a warning is logged.
 
 ### API
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
