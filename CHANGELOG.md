@@ -95,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where directories cannot be fsynced). A crash or concurrent writer can no
   longer leave a truncated manifest, offset database or segment. Leftover
   temp files are never listed as keys.
+- **`restore.rewrite_schema_ids` did nothing for repartitioned topics.** The
+  1:1 path rewrote Confluent schema IDs, but the repartition (fan-out) path
+  produced the source registry's IDs unchanged, so consumers of a
+  repartitioned topic resolved the wrong schemas on the target. Both paths
+  now apply the same rewrite.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -232,7 +237,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gain the `use_emulator` and `allow_http` fields. Code that builds them
   field by field must set both (`false` keeps the previous behaviour).
 
+- `restore.schema_id_rewrite_topics` (source topics the schema ID rewrite
+  applies to; all by default) and `restore.schema_id_rewrite_strict` (fail on
+  a framed key or value whose ID is not in `schema_id_mapping`, instead of
+  restoring it with the source ID). The restore report counts
+  `schema_ids_rewritten` / `schema_ids_unmapped` per topic; `restore` prints
+  them.
+
 ### API
+- `TopicRestoreReport::{schema_ids_rewritten, schema_ids_unmapped}` and
+  `RestoreOptions::{schema_id_rewrite_topics, schema_id_rewrite_strict}`
+  (new public fields: struct literals need them or `..Default::default()`).
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
 
