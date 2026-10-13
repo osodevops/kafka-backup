@@ -166,6 +166,10 @@ pub struct RestoreEngine {
     offset_mapping: Arc<Mutex<OffsetMapping>>,
     progress_tx: broadcast::Sender<RestoreProgress>,
     target_config: Option<crate::config::KafkaConfig>,
+    /// Restore-wide record/byte rate limit, shared by every partition.
+    rate_limiter: Option<Arc<super::rate_limit::RestoreRateLimiter>>,
+    /// Target topic -> `max.message.bytes` (`None` when it could not be read).
+    max_message_bytes: Arc<Mutex<HashMap<String, Option<usize>>>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -341,6 +345,11 @@ impl RestoreEngine {
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (progress_tx, _) = broadcast::channel(100);
+        let rate_limiter = config
+            .restore
+            .as_ref()
+            .and_then(super::rate_limit::RestoreRateLimiter::from_options)
+            .map(Arc::new);
 
         Ok(Self {
             config,
@@ -355,6 +364,8 @@ impl RestoreEngine {
             offset_mapping: Arc::new(Mutex::new(OffsetMapping::new())),
             progress_tx,
             target_config: Some(target_config),
+            rate_limiter,
+            max_message_bytes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1216,6 +1227,8 @@ impl RestoreEngine {
             .cloned()
             .unwrap_or_else(|| topic_backup.name.clone());
 
+        let produce_path = self.produce_path(&target_topic, options).await?;
+
         // Repartitioning branch: delegate to fan-out module
         if let Some(repart_config) = options.repartitioning.get(&target_topic) {
             info!(
@@ -1239,6 +1252,7 @@ impl RestoreEngine {
                 repart_config,
                 options,
                 router,
+                produce_path,
                 self.storage.clone(),
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.health),
@@ -1316,6 +1330,7 @@ impl RestoreEngine {
                 target_partition,
                 segments: partition_backup.segments.clone(),
                 router,
+                produce_path: produce_path.clone(),
                 storage: self.storage.clone(),
                 options: options.clone(),
                 metrics: Arc::clone(&self.metrics),
@@ -1361,6 +1376,65 @@ impl RestoreEngine {
             records_dropped_by_filter: dropped_by_filter,
             records_tombstoned_by_filter: tombstoned_by_filter,
         })
+    }
+
+    /// The produce plumbing for one target topic.
+    async fn produce_path(
+        &self,
+        target_topic: &str,
+        options: &RestoreOptions,
+    ) -> Result<super::produce_path::ProducePath> {
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+        let max_message_bytes = self.target_max_message_bytes(&router, target_topic).await;
+        Ok(super::produce_path::ProducePath::new(
+            router,
+            self.rate_limiter.clone(),
+            max_message_bytes,
+            options,
+        ))
+    }
+
+    /// The target topic's `max.message.bytes` (DescribeConfigs, cached per
+    /// topic). `None` when it cannot be read, e.g. without DescribeConfigs
+    /// permission: the pre-check is then skipped and an oversized record
+    /// fails at produce time with the broker's RECORD_TOO_LARGE.
+    async fn target_max_message_bytes(
+        &self,
+        router: &PartitionLeaderRouter,
+        target_topic: &str,
+    ) -> Option<usize> {
+        if let Some(cached) = self.max_message_bytes.lock().await.get(target_topic) {
+            return *cached;
+        }
+        let value = match router
+            .describe_configs(&[(ConfigResourceType::Topic, target_topic.to_string())])
+            .await
+        {
+            Ok(configs) => configs
+                .get(&(ConfigResourceType::Topic, target_topic.to_string()))
+                .and_then(|entries| super::produce_path::max_message_bytes_from_configs(entries)),
+            Err(e) => {
+                warn!(
+                    "Could not read max.message.bytes of target topic {}: {}; records are not \
+                     size-checked before producing",
+                    target_topic, e
+                );
+                None
+            }
+        };
+        if let Some(max) = value {
+            debug!("Target topic {} max.message.bytes = {}", target_topic, max);
+        }
+        self.max_message_bytes
+            .lock()
+            .await
+            .insert(target_topic.to_string(), value);
+        value
     }
 
     /// Load checkpoint from file
@@ -1676,7 +1750,9 @@ struct RestorePartitionContext {
     source_partition: i32,
     target_partition: i32,
     segments: Vec<SegmentMetadata>,
+    #[allow(dead_code)]
     router: Arc<PartitionLeaderRouter>,
+    produce_path: super::produce_path::ProducePath,
     storage: Arc<dyn StorageBackend>,
     options: RestoreOptions,
     metrics: Arc<PerformanceMetrics>,
@@ -1855,31 +1931,34 @@ impl RestorePartitionContext {
                 })
                 .sum();
 
-            // Produce records in batches. Records the filter dropped are not
+            // A record larger than the target topic's max.message.bytes
+            // fails the partition before anything of this segment is sent.
+            self.produce_path.check_record_sizes(
+                &records_to_produce,
+                super::produce_path::RecordOrigin {
+                    source_topic: &self.source_topic,
+                    source_partition: self.source_partition,
+                },
+                &self.target_topic,
+                self.target_partition,
+            )?;
+
+            // Produce records in batches capped by record count and encoded
+            // bytes. Records the filter dropped are not
             // mapped: `OffsetMapping::resolve_target_offset` resolves a
             // committed offset that points at one to the next restored
             // record, as it does for any other gap.
-            let batch_size = self.options.produce_batch_size;
-            for batch in records_to_produce.chunks(batch_size) {
-                // Apply rate limiting if configured
-                if let Some(rate) = self.options.rate_limit_records_per_sec {
-                    let delay = Duration::from_secs_f64(batch.len() as f64 / rate as f64);
-                    tokio::time::sleep(delay).await;
-                }
+            for range in self.produce_path.plan(&records_to_produce) {
+                let batch = &records_to_produce[range];
 
-                // Produce using router (automatically routes to partition leader)
+                // Produce (routed to the partition leader, after the
+                // restore-wide rate limit).
                 match self
-                    .router
-                    .produce(
-                        &self.target_topic,
-                        self.target_partition,
-                        batch.to_vec(),
-                        self.options.produce_acks,
-                        self.options.produce_timeout_ms,
-                    )
+                    .produce_path
+                    .produce(&self.target_topic, self.target_partition, batch)
                     .await
                 {
-                    Ok(produce_response) => {
+                    Ok(sub_batch_offsets) => {
                         self.kafka_cb.record_success();
                         self.health.mark_healthy("kafka");
 
@@ -1891,7 +1970,7 @@ impl RestorePartitionContext {
                         let mut batch_pairs: Vec<crate::manifest::OffsetPair> =
                             Vec::with_capacity(batch.len());
                         let mut record_idx = 0;
-                        for (sub_base_offset, sub_count) in &produce_response.sub_batch_offsets {
+                        for (sub_base_offset, sub_count) in &sub_batch_offsets {
                             for j in 0..*sub_count {
                                 let record = &batch[record_idx];
                                 let target_offset = sub_base_offset + j as i64;

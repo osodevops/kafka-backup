@@ -95,6 +95,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where directories cannot be fsynced). A crash or concurrent writer can no
   longer leave a truncated manifest, offset database or segment. Leftover
   temp files are never listed as keys.
+- `restore.rate_limit_bytes_per_sec` was validated but never applied. It
+  now limits the restore's produce rate (see Changed).
+- A produce batch whose records span more than ~24.8 days of timestamps is
+  sent as several sub-batches; a retry after a lost connection resent the
+  sub-batches the broker had already acknowledged, duplicating them. Each
+  sub-batch is now encoded once and retried on its own with identical
+  bytes.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -163,6 +170,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use `Config::check_security_sections` on raw YAML.
 - **API (semver minor):** `SaslMechanism` is now `#[non_exhaustive]`.
   Matches on it outside this crate need a wildcard arm.
+- **`restore.rate_limit_records_per_sec` is now a restore-wide limit.** It
+  was applied per partition (each partition slept `batch / rate` before
+  every batch, so eight concurrent partitions ran at eight times the
+  configured rate). It is now one token bucket shared by every partition
+  and every repartitioning writer, as is `rate_limit_bytes_per_sec`.
+  Configurations tuned around the old behaviour should multiply the value
+  by `max_concurrent_partitions` to keep the same throughput.
 
 ### Added
 - `backup.isolation_level` (`read_committed` default, `read_uncommitted`)
@@ -231,10 +245,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **API (semver minor):** `StorageBackendConfig::Azure` and `AzureConfig`
   gain the `use_emulator` and `allow_http` fields. Code that builds them
   field by field must set both (`false` keeps the previous behaviour).
+- **`restore.produce_max_batch_bytes`** (default 1 MiB): produce batches are
+  capped by uncompressed encoded size as well as by `produce_batch_size`
+  records, and further capped so that a compressed batch always fits the
+  target topic's `max.message.bytes`. Restores of large records into
+  Confluent Cloud (2 MiB default limit, 8 MiB maximum) no longer fail with
+  `RECORD_TOO_LARGE` because a 1000-record batch outgrew the limit.
+- **`max.message.bytes` pre-check.** The target topic's
+  `max.message.bytes` is read once per topic (DescribeConfigs). Before a
+  segment's records are produced, any record that does not fit even alone
+  in a compressed batch fails the partition with a
+  `KafkaError::RecordTooLarge` naming the source topic, partition and
+  offset, the record's size and the target topic's limit. Without
+  DescribeConfigs permission the check is skipped with a warning.
 
 ### API
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
+- `RestoreOptions` gains `produce_max_batch_bytes`; `KafkaError` gains
+  `RecordTooLarge` (it is `#[non_exhaustive]`). `restore::repartition::
+  restore_topic_repartitioned` is now crate-private (it takes the engine's
+  internal produce plumbing).
 
 ## [0.23.8] - 2026-10-09
 

@@ -9,7 +9,7 @@
 //! [`encode_producer_batch`] and sent by [`produce_encoded_batch`], so a
 //! retry resends identical bytes — what the broker's sequence check expects.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use indexmap::IndexMap;
 use kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
 use kafka_protocol::messages::{
@@ -19,10 +19,7 @@ use kafka_protocol::messages::{
     TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH,
-};
+use kafka_protocol::records::Compression;
 use std::sync::Arc;
 
 use super::consumer_groups::coordinator_from_response;
@@ -71,6 +68,15 @@ pub struct ProducerBatch {
     pub base_sequence: i32,
     /// Whether the batch is part of a transaction.
     pub transactional: bool,
+}
+
+impl ProducerBatch {
+    /// A batch without a producer id: no broker-side de-duplication.
+    pub const NON_IDEMPOTENT: ProducerBatch = ProducerBatch {
+        producer: ProducerIdAndEpoch::NONE,
+        base_sequence: -1,
+        transactional: false,
+    };
 }
 
 /// Whether a broker error code is worth retrying for the transactional
@@ -270,50 +276,7 @@ pub fn encode_producer_batch(
         CompressionType::Zstd => Compression::Zstd,
         CompressionType::Lz4 => Compression::Lz4,
     };
-    if records.is_empty() {
-        return Err(KafkaError::Protocol("cannot encode an empty record batch".to_string()).into());
-    }
-    let kafka_records: Vec<Record> = records
-        .iter()
-        .enumerate()
-        .map(|(i, r)| Record {
-            transactional: batch.transactional,
-            control: false,
-            delete_horizon: false,
-            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-            producer_id: batch.producer.producer_id,
-            producer_epoch: batch.producer.producer_epoch,
-            timestamp_type: TimestampType::Creation,
-            offset: i as i64,
-            // offset - sequence is constant, so the encoder writes a single
-            // batch whose base sequence is `base_sequence`.
-            sequence: batch.base_sequence.wrapping_add(i as i32),
-            timestamp: r.timestamp,
-            key: r.key.clone().map(Bytes::from),
-            value: r.value.clone().map(Bytes::from),
-            headers: r
-                .headers
-                .iter()
-                .map(|h| {
-                    (
-                        StrBytes::from_string(h.key.clone()),
-                        h.value.clone().map(Bytes::from),
-                    )
-                })
-                .collect(),
-        })
-        .collect();
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        kafka_records.iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression,
-        },
-    )
-    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
-    Ok(buf.freeze())
+    super::produce::encode_batch(records, batch, compression)
 }
 
 /// Produce one encoded batch (see [`encode_producer_batch`]) to the

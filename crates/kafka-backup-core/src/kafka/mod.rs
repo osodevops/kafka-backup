@@ -7,7 +7,7 @@ pub mod consumer_groups;
 mod fetch;
 mod metadata;
 mod partition_router;
-mod produce;
+pub(crate) mod produce;
 pub mod sasl;
 mod scram;
 pub mod tls;

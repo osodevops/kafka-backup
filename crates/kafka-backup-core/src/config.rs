@@ -994,11 +994,15 @@ pub struct RestoreOptions {
     #[serde(default)]
     pub strip_offset_headers: bool,
 
-    /// Rate limit in records per second
+    /// Rate limit in records per second for the whole restore: one token
+    /// bucket shared by every partition (before 0.24 each partition was
+    /// limited to this rate on its own).
     #[serde(default)]
     pub rate_limit_records_per_sec: Option<u64>,
 
-    /// Rate limit in bytes per second
+    /// Rate limit in bytes per second for the whole restore, shared by
+    /// every partition. Bytes are the records' uncompressed encoded size
+    /// (key, value, headers and record framing).
     #[serde(default)]
     pub rate_limit_bytes_per_sec: Option<u64>,
 
@@ -1009,6 +1013,14 @@ pub struct RestoreOptions {
     /// Batch size for producing to target cluster (number of records)
     #[serde(default = "default_produce_batch_size")]
     pub produce_batch_size: usize,
+
+    /// Maximum uncompressed size of one produce batch in bytes (default
+    /// 1 MiB). A batch closes at `produce_batch_size` records or at this
+    /// size, whichever comes first; it is further capped below the target
+    /// topic's `max.message.bytes`. A single record larger than the batch
+    /// cap is sent in a batch of its own.
+    #[serde(default = "default_produce_max_batch_bytes")]
+    pub produce_max_batch_bytes: usize,
 
     /// Producer acknowledgement level sent to the broker.
     ///
@@ -1215,6 +1227,7 @@ impl Default for RestoreOptions {
             rate_limit_bytes_per_sec: None,
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_state: None,
@@ -1248,6 +1261,10 @@ fn default_max_concurrent_partitions() -> usize {
 
 fn default_produce_batch_size() -> usize {
     1000
+}
+
+fn default_produce_max_batch_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_produce_acks() -> i16 {
@@ -1552,6 +1569,12 @@ impl RestoreOptions {
             return Err(crate::Error::Config(
                 "produce_batch_size must be > 0".to_string(),
             ));
+        }
+        if self.produce_max_batch_bytes < 1024 {
+            return Err(crate::Error::Config(format!(
+                "produce_max_batch_bytes must be at least 1024, got {}",
+                self.produce_max_batch_bytes
+            )));
         }
 
         // Validate consumer group offset reset
@@ -2016,6 +2039,7 @@ connection:
         RestoreOptions {
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),

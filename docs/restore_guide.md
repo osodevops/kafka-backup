@@ -250,8 +250,10 @@ restore:
 | `include_original_offset_header` | bool | false | Add `x-original-offset` / `x-original-timestamp` / `x-source-partition` to produced records |
 | `strip_offset_headers` | bool | false | Remove the headers the backup added (`backup.include_offset_headers`, default on) so restored records match the source header-for-header |
 | `max_concurrent_partitions` | usize | 4 | Parallel partition restores |
-| `produce_batch_size` | usize | 1000 | Records per produce batch |
-| `rate_limit_records_per_sec` | u64 | None | Rate limit (records/sec) |
+| `produce_batch_size` | usize | 1000 | Records per produce batch at most |
+| `produce_max_batch_bytes` | usize | 1048576 | Uncompressed bytes per produce batch at most; also capped below the target topic's `max.message.bytes` |
+| `rate_limit_records_per_sec` | u64 | None | Rate limit for the whole restore (records/sec), shared by all partitions |
+| `rate_limit_bytes_per_sec` | u64 | None | Rate limit for the whole restore (bytes/sec), shared by all partitions |
 | `checkpoint_state` | path | None | Checkpoint file for resume |
 | `checkpoint_interval_secs` | u64 | 60 | Checkpoint save interval |
 | `reset_consumer_offsets` | bool | false | Auto-reset consumer offsets |

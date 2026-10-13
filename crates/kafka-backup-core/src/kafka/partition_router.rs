@@ -603,6 +603,47 @@ impl PartitionLeaderRouter {
 
     /// Produce records to a partition, routing to the correct leader.
     ///
+    /// Records are split by timestamp range (see `produce::produce`), each
+    /// sub-batch is encoded once without a producer id and sent with
+    /// [`Self::produce_encoded`]. A retry resends identical bytes, and a
+    /// sub-batch the broker acknowledged is never sent again.
+    pub async fn produce(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: Vec<BackupRecord>,
+        acks: i16,
+        timeout_ms: i32,
+    ) -> Result<ProduceResponse> {
+        let mut sub_batch_offsets = Vec::new();
+        for range in super::produce::split_by_timestamp_ranges(&records) {
+            let sub_batch = &records[range];
+            let bytes = super::produce::encode_batch(
+                sub_batch,
+                &super::transactions::ProducerBatch::NON_IDEMPOTENT,
+                kafka_protocol::records::Compression::Zstd,
+            )?;
+            let base_offset = self
+                .produce_encoded(topic, partition, bytes, acks, timeout_ms)
+                .await?;
+            sub_batch_offsets.push((base_offset, sub_batch.len()));
+        }
+        Ok(ProduceResponse {
+            base_offset: sub_batch_offsets.first().map_or(-1, |(base, _)| *base),
+            error_code: 0,
+            record_count: records.len(),
+            sub_batch_offsets,
+        })
+    }
+
+    /// Send one encoded record batch to the partition's leader and return
+    /// the base offset the broker assigned.
+    ///
+    /// Every attempt sends the same `batch` bytes, so a batch carrying a
+    /// producer id and sequence is de-duplicated by the broker however many
+    /// times it is resent. `KafkaClient::send_request` underneath also
+    /// resends the identical request frame once after a lost connection.
+    ///
     /// Handles two failure classes (Issue #67 bug 8):
     ///
     /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
@@ -615,15 +656,15 @@ impl PartitionLeaderRouter {
     ///    pool of the broker the failed request was sent to (issue #197). This
     ///    covers transient network blips and broker restarts.
     ///
-    /// Records are only cloned when a retry is actually required.
-    pub async fn produce(
+    /// Any other error is returned to the caller.
+    pub async fn produce_encoded(
         &self,
         topic: &str,
         partition: i32,
-        records: Vec<BackupRecord>,
+        batch: bytes::Bytes,
         acks: i16,
         timeout_ms: i32,
-    ) -> Result<ProduceResponse> {
+    ) -> Result<i64> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
         const MAX_LEADER_RETRIES: u32 = 20;
 
@@ -632,10 +673,10 @@ impl PartitionLeaderRouter {
 
         loop {
             match self
-                .produce_internal(topic, partition, &records, acks, timeout_ms)
+                .produce_internal(topic, partition, batch.clone(), acks, timeout_ms)
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(base_offset) => return Ok(base_offset),
                 Err(RoutedError { error, .. })
                     if is_not_leader_error(&error) && leader_attempts < MAX_LEADER_RETRIES =>
                 {
@@ -677,19 +718,18 @@ impl PartitionLeaderRouter {
         }
     }
 
-    /// Internal produce implementation — borrows records to avoid unnecessary
-    /// cloning; tagged with the broker it was sent to.
+    /// One produce attempt of an encoded batch, tagged with the broker it
+    /// was sent to.
     async fn produce_internal(
         &self,
         topic: &str,
         partition: i32,
-        records: &[BackupRecord],
+        batch: bytes::Bytes,
         acks: i16,
         timeout_ms: i32,
-    ) -> std::result::Result<ProduceResponse, RoutedError> {
+    ) -> std::result::Result<i64, RoutedError> {
         let (leader_id, client) = self.route(topic, partition).await?;
-        client
-            .produce(topic, partition, records.to_vec(), acks, timeout_ms)
+        super::produce::produce_encoded(&client, topic, partition, batch, acks, timeout_ms)
             .await
             .map_err(|error| RoutedError::at(leader_id, error))
     }

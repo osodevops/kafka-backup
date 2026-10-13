@@ -7,6 +7,8 @@ pub mod offset_automation;
 pub mod offset_reset;
 pub mod offset_rollback;
 pub mod preflight;
+pub(crate) mod produce_path;
+pub(crate) mod rate_limit;
 pub mod repartition;
 pub mod three_phase;
 

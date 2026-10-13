@@ -329,6 +329,7 @@ impl ErrorType {
             crate::error::KafkaError::TlsConfig(_) => ErrorType::Auth,
             crate::error::KafkaError::CertificateLoad { .. } => ErrorType::Auth,
             crate::error::KafkaError::PrivateKeyLoad { .. } => ErrorType::Auth,
+            crate::error::KafkaError::RecordTooLarge { .. } => ErrorType::Unknown,
         }
     }
 

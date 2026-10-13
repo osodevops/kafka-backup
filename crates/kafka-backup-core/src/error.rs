@@ -132,6 +132,32 @@ pub enum KafkaError {
     /// Private key loading error
     #[error("Failed to load private key from {path}: {message}")]
     PrivateKeyLoad { path: String, message: String },
+
+    /// A record cannot be produced because, even alone in a compressed
+    /// batch, it exceeds the target topic's `max.message.bytes`.
+    #[error(
+        "Record at source offset {source_offset} of {source_topic}[{source_partition}] is \
+         {batch_bytes} bytes as a single-record batch, larger than max.message.bytes \
+         ({max_message_bytes}) of target topic {target_topic}[{target_partition}]. Raise \
+         max.message.bytes on the target topic (or exclude the record) and resume"
+    )]
+    RecordTooLarge {
+        /// Source topic of the record.
+        source_topic: String,
+        /// Source partition of the record (`-1` on the repartitioning path,
+        /// where a writer takes records from every source partition).
+        source_partition: i32,
+        /// Offset of the record in the source partition.
+        source_offset: i64,
+        /// Target topic.
+        target_topic: String,
+        /// Target partition.
+        target_partition: i32,
+        /// Size of the compressed single-record batch.
+        batch_bytes: usize,
+        /// The target topic's `max.message.bytes`.
+        max_message_bytes: usize,
+    },
 }
 
 impl Error {

@@ -8,14 +8,13 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{RepartitioningStrategy, RestoreOptions, TopicRepartitioning};
 use crate::health::HealthCheck;
+use crate::kafka::produce::{record_size_upper_bound, RECORD_BATCH_OVERHEAD};
 use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::{
     BackupRecord, PartitionRestoreReport, RestoreCheckpoint, SegmentMetadata, TopicBackup,
@@ -26,6 +25,7 @@ use crate::storage::StorageBackend;
 use crate::{Error, Result};
 
 use super::helpers;
+use super::produce_path::{ProducePath, RecordOrigin};
 
 /// Kafka's default seed for murmur2 hashing (0x9747b28c).
 const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
@@ -80,12 +80,13 @@ impl Partitioner {
 /// through bounded channels, with the `Partitioner` routing each record
 /// to the correct channel based on its key.
 #[allow(clippy::too_many_arguments)]
-pub async fn restore_topic_repartitioned(
+pub(crate) async fn restore_topic_repartitioned(
     topic_backup: &TopicBackup,
     target_topic: &str,
     repart_config: &TopicRepartitioning,
     options: &RestoreOptions,
     router: Arc<PartitionLeaderRouter>,
+    produce_path: ProducePath,
     storage: Arc<dyn StorageBackend>,
     metrics: Arc<PerformanceMetrics>,
     health: Arc<HealthCheck>,
@@ -205,29 +206,30 @@ pub async fn restore_topic_repartitioned(
         let rx = receivers[target_partition as usize]
             .take()
             .expect("receiver already taken");
-        let router = Arc::clone(&router);
+        let produce_path = produce_path.clone();
+        let source_topic = topic_backup.name.clone();
         let target_topic = target_topic.to_string();
         let cancel = Arc::clone(&cancel);
         let kafka_cb = Arc::clone(&kafka_cb);
         let health = Arc::clone(&health);
         let metrics = Arc::clone(&metrics);
-        let options = options.clone();
 
         writer_handles.push(tokio::spawn(async move {
             run_writer(
                 rx,
-                &router,
+                &produce_path,
+                &source_topic,
                 &target_topic,
                 target_partition,
                 &cancel,
                 &kafka_cb,
                 &health,
                 &metrics,
-                &options,
             )
             .await
         }));
     }
+    drop(router);
 
     // Join all reader tasks
     let mut reader_errors = Vec::new();
@@ -391,46 +393,74 @@ async fn run_reader(
     Ok(())
 }
 
-/// Writer task: receives records from a channel and produces them in batches.
+/// Writer task: receives records from a channel and produces them in
+/// batches capped by record count and encoded bytes.
 #[allow(clippy::too_many_arguments)]
 async fn run_writer(
     mut rx: mpsc::Receiver<BackupRecord>,
-    router: &PartitionLeaderRouter,
+    produce_path: &ProducePath,
+    source_topic: &str,
     target_topic: &str,
     target_partition: i32,
     cancel: &Arc<AtomicBool>,
     kafka_cb: &CircuitBreaker,
     health: &HealthCheck,
     metrics: &PerformanceMetrics,
-    options: &RestoreOptions,
 ) -> Result<PartitionRestoreReport> {
-    let batch_size = options.produce_batch_size;
+    let batch_size = produce_path.max_batch_records();
+    let max_batch_bytes = produce_path.max_batch_bytes();
     let mut total_records = 0u64;
     let mut total_bytes = 0u64;
 
     let mut batch: Vec<BackupRecord> = Vec::with_capacity(batch_size);
+    // A record drained from the channel that did not fit the previous batch.
+    let mut carry: Option<BackupRecord> = None;
 
     loop {
-        // Drain up to batch_size records, blocking on the first one
-        if batch.is_empty() {
+        // Start the batch with the carried record, else block on the first one
+        let mut batch_encoded = RECORD_BATCH_OVERHEAD;
+        if let Some(record) = carry.take() {
+            batch_encoded += record_size_upper_bound(&record);
+            batch.push(record);
+        } else {
             match rx.recv().await {
-                Some(record) => batch.push(record),
+                Some(record) => {
+                    batch_encoded += record_size_upper_bound(&record);
+                    batch.push(record);
+                }
                 None => break, // channel closed, all readers done
             }
         }
 
-        // Non-blocking drain to fill the batch
+        // Non-blocking drain to fill the batch up to both caps
         while batch.len() < batch_size {
             match rx.try_recv() {
-                Ok(record) => batch.push(record),
+                Ok(record) => {
+                    let size = record_size_upper_bound(&record);
+                    if batch_encoded + size > max_batch_bytes {
+                        carry = Some(record);
+                        break;
+                    }
+                    batch_encoded += size;
+                    batch.push(record);
+                }
                 Err(_) => break,
             }
         }
 
-        // Apply rate limiting
-        if let Some(rate) = options.rate_limit_records_per_sec {
-            let delay = Duration::from_secs_f64(batch.len() as f64 / rate as f64);
-            tokio::time::sleep(delay).await;
+        // The fan-out path has no single source partition per writer; the
+        // error names the record's source offset and the target partition.
+        if let Err(e) = produce_path.check_record_sizes(
+            &batch,
+            RecordOrigin {
+                source_topic,
+                source_partition: -1,
+            },
+            target_topic,
+            target_partition,
+        ) {
+            cancel.store(true, Ordering::Relaxed);
+            return Err(e);
         }
 
         let batch_bytes: u64 = batch
@@ -441,14 +471,9 @@ async fn run_writer(
             })
             .sum();
 
-        match router
-            .produce(
-                target_topic,
-                target_partition,
-                batch.clone(),
-                options.produce_acks,
-                options.produce_timeout_ms,
-            )
+        // Produce (after the restore-wide rate limit)
+        match produce_path
+            .produce(target_topic, target_partition, &batch)
             .await
         {
             Ok(_) => {

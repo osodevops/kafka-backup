@@ -1021,18 +1021,29 @@ restore:
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `max_concurrent_partitions` | int | No | `4` | Concurrent partition restores |
-| `produce_batch_size` | int | No | `1000` | Records per produce batch |
+| `produce_batch_size` | int | No | `1000` | Records per produce batch at most |
+| `produce_max_batch_bytes` | int | No | `1048576` | Uncompressed bytes per produce batch at most (1 MiB). A batch closes at whichever of `produce_batch_size` / `produce_max_batch_bytes` is reached first, and is further capped so that, compressed, it always fits the target topic's `max.message.bytes` |
 | `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget |
 | `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
-| `rate_limit_records_per_sec` | int | No | - | Rate limit (records/sec) |
-| `rate_limit_bytes_per_sec` | int | No | - | Rate limit (bytes/sec) |
+| `rate_limit_records_per_sec` | int | No | - | Rate limit for the **whole restore** (records/sec), shared by every partition. Before 0.24 each partition was limited to this rate separately |
+| `rate_limit_bytes_per_sec` | int | No | - | Rate limit for the whole restore (bytes/sec, the records' uncompressed encoded size), shared by every partition. Before 0.24 it was accepted but had no effect |
 | `circuit_breaker` | map | No | see [Circuit breaker](#circuit-breaker-backup-and-restore) | Kafka circuit-breaker settings (advisory) |
+
+Before a segment's records are produced, each is checked against the
+target topic's `max.message.bytes` (read once per topic with
+DescribeConfigs). A record that does not fit even alone in a compressed
+batch fails the partition with the record's source topic, partition and
+offset, and the target topic's limit; nothing of that segment is produced.
+Raise `max.message.bytes` on the target topic and resume. Without
+DescribeConfigs permission the check is skipped (a warning is logged) and
+the broker rejects such a record with `RECORD_TOO_LARGE`.
 
 ```yaml
 restore:
   max_concurrent_partitions: 8
   produce_batch_size: 500
-  rate_limit_records_per_sec: 10000
+  produce_max_batch_bytes: 1048576
+  rate_limit_records_per_sec: 10000   # total across all partitions
   circuit_breaker:
     enabled: true
     failure_threshold: 15
