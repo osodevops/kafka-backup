@@ -448,7 +448,7 @@ storage:
   account_name: mystorageaccount
   container_name: kafka-backups
 
-  # Optional - Account key (uses the credential chain below if omitted)
+  # Optional - Account key (uses the precedence below if omitted)
   account_key: your-account-key
 
   # Optional - Key prefix for all operations
@@ -458,26 +458,45 @@ storage:
   # endpoint: https://mystorageaccount.blob.core.usgovcloudapi.net
 
   # Optional - other credential types
-  # sas_token: "sv=2023-...&sig=..."
+  # sas_token: "?sv=2022-11-02&ss=b&...&sig=..."  # paste as the portal shows it
   # client_id: <app-or-managed-identity-client-id>
   # tenant_id: <tenant-id>
   # client_secret: ${AZURE_CLIENT_SECRET}      # service principal
   # use_workload_identity: true                 # AKS Workload Identity (federated token)
+
+  # Optional - Azure Storage emulator (Azurite)
+  # use_emulator: true      # http, path-style, well-known key unless account_key / sas_token
+  # allow_http: true        # implied by use_emulator and by an http:// endpoint
 ```
 
-**Environment Variables:**
-- `AZURE_STORAGE_KEY` - Account key (fallback)
-- `AZURE_STORAGE_SAS_TOKEN` - SAS token (fallback)
-- `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` - Tenant / client ID (service principal or Workload Identity)
-- `AZURE_CLIENT_SECRET` - Client secret for service principal
-- `AZURE_FEDERATED_TOKEN_FILE` - Projected token file injected by the AKS Workload Identity webhook; when set, Workload Identity is used automatically
-
 **Credential precedence:**
-1. `sas_token`
-2. `account_key`
+1. `sas_token`: the SAS query string as the portal or `az ... generate-sas` prints it. Values are percent-decoded once (earlier versions sent them double-encoded, so portal tokens failed with 403).
+2. `account_key` (with `use_emulator` and neither 1 nor 2 set: the well-known emulator key)
 3. Service principal (`client_id` + `tenant_id` + `client_secret`)
-4. Workload Identity (`use_workload_identity: true` or `AZURE_FEDERATED_TOKEN_FILE` present) — YAML `client_id`/`tenant_id` override the webhook-injected `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`
-5. `DefaultAzureCredential` chain (environment, managed identity, Azure CLI, Azure Developer CLI)
+4. Workload Identity (`use_workload_identity: true` or `AZURE_FEDERATED_TOKEN_FILE` present). YAML `client_id`/`tenant_id` override the webhook-injected `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`
+5. Managed identity via IMDS. Set `client_id` to the client ID of a user-assigned identity to select it; without `client_id` the system-assigned identity is used
+
+No other credential source is used (no Azure CLI). For a YAML config, credentials come only
+from the YAML (use `${VAR}` interpolation for secrets), except the Workload Identity variables
+above. The `--path azure://account/container` form reads `AZURE_STORAGE_KEY` /
+`AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_CLIENT_SECRET` and `AZURE_FEDERATED_TOKEN_FILE` from the environment.
+
+**Azurite (local testing):**
+
+```yaml
+storage:
+  backend: azure
+  account_name: devstoreaccount1
+  container_name: kafka-backups      # create it first; the backend does not create containers
+  endpoint: http://127.0.0.1:10000/devstoreaccount1
+  use_emulator: true
+```
+
+```bash
+docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.37.0 \
+  azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+```
 
 ### Google Cloud Storage
 
@@ -1030,6 +1049,9 @@ restore:
 2. For Managed Identity, verify:
    - Identity is assigned to the resource
    - Identity has "Storage Blob Data Contributor" role
+   - With more than one user-assigned identity on the VM / node, `client_id` is set to the one to use
+
+3. For a SAS token, check it has not expired (`se=`) and grants the permissions the operation needs (`sp=` with r, w, d, l, a, c)
 
 #### GCS: "Permission denied"
 

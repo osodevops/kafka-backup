@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Azure: SAS tokens pasted as the portal prints them now work. Values such as
+  `sig=...%2B...%3D` were passed on still percent-encoded and object_store
+  encoded them again, so every request failed with 403. The token is now
+  parsed with `object_store::azure::split_sas`, which decodes each value once.
+  A malformed token is a configuration error.
+- Azure: the YAML `client_id` is now passed to the managed-identity (IMDS)
+  credential, so a user-assigned identity can be selected. Before, IMDS
+  always used the system-assigned identity.
+- Azure: the documented credential precedence now matches the code. The last
+  step is IMDS managed identity; there is no Azure CLI or "environment"
+  fallback.
+- Filesystem backend: `put` writes to a temp file in the same directory,
+  fsyncs it, renames it over the key and fsyncs the directory (best effort
+  where directories cannot be fsynced). A crash or concurrent writer can no
+  longer leave a truncated manifest, offset database or segment. Leftover
+  temp files are never listed as keys.
+
+### Added
+- Azure emulator support for local testing with Azurite, through the
+  `use_emulator` and `allow_http` keys. `allow_http` is also implied by an
+  `http://` endpoint, as for S3. `use_emulator` uses path-style URLs (it
+  appends the account to a bare `endpoint`). It also uses the well-known
+  emulator key unless `account_key` or `sas_token` is set.
+- `EMULATOR_ACCOUNT` / `EMULATOR_ACCOUNT_KEY` are exported from
+  `kafka_backup_core::storage`.
+- **API (semver minor):** `StorageBackendConfig::Azure` and `AzureConfig`
+  gain the `use_emulator` and `allow_http` fields. Code that builds them
+  field by field must set both (`false` keeps the previous behaviour).
+
 ## [0.23.8] - 2026-10-09
 
 ### Fixed
