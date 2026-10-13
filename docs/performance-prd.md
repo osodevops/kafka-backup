@@ -179,7 +179,7 @@ source:
     - broker-1:9092
     - broker-2:9092
   security:
-    sasl_mechanism: plain
+    sasl_mechanism: PLAIN
     sasl_username: "backup-user"
     sasl_password: "${KAFKA_PASSWORD}"
     security_protocol: "SASL_SSL"

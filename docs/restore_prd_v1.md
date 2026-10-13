@@ -845,7 +845,7 @@ restore:
       - "target-broker-1:9092"
       - "target-broker-2:9092"
     security:
-      sasl_mechanism: "plain"
+      sasl_mechanism: "PLAIN"
       sasl_username: "restore-user"
       sasl_password: "${KAFKA_RESTORE_PASSWORD}"
       security_protocol: "SASL_SSL"
