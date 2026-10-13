@@ -6,7 +6,7 @@ use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::protocol::{Decodable, Encodable};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,12 +27,13 @@ pub const WRITE_TIMEOUT_SECS: u64 = 10;
 /// connection failures while the broker may still be processing the request.
 pub const RESPONSE_TIMEOUT_SECS: u64 = 60;
 
-use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
+use crate::config::{IsolationLevel, KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
 use crate::Result;
 
 use super::connection_error::{connection_io_error, request_timeout_error};
 use super::metadata::{BrokerMetadata, TopicMetadata};
+use super::sasl::reauth::{ReauthContext, ReauthTiming};
 use super::FetchResponse;
 use super::ProduceResponse;
 
@@ -60,6 +61,17 @@ pub struct KafkaClient {
     /// reach the group's coordinator, which is usually not the broker this
     /// client is connected to (#224).
     coordinators: Arc<Mutex<CoordinatorConnections>>,
+
+    /// Source of `BrokerConnection::generation`: incremented on every
+    /// connect and reconnect, so a KIP-368 re-auth task can tell whether
+    /// the slot still holds the connection it was spawned for.
+    connection_generation: Arc<AtomicU64>,
+
+    /// When KIP-368 re-auth fires relative to the session lifetime.
+    reauth_timing: ReauthTiming,
+
+    /// Number of live KIP-368 re-auth tasks for this client.
+    pub(super) live_reauth_tasks: Arc<AtomicUsize>,
 }
 
 /// Coordinator node id -> (address, client).
@@ -97,6 +109,31 @@ pub(super) struct BrokerConnection {
     pub(super) stream: ConnectionStream,
     #[allow(dead_code)]
     pub(super) broker_id: i32,
+    /// Distinguishes this connection from earlier and later ones in the
+    /// same slot (see `KafkaClient::connection_generation`).
+    pub(super) generation: u64,
+    /// The KIP-368 re-auth task serving this connection, aborted when the
+    /// connection is dropped or replaced.
+    pub(super) reauth_task: Option<tokio::task::AbortHandle>,
+}
+
+impl BrokerConnection {
+    fn new(stream: ConnectionStream, generation: u64) -> Self {
+        Self {
+            stream,
+            broker_id: -1, // Unknown until metadata fetch
+            generation,
+            reauth_task: None,
+        }
+    }
+}
+
+impl Drop for BrokerConnection {
+    fn drop(&mut self) {
+        if let Some(task) = self.reauth_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl KafkaClient {
@@ -109,7 +146,34 @@ impl KafkaClient {
             topics: Arc::new(Mutex::new(HashMap::new())),
             correlation_id: Arc::new(AtomicI32::new(1)),
             coordinators: Arc::new(Mutex::new(HashMap::new())),
+            connection_generation: Arc::new(AtomicU64::new(0)),
+            reauth_timing: ReauthTiming::DEFAULT,
+            live_reauth_tasks: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Override the KIP-368 re-auth timing (tests).
+    #[cfg(test)]
+    pub(crate) fn with_reauth_timing(mut self, timing: ReauthTiming) -> Self {
+        self.reauth_timing = timing;
+        self
+    }
+
+    /// Number of live KIP-368 re-auth tasks for this client.
+    #[cfg(test)]
+    pub(crate) fn live_reauth_tasks(&self) -> usize {
+        self.live_reauth_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Generation of the connection currently in the slot, if any.
+    #[cfg(test)]
+    pub(crate) async fn current_connection_generation(&self) -> Option<u64> {
+        self.connection.lock().await.as_ref().map(|c| c.generation)
+    }
+
+    /// Next connection generation.
+    fn next_generation(&self) -> u64 {
+        self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub(super) fn config_clone(&self) -> KafkaConfig {
@@ -150,18 +214,16 @@ impl KafkaClient {
         for server in &self.config.bootstrap_servers {
             match self.try_connect(server).await {
                 Ok(stream) => {
+                    let generation = self.next_generation();
                     let mut conn = self.connection.lock().await;
-                    *conn = Some(BrokerConnection {
-                        stream,
-                        broker_id: -1, // Unknown until metadata fetch
-                    });
+                    *conn = Some(BrokerConnection::new(stream, generation));
 
                     // Perform SASL authentication if configured
                     if self.config.security.security_protocol == SecurityProtocol::SaslPlaintext
                         || self.config.security.security_protocol == SecurityProtocol::SaslSsl
                     {
                         drop(conn);
-                        self.authenticate(server).await?;
+                        self.authenticate(server, generation).await?;
                     }
 
                     debug!("Connected to Kafka broker: {}", server);
@@ -267,7 +329,9 @@ impl KafkaClient {
         Ok(())
     }
 
-    async fn authenticate(&self, broker_endpoint: &str) -> Result<()> {
+    /// Authenticate the connection of `generation` (just placed in the
+    /// slot by `connect` / `reconnect`).
+    async fn authenticate(&self, broker_endpoint: &str, generation: u64) -> Result<()> {
         let security = &self.config.security;
 
         if let Some(factory) = security.sasl_mechanism_plugin_factory.clone() {
@@ -281,7 +345,7 @@ impl KafkaClient {
                     "SASL plugin factory failed for broker {host}:{port}: {e}"
                 ))
             })?;
-            return self.sasl_plugin_auth(plugin).await;
+            return self.sasl_plugin_auth(plugin, generation).await;
         }
 
         match security.sasl_mechanism {
@@ -314,6 +378,13 @@ impl KafkaClient {
                         .to_string(),
                 ))
             }
+            Some(SaslMechanism::OAuthBearer) => {
+                // OAUTHBEARER needs a token provider, which this crate does
+                // not ship: it only works through a plugin factory.
+                Err(crate::Error::Authentication(
+                    crate::config::OAUTHBEARER_REQUIRES_PLUGIN.to_string(),
+                ))
+            }
             None => Ok(()), // No authentication needed
         }
     }
@@ -321,7 +392,11 @@ impl KafkaClient {
     /// Drive a handshake through a [`SaslMechanismPlugin`]. The client owns
     /// the wire protocol (`SaslHandshake` + repeated `SaslAuthenticate`);
     /// the plugin owns the mechanism-specific bytes.
-    async fn sasl_plugin_auth(&self, plugin: super::SaslMechanismPluginHandle) -> Result<()> {
+    async fn sasl_plugin_auth(
+        &self,
+        plugin: super::SaslMechanismPluginHandle,
+        generation: u64,
+    ) -> Result<()> {
         use super::sasl::SaslAuthOutcome;
         use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
 
@@ -365,12 +440,8 @@ impl KafkaClient {
                 SaslAuthOutcome::Done => {
                     debug!("SASL {} plugin authentication successful", mechanism_name);
                     if plugin.supports_reauth() {
-                        super::sasl::reauth::spawn_reauth_task(
-                            Arc::downgrade(&self.connection),
-                            self.correlation_id.clone(),
-                            plugin.clone(),
-                            resp.session_lifetime_ms,
-                        );
+                        self.schedule_reauth(plugin.clone(), generation, resp.session_lifetime_ms)
+                            .await;
                     } else {
                         debug!(
                             "SASL {} plugin opted out of live re-authentication; \
@@ -381,6 +452,38 @@ impl KafkaClient {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Spawn the KIP-368 re-auth task for the connection of `generation`
+    /// and bind it to that connection, which aborts it when dropped or
+    /// replaced. If the slot no longer holds that connection, the task is
+    /// aborted straight away.
+    async fn schedule_reauth(
+        &self,
+        plugin: super::SaslMechanismPluginHandle,
+        generation: u64,
+        session_lifetime_ms: i64,
+    ) {
+        let ctx = ReauthContext {
+            connection: Arc::downgrade(&self.connection),
+            generation,
+            correlation_id: self.correlation_id.clone(),
+            timing: self.reauth_timing,
+            live_tasks: self.live_reauth_tasks.clone(),
+        };
+        let Some(task) = super::sasl::reauth::spawn_reauth_task(ctx, plugin, session_lifetime_ms)
+        else {
+            return;
+        };
+        let mut slot = self.connection.lock().await;
+        match slot.as_mut() {
+            Some(conn) if conn.generation == generation => {
+                if let Some(previous) = conn.reauth_task.replace(task) {
+                    previous.abort();
+                }
+            }
+            _ => task.abort(),
         }
     }
 
@@ -548,21 +651,19 @@ impl KafkaClient {
     /// This re-establishes the TCP (and TLS) connection and performs SASL
     /// authentication directly (without going through send_request) to
     /// avoid async recursion.
-    async fn reconnect(&self) -> Result<()> {
+    pub(super) async fn reconnect(&self) -> Result<()> {
         {
             let mut conn = self.connection.lock().await;
-            *conn = None; // Drop the old connection
+            *conn = None; // Drop the old connection (and abort its re-auth task)
         }
 
         // Re-establish TCP/TLS connection
         for server in &self.config.bootstrap_servers {
             match self.try_connect(server).await {
                 Ok(stream) => {
+                    let generation = self.next_generation();
                     let mut conn = self.connection.lock().await;
-                    *conn = Some(BrokerConnection {
-                        stream,
-                        broker_id: -1,
-                    });
+                    *conn = Some(BrokerConnection::new(stream, generation));
 
                     // Re-authenticate if needed. `authenticate` routes through
                     // `send_request`, but `can_retry` is false for
@@ -574,7 +675,7 @@ impl KafkaClient {
                         || self.config.security.security_protocol == SecurityProtocol::SaslSsl
                     {
                         drop(conn);
-                        Box::pin(self.authenticate(server)).await?;
+                        Box::pin(self.authenticate(server, generation)).await?;
                     }
 
                     debug!("Reconnected to Kafka broker: {}", server);
@@ -643,6 +744,13 @@ impl KafkaClient {
             ApiKey::DescribeAcls => 1,
             ApiKey::CreateAcls => 1,
             ApiKey::DeleteAcls => 1,
+            // Producer identity (KIP-98). InitProducerId v3 (Kafka 2.5+)
+            // carries the current producer id and epoch so an idempotent
+            // producer can bump its epoch (KIP-360). FindCoordinator v2
+            // above already takes key_type 1 (transaction coordinator).
+            ApiKey::InitProducerId => 3,
+            ApiKey::AddPartitionsToTxn => 1,
+            ApiKey::EndTxn => 1,
             _ => 0,
         }
     }
@@ -661,20 +769,29 @@ impl KafkaClient {
             .ok_or_else(|| KafkaError::TopicNotExists(topic.to_string()).into())
     }
 
-    /// Fetch records from a topic/partition
+    /// Fetch records from a topic/partition at the given transaction
+    /// isolation level (see [`super::fetch::fetch`]).
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> Result<FetchResponse> {
-        super::fetch::fetch(self, topic, partition, offset, max_bytes).await
+        super::fetch::fetch(self, topic, partition, offset, max_bytes, isolation).await
     }
 
-    /// Get the earliest and latest offsets for a partition
-    pub async fn get_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        super::fetch::get_offsets(self, topic, partition).await
+    /// Get the earliest and latest offsets for a partition. "Latest" is the
+    /// last stable offset under [`IsolationLevel::ReadCommitted`] and the
+    /// high watermark under [`IsolationLevel::ReadUncommitted`].
+    pub async fn get_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
+        super::fetch::get_offsets(self, topic, partition, isolation).await
     }
 
     /// Produce records to a topic/partition

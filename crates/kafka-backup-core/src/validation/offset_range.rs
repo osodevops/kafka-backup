@@ -6,6 +6,7 @@ use tracing::debug;
 
 use super::context::ValidationContext;
 use super::{CheckOutcome, ValidationCheck, ValidationResult};
+use crate::config::IsolationLevel;
 use crate::Result;
 
 /// Verifies that per-partition offset ranges in the restored cluster align
@@ -54,7 +55,13 @@ impl ValidationCheck for OffsetRangeCheck {
 
                 match ctx
                     .target_client
-                    .get_offsets(&topic_backup.name, partition.partition_id)
+                    // Restored records are not transactional: the high
+                    // watermark is the log end.
+                    .get_offsets(
+                        &topic_backup.name,
+                        partition.partition_id,
+                        IsolationLevel::ReadUncommitted,
+                    )
                     .await
                 {
                     Ok((earliest, latest)) => {

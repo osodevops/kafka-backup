@@ -49,6 +49,33 @@ impl KafkaTestCluster {
         })
     }
 
+    /// Start a Kafka container whose single broker can run transactions:
+    /// the transaction state log needs replication factor 1 and min ISR 1.
+    ///
+    /// `KAFKA_BACKUP_TEST_CP_KAFKA_TAG` selects another `confluentinc/cp-kafka`
+    /// tag (ZooKeeper mode, so 7.x at most), e.g. `7.8.0` for Kafka 3.8.
+    pub async fn start_with_transactions() -> anyhow::Result<Self> {
+        let kafka = Kafka::default()
+            .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS", "1");
+
+        let container = match std::env::var("KAFKA_BACKUP_TEST_CP_KAFKA_TAG") {
+            Ok(tag) if !tag.is_empty() => kafka.with_tag(tag).start().await?,
+            _ => kafka.start().await?,
+        };
+
+        let host = container.get_host().await?;
+        let port = container.get_host_port_ipv4(9093).await?;
+        let bootstrap_servers = format!("{}:{}", host, port);
+
+        Ok(KafkaTestCluster {
+            container,
+            bootstrap_servers,
+        })
+    }
+
     /// Create a Kafka client connected to this cluster.
     pub fn create_client(&self) -> KafkaClient {
         let config = KafkaConfig {

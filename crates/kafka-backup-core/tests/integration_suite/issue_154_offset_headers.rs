@@ -136,7 +136,13 @@ async fn fetch_all(client: &KafkaClient, topic: &str, expected: usize) -> Vec<Ba
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while out.len() < expected && tokio::time::Instant::now() < deadline {
         let resp = client
-            .fetch(topic, 0, offset, 8 * 1024 * 1024)
+            .fetch(
+                topic,
+                0,
+                offset,
+                8 * 1024 * 1024,
+                kafka_backup_core::IsolationLevel::ReadUncommitted,
+            )
             .await
             .expect("fetch");
         if resp.records.is_empty() {

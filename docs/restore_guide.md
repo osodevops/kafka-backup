@@ -250,8 +250,11 @@ restore:
 | `include_original_offset_header` | bool | false | Add `x-original-offset` / `x-original-timestamp` / `x-source-partition` to produced records |
 | `strip_offset_headers` | bool | false | Remove the headers the backup added (`backup.include_offset_headers`, default on) so restored records match the source header-for-header |
 | `max_concurrent_partitions` | usize | 4 | Parallel partition restores |
-| `produce_batch_size` | usize | 1000 | Records per produce batch |
-| `rate_limit_records_per_sec` | u64 | None | Rate limit (records/sec) |
+| `produce_batch_size` | usize | 1000 | Records per produce batch at most |
+| `produce_max_batch_bytes` | usize | 1048576 | Uncompressed bytes per produce batch at most; also capped below the target topic's `max.message.bytes` |
+| `rate_limit_records_per_sec` | u64 | None | Rate limit for the whole restore (records/sec), shared by all partitions |
+| `rate_limit_bytes_per_sec` | u64 | None | Rate limit for the whole restore (bytes/sec), shared by all partitions |
+| `idempotent_producer` | bool | true | Idempotent produce: retries are de-duplicated by the broker (requires `produce_acks: -1`; falls back with a warning when not permitted) |
 | `checkpoint_state` | path | None | Checkpoint file for resume |
 | `checkpoint_interval_secs` | u64 | 60 | Checkpoint save interval |
 | `reset_consumer_offsets` | bool | false | Auto-reset consumer offsets |
@@ -684,7 +687,38 @@ Large restores can take hours or days. Checkpointing enables:
 restore:
   checkpoint_state: /var/lib/kafka-backup/restore-checkpoint.json
   checkpoint_interval_secs: 60
+  checkpoint_storage: local     # local (default) | remote | both
+  # restore_id: orders-dr-2025  # names the remote copy; derived by default
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `checkpoint_state` | none | Local checkpoint file. Written atomically (temp file, fsync, rename), so a crash never leaves a partial file |
+| `checkpoint_interval_secs` | 60 | Seconds between saves while the restore runs; the checkpoint is also saved after every topic and when the run stops |
+| `checkpoint_storage` | `local` | `remote` keeps the checkpoint in backup storage at `{backup_id}/restore-checkpoints/{restore_id}.json`, so a restarted pod without the local file resumes; `both` writes both (`both` requires `checkpoint_state`) |
+| `restore_id` | derived | Names the remote checkpoint. Default: a digest of the backup id, the target bootstrap servers and the restore configuration, so re-running the same restore finds it |
+
+The checkpoint file is created as soon as the restore starts (before
+anything is produced), not only after the first topic.
+
+### What the checkpoint records
+
+The checkpoint only ever describes work the target acknowledged:
+
+- a segment is listed in `segments_completed` once **all** its records were
+  acknowledged (on the repartitioning path too, where a segment's records
+  go to several writers);
+- each source partition records `last_source_offset_acked` (the source
+  offset of its last acknowledged record) and `target_hw_after_ack` (the
+  target partition's high watermark after that acknowledgement; before the
+  first batch, the high watermark when the restore started);
+- `records_restored` and `bytes_restored` count acknowledged records;
+- `stopped_cleanly` is `true` once the run stopped by itself (finished or
+  failed) with nothing in flight.
+
+When one partition fails, the other partitions of the topic stop after the
+batch they have in flight and are awaited before the error is reported, so
+the saved checkpoint matches the target exactly.
 
 ### Checkpoint File Format
 
@@ -694,44 +728,85 @@ restore:
   "start_time": 1705312800000,
   "last_checkpoint_time": 1705313400000,
   "segments_completed": [
-    "backup-2025-01-15/orders/0/segment-000001.bin",
-    "backup-2025-01-15/orders/0/segment-000002.bin"
+    "backup-2025-01-15/topics/orders/partition=0/segment-00000000000000000000.bin"
   ],
-  "segments_in_progress": [
-    ["backup-2025-01-15/orders/1/segment-000001.bin", 52428800]
-  ],
+  "segments_in_progress": [],
   "records_restored": 125000,
   "bytes_restored": 52428800,
-  "config_hash": "abc123..."
+  "config_hash": "abc123...",
+  "restore_id": "3f9c1e0a5b7d2c4e",
+  "partitions": {
+    "orders:0": {
+      "source_topic": "orders",
+      "source_partition": 0,
+      "target_topic": "orders",
+      "target_partition": 0,
+      "last_source_offset_acked": 124999,
+      "target_hw_after_ack": 125000,
+      "records_acked": 125000,
+      "bytes_acked": 52428800
+    }
+  },
+  "stopped_cleanly": false
 }
 ```
 
 ### Resuming a Restore
 
-Simply run the same restore command again. The engine will:
+Run the same restore again (same configuration: a changed configuration
+starts over). The engine:
 
-1. Load the checkpoint file
-2. Skip completed segments
-3. Resume from in-progress segments
-4. Continue processing remaining segments
+1. Loads the checkpoint (the newer of the local and remote copies).
+2. If the previous run did not stop cleanly, waits until
+   `checkpoint_interval_secs` + `produce_timeout_ms` + 5 s have passed since
+   its last save, so requests it had in flight cannot land later.
+3. Skips completed segments, and inside a partially restored segment the
+   records at or below `last_source_offset_acked`.
+4. Compares each target partition's high watermark with
+   `target_hw_after_ack`. Records written after the last save (the
+   difference) are read back from the target and compared, record by
+   record (key, value, headers), with the records the restore would
+   produce next; matching records are skipped and mapped, not produced
+   again. The resumed restore therefore writes **no duplicates and misses
+   nothing**.
+5. Fails with a clear error instead of guessing when the target was
+   changed by someone else: a high watermark below the recorded one (topic
+   deleted, recreated or truncated), a record that does not match, or more
+   extra records than the backup has left ("another writer").
+
+`purge_topics` is not applied again when resuming a checkpoint with
+progress (it would delete the records already restored).
+
+Limitations:
+
+- The repartitioning path resumes at segment granularity: records of a
+  segment that was not completely acknowledged are produced again.
+- When several source partitions are mapped onto one target partition
+  (`partition_mapping`), their high watermark cannot be attributed, so
+  records acknowledged after the last save may be produced again (a
+  warning is logged).
 
 ```bash
 # Initial restore (interrupted)
 kafka-backup restore --config restore.yaml
-# Ctrl+C or failure
+# killed, OOM, node drained ...
 
 # Resume
 kafka-backup restore --config restore.yaml
-# INFO Loaded checkpoint: 150 segments completed, 125000 records restored
-# INFO Resuming from checkpoint...
+# INFO Loaded restore checkpoint from ...: 150 segments completed, 125000 records restored
+# INFO Resuming orders[0] -> orders[0]: 2000 record(s) were acknowledged after the last
+#      checkpoint save; verifying them against the target before continuing
 ```
 
 ### Checkpoint Best Practices
 
-1. **Use local filesystem** for checkpoint files (not S3)
-2. **Set appropriate interval**: 60s is good for most cases
-3. **Clean up** checkpoint files after successful restore
-4. **Don't modify config** between resume attempts
+1. **Kubernetes:** use `checkpoint_storage: remote` (or `both`) so a
+   rescheduled pod resumes without a persistent volume
+2. **Set an appropriate interval**: 60s is good for most cases; a shorter
+   interval shortens the wait after a crash
+3. **Clean up** checkpoint files after a successful restore
+4. **Don't modify config** between resume attempts, and don't let other
+   producers write to the target topics during the restore
 
 ---
 

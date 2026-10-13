@@ -206,9 +206,20 @@ pub fn plan_prune(
             continue;
         }
         let bytes: u64 = segments.iter().map(|s| s.compressed_size).sum();
+        // The range spans everything the pruned segments accounted for
+        // (their covered ranges), not just their first/last record, so the
+        // remaining intervals stay contiguous for `validate`.
         let range = PrunedRange {
-            start_offset: segments.first().map(|s| s.start_offset).unwrap_or(0),
-            end_offset: segments.last().map(|s| s.end_offset).unwrap_or(0),
+            start_offset: segments
+                .iter()
+                .map(SegmentMetadata::covered_start)
+                .min()
+                .unwrap_or(0),
+            end_offset: segments
+                .iter()
+                .map(SegmentMetadata::covered_end)
+                .max()
+                .unwrap_or(0),
             segments: segments.len() as u32,
             bytes,
             pruned_at: now_ms,
@@ -308,6 +319,10 @@ mod tests {
             compressed_size: bytes,
             sha256: String::new(),
             uploaded_at,
+            covered_start_offset: None,
+            covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
         }
     }
 
@@ -320,6 +335,11 @@ mod tests {
             segments,
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }];
         m
     }
@@ -423,6 +443,33 @@ mod tests {
         );
         assert_eq!(plan.segments, 2);
         assert_eq!(plan.partitions[0].range.end_offset, 19);
+    }
+
+    #[test]
+    fn pruned_range_records_the_covered_bounds() {
+        // Segments that account for offsets beyond their records (compaction
+        // holes, trailing markers) leave a pruned range spanning everything
+        // they covered, so the next segment stays contiguous with it.
+        let mut first = seg(2, 9, 100, 10);
+        first.covered_start_offset = Some(0);
+        first.covered_end_offset = Some(12);
+        let mut second = seg(13, 19, 200, 10);
+        second.covered_start_offset = Some(13);
+        second.covered_end_offset = Some(19);
+        let plan = plan_prune(
+            &manifest(vec![first, second, seg(20, 29, 900, 10)]),
+            &resume(30),
+            &PruneCriteria {
+                older_than: Some(500),
+                keep_segments: 1,
+                ..Default::default()
+            },
+            1_000,
+            PruneReason::Retention,
+        );
+        assert_eq!(plan.partitions.len(), 1);
+        let range = &plan.partitions[0].range;
+        assert_eq!((range.start_offset, range.end_offset), (0, 19));
     }
 
     #[test]

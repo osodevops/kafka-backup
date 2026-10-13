@@ -29,6 +29,7 @@
 - **Compliance evidence** — Signed JSON/PDF reports for SOX, CMMC, and GDPR auditors
 - **High performance** — 100+ MB/s throughput with zstd/lz4 compression
 - **Incremental backups** — Resume from where you left off
+- **Transaction-aware** — Archives what a `read_committed` consumer sees: no aborted records, no transaction markers (`backup.isolation_level`)
 - **Topic filtering** — Wildcard patterns for include/exclude
 - **Auto-repartitioning** — Restore to clusters with different partition counts
 - **Deployment agnostic** — Bare metal, VM, Docker, or Kubernetes
@@ -365,6 +366,8 @@ the pod exits. Keep the value within the pod termination grace period.
 - `kafka_backup_snapshot_records_target` — Records this run will fetch (captured snapshot range minus what earlier runs already archived)
 - `kafka_backup_snapshot_records_remaining` — Records this run has still to fetch
 - `kafka_backup_records_total` — Total records backed up
+- `kafka_backup_lso_lag` — High watermark minus last stable offset per partition; stays above 0 under a hanging transaction ([alert](docs/configuration.md#hanging-transactions))
+- `kafka_backup_aborted_records_dropped_total` / `kafka_backup_control_records_skipped_total` — Transactional records not archived under `read_committed`
 - `kafka_backup_compression_ratio` — Compression efficiency
 - `kafka_backup_storage_write_latency_seconds` — Storage I/O latency
 - `kafka_backup_validation_checks_passed_total` — Validation checks passed

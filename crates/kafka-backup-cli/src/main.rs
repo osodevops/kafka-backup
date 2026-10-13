@@ -1,5 +1,7 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod commands;
@@ -31,6 +33,26 @@ struct Cli {
     /// Enable verbose logging (-v for debug, -vv for trace)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Log format. Logs always go to stderr, so stdout carries only command
+    /// output (e.g. `--format json`). `json` writes one JSON object per line
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = LogFormat::Text,
+        env = "KAFKA_BACKUP_LOG_FORMAT"
+    )]
+    log_format: LogFormat,
+}
+
+/// Format of the log lines written to stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines (coloured when stderr is a terminal)
+    Text,
+    /// One JSON object per line (timestamp, level, target, message, fields)
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -99,7 +121,7 @@ enum Commands {
 
     /// Validate a backup's integrity (checksums, segment counts, manifests)
     #[command(
-        after_help = "Examples:\n  kafka-backup validate --config backup.yaml\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep"
+        after_help = "Examples:\n  kafka-backup validate --config backup.yaml\n  kafka-backup validate --path s3://bucket --backup-id my-backup\n  kafka-backup validate --path s3://bucket --backup-id my-backup --deep\n  kafka-backup validate --config backup.yaml --verify-sha256"
     )]
     Validate {
         /// Path to the backup configuration file (storage + backup_id come from it)
@@ -113,9 +135,16 @@ enum Commands {
         #[arg(short, long, requires = "path")]
         backup_id: Option<String>,
 
-        /// Perform deep validation (read and verify each segment)
+        /// Deep validation: read every segment, verify its SHA-256, decode it
+        /// and check record count and offsets, and check that each
+        /// partition's offsets are contiguous (no unrecorded holes)
         #[arg(long, default_value = "false")]
         deep: bool,
+
+        /// Read every segment and verify its SHA-256 against the manifest
+        /// without decoding it (faster than --deep), plus the contiguity check
+        #[arg(long = "verify-sha256", default_value = "false")]
+        verify_sha256: bool,
     },
 
     /// Delete aged/oversized segments from a backup set, recording the
@@ -547,6 +576,29 @@ enum ValidationAction {
     },
 }
 
+/// Install the tracing subscriber. Logs go to stderr (issue #188): stdout is
+/// reserved for command output, which scripts parse (`--format json`).
+fn init_logging(filter: EnvFilter, format: LogFormat) {
+    let registry = tracing_subscriber::registry().with(filter);
+    match format {
+        LogFormat::Text => registry
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(std::io::stderr().is_terminal()),
+            )
+            .init(),
+        LogFormat::Json => registry
+            .with(
+                fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(std::io::stderr),
+            )
+            .init(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -563,10 +615,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+    init_logging(filter, cli.log_format);
 
     match cli.command {
         Commands::Backup { config } => {
@@ -601,12 +650,14 @@ async fn main() -> Result<()> {
             path,
             backup_id,
             deep,
+            verify_sha256,
         } => {
             commands::validate::run(
                 config.as_deref(),
                 path.as_deref(),
                 backup_id.as_deref(),
                 deep,
+                verify_sha256,
             )
             .await?;
         }

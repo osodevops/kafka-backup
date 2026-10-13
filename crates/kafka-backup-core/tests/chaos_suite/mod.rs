@@ -1,13 +1,10 @@
-//! Chaos engineering tests for kafka-backup-core.
+//! Chaos tests for kafka-backup-core.
 //!
-//! These tests simulate failure scenarios to verify resilience:
-//! - Broker failures during backup/restore
-//! - Network partitions during offset operations
-//! - Partition leader elections
-//!
-//! These tests are slower and more resource-intensive than regular
-//! integration tests. They should be run in a dedicated CI job.
+//! Each test drives the real engine against a Kafka container and injects
+//! faults through the core's `failpoints` feature (the `fail` crate), then
+//! checks invariants on what is in storage.
 
-pub mod broker_failures;
-pub mod network_partitions;
-pub mod partition_leadership;
+#[path = "../integration_suite/common.rs"]
+mod common;
+
+pub mod checkpoint_durability;

@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::config::KafkaConfig;
+use crate::config::{IsolationLevel, KafkaConfig};
 use crate::error::KafkaError;
 use crate::Result;
 
@@ -386,12 +386,16 @@ impl PartitionLeaderRouter {
     ///    outlast that single retry — a proxy or broker resetting connections
     ///    for a second or two would otherwise fail the partition, and with it
     ///    the whole backup, hours in (issue #146).
+    ///
+    /// `isolation` is passed through to the Fetch request (see
+    /// [`super::fetch::fetch`]).
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> Result<FetchResponse> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
 
@@ -399,7 +403,7 @@ impl PartitionLeaderRouter {
 
         loop {
             match self
-                .fetch_internal(topic, partition, offset, max_bytes)
+                .fetch_internal(topic, partition, offset, max_bytes, isolation)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -412,7 +416,7 @@ impl PartitionLeaderRouter {
                     );
                     self.refresh_partition_leader(topic, partition).await?;
                     return self
-                        .fetch_internal(topic, partition, offset, max_bytes)
+                        .fetch_internal(topic, partition, offset, max_bytes, isolation)
                         .await
                         .map_err(RoutedError::into_error);
                 }
@@ -446,26 +450,20 @@ impl PartitionLeaderRouter {
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> std::result::Result<FetchResponse, RoutedError> {
         let (leader_id, client) = self.route(topic, partition).await?;
         client
-            .fetch(topic, partition, offset, max_bytes)
+            .fetch(topic, partition, offset, max_bytes, isolation)
             .await
             .map_err(|error| RoutedError::at(leader_id, error))
     }
 
-    /// Batch get offsets for all given topic-partitions in minimal network calls.
-    ///
-    /// Groups partitions by their leader broker and sends one batched ListOffsetsRequest
-    /// per broker per timestamp. For N partitions across B brokers, this makes 2*B requests
-    /// (earliest + latest) instead of 2*N individual requests.
-    ///
-    /// Returns a map of (topic, partition) -> (earliest, latest) offset.
-    pub async fn batch_get_all_offsets(
+    /// Group partitions by their leader broker.
+    async fn partitions_by_leader(
         &self,
         partitions: &[(String, i32)],
-    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
-        // Group partitions by leader broker
+    ) -> Result<HashMap<i32, Vec<(String, i32)>>> {
         let mut broker_partitions: HashMap<i32, Vec<(String, i32)>> = HashMap::new();
         for (topic, partition) in partitions {
             let leader_id = self.get_leader(topic, *partition).await?;
@@ -474,11 +472,31 @@ impl PartitionLeaderRouter {
                 .or_default()
                 .push((topic.clone(), *partition));
         }
+        Ok(broker_partitions)
+    }
+
+    /// Batch get offsets for all given topic-partitions in minimal network calls.
+    ///
+    /// Groups partitions by their leader broker and sends one batched ListOffsetsRequest
+    /// per broker per timestamp. For N partitions across B brokers, this makes 2*B requests
+    /// (earliest + latest) instead of 2*N individual requests.
+    ///
+    /// Returns a map of (topic, partition) -> (earliest, latest) offset, where
+    /// "latest" is the last stable offset under
+    /// [`IsolationLevel::ReadCommitted`] and the high watermark under
+    /// [`IsolationLevel::ReadUncommitted`].
+    pub async fn batch_get_all_offsets(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
+        let broker_partitions = self.partitions_by_leader(partitions).await?;
 
         debug!(
-            "batch_get_all_offsets: {} partitions across {} brokers",
+            "batch_get_all_offsets: {} partitions across {} brokers (isolation={})",
             partitions.len(),
-            broker_partitions.len()
+            broker_partitions.len(),
+            isolation
         );
 
         let mut all_results: HashMap<(String, i32), (i64, i64)> = HashMap::new();
@@ -500,9 +518,9 @@ impl PartitionLeaderRouter {
                 .collect();
 
             let earliest_offsets: HashMap<(String, i32), i64> =
-                super::fetch::batch_get_offsets(&client, &earliest_requests).await?;
+                super::fetch::batch_get_offsets(&client, &earliest_requests, isolation).await?;
             let latest_offsets: HashMap<(String, i32), i64> =
-                super::fetch::batch_get_offsets(&client, &latest_requests).await?;
+                super::fetch::batch_get_offsets(&client, &latest_requests, isolation).await?;
 
             // Merge results
             for (topic, partition) in broker_parts {
@@ -522,33 +540,123 @@ impl PartitionLeaderRouter {
         Ok(all_results)
     }
 
-    /// Get the earliest and latest offsets for a partition.
-    pub async fn get_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        // First attempt
-        match self.get_offsets_internal(topic, partition).await {
-            Ok(offsets) => Ok(offsets),
-            Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
-                warn!(
-                    "NOT_LEADER_FOR_PARTITION error for {}/{} during get_offsets, refreshing metadata",
-                    topic, partition
-                );
-                // Routing problem, not a connection problem: refresh the
-                // leader map and retry; every pool stays intact.
-                self.refresh_partition_leader(topic, partition).await?;
-                self.get_offsets_internal(topic, partition).await
+    /// Batch get the latest offset of every given partition: one
+    /// ListOffsets request per leader broker. "Latest" is the last stable
+    /// offset under [`IsolationLevel::ReadCommitted`] and the high watermark
+    /// under [`IsolationLevel::ReadUncommitted`].
+    pub async fn batch_get_latest_offsets(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), i64>> {
+        let broker_partitions = self.partitions_by_leader(partitions).await?;
+        let mut all_results = HashMap::with_capacity(partitions.len());
+        for (broker_id, broker_parts) in &broker_partitions {
+            let client = self.get_broker_connection(*broker_id).await?;
+            let requests: Vec<(String, i32, i64)> = broker_parts
+                .iter()
+                .map(|(t, p)| (t.clone(), *p, -1i64))
+                .collect();
+            all_results
+                .extend(super::fetch::batch_get_offsets(&client, &requests, isolation).await?);
+        }
+        Ok(all_results)
+    }
+
+    /// Get the earliest and latest offsets for a partition. "Latest" is the
+    /// last stable offset under [`IsolationLevel::ReadCommitted`] and the
+    /// high watermark under [`IsolationLevel::ReadUncommitted`].
+    pub async fn get_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
+        // A partition of a topic created moments ago (restore creates its
+        // targets, then reads their high watermarks before producing) may
+        // not have an elected leader yet, or the leader may move. Retry like
+        // `produce` does instead of failing the topic on the first answer.
+        const MAX_LEADER_RETRIES: u32 = 20;
+        let mut leader_attempts = 0;
+        loop {
+            match self.get_offsets_internal(topic, partition, isolation).await {
+                Ok(offsets) => return Ok(offsets),
+                Err(e) if is_leader_not_ready(&e) && leader_attempts < MAX_LEADER_RETRIES => {
+                    leader_attempts += 1;
+                    let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
+                    warn!(
+                        "Leader not ready for {}/{} during get_offsets (attempt {}/{}), refreshing metadata after {:?}: {}",
+                        topic, partition, leader_attempts, MAX_LEADER_RETRIES, backoff, e
+                    );
+                    tokio::time::sleep(backoff).await;
+                    // Routing problem, not a connection problem: refresh the
+                    // leader map and retry; every pool stays intact. A refresh
+                    // that finds no leader yet is retried with the request.
+                    if let Err(refresh) = self.refresh_partition_leader(topic, partition).await {
+                        debug!(
+                            "Leader refresh for {}/{} failed (will retry): {}",
+                            topic, partition, refresh
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 
     /// Internal get_offsets implementation.
-    async fn get_offsets_internal(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
+    async fn get_offsets_internal(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
         let client = self.get_leader_client(topic, partition).await?;
-        client.get_offsets(topic, partition).await
+        client.get_offsets(topic, partition, isolation).await
     }
 
     /// Produce records to a partition, routing to the correct leader.
+    ///
+    /// Records are split by timestamp range (see `produce::produce`), each
+    /// sub-batch is encoded once without a producer id and sent with
+    /// [`Self::produce_encoded`]. A retry resends identical bytes, and a
+    /// sub-batch the broker acknowledged is never sent again.
+    pub async fn produce(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: Vec<BackupRecord>,
+        acks: i16,
+        timeout_ms: i32,
+    ) -> Result<ProduceResponse> {
+        let mut sub_batch_offsets = Vec::new();
+        for range in super::produce::split_by_timestamp_ranges(&records) {
+            let sub_batch = &records[range];
+            let bytes = super::produce::encode_batch(
+                sub_batch,
+                &super::transactions::ProducerBatch::NON_IDEMPOTENT,
+                kafka_protocol::records::Compression::Zstd,
+            )?;
+            let base_offset = self
+                .produce_encoded(topic, partition, bytes, acks, timeout_ms)
+                .await?;
+            sub_batch_offsets.push((base_offset, sub_batch.len()));
+        }
+        Ok(ProduceResponse {
+            base_offset: sub_batch_offsets.first().map_or(-1, |(base, _)| *base),
+            error_code: 0,
+            record_count: records.len(),
+            sub_batch_offsets,
+        })
+    }
+
+    /// Send one encoded record batch to the partition's leader and return
+    /// the base offset the broker assigned.
+    ///
+    /// Every attempt sends the same `batch` bytes, so a batch carrying a
+    /// producer id and sequence is de-duplicated by the broker however many
+    /// times it is resent. `KafkaClient::send_request` underneath also
+    /// resends the identical request frame once after a lost connection.
     ///
     /// Handles two failure classes (Issue #67 bug 8):
     ///
@@ -562,15 +670,15 @@ impl PartitionLeaderRouter {
     ///    pool of the broker the failed request was sent to (issue #197). This
     ///    covers transient network blips and broker restarts.
     ///
-    /// Records are only cloned when a retry is actually required.
-    pub async fn produce(
+    /// Any other error is returned to the caller.
+    pub async fn produce_encoded(
         &self,
         topic: &str,
         partition: i32,
-        records: Vec<BackupRecord>,
+        batch: bytes::Bytes,
         acks: i16,
         timeout_ms: i32,
-    ) -> Result<ProduceResponse> {
+    ) -> Result<i64> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
         const MAX_LEADER_RETRIES: u32 = 20;
 
@@ -579,10 +687,10 @@ impl PartitionLeaderRouter {
 
         loop {
             match self
-                .produce_internal(topic, partition, &records, acks, timeout_ms)
+                .produce_internal(topic, partition, batch.clone(), acks, timeout_ms)
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(base_offset) => return Ok(base_offset),
                 Err(RoutedError { error, .. })
                     if is_not_leader_error(&error) && leader_attempts < MAX_LEADER_RETRIES =>
                 {
@@ -624,19 +732,18 @@ impl PartitionLeaderRouter {
         }
     }
 
-    /// Internal produce implementation — borrows records to avoid unnecessary
-    /// cloning; tagged with the broker it was sent to.
+    /// One produce attempt of an encoded batch, tagged with the broker it
+    /// was sent to.
     async fn produce_internal(
         &self,
         topic: &str,
         partition: i32,
-        records: &[BackupRecord],
+        batch: bytes::Bytes,
         acks: i16,
         timeout_ms: i32,
-    ) -> std::result::Result<ProduceResponse, RoutedError> {
+    ) -> std::result::Result<i64, RoutedError> {
         let (leader_id, client) = self.route(topic, partition).await?;
-        client
-            .produce(topic, partition, records.to_vec(), acks, timeout_ms)
+        super::produce::produce_encoded(&client, topic, partition, batch, acks, timeout_ms)
             .await
             .map_err(|error| RoutedError::at(leader_id, error))
     }
@@ -681,6 +788,21 @@ impl PartitionLeaderRouter {
     /// Apply incremental configuration changes through the bootstrap client.
     pub async fn incremental_alter_configs(&self, changes: &[super::ConfigChange]) -> Result<()> {
         super::incremental_alter_configs(self.bootstrap_client.as_ref(), changes).await
+    }
+
+    /// Apply (or only validate) incremental configuration changes through the
+    /// bootstrap client, returning each resource's result.
+    pub async fn incremental_alter_configs_per_resource(
+        &self,
+        changes: &[super::ConfigChange],
+        validate_only: bool,
+    ) -> Result<Vec<super::ConfigChangeResult>> {
+        super::incremental_alter_configs_per_resource(
+            self.bootstrap_client.as_ref(),
+            changes,
+            validate_only,
+        )
+        .await
     }
 
     /// Get metadata for a specific topic.
@@ -1054,6 +1176,25 @@ fn is_connection_error(error: &crate::Error) -> bool {
     super::connection_error::is_connection_error(error)
 }
 
+/// A partition whose leader is not usable yet: NOT_LEADER_OR_FOLLOWER (6),
+/// LEADER_NOT_AVAILABLE (5), or metadata that still reports no leader
+/// (`-1`, e.g. right after the topic was created).
+fn is_leader_not_ready(error: &crate::Error) -> bool {
+    if is_not_leader_error(error) {
+        return true;
+    }
+    match error {
+        crate::Error::Kafka(KafkaError::BrokerError { code, .. }) => *code == 5,
+        crate::Error::Kafka(KafkaError::PartitionNotAvailable { .. }) => true,
+        _ => {
+            let msg = error.to_string();
+            msg.contains("LEADER_NOT_AVAILABLE")
+                || msg.contains("code 5")
+                || msg.contains("Unknown broker ID: -1")
+        }
+    }
+}
+
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).
 fn is_not_leader_error(error: &crate::Error) -> bool {
     match error {
@@ -1063,6 +1204,56 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
             let msg = error.to_string();
             msg.contains("NOT_LEADER") || msg.contains("code 6") || msg.contains("error_code=6")
         }
+    }
+}
+
+/// The two partition reads the backup fetch loop needs, behind a trait so
+/// the loop can be driven by a scripted source in tests.
+#[async_trait::async_trait]
+pub(crate) trait PartitionFetcher: Send + Sync {
+    /// Fetch records from `offset`; the response's `next_offset` is past
+    /// any trailing offsets that held no record or were filtered out
+    /// (compacted away, transaction markers, aborted records).
+    async fn fetch_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+        isolation: IsolationLevel,
+    ) -> Result<FetchResponse>;
+
+    /// `(log start offset, end)`: the end is the last stable offset under
+    /// read_committed and the high watermark under read_uncommitted.
+    async fn partition_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)>;
+}
+
+#[async_trait::async_trait]
+impl PartitionFetcher for PartitionLeaderRouter {
+    async fn fetch_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+        isolation: IsolationLevel,
+    ) -> Result<FetchResponse> {
+        self.fetch(topic, partition, offset, max_bytes, isolation)
+            .await
+    }
+
+    async fn partition_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
+        self.get_offsets(topic, partition, isolation).await
     }
 }
 
@@ -1104,5 +1295,41 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped.get(&1), Some(&vec![(0, 10), (2, 30)]));
         assert_eq!(grouped.get(&2), Some(&vec![(1, 20)]));
+    }
+}
+
+#[cfg(test)]
+mod leader_readiness_tests {
+    use super::*;
+
+    fn broker_error(code: i16) -> crate::Error {
+        crate::Error::Kafka(KafkaError::BrokerError {
+            code,
+            message: format!("ListOffsets error for t:0: code {code}"),
+        })
+    }
+
+    #[test]
+    fn leader_not_ready_covers_new_topic_states() {
+        assert!(is_leader_not_ready(&broker_error(6)));
+        assert!(is_leader_not_ready(&broker_error(5)));
+        assert!(is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::PartitionNotAvailable {
+                topic: "t".into(),
+                partition: 0,
+            }
+        )));
+        assert!(is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::Protocol("Unknown broker ID: -1".into())
+        )));
+    }
+
+    #[test]
+    fn other_errors_are_not_retried_as_leader_errors() {
+        assert!(!is_leader_not_ready(&broker_error(3)));
+        assert!(!is_leader_not_ready(&broker_error(29)));
+        assert!(!is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::Protocol("Unknown broker ID: 7".into())
+        )));
     }
 }

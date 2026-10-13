@@ -306,9 +306,14 @@ fn print_plan_text(plan: &OffsetResetPlan) {
 
         for partition in &group.partitions {
             let tp = format!("{}/{}", partition.topic, partition.partition);
+            let target = if partition.approximate {
+                format!("~{} (approximate)", partition.target_offset)
+            } else {
+                partition.target_offset.to_string()
+            };
             println!(
                 "║   {:24} │ {:16} │ {:26} ║",
-                tp, partition.source_offset, partition.target_offset
+                tp, partition.source_offset, target
             );
         }
         println!(
@@ -317,6 +322,17 @@ fn print_plan_text(plan: &OffsetResetPlan) {
     }
 
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
+
+    if plan
+        .groups
+        .iter()
+        .flat_map(|g| &g.partitions)
+        .any(|p| p.approximate)
+    {
+        println!();
+        println!("~ Approximate: interpolated because the offset mapping has no per-record");
+        println!("  entries for that partition. Check these offsets before applying.");
+    }
 
     // `plan` never commits offsets, whatever `--dry-run` says.
     println!();

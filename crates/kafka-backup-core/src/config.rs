@@ -322,11 +322,22 @@ impl Default for ConnectionConfig {
 }
 
 /// SASL mechanism
+///
+/// `#[non_exhaustive]`: match on it with a wildcard arm, as more
+/// mechanisms may be added.
+///
+/// SCRAM accepts Kafka's own names (`SCRAM-SHA-256`, `SCRAM-SHA-512`, as in
+/// `sasl.mechanism`) and the `SCRAM-SHA256` / `SCRAM-SHA512` spellings
+/// earlier releases required. Serialisation keeps the latter, so configs
+/// written by this version still load in older ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING-KEBAB-CASE")]
+#[non_exhaustive]
 pub enum SaslMechanism {
     Plain,
+    #[serde(alias = "SCRAM-SHA-256")]
     ScramSha256,
+    #[serde(alias = "SCRAM-SHA-512")]
     ScramSha512,
     /// SASL/GSSAPI (Kerberos). The enum variant is always present, but
     /// constructing a working client requires the `gssapi` cargo feature
@@ -334,7 +345,26 @@ pub enum SaslMechanism {
     /// CLI builds without the feature surface a clear runtime error when
     /// a config requests `GSSAPI`.
     Gssapi,
+    /// SASL/OAUTHBEARER (RFC 7628), e.g. Confluent Cloud OAuth. YAML
+    /// spelling `OAUTHBEARER`. This crate ships no token provider: a
+    /// [`SaslMechanismPlugin`](crate::kafka::SaslMechanismPlugin) must be
+    /// installed through `SecurityConfig::sasl_mechanism_plugin_factory`
+    /// (Kafka Backup Enterprise does this when its `oauth` licence feature
+    /// is enabled). Without one, authentication fails with an error that
+    /// says so.
+    #[serde(rename = "OAUTHBEARER")]
+    OAuthBearer,
 }
+
+/// Error raised when `sasl_mechanism: OAUTHBEARER` reaches authentication
+/// without a plugin factory.
+pub const OAUTHBEARER_REQUIRES_PLUGIN: &str = "SASL OAUTHBEARER requires Kafka Backup Enterprise \
+     (licence feature `oauth`) or a custom SaslMechanismPlugin";
+
+/// Hint for OAuth-looking keys found under `source.security` /
+/// `target.security`.
+pub const OAUTH_SETTINGS_HINT: &str =
+    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)";
 
 /// Topic selection configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -483,6 +513,54 @@ impl CircuitBreakerSettings {
     }
 }
 
+/// Transaction isolation for the reads a backup makes (Fetch and
+/// ListOffsets), the same choice as the Java consumer's `isolation.level`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    /// Archive only what a `read_committed` consumer sees (default since
+    /// 0.25): records of committed transactions and non-transactional
+    /// records. Records of aborted transactions and the transaction markers
+    /// (commit/abort control records) are not archived, and a partition is
+    /// read up to its last stable offset (LSO), not its high watermark — the
+    /// records of a transaction still open are archived by a later run, once
+    /// it has committed.
+    #[default]
+    #[serde(alias = "READ_COMMITTED")]
+    ReadCommitted,
+    /// Archive every record up to the high watermark, as versions before
+    /// 0.25 did: records of aborted and open transactions are archived, and
+    /// so are the transaction markers, which a restore writes back as
+    /// ordinary records. Only for topics without transactional producers, or
+    /// to keep an existing backup set uniform.
+    #[serde(alias = "READ_UNCOMMITTED")]
+    ReadUncommitted,
+}
+
+impl IsolationLevel {
+    /// The Kafka protocol value (`isolation_level` in Fetch and ListOffsets).
+    pub fn as_protocol(self) -> i8 {
+        match self {
+            IsolationLevel::ReadUncommitted => 0,
+            IsolationLevel::ReadCommitted => 1,
+        }
+    }
+
+    /// The configuration spelling (`read_committed` / `read_uncommitted`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationLevel::ReadCommitted => "read_committed",
+            IsolationLevel::ReadUncommitted => "read_uncommitted",
+        }
+    }
+}
+
+impl std::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Backup-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupOptions {
@@ -509,6 +587,14 @@ pub struct BackupOptions {
     /// Run continuously or one-shot (default: one-shot)
     #[serde(default)]
     pub continuous: bool,
+
+    /// Transaction isolation for the backup's reads: `read_committed`
+    /// (default) archives what a `read_committed` consumer sees and stops at
+    /// the last stable offset; `read_uncommitted` archives everything up to
+    /// the high watermark, including aborted records and transaction
+    /// markers, as versions before 0.25 did. See [`IsolationLevel`].
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
 
     /// Include internal topics (default: false)
     #[serde(default)]
@@ -553,12 +639,14 @@ pub struct BackupOptions {
     #[serde(default)]
     pub source_cluster_id: Option<String>,
 
-    /// Snapshot mode: capture current high watermarks at backup start and stop
-    /// when all partitions have reached their target offsets.
+    /// Snapshot mode: capture each partition's end offset at backup start and
+    /// stop when all partitions have reached their target offsets. The end is
+    /// the last stable offset under `isolation_level: read_committed` (the
+    /// default) and the high watermark under `read_uncommitted`.
     ///
     /// This provides consistent "point-in-time" snapshots for DR backups.
     /// When enabled:
-    /// 1. At startup, captures high watermarks for ALL partitions
+    /// 1. At startup, captures the end offsets of ALL partitions
     /// 2. Each partition backs up until it reaches its snapshot target
     /// 3. Backup exits cleanly when all partitions are caught up
     ///
@@ -635,6 +723,18 @@ pub struct BackupOptions {
     /// thresholds (failure=5, reset=30s, success=2).
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerSettings,
+
+    /// On a graceful shutdown (SIGTERM / Ctrl-C), how long partition tasks
+    /// get to stop fetching, write their buffered records as a final segment
+    /// and record it in the manifest before they are aborted. An aborted
+    /// partition loses nothing durable: its unsaved progress is re-read on
+    /// the next run. Default: 30 seconds.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+}
+
+fn default_shutdown_grace_secs() -> u64 {
+    30
 }
 
 /// Retention policy for a backup set (issue #169).
@@ -721,6 +821,7 @@ impl Default for BackupOptions {
             compression_level: default_compression_level(),
             start_offset: StartOffset::default(),
             continuous: false,
+            isolation_level: IsolationLevel::default(),
             include_internal_topics: false,
             internal_topics: Vec::new(),
             on_missing_topic: OnMissingTopic::default(),
@@ -738,6 +839,7 @@ impl Default for BackupOptions {
             require_topic_configs: false,
             retention: None,
             circuit_breaker: CircuitBreakerSettings::default(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
         }
     }
 }
@@ -805,6 +907,26 @@ impl std::fmt::Display for RepartitioningStrategy {
     }
 }
 
+/// Serialize a `HashMap` with its entries sorted by key.
+///
+/// `HashMap` iteration order differs from run to run, and the restore
+/// checkpoint is keyed by a hash of the serialized `RestoreOptions`. Sorting
+/// makes that hash stable, so a restore whose options contain a map with two
+/// or more entries can resume its checkpoint. Maps with zero or one entry
+/// serialize exactly as before, which keeps existing checkpoint hashes.
+fn serialize_sorted_map<K, V, S>(
+    map: &std::collections::HashMap<K, V>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    K: Serialize + Ord,
+    V: Serialize,
+    S: serde::Serializer,
+{
+    let sorted: std::collections::BTreeMap<&K, &V> = map.iter().collect();
+    sorted.serialize(serializer)
+}
+
 /// Per-topic repartitioning configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicRepartitioning {
@@ -845,6 +967,59 @@ pub enum ExistingTopicConfigPolicy {
     Fail,
 }
 
+/// What a restore does with captured topic configuration the target does not
+/// take as is (`restore.unsupported_config_policy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedConfigPolicy {
+    /// Restore without the keys the target does not report, reports
+    /// read-only or rejects, clamp values outside the `target_profile`
+    /// limits, and list both in the restore report.
+    #[default]
+    Skip,
+    /// Fail the restore, listing every such key, before any configuration
+    /// is changed.
+    Fail,
+}
+
+/// Known limits of a restore target platform (`restore.target_profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TargetProfile {
+    /// Confluent Cloud: replication factor 3 for created topics and the
+    /// documented topic-configuration ranges.
+    ConfluentCloud,
+}
+
+/// Confluent Cloud cluster type (`restore.target_cluster_type`); some
+/// `target_profile: confluent_cloud` limits depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetClusterType {
+    Basic,
+    Standard,
+    Enterprise,
+    Dedicated,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// Where a restore keeps its checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestoreCheckpointStorage {
+    /// The local `checkpoint_state` file.
+    #[default]
+    Local,
+    /// Backup storage only.
+    Remote,
+    /// The local file and backup storage.
+    Both,
+}
+
 /// Restore-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOptions {
@@ -861,11 +1036,11 @@ pub struct RestoreOptions {
     pub source_partitions: Option<Vec<i32>>,
 
     /// Partition mapping (source_partition -> target_partition)
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub partition_mapping: std::collections::HashMap<i32, i32>,
 
     /// Topic mapping (original -> target)
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub topic_mapping: std::collections::HashMap<String, String>,
 
     /// Consumer group offset handling strategy
@@ -899,11 +1074,15 @@ pub struct RestoreOptions {
     #[serde(default)]
     pub strip_offset_headers: bool,
 
-    /// Rate limit in records per second
+    /// Rate limit in records per second for the whole restore: one token
+    /// bucket shared by every partition (before 0.25 each partition was
+    /// limited to this rate on its own).
     #[serde(default)]
     pub rate_limit_records_per_sec: Option<u64>,
 
-    /// Rate limit in bytes per second
+    /// Rate limit in bytes per second for the whole restore, shared by
+    /// every partition. Bytes are the records' uncompressed encoded size
+    /// (key, value, headers and record framing).
     #[serde(default)]
     pub rate_limit_bytes_per_sec: Option<u64>,
 
@@ -914,6 +1093,17 @@ pub struct RestoreOptions {
     /// Batch size for producing to target cluster (number of records)
     #[serde(default = "default_produce_batch_size")]
     pub produce_batch_size: usize,
+
+    /// Maximum uncompressed size of one produce batch in bytes (default
+    /// 1 MiB). A batch closes at `produce_batch_size` records or at this
+    /// size, whichever comes first; it is further capped below the target
+    /// topic's `max.message.bytes`. A single record larger than the batch
+    /// cap is sent in a batch of its own.
+    #[serde(
+        default = "default_produce_max_batch_bytes",
+        skip_serializing_if = "is_default_produce_max_batch_bytes"
+    )]
+    pub produce_max_batch_bytes: usize,
 
     /// Producer acknowledgement level sent to the broker.
     ///
@@ -927,6 +1117,19 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_acks")]
     pub produce_acks: i16,
 
+    /// Produce with an idempotent producer (default `true`): one producer id
+    /// per restore and a sequence number per partition, so a batch resent
+    /// after a timeout or a lost connection is de-duplicated by the broker
+    /// instead of written twice. Requires `produce_acks: -1`. When the
+    /// cluster denies or does not support idempotence (Kafka before 2.5,
+    /// no IdempotentWrite/Write permission), the restore logs a warning,
+    /// records it in the report and produces without a producer id.
+    #[serde(
+        default = "default_idempotent_producer",
+        skip_serializing_if = "is_default_idempotent_producer"
+    )]
+    pub idempotent_producer: bool,
+
     /// Broker-side produce timeout in milliseconds (default: 30 000).
     ///
     /// The broker waits up to this duration for the required acks before
@@ -936,13 +1139,28 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_timeout_ms")]
     pub produce_timeout_ms: i32,
 
-    /// Checkpoint state file path for resumable restores
+    /// Checkpoint state file path for resumable restores (written
+    /// atomically: temp file, fsync, rename).
     #[serde(default)]
     pub checkpoint_state: Option<std::path::PathBuf>,
 
-    /// Checkpoint interval in seconds
+    /// Seconds between checkpoint saves while a restore runs (the
+    /// checkpoint is also saved after every topic).
     #[serde(default = "default_restore_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+
+    /// Where the restore checkpoint is kept: `local` (default, the
+    /// `checkpoint_state` file), `remote` (backup storage, at
+    /// `{backup_id}/restore-checkpoints/{restore_id}.json`, so a restarted
+    /// pod without the local file resumes) or `both`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub checkpoint_storage: RestoreCheckpointStorage,
+
+    /// Names the remote checkpoint. Default: derived from the backup id,
+    /// the target bootstrap servers and the restore configuration, so a
+    /// re-run of the same restore finds its checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_id: Option<String>,
 
     /// Consumer groups to reset offsets for (requires reset_consumer_offsets)
     #[serde(default)]
@@ -971,7 +1189,7 @@ pub struct RestoreOptions {
     /// When set, records are re-partitioned on the fly using the configured strategy
     /// instead of the default 1:1 partition mapping.
     /// Mutually exclusive with `partition_mapping`.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub repartitioning: std::collections::HashMap<String, TopicRepartitioning>,
 
     /// Purge target topics before restoring by advancing each partition's
@@ -1010,9 +1228,32 @@ pub struct RestoreOptions {
 
     /// Per-target-topic configuration overrides. These take precedence over
     /// values captured from the source manifest.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub topic_config_overrides:
         std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+
+    /// Topic configuration (captured or overridden) the target does not take
+    /// as is: keys its DescribeConfigs does not report or reports read-only,
+    /// keys it rejects (each probed on its own with `validate_only`), and
+    /// values outside the `target_profile` limits. `skip` (default) restores
+    /// the rest and lists them in the restore report; `fail` stops the
+    /// restore before any configuration is changed.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub unsupported_config_policy: UnsupportedConfigPolicy,
+
+    /// Known limits of the target platform: `confluent_cloud` creates topics
+    /// with replication factor 3 (unless `default_replication_factor` is set)
+    /// and clamps (or, with `unsupported_config_policy: fail`, rejects)
+    /// values outside Confluent Cloud's documented ranges. Which keys the
+    /// target accepts is always decided by probing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_profile: Option<TargetProfile>,
+
+    /// Confluent Cloud cluster type, for the limits that depend on it
+    /// (`max.message.bytes`, `max.compaction.lag.ms`). Unset: the most
+    /// permissive limit of any cluster type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cluster_type: Option<TargetClusterType>,
 
     /// Rewrite Confluent wire-format schema IDs in record keys and values.
     /// This is populated by the enterprise Schema Registry restore before the
@@ -1023,8 +1264,28 @@ pub struct RestoreOptions {
     /// Source-to-target Schema Registry ID mapping used by
     /// `rewrite_schema_ids`. Map keys are the IDs encoded after the Confluent
     /// magic byte and values are the IDs registered in the target registry.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub schema_id_mapping: std::collections::HashMap<i32, i32>,
+
+    /// Source topics whose records `rewrite_schema_ids` applies to (glob,
+    /// or regex with a `~` prefix, as in topic selection). Empty (the
+    /// default): every restored topic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_id_rewrite_topics: Vec<String>,
+
+    /// Fail the restore on a key or value that starts with the Confluent
+    /// magic byte but is shorter than the 5-byte frame or carries a schema
+    /// ID absent from `schema_id_mapping`, instead of producing it with the
+    /// source registry's ID. Default `true` (0.24 always failed). A raw (not
+    /// Schema Registry framed) payload that starts with a zero byte looks
+    /// the same, so for topics with raw keys or values either leave them out
+    /// of `schema_id_rewrite_topics` or set this to `false`, which restores
+    /// such payloads unchanged and counts the unmapped ones.
+    #[serde(
+        default = "default_schema_id_rewrite_strict",
+        skip_serializing_if = "is_default_schema_id_rewrite_strict"
+    )]
+    pub schema_id_rewrite_strict: bool,
 
     /// Phase 1 header preflight behaviour.
     ///
@@ -1124,10 +1385,14 @@ impl Default for RestoreOptions {
             rate_limit_bytes_per_sec: None,
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
+            idempotent_producer: default_idempotent_producer(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_state: None,
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
+            checkpoint_storage: RestoreCheckpointStorage::default(),
+            restore_id: None,
             consumer_groups: Vec::new(),
             reset_consumer_offsets: false,
             offset_report: None,
@@ -1139,8 +1404,13 @@ impl Default for RestoreOptions {
             restore_topic_configs: default_restore_topic_configs(),
             existing_topic_config_policy: ExistingTopicConfigPolicy::default(),
             topic_config_overrides: Default::default(),
+            unsupported_config_policy: UnsupportedConfigPolicy::default(),
+            target_profile: None,
+            target_cluster_type: None,
             rewrite_schema_ids: false,
             schema_id_mapping: Default::default(),
+            schema_id_rewrite_topics: Vec::new(),
+            schema_id_rewrite_strict: default_schema_id_rewrite_strict(),
             header_preflight: HeaderPreflightMode::default(),
             header_preflight_external: false,
             dry_run_check_segments: false,
@@ -1160,6 +1430,33 @@ fn default_produce_batch_size() -> usize {
     1000
 }
 
+fn default_produce_max_batch_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_idempotent_producer() -> bool {
+    true
+}
+
+// Options added in 0.25 are left out of the serialized options at their
+// defaults: the restore checkpoint's config hash is taken over them, and a
+// checkpoint written by an earlier release must keep its hash.
+fn is_default_produce_max_batch_bytes(value: &usize) -> bool {
+    *value == default_produce_max_batch_bytes()
+}
+
+fn default_schema_id_rewrite_strict() -> bool {
+    true
+}
+
+fn is_default_schema_id_rewrite_strict(value: &bool) -> bool {
+    *value == default_schema_id_rewrite_strict()
+}
+
+fn is_default_idempotent_producer(value: &bool) -> bool {
+    *value == default_idempotent_producer()
+}
+
 fn default_produce_acks() -> i16 {
     -1 // acks=all — highest durability (safe default)
 }
@@ -1171,6 +1468,22 @@ fn default_produce_timeout_ms() -> i32 {
 /// Public accessor for integration tests that assert the default acks value.
 pub fn default_produce_acks_pub() -> i16 {
     default_produce_acks()
+}
+
+/// YAML keys `SecurityConfig` accepts, derived from its serialized form so
+/// the list cannot drift from the struct (`sasl_mechanism_plugin_factory`
+/// is `#[serde(skip)]` and so is not one of them).
+fn security_config_keys() -> Vec<String> {
+    serde_yaml::to_value(SecurityConfig::default())
+        .ok()
+        .and_then(|v| {
+            v.as_mapping().map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// Public accessor for integration tests that assert the default timeout value.
@@ -1190,12 +1503,21 @@ impl Config {
     /// `fetch_max_bytez` would otherwise be silently dropped and the
     /// operator-provided or hand-written option would simply not apply.
     /// Callers should surface the returned paths as warnings.
+    ///
+    /// Unknown keys under `source.security` / `target.security` are an
+    /// error rather than a warning (see [`Self::check_security_sections`]).
     pub fn from_yaml_with_warnings(yaml: &str) -> crate::Result<(Self, Vec<String>)> {
         let mut ignored = Vec::new();
         let deserializer = serde_yaml::Deserializer::from_str(yaml);
         let config: Config =
             serde_ignored::deserialize(deserializer, |path| ignored.push(path.to_string()))
                 .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+
+        let mut raw: serde_yaml::Value = serde_yaml::from_str(yaml)
+            .map_err(|e| crate::Error::Config(format!("Failed to parse config: {e}")))?;
+        // Resolve `<<: *anchor` merge keys so they are not read as keys.
+        let _ = raw.apply_merge();
+        Self::check_security_sections(&raw)?;
 
         let ignored = ignored
             .into_iter()
@@ -1213,6 +1535,53 @@ impl Config {
             .collect();
 
         Ok((config, ignored))
+    }
+
+    /// Reject unknown keys under `source.security` and `target.security` in
+    /// a raw YAML config.
+    ///
+    /// Elsewhere an unknown key is only a warning, but a security block
+    /// with a misplaced or misspelt setting connects with different
+    /// credentials than the operator intended (or none), so it is an error.
+    /// OAuth-looking keys (for example `security.oauth`) get a hint that
+    /// those settings belong under `enterprise.oauth`. Every unknown key is
+    /// reported at once. Values of the wrong type are left to
+    /// deserialization to report.
+    pub fn check_security_sections(root: &serde_yaml::Value) -> crate::Result<()> {
+        let known = security_config_keys();
+        let mut problems = Vec::new();
+        for section in ["source", "target"] {
+            let Some(map) = root
+                .get(section)
+                .and_then(|s| s.get("security"))
+                .and_then(|s| s.as_mapping())
+            else {
+                continue;
+            };
+            for key in map.keys() {
+                let name = match key.as_str() {
+                    Some(name) => name.to_string(),
+                    None => serde_yaml::to_string(key)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                };
+                if known.contains(&name) {
+                    continue;
+                }
+                let hint = if name.to_ascii_lowercase().contains("oauth") {
+                    OAUTH_SETTINGS_HINT.to_string()
+                } else {
+                    format!("valid keys are {}", known.join(", "))
+                };
+                problems.push(format!("unknown key `{section}.security.{name}`: {hint}"));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::Error::Config(problems.join("; ")))
+        }
     }
 
     /// Keys that are accepted for backwards compatibility but have no effect
@@ -1391,6 +1760,54 @@ impl RestoreOptions {
                 "produce_batch_size must be > 0".to_string(),
             ));
         }
+        if self.idempotent_producer && self.produce_acks != -1 {
+            return Err(crate::Error::Config(format!(
+                "restore.idempotent_producer requires produce_acks: -1 (got {}). Set \
+                 produce_acks: -1, or idempotent_producer: false to produce with acks {} \
+                 without duplicate protection",
+                self.produce_acks, self.produce_acks
+            )));
+        }
+        if self.checkpoint_storage == RestoreCheckpointStorage::Both
+            && self.checkpoint_state.is_none()
+        {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_storage: both requires restore.checkpoint_state (the local \
+                 file)"
+                    .to_string(),
+            ));
+        }
+        if self.checkpoint_interval_secs == 0 {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if let Some(id) = &self.restore_id {
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err(crate::Error::Config(format!(
+                    "restore.restore_id may only contain letters, digits, '-', '_' and '.', got \
+                     {id:?}"
+                )));
+            }
+        }
+        if self.produce_max_batch_bytes < 1024 {
+            return Err(crate::Error::Config(format!(
+                "produce_max_batch_bytes must be at least 1024, got {}",
+                self.produce_max_batch_bytes
+            )));
+        }
+
+        if self.target_cluster_type.is_some()
+            && self.target_profile != Some(TargetProfile::ConfluentCloud)
+        {
+            return Err(crate::Error::Config(
+                "target_cluster_type needs target_profile: confluent_cloud".to_string(),
+            ));
+        }
 
         // Validate consumer group offset reset
         if self.reset_consumer_offsets
@@ -1399,6 +1816,16 @@ impl RestoreOptions {
         {
             return Err(crate::Error::Config(
                 "consumer_groups must be specified when reset_consumer_offsets is true".to_string(),
+            ));
+        }
+
+        if !self.rewrite_schema_ids
+            && (!self.schema_id_rewrite_strict || !self.schema_id_rewrite_topics.is_empty())
+        {
+            return Err(crate::Error::Config(
+                "schema_id_rewrite_topics and schema_id_rewrite_strict need \
+                 rewrite_schema_ids: true"
+                    .to_string(),
             ));
         }
 
@@ -1683,6 +2110,206 @@ sasl_krb5_config_path: /etc/krb5.conf
     }
 
     #[test]
+    fn test_security_config_oauthbearer_serde_roundtrip() {
+        let yaml = r#"
+security_protocol: SASL_SSL
+sasl_mechanism: OAUTHBEARER
+"#;
+        let cfg: SecurityConfig = serde_yaml::from_str(yaml).expect("deserialize OAUTHBEARER");
+        assert_eq!(cfg.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        let back = serde_yaml::to_string(&cfg).expect("serialize");
+        assert!(
+            back.contains("sasl_mechanism: OAUTHBEARER"),
+            "expected OAUTHBEARER spelling in:\n{back}"
+        );
+        // The automatic SCREAMING-KEBAB-CASE spelling must not be accepted.
+        assert!(serde_yaml::from_str::<SaslMechanism>("O-AUTH-BEARER").is_err());
+    }
+
+    #[test]
+    fn test_sasl_mechanism_accepts_kafka_canonical_and_legacy_scram_spellings() {
+        // Kafka's own names (`sasl.mechanism=SCRAM-SHA-512`, used throughout
+        // the docs) and the spellings this crate has always accepted.
+        for (spelling, expected) in [
+            ("SCRAM-SHA-256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA-512", SaslMechanism::ScramSha512),
+            ("SCRAM-SHA512", SaslMechanism::ScramSha512),
+            ("PLAIN", SaslMechanism::Plain),
+            ("GSSAPI", SaslMechanism::Gssapi),
+            ("OAUTHBEARER", SaslMechanism::OAuthBearer),
+        ] {
+            let parsed: SaslMechanism = serde_yaml::from_str(spelling)
+                .unwrap_or_else(|e| panic!("{spelling} must parse: {e}"));
+            assert_eq!(parsed, expected, "{spelling}");
+
+            let yaml = format!(
+                "security_protocol: SASL_SSL\nsasl_mechanism: {spelling}\n\
+                 sasl_username: u\nsasl_password: p\n"
+            );
+            let cfg: SecurityConfig = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("security block with {spelling}: {e}"));
+            assert_eq!(cfg.sasl_mechanism, Some(expected), "{spelling}");
+        }
+        // Not a mechanism name in either spelling.
+        assert!(serde_yaml::from_str::<SaslMechanism>("SCRAM-SHA-1").is_err());
+        assert!(serde_yaml::from_str::<SaslMechanism>("SCRAM").is_err());
+    }
+
+    #[test]
+    fn test_sasl_mechanism_serialized_spelling_is_unchanged() {
+        // Serialisation keeps the spelling earlier releases wrote and read,
+        // so a config written by this version still loads in older ones.
+        for (mechanism, spelling) in [
+            (SaslMechanism::ScramSha256, "SCRAM-SHA256"),
+            (SaslMechanism::ScramSha512, "SCRAM-SHA512"),
+        ] {
+            let out = serde_yaml::to_string(&mechanism).expect("serialize");
+            assert_eq!(out.trim(), spelling);
+            let back: SaslMechanism = serde_yaml::from_str(&out).expect("roundtrip");
+            assert_eq!(back, mechanism);
+        }
+    }
+
+    #[test]
+    fn test_full_config_with_canonical_scram_name_parses() {
+        // The shape used in docs/configuration.md and the example configs.
+        let yaml = r#"
+mode: backup
+backup_id: scram-canonical
+source:
+  bootstrap_servers: ["kafka:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA-512
+    sasl_username: user
+    sasl_password: secret
+storage:
+  backend: filesystem
+  path: /tmp/scram-canonical
+"#;
+        let (config, warnings) =
+            Config::from_yaml_with_warnings(yaml).expect("canonical SCRAM name parses");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            config.source.unwrap().security.sasl_mechanism,
+            Some(SaslMechanism::ScramSha512)
+        );
+    }
+
+    const SECURITY_LINT_BASE: &str = r#"
+mode: backup
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+storage:
+  backend: filesystem
+  path: /tmp/lint
+"#;
+
+    #[test]
+    fn security_lint_accepts_known_keys() {
+        let yaml = r#"
+mode: restore
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA512
+    sasl_username: u
+    sasl_password: p
+    ssl_ca_location: /ca.pem
+    ssl_certificate_location: /c.pem
+    ssl_key_location: /k.pem
+    sasl_kerberos_service_name: kafka
+    sasl_keytab_path: /k.keytab
+    sasl_krb5_config_path: /krb5.conf
+target:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: filesystem
+  path: /tmp/lint
+enterprise:
+  oauth:
+    providers: {}
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).expect("valid config");
+        assert_eq!(
+            config.source.unwrap().security.sasl_mechanism,
+            Some(SaslMechanism::ScramSha512)
+        );
+        // `enterprise:` is not this crate's business: a warning, not an error.
+        assert!(warnings.iter().any(|w| w.starts_with("enterprise")));
+        Config::from_yaml_with_warnings(SECURITY_LINT_BASE).expect("OAUTHBEARER parses");
+    }
+
+    #[test]
+    fn security_lint_rejects_oauth_settings_with_enterprise_hint() {
+        let source_oauth = SECURITY_LINT_BASE.replace(
+            "    sasl_mechanism: OAUTHBEARER\n",
+            "    sasl_mechanism: OAUTHBEARER\n    oauth:\n      client_id: x\n",
+        );
+        let target_oauth = format!(
+            "{SECURITY_LINT_BASE}target:\n  bootstrap_servers: [\"localhost:9092\"]\n  \
+             security:\n    sasl_oauthbearer_token_endpoint_url: https://idp/token\n"
+        );
+        for (yaml, key) in [
+            (source_oauth, "source.security.oauth"),
+            (
+                target_oauth,
+                "target.security.sasl_oauthbearer_token_endpoint_url",
+            ),
+        ] {
+            let err = Config::from_yaml_with_warnings(&yaml)
+                .expect_err(&format!("{key} must be rejected"))
+                .to_string();
+            assert!(err.contains(key), "names the key: {err}");
+            assert!(
+                err.contains(
+                    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)"
+                ),
+                "hint: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_lint_rejects_typos_and_lists_valid_keys() {
+        let yaml = SECURITY_LINT_BASE.replace(
+            "    sasl_mechanism: OAUTHBEARER\n",
+            "    sasl_mechanism: OAUTHBEARER\n    sasl_pasword: oops\n",
+        );
+        let err = Config::from_yaml_with_warnings(&yaml)
+            .expect_err("typo under security must be rejected")
+            .to_string();
+        assert!(err.contains("source.security.sasl_pasword"), "{err}");
+        assert!(err.contains("sasl_password"), "lists valid keys: {err}");
+        assert!(!err.contains("enterprise.oauth"), "no OAuth hint: {err}");
+    }
+
+    #[test]
+    fn security_lint_ignores_other_sections_and_missing_security() {
+        // Unknown keys elsewhere stay warnings (existing behaviour).
+        let yaml = r#"
+mode: backup
+backup_id: lint
+source:
+  bootstrap_servers: ["localhost:9092"]
+  not_security: 1
+storage:
+  backend: filesystem
+  path: /tmp/lint
+"#;
+        let (_, warnings) = Config::from_yaml_with_warnings(yaml).expect("no security block");
+        assert!(warnings.iter().any(|w| w == "source.not_security"));
+        assert!(Config::check_security_sections(&serde_yaml::Value::Null).is_ok());
+    }
+
+    #[test]
     fn test_security_config_gssapi_fields_default_to_none() {
         // A pre-GSSAPI config (no kerberos fields) must still parse, with
         // the new fields defaulting to None. Guards backwards-compat for
@@ -1725,11 +2352,217 @@ connection:
         RestoreOptions {
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
             ..RestoreOptions::default()
         }
+    }
+
+    #[test]
+    fn schema_id_rewrite_options_parse_and_validate() {
+        let yaml = r#"
+rewrite_schema_ids: true
+schema_id_mapping: {7: 42}
+schema_id_rewrite_topics: ["orders-*", "~^payments-v\\d+$"]
+schema_id_rewrite_strict: true
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(opts.schema_id_rewrite_topics.len(), 2);
+        assert!(opts.schema_id_rewrite_strict);
+        opts.validate().unwrap();
+
+        for tweak in [
+            |o: &mut RestoreOptions| o.schema_id_rewrite_strict = false,
+            |o: &mut RestoreOptions| o.schema_id_rewrite_topics = vec!["orders".into()],
+        ] {
+            let mut opts = RestoreOptions::default();
+            tweak(&mut opts);
+            let err = opts.validate().unwrap_err().to_string();
+            assert!(err.contains("rewrite_schema_ids: true"), "{err}");
+        }
+    }
+
+    #[test]
+    fn schema_id_rewrite_defaults_do_not_change_the_serialized_options() {
+        // The restore checkpoint's config hash is taken over the serialized
+        // options: unset new fields must not change it for existing
+        // checkpoints.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        assert!(!json.contains("schema_id_rewrite_topics"), "{json}");
+        assert!(!json.contains("schema_id_rewrite_strict"), "{json}");
+    }
+
+    /// The restore checkpoint's config hash is taken over the serialized
+    /// options. Every option added in 0.25 is left out at its default, so the
+    /// serialized defaults are exactly the 0.23.x keys, in the 0.23.x order,
+    /// and a checkpoint written by 0.23.x is still resumed after an upgrade.
+    /// A non-default value is serialized, so changing it starts over.
+    #[test]
+    fn options_added_in_0_25_are_not_serialized_at_their_defaults() {
+        const KEYS_0_23: &[&str] = &[
+            "time_window_start",
+            "time_window_end",
+            "source_partitions",
+            "partition_mapping",
+            "topic_mapping",
+            "consumer_group_strategy",
+            "dry_run",
+            "include_original_offset_header",
+            "strip_offset_headers",
+            "rate_limit_records_per_sec",
+            "rate_limit_bytes_per_sec",
+            "max_concurrent_partitions",
+            "produce_batch_size",
+            "produce_acks",
+            "produce_timeout_ms",
+            "checkpoint_state",
+            "checkpoint_interval_secs",
+            "consumer_groups",
+            "reset_consumer_offsets",
+            "offset_report",
+            "create_topics",
+            "default_replication_factor",
+            "repartitioning",
+            "purge_topics",
+            "auto_consumer_groups",
+            "restore_topic_configs",
+            "existing_topic_config_policy",
+            "topic_config_overrides",
+            "rewrite_schema_ids",
+            "schema_id_mapping",
+            "header_preflight",
+            "dry_run_check_segments",
+            "circuit_breaker",
+        ];
+        // Top-level keys in serialized order (a YAML mapping keeps it).
+        let top_level_keys = |opts: &RestoreOptions| -> Vec<String> {
+            serde_yaml::to_value(opts)
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(top_level_keys(&RestoreOptions::default()), KEYS_0_23);
+        // Deserialising the 0.23.x form yields the 0.25 defaults.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        let back: RestoreOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert!(back.idempotent_producer);
+        assert_eq!(
+            back.produce_max_batch_bytes,
+            default_produce_max_batch_bytes()
+        );
+        assert_eq!(back.checkpoint_storage, RestoreCheckpointStorage::Local);
+
+        // Each 0.25 option, set away from its default, is serialized.
+        type Tweak = fn(&mut RestoreOptions);
+        let tweaks: Vec<(&str, Tweak)> = vec![
+            ("produce_max_batch_bytes", |o| {
+                o.produce_max_batch_bytes = 4096
+            }),
+            ("idempotent_producer", |o| o.idempotent_producer = false),
+            ("checkpoint_storage", |o| {
+                o.checkpoint_storage = RestoreCheckpointStorage::Remote
+            }),
+            ("restore_id", |o| o.restore_id = Some("orders-dr".into())),
+            ("unsupported_config_policy", |o| {
+                o.unsupported_config_policy = UnsupportedConfigPolicy::Fail
+            }),
+            ("target_profile", |o| {
+                o.target_profile = Some(TargetProfile::ConfluentCloud)
+            }),
+            ("target_cluster_type", |o| {
+                o.target_cluster_type = Some(TargetClusterType::Dedicated)
+            }),
+            ("schema_id_rewrite_topics", |o| {
+                o.schema_id_rewrite_topics = vec!["orders".into()]
+            }),
+            ("schema_id_rewrite_strict", |o| {
+                o.schema_id_rewrite_strict = false
+            }),
+        ];
+        for (key, tweak) in tweaks {
+            let mut opts = RestoreOptions::default();
+            tweak(&mut opts);
+            let keys = top_level_keys(&opts);
+            assert!(
+                keys.iter().any(|k| k == key),
+                "{key} not serialized: {keys:?}"
+            );
+            assert_eq!(keys.len(), KEYS_0_23.len() + 1, "{key}: {keys:?}");
+        }
+    }
+
+    #[test]
+    fn idempotent_producer_is_on_by_default_and_requires_acks_all() {
+        let opts = valid_restore_options();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_acks, -1);
+        assert!(opts.validate().is_ok());
+
+        for acks in [0, 1] {
+            let mut opts = valid_restore_options();
+            opts.produce_acks = acks;
+            let err = opts.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("idempotent_producer requires produce_acks: -1"),
+                "{err}"
+            );
+
+            opts.idempotent_producer = false;
+            assert!(opts.validate().is_ok(), "acks {acks} without idempotence");
+        }
+
+        let yaml = "produce_acks: 1\nidempotent_producer: false\n";
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert!(!opts.idempotent_producer);
+        assert!(opts.validate().is_ok());
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_max_batch_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn restore_checkpoint_storage_options_validate() {
+        let opts: RestoreOptions =
+            serde_yaml::from_str("checkpoint_storage: remote\nrestore_id: orders-dr.1\n").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Remote);
+        assert!(opts.validate().is_ok(), "remote needs no local file");
+
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Local);
+        assert_eq!(opts.restore_id, None);
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_storage = RestoreCheckpointStorage::Both;
+        let err = opts.validate().unwrap_err().to_string();
+        assert!(err.contains("requires restore.checkpoint_state"), "{err}");
+        opts.checkpoint_state = Some("/tmp/cp.json".into());
+        assert!(opts.validate().is_ok());
+
+        let mut opts = valid_restore_options();
+        opts.restore_id = Some("../escape".to_string());
+        assert!(opts.validate().is_err());
+        opts.restore_id = Some(String::new());
+        assert!(opts.validate().is_err());
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_interval_secs = 0;
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn produce_max_batch_bytes_must_hold_a_batch() {
+        let mut opts = valid_restore_options();
+        opts.produce_max_batch_bytes = 100;
+        assert!(opts.validate().is_err());
+        opts.produce_max_batch_bytes = 8 * 1024 * 1024;
+        assert!(opts.validate().is_ok());
     }
 
     #[test]
@@ -1746,6 +2579,56 @@ connection:
             },
         );
         assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn topic_config_compat_options_parse_and_validate() {
+        let yaml = r#"
+unsupported_config_policy: fail
+target_profile: confluent_cloud
+target_cluster_type: standard
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            opts.unsupported_config_policy,
+            UnsupportedConfigPolicy::Fail
+        );
+        assert_eq!(opts.target_profile, Some(TargetProfile::ConfluentCloud));
+        assert_eq!(opts.target_cluster_type, Some(TargetClusterType::Standard));
+        opts.validate().unwrap();
+
+        let defaults = RestoreOptions::default();
+        assert_eq!(
+            defaults.unsupported_config_policy,
+            UnsupportedConfigPolicy::Skip
+        );
+        assert_eq!(defaults.target_profile, None);
+
+        let orphan = RestoreOptions {
+            target_cluster_type: Some(TargetClusterType::Dedicated),
+            ..Default::default()
+        };
+        let err = orphan.validate().unwrap_err().to_string();
+        assert!(err.contains("target_profile: confluent_cloud"), "{err}");
+
+        assert!(serde_yaml::from_str::<RestoreOptions>("target_profile: aws_msk").is_err());
+        assert!(
+            serde_yaml::from_str::<RestoreOptions>("unsupported_config_policy: ignore").is_err()
+        );
+    }
+
+    #[test]
+    fn topic_config_compat_defaults_do_not_change_the_serialized_options() {
+        // The restore checkpoint's config hash is taken over the serialized
+        // options: unset new fields must not change it.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        for key in [
+            "unsupported_config_policy",
+            "target_profile",
+            "target_cluster_type",
+        ] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
     }
 
     #[test]
@@ -1891,6 +2774,60 @@ storage:
         );
         let bad = format!("{base}backup:\n  on_missing_topic: ignore\n");
         assert!(serde_yaml::from_str::<Config>(&bad).is_err());
+    }
+
+    #[test]
+    fn isolation_level_defaults_to_read_committed() {
+        let base = r#"
+mode: backup
+backup_id: iso
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+"#;
+        // No backup section, and a backup section without the key.
+        let config: Config = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            config.backup.unwrap_or_default().isolation_level,
+            IsolationLevel::ReadCommitted
+        );
+        let other = format!("{base}backup:\n  compression: lz4\n");
+        let config: Config = serde_yaml::from_str(&other).unwrap();
+        assert_eq!(
+            config.backup.unwrap().isolation_level,
+            IsolationLevel::ReadCommitted
+        );
+        assert_eq!(IsolationLevel::ReadCommitted.as_protocol(), 1);
+        assert_eq!(IsolationLevel::ReadUncommitted.as_protocol(), 0);
+    }
+
+    #[test]
+    fn isolation_level_read_uncommitted_is_the_opt_out() {
+        let base = r#"
+mode: backup
+backup_id: iso
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+"#;
+        for (value, expected) in [
+            ("read_uncommitted", IsolationLevel::ReadUncommitted),
+            ("READ_UNCOMMITTED", IsolationLevel::ReadUncommitted),
+            ("read_committed", IsolationLevel::ReadCommitted),
+            ("READ_COMMITTED", IsolationLevel::ReadCommitted),
+        ] {
+            let yaml = format!("{base}backup:\n  isolation_level: {value}\n");
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(config.backup.unwrap().isolation_level, expected, "{value}");
+        }
+        let bad = format!("{base}backup:\n  isolation_level: committed\n");
+        assert!(serde_yaml::from_str::<Config>(&bad).is_err());
+        assert_eq!(
+            serde_json::to_string(&IsolationLevel::ReadUncommitted).unwrap(),
+            "\"read_uncommitted\""
+        );
     }
 
     #[test]

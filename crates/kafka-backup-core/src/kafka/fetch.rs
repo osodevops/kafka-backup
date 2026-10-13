@@ -1,5 +1,8 @@
 //! Kafka Fetch API implementation.
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
+
 use bytes::{Buf, Bytes};
 use kafka_protocol::compression::{self as cmpr, Decompressor};
 use kafka_protocol::messages::{
@@ -12,30 +15,68 @@ use kafka_protocol::records::{Record, RecordBatchDecoder};
 use tracing::debug;
 
 use super::KafkaClient;
+use crate::config::IsolationLevel;
 use crate::error::KafkaError;
 use crate::manifest::BackupRecord;
 use crate::Result;
 
 /// Response from a fetch operation
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FetchResponse {
     /// Records fetched
     pub records: Vec<BackupRecord>,
     /// High watermark for the partition
     pub high_watermark: i64,
+    /// Last stable offset (LSO) for the partition: the first offset of the
+    /// earliest transaction still open on it, or the high watermark when
+    /// none is. `-1` when the broker did not report one. A `read_committed`
+    /// fetch never returns data at or beyond it.
+    pub last_stable_offset: i64,
     /// Log start offset for the partition
     pub log_start_offset: i64,
     /// Next offset to fetch
     pub next_offset: i64,
+    /// Transaction control records (commit and abort markers) passed over.
+    /// Always 0 for a `read_uncommitted` fetch, which returns them as records.
+    pub control_records_skipped: u64,
+    /// Records of aborted transactions dropped. Always 0 for a
+    /// `read_uncommitted` fetch.
+    pub aborted_records_dropped: u64,
+    /// The batches behind the two counters above, in offset order, so a
+    /// caller can attribute them to the segment whose offset range holds them.
+    pub skipped: Vec<SkippedBatch>,
 }
 
-/// Fetch records from a topic/partition
+/// A record batch a `read_committed` fetch passed over without returning its
+/// records: a transaction marker, or a batch of an aborted transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedBatch {
+    /// Last offset of the batch (inclusive).
+    pub last_offset: i64,
+    /// Control records in the batch at or after the fetch offset.
+    pub control_records: u64,
+    /// Aborted records in the batch at or after the fetch offset.
+    pub aborted_records: u64,
+}
+
+/// Fetch records from a topic/partition.
+///
+/// `isolation` is the Fetch request's `isolation_level`. With
+/// [`IsolationLevel::ReadCommitted`] the broker returns data only up to the
+/// last stable offset, together with the aborted transactions in the
+/// returned range, and the records of those transactions and every
+/// transaction marker are filtered out here, the way the Java consumer
+/// filters them.
+/// [`IsolationLevel::ReadUncommitted`] returns every record, markers
+/// included, as versions before 0.25 did.
 pub async fn fetch(
     client: &KafkaClient,
     topic: &str,
     partition: i32,
     offset: i64,
     max_bytes: i32,
+    isolation: IsolationLevel,
 ) -> Result<FetchResponse> {
     let fetch_partition = kafka_protocol::messages::fetch_request::FetchPartition::default()
         .with_partition(partition)
@@ -52,7 +93,7 @@ pub async fn fetch(
         .with_max_wait_ms(500)
         .with_min_bytes(1)
         .with_max_bytes(max_bytes)
-        .with_isolation_level(0) // READ_UNCOMMITTED
+        .with_isolation_level(isolation.as_protocol())
         .with_topics(vec![fetch_topic]);
 
     let response: KafkaFetchResponse = client.send_request(ApiKey::Fetch, request).await?;
@@ -65,10 +106,11 @@ pub async fn fetch(
     }
 
     // Parse the response
-    let mut records = Vec::new();
-    let mut high_watermark = 0i64;
-    let mut log_start_offset = 0i64;
-    let mut next_offset = offset;
+    let mut result = FetchResponse {
+        last_stable_offset: -1,
+        next_offset: offset,
+        ..FetchResponse::default()
+    };
 
     for topic_response in &response.responses {
         if topic_response.topic.as_str() != topic {
@@ -92,43 +134,168 @@ pub async fn fetch(
                 .into());
             }
 
-            high_watermark = partition_response.high_watermark;
-            log_start_offset = partition_response.log_start_offset;
+            result.high_watermark = partition_response.high_watermark;
+            result.last_stable_offset = partition_response.last_stable_offset;
+            result.log_start_offset = partition_response.log_start_offset;
 
             // Decode record batches
             if let Some(ref records_data) = partition_response.records {
                 if !records_data.is_empty() {
-                    let (decoded, batch_next_offset) = decode_fetch_data(records_data, offset)?;
-                    records = decoded;
-                    next_offset = batch_next_offset;
+                    let mut filter = match isolation {
+                        IsolationLevel::ReadUncommitted => TransactionFilter::ReadUncommitted,
+                        IsolationLevel::ReadCommitted => {
+                            TransactionFilter::ReadCommitted(AbortedTransactions::new(
+                                partition_response
+                                    .aborted_transactions
+                                    .iter()
+                                    .flatten()
+                                    .map(|t| (t.producer_id.0, t.first_offset)),
+                            ))
+                        }
+                    };
+                    let decoded = decode_fetch_data(records_data, offset, &mut filter)?;
+                    result.records = decoded.records;
+                    result.next_offset = decoded.next_offset;
+                    result.control_records_skipped = decoded.control_records_skipped;
+                    result.aborted_records_dropped = decoded.aborted_records_dropped;
+                    result.skipped = decoded.skipped;
                 }
             }
         }
     }
 
     debug!(
-        "fetch_result: {}:{} records={} high_watermark={} next_offset={} offset_start={}",
+        "fetch_result: {}:{} isolation={} records={} high_watermark={} last_stable_offset={} \
+         next_offset={} offset_start={} control_skipped={} aborted_dropped={}",
         topic,
         partition,
-        records.len(),
-        high_watermark,
-        next_offset,
-        offset
+        isolation,
+        result.records.len(),
+        result.high_watermark,
+        result.last_stable_offset,
+        result.next_offset,
+        offset,
+        result.control_records_skipped,
+        result.aborted_records_dropped
     );
 
-    Ok(FetchResponse {
-        records,
-        high_watermark,
-        log_start_offset,
-        next_offset,
-    })
+    Ok(result)
 }
 
 /// Byte positions within a v2 record batch: base_offset 0..8,
-/// batch_length 8..12 (length of everything after itself), then
-/// partition_leader_epoch, magic, crc, attributes, last_offset_delta 23..27.
+/// batch_length 8..12 (length of everything after itself),
+/// partition_leader_epoch 12..16, magic 16, crc 17..21, attributes 21..23,
+/// last_offset_delta 23..27, base_timestamp 27..35, max_timestamp 35..43,
+/// producer_id 43..51, producer_epoch 51..53, base_sequence 53..57,
+/// records_count 57..61.
 const BATCH_LENGTH_END: usize = 12;
+const MAGIC_OFFSET: usize = 16;
+const ATTRIBUTES_RANGE: std::ops::Range<usize> = 21..23;
 const LAST_OFFSET_DELTA_RANGE: std::ops::Range<usize> = 23..27;
+const PRODUCER_ID_RANGE: std::ops::Range<usize> = 43..51;
+const RECORDS_COUNT_RANGE: std::ops::Range<usize> = 57..61;
+/// Size of a v2 record batch header (everything before the records).
+const V2_BATCH_HEADER_SIZE: usize = 61;
+/// Batch attribute bit: the batch belongs to a transaction.
+const TRANSACTIONAL_FLAG: i16 = 0x10;
+/// Batch attribute bit: the batch holds control records (transaction markers).
+const CONTROL_FLAG: i16 = 0x20;
+/// Control record type of an ABORT marker. A control record's key is
+/// `version: i16, type: i16`; type 0 is ABORT, 1 is COMMIT.
+const CONTROL_TYPE_ABORT: i16 = 0;
+
+/// The transaction fields of a v2 batch header that the read_committed
+/// filter needs, read from the header bytes. They are there even when
+/// compaction has removed every record of the batch.
+#[derive(Debug, Clone, Copy)]
+struct TransactionHeader {
+    transactional: bool,
+    control: bool,
+    producer_id: i64,
+    records_count: i32,
+}
+
+impl TransactionHeader {
+    /// `None` for a batch that is not a complete v2 batch (message format
+    /// v0/v1 has no transactions).
+    fn parse(batch: &[u8]) -> Option<Self> {
+        if batch.len() < V2_BATCH_HEADER_SIZE || batch[MAGIC_OFFSET] != 2 {
+            return None;
+        }
+        let attributes = i16::from_be_bytes(batch[ATTRIBUTES_RANGE].try_into().unwrap());
+        Some(Self {
+            transactional: attributes & TRANSACTIONAL_FLAG != 0,
+            control: attributes & CONTROL_FLAG != 0,
+            producer_id: i64::from_be_bytes(batch[PRODUCER_ID_RANGE].try_into().unwrap()),
+            records_count: i32::from_be_bytes(batch[RECORDS_COUNT_RANGE].try_into().unwrap()),
+        })
+    }
+}
+
+/// The aborted transactions a read_committed fetch reported, tracked the way
+/// the Java consumer does (`CompletedFetch`): a min-heap of
+/// `(first_offset, producer_id)` not yet reached, and the producers whose
+/// aborted transaction has begun but whose ABORT marker has not been passed.
+#[derive(Debug, Default)]
+pub(crate) struct AbortedTransactions {
+    pending: BinaryHeap<Reverse<(i64, i64)>>,
+    aborted_producers: HashSet<i64>,
+}
+
+impl AbortedTransactions {
+    /// From `(producer_id, first_offset)` pairs as the broker lists them.
+    pub(crate) fn new(transactions: impl IntoIterator<Item = (i64, i64)>) -> Self {
+        Self {
+            pending: transactions
+                .into_iter()
+                .map(|(producer_id, first_offset)| Reverse((first_offset, producer_id)))
+                .collect(),
+            aborted_producers: HashSet::new(),
+        }
+    }
+
+    /// Every aborted transaction that began at or before `last_offset` is
+    /// now in progress: its producer's transactional batches are aborted
+    /// until its ABORT marker.
+    fn begin_up_to(&mut self, last_offset: i64) {
+        while let Some(Reverse((first_offset, producer_id))) = self.pending.peek().copied() {
+            if first_offset > last_offset {
+                break;
+            }
+            self.pending.pop();
+            self.aborted_producers.insert(producer_id);
+        }
+    }
+}
+
+/// How `decode_fetch_data` treats transactional data.
+pub(crate) enum TransactionFilter {
+    /// Return every record, control records (markers) included — the
+    /// behaviour of versions before 0.25.
+    ReadUncommitted,
+    /// Return what a `read_committed` consumer sees.
+    ReadCommitted(AbortedTransactions),
+}
+
+/// Records decoded from one partition's fetched data.
+#[derive(Debug, Default)]
+pub(crate) struct DecodedFetch {
+    pub(crate) records: Vec<BackupRecord>,
+    pub(crate) next_offset: i64,
+    pub(crate) control_records_skipped: u64,
+    pub(crate) aborted_records_dropped: u64,
+    pub(crate) skipped: Vec<SkippedBatch>,
+}
+
+/// What the read_committed filter does with one batch.
+enum BatchDisposition {
+    /// Return its records.
+    Keep,
+    /// A transaction marker: skip it.
+    Control,
+    /// A batch of an aborted transaction: drop it.
+    Aborted,
+}
 
 /// Decode fetched record data and compute the next offset to fetch.
 ///
@@ -142,14 +309,29 @@ const LAST_OFFSET_DELTA_RANGE: std::ops::Range<usize> = 23..27;
 /// its entire tail — while the batch keeps its original offset range. Deriving
 /// the next offset from the last decoded record would make the fetch loop
 /// re-request the same batch forever (stalled backup, issue #54 in the
-/// operator repo).
+/// operator repo). For the same reason the next offset advances past the
+/// batches the read_committed filter skips.
+///
+/// With [`TransactionFilter::ReadCommitted`] the batches are filtered the way
+/// the Java consumer does it, from the batch headers (which survive
+/// compaction): before a batch with a producer id is handled, every aborted
+/// transaction whose first offset is at or before the batch's last offset
+/// adds its producer to the aborted set. A control batch is skipped; when it
+/// is an ABORT marker its producer leaves the set. A transactional batch of
+/// a producer in the set is dropped. Everything else is returned.
 ///
 /// The Kafka Fetch response may contain a truncated batch at the end when the
 /// response hits max_bytes; it is detected via the batch_length header and
 /// ignored.
-fn decode_fetch_data(data: &Bytes, fetch_offset: i64) -> Result<(Vec<BackupRecord>, i64)> {
-    let mut records = Vec::new();
-    let mut next_offset = fetch_offset;
+pub(crate) fn decode_fetch_data(
+    data: &Bytes,
+    fetch_offset: i64,
+    filter: &mut TransactionFilter,
+) -> Result<DecodedFetch> {
+    let mut out = DecodedFetch {
+        next_offset: fetch_offset,
+        ..DecodedFetch::default()
+    };
 
     let total = data.len();
     let mut pos = 0usize;
@@ -171,62 +353,168 @@ fn decode_fetch_data(data: &Bytes, fetch_offset: i64) -> Result<(Vec<BackupRecor
             break;
         }
 
-        let mut batch_buf = data.slice(pos..pos + batch_total);
-        let raw_headers = std::cell::RefCell::new(None);
-        let decode = |input: &mut Bytes, compression: Compression| -> anyhow::Result<Bytes> {
-            let body = match compression {
-                Compression::None => {
-                    cmpr::None::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
-                }
-                Compression::Gzip => {
-                    cmpr::Gzip::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
-                }
-                Compression::Snappy => {
-                    cmpr::Snappy::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
-                }
-                Compression::Lz4 => {
-                    cmpr::Lz4::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
-                }
-                Compression::Zstd => {
-                    cmpr::Zstd::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
-                }
-            };
-            *raw_headers.borrow_mut() = Some(super::header_codec::decode(&body)?);
-            Ok(body)
-        };
-        let record_set =
-            RecordBatchDecoder::decode_with_custom_compression(&mut batch_buf, Some(&decode))
-                .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {e:?}")))?;
-        let raw_headers = raw_headers.into_inner();
-        if raw_headers
-            .as_ref()
-            .is_some_and(|h| h.len() != record_set.records.len())
-        {
-            return Err(
-                KafkaError::Protocol("Kafka record/header list count mismatch".into()).into(),
-            );
-        }
-        for (i, record) in record_set.records.iter().enumerate() {
-            if record.offset >= fetch_offset {
-                let mut record = convert_record(record);
-                if let Some(headers) = &raw_headers {
-                    record.headers = headers[i].clone();
-                }
-                records.push(record);
-            }
-        }
-
         let last_offset_delta = i32::from_be_bytes(
             data[pos + LAST_OFFSET_DELTA_RANGE.start..pos + LAST_OFFSET_DELTA_RANGE.end]
                 .try_into()
                 .unwrap(),
         );
-        next_offset = next_offset.max(base_offset + last_offset_delta as i64 + 1);
-
+        let last_offset = base_offset + last_offset_delta as i64;
+        let batch = data.slice(pos..pos + batch_total);
         pos += batch_total;
+        out.next_offset = out.next_offset.max(last_offset + 1);
+
+        let header = match &*filter {
+            TransactionFilter::ReadUncommitted => None,
+            TransactionFilter::ReadCommitted(_) => TransactionHeader::parse(&batch),
+        };
+
+        // Decoded lazily: an aborted batch whose records all lie at or after
+        // the fetch offset is counted from its header and never decompressed.
+        let mut records: Option<DecodedBatch> = None;
+        let disposition = match (&mut *filter, header) {
+            (TransactionFilter::ReadCommitted(aborted), Some(h)) if h.producer_id >= 0 => {
+                aborted.begin_up_to(last_offset);
+                if h.control {
+                    let decoded = decode_batch(&batch)?;
+                    if is_abort_marker(&decoded.records) {
+                        aborted.aborted_producers.remove(&h.producer_id);
+                    }
+                    records = Some(decoded);
+                    BatchDisposition::Control
+                } else if h.transactional && aborted.aborted_producers.contains(&h.producer_id) {
+                    BatchDisposition::Aborted
+                } else {
+                    BatchDisposition::Keep
+                }
+            }
+            (TransactionFilter::ReadCommitted(_), Some(h)) if h.control => {
+                BatchDisposition::Control
+            }
+            _ => BatchDisposition::Keep,
+        };
+
+        match disposition {
+            BatchDisposition::Keep => {
+                let decoded = match records {
+                    Some(decoded) => decoded,
+                    None => decode_batch(&batch)?,
+                };
+                decoded.push_from(fetch_offset, &mut out.records);
+            }
+            BatchDisposition::Control | BatchDisposition::Aborted => {
+                let header_count = header.map_or(0, |h| h.records_count.max(0) as u64);
+                let count = if base_offset >= fetch_offset {
+                    header_count
+                } else {
+                    let decoded = match records {
+                        Some(decoded) => decoded,
+                        None => decode_batch(&batch)?,
+                    };
+                    decoded
+                        .records
+                        .iter()
+                        .filter(|r| r.offset >= fetch_offset)
+                        .count() as u64
+                };
+                let (control_records, aborted_records) = match disposition {
+                    BatchDisposition::Control => (count, 0),
+                    _ => (0, count),
+                };
+                out.control_records_skipped += control_records;
+                out.aborted_records_dropped += aborted_records;
+                if last_offset >= fetch_offset {
+                    out.skipped.push(SkippedBatch {
+                        last_offset,
+                        control_records,
+                        aborted_records,
+                    });
+                }
+            }
+        }
     }
 
-    Ok((records, next_offset))
+    Ok(out)
+}
+
+/// The records of one complete batch.
+struct DecodedBatch {
+    records: Vec<Record>,
+    /// Each record's headers in wire order, duplicates and null values
+    /// included. kafka-protocol's `Record` keeps headers in a map, which
+    /// collapses repeated keys, so they are read from the decompressed
+    /// record bytes instead. `None` when the codec did not hand the record
+    /// bytes over (no v2 records); the map headers are used then.
+    headers: Option<Vec<Vec<crate::manifest::RecordHeader>>>,
+}
+
+impl DecodedBatch {
+    /// Append the records at or after `fetch_offset` to `out`.
+    fn push_from(self, fetch_offset: i64, out: &mut Vec<BackupRecord>) {
+        let mut ordered = self.headers.map(Vec::into_iter);
+        for record in &self.records {
+            let headers = ordered.as_mut().and_then(Iterator::next);
+            if record.offset >= fetch_offset {
+                let mut converted = convert_record(record);
+                if let Some(headers) = headers {
+                    converted.headers = headers;
+                }
+                out.push(converted);
+            }
+        }
+    }
+}
+
+/// Decode the records of one complete batch. Batch framing, CRC checks,
+/// decompression and timestamps stay with the upstream codec; the ordered
+/// header lists are taken from the decompressed records on the way through.
+fn decode_batch(batch: &Bytes) -> Result<DecodedBatch> {
+    let mut buf = batch.clone();
+    let ordered_headers = std::cell::RefCell::new(None);
+    let decompress = |input: &mut Bytes, compression: Compression| -> anyhow::Result<Bytes> {
+        let body = match compression {
+            Compression::None => {
+                cmpr::None::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Gzip => {
+                cmpr::Gzip::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Snappy => {
+                cmpr::Snappy::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Lz4 => {
+                cmpr::Lz4::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Zstd => {
+                cmpr::Zstd::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+        };
+        *ordered_headers.borrow_mut() = Some(super::header_codec::decode(&body)?);
+        Ok(body)
+    };
+    let set = RecordBatchDecoder::decode_with_custom_compression(&mut buf, Some(&decompress))
+        .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {e:?}")))?;
+    let headers = ordered_headers.into_inner();
+    if headers
+        .as_ref()
+        .is_some_and(|h| h.len() != set.records.len())
+    {
+        return Err(KafkaError::Protocol("Kafka record/header list count mismatch".into()).into());
+    }
+    Ok(DecodedBatch {
+        records: set.records,
+        headers,
+    })
+}
+
+/// Whether a control batch is an ABORT marker: its first record's key is
+/// `version: i16, type: i16` with type 0. A control batch emptied by
+/// compaction is not (the Java consumer's `containsAbortMarker`).
+fn is_abort_marker(records: &[Record]) -> bool {
+    records
+        .first()
+        .and_then(|r| r.key.as_ref())
+        .filter(|key| key.len() >= 4)
+        .is_some_and(|key| i16::from_be_bytes([key[2], key[3]]) == CONTROL_TYPE_ABORT)
 }
 
 /// Convert a kafka-protocol Record to our BackupRecord
@@ -257,10 +545,13 @@ fn convert_record(record: &Record) -> BackupRecord {
 /// batched request to the broker. This is critical for performance on high-latency
 /// connections where per-partition requests would serialize through the connection mutex.
 ///
-/// Timestamp values: -2 = earliest, -1 = latest
+/// Timestamp values: -2 = earliest, -1 = latest. With
+/// [`IsolationLevel::ReadCommitted`], "latest" is the last stable offset;
+/// with [`IsolationLevel::ReadUncommitted`] it is the high watermark.
 pub async fn batch_get_offsets(
     client: &KafkaClient,
     requests: &[(String, i32, i64)], // (topic, partition, timestamp)
+    isolation: IsolationLevel,
 ) -> Result<std::collections::HashMap<(String, i32), i64>> {
     use std::collections::HashMap;
 
@@ -293,7 +584,7 @@ pub async fn batch_get_offsets(
 
     let request = ListOffsetsRequest::default()
         .with_replica_id(BrokerId(-1))
-        .with_isolation_level(0)
+        .with_isolation_level(isolation.as_protocol())
         .with_topics(topics);
 
     let response: kafka_protocol::messages::ListOffsetsResponse =
@@ -326,24 +617,32 @@ pub async fn batch_get_offsets(
     }
 
     debug!(
-        "batch_get_offsets: {} results from {} requests",
+        "batch_get_offsets: {} results from {} requests (isolation={})",
         results.len(),
-        requests.len()
+        requests.len(),
+        isolation
     );
 
     Ok(results)
 }
 
-/// Get the earliest and latest offsets for a partition
-pub async fn get_offsets(client: &KafkaClient, topic: &str, partition: i32) -> Result<(i64, i64)> {
+/// Get the earliest and latest offsets for a partition. "Latest" is the last
+/// stable offset with [`IsolationLevel::ReadCommitted`] and the high
+/// watermark with [`IsolationLevel::ReadUncommitted`].
+pub async fn get_offsets(
+    client: &KafkaClient,
+    topic: &str,
+    partition: i32,
+    isolation: IsolationLevel,
+) -> Result<(i64, i64)> {
     // Fetch earliest offset (timestamp = -2)
-    let earliest = list_offset(client, topic, partition, -2).await?;
+    let earliest = list_offset(client, topic, partition, -2, isolation).await?;
     // Fetch latest offset (timestamp = -1)
-    let latest = list_offset(client, topic, partition, -1).await?;
+    let latest = list_offset(client, topic, partition, -1, isolation).await?;
 
     debug!(
-        "Offsets for {}:{}: earliest={}, latest={}",
-        topic, partition, earliest, latest
+        "Offsets for {}:{}: earliest={}, latest={} (isolation={})",
+        topic, partition, earliest, latest, isolation
     );
 
     Ok((earliest, latest))
@@ -355,6 +654,7 @@ async fn list_offset(
     topic: &str,
     partition: i32,
     timestamp: i64,
+    isolation: IsolationLevel,
 ) -> Result<i64> {
     let list_partition =
         kafka_protocol::messages::list_offsets_request::ListOffsetsPartition::default()
@@ -367,7 +667,7 @@ async fn list_offset(
 
     let request = ListOffsetsRequest::default()
         .with_replica_id(BrokerId(-1)) // Client mode
-        .with_isolation_level(0) // READ_UNCOMMITTED
+        .with_isolation_level(isolation.as_protocol())
         .with_topics(vec![list_topic]);
 
     let response: kafka_protocol::messages::ListOffsetsResponse =
@@ -469,8 +769,15 @@ mod tests {
         batch[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
     }
 
+    /// Decode as a `read_uncommitted` fetch (the behaviour before 0.25).
     fn parse(data: Vec<u8>, fetch_offset: i64) -> (Vec<BackupRecord>, i64) {
-        decode_fetch_data(&Bytes::from(data), fetch_offset).expect("decode failed")
+        let decoded = decode_fetch_data(
+            &Bytes::from(data),
+            fetch_offset,
+            &mut TransactionFilter::ReadUncommitted,
+        )
+        .expect("decode failed");
+        (decoded.records, decoded.next_offset)
     }
 
     /// Issue #155: a null header value (`-1` length on the wire) must be
@@ -668,8 +975,9 @@ mod tests {
         let raw = hex_to_bytes(JAVA_WIDE_TIMESTAMP_BATCH_HEX);
         assert_eq!(raw.len(), 451, "fixture is a single 451-byte batch");
 
-        let (records, next_offset) =
-            decode_fetch_data(&raw, 0).expect("batch produced by the Java client must decode");
+        let decoded = decode_fetch_data(&raw, 0, &mut TransactionFilter::ReadUncommitted)
+            .expect("batch produced by the Java client must decode");
+        let (records, next_offset) = (decoded.records, decoded.next_offset);
 
         assert_eq!(records.len(), 20);
         assert_eq!(next_offset, 20);
@@ -704,5 +1012,346 @@ mod tests {
                 .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).expect("hex"))
                 .collect::<Vec<u8>>(),
         )
+    }
+
+    // ------------------------------------------------------------------
+    // read_committed: aborted transactions and transaction markers.
+    // ------------------------------------------------------------------
+
+    const PID_A: i64 = 1_000;
+    const PID_B: i64 = 2_000;
+
+    /// A record of producer `producer_id` (`NO_PRODUCER_ID` for a plain
+    /// producer).
+    fn producer_record(offset: i64, producer_id: i64, transactional: bool) -> Record {
+        Record {
+            transactional,
+            producer_id,
+            producer_epoch: if producer_id >= 0 {
+                0
+            } else {
+                NO_PRODUCER_EPOCH
+            },
+            ..make_record(offset)
+        }
+    }
+
+    fn encode_records(records: &[Record]) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            records.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .expect("encode failed");
+        buf.to_vec()
+    }
+
+    /// One batch of a transactional producer.
+    fn txn_batch(offsets: &[i64], producer_id: i64) -> Vec<u8> {
+        let records: Vec<Record> = offsets
+            .iter()
+            .map(|&o| producer_record(o, producer_id, true))
+            .collect();
+        encode_records(&records)
+    }
+
+    /// One batch of an idempotent (non-transactional) producer.
+    fn idempotent_batch(offsets: &[i64], producer_id: i64) -> Vec<u8> {
+        let records: Vec<Record> = offsets
+            .iter()
+            .map(|&o| producer_record(o, producer_id, false))
+            .collect();
+        encode_records(&records)
+    }
+
+    /// A COMMIT or ABORT marker as the broker writes it: a transactional
+    /// control batch holding one control record whose key is
+    /// `version: i16 = 0, type: i16` (0 = ABORT, 1 = COMMIT) and whose value
+    /// is `version: i16 = 0, coordinator_epoch: i32`.
+    fn marker(offset: i64, producer_id: i64, commit: bool) -> Vec<u8> {
+        let record = Record {
+            control: true,
+            key: Some(Bytes::from(vec![0, 0, 0, u8::from(commit)])),
+            value: Some(Bytes::from_static(&[0, 0, 0, 0, 0, 0])),
+            ..producer_record(offset, producer_id, true)
+        };
+        encode_records(std::slice::from_ref(&record))
+    }
+
+    /// Remove every record from a batch while keeping its offset range and
+    /// producer fields, as the log cleaner does.
+    fn emptied(mut batch: Vec<u8>, last_offset_delta: i32) -> Vec<u8> {
+        batch.truncate(V2_BATCH_HEADER_SIZE);
+        batch[RECORDS_COUNT_RANGE].copy_from_slice(&0i32.to_be_bytes());
+        let batch_length = (batch.len() - BATCH_LENGTH_END) as i32;
+        batch[8..12].copy_from_slice(&batch_length.to_be_bytes());
+        patch_last_offset_delta(&mut batch, last_offset_delta);
+        batch
+    }
+
+    /// One batch of a plain (non-idempotent) producer.
+    fn plain_batch(offsets: &[i64]) -> Vec<u8> {
+        encode_batch(offsets)
+    }
+
+    fn concat(batches: &[Vec<u8>]) -> Vec<u8> {
+        batches.concat()
+    }
+
+    fn read_committed(data: Vec<u8>, fetch_offset: i64, aborted: &[(i64, i64)]) -> DecodedFetch {
+        let mut filter =
+            TransactionFilter::ReadCommitted(AbortedTransactions::new(aborted.iter().copied()));
+        decode_fetch_data(&Bytes::from(data), fetch_offset, &mut filter).expect("decode failed")
+    }
+
+    fn offsets_of(decoded: &DecodedFetch) -> Vec<i64> {
+        decoded.records.iter().map(|r| r.offset).collect()
+    }
+
+    #[test]
+    fn commit_marker_is_skipped_and_committed_records_are_kept() {
+        let data = concat(&[
+            txn_batch(&[0, 1, 2], PID_A),
+            marker(3, PID_A, true),
+            plain_batch(&[4]),
+        ]);
+        let d = read_committed(data, 0, &[]);
+        assert_eq!(offsets_of(&d), vec![0, 1, 2, 4]);
+        assert_eq!(d.next_offset, 5);
+        assert_eq!(d.control_records_skipped, 1);
+        assert_eq!(d.aborted_records_dropped, 0);
+        assert_eq!(
+            d.skipped,
+            vec![SkippedBatch {
+                last_offset: 3,
+                control_records: 1,
+                aborted_records: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn abort_marker_drops_the_aborted_transaction() {
+        let data = concat(&[
+            txn_batch(&[0, 1], PID_A),
+            plain_batch(&[2]),
+            txn_batch(&[3], PID_A),
+            marker(4, PID_A, false),
+            plain_batch(&[5]),
+        ]);
+        let d = read_committed(data, 0, &[(PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![2, 5]);
+        assert_eq!(d.next_offset, 6, "advances past the marker");
+        assert_eq!(d.aborted_records_dropped, 3);
+        assert_eq!(d.control_records_skipped, 1);
+        assert_eq!(
+            d.skipped.iter().map(|s| s.last_offset).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn interleaved_producers_drop_only_the_aborted_transaction() {
+        // A commits, B aborts, then B starts a new transaction that commits.
+        let data = concat(&[
+            txn_batch(&[0], PID_A),
+            txn_batch(&[1], PID_B),
+            plain_batch(&[2]),
+            txn_batch(&[3], PID_A),
+            txn_batch(&[4], PID_B),
+            marker(5, PID_A, true),
+            marker(6, PID_B, false),
+            plain_batch(&[7]),
+            txn_batch(&[8], PID_B),
+            marker(9, PID_B, true),
+        ]);
+        let d = read_committed(data, 0, &[(PID_B, 1)]);
+        assert_eq!(offsets_of(&d), vec![0, 2, 3, 7, 8]);
+        assert_eq!(d.aborted_records_dropped, 2);
+        assert_eq!(d.control_records_skipped, 3);
+        assert_eq!(d.next_offset, 10);
+    }
+
+    #[test]
+    fn a_producer_aborting_twice_is_tracked_per_transaction() {
+        let data = concat(&[
+            txn_batch(&[0, 1], PID_A),
+            marker(2, PID_A, false),
+            txn_batch(&[3], PID_A),
+            marker(4, PID_A, true),
+            txn_batch(&[5], PID_A),
+            marker(6, PID_A, false),
+            plain_batch(&[7]),
+        ]);
+        let d = read_committed(data, 0, &[(PID_A, 5), (PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![3, 7]);
+        assert_eq!(d.aborted_records_dropped, 3);
+        assert_eq!(d.control_records_skipped, 3);
+    }
+
+    /// Resuming inside an aborted transaction: the broker lists the
+    /// transaction (it began before the fetch offset) and returns the batch
+    /// holding the fetch offset from its start.
+    #[test]
+    fn resume_mid_transaction_where_the_aborted_list_overlaps_the_fetch_start() {
+        let data = concat(&[
+            txn_batch(&[0, 1, 2, 3, 4], PID_A),
+            plain_batch(&[5]),
+            txn_batch(&[6, 7], PID_A),
+            marker(8, PID_A, false),
+            plain_batch(&[9]),
+        ]);
+        let d = read_committed(data, 3, &[(PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![5, 9]);
+        assert_eq!(
+            d.aborted_records_dropped, 4,
+            "3, 4, 6 and 7 — not the offsets before the fetch offset"
+        );
+        assert_eq!(d.control_records_skipped, 1);
+        assert_eq!(d.next_offset, 10);
+        assert_eq!(
+            d.skipped[0],
+            SkippedBatch {
+                last_offset: 4,
+                control_records: 0,
+                aborted_records: 2
+            }
+        );
+    }
+
+    #[test]
+    fn resume_mid_batch_of_a_committed_transaction() {
+        let data = concat(&[txn_batch(&[0, 1, 2, 3, 4], PID_A), marker(5, PID_A, true)]);
+        let d = read_committed(data, 3, &[]);
+        assert_eq!(offsets_of(&d), vec![3, 4]);
+        assert_eq!(d.control_records_skipped, 1);
+        assert_eq!(d.next_offset, 6);
+    }
+
+    /// Resuming exactly at a marker: it is skipped and counted once.
+    #[test]
+    fn resume_at_a_marker_skips_it() {
+        let data = concat(&[marker(5, PID_A, true), plain_batch(&[6])]);
+        let d = read_committed(data, 5, &[]);
+        assert_eq!(offsets_of(&d), vec![6]);
+        assert_eq!(d.control_records_skipped, 1);
+        assert_eq!(d.next_offset, 7);
+    }
+
+    /// The Java consumer only aborts *transactional* batches: an idempotent
+    /// batch carrying the same producer id is kept.
+    #[test]
+    fn idempotent_batch_of_an_aborted_producer_id_is_kept() {
+        let data = concat(&[
+            txn_batch(&[0], PID_A),
+            idempotent_batch(&[1], PID_A),
+            marker(2, PID_A, false),
+        ]);
+        let d = read_committed(data, 0, &[(PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![1]);
+        assert_eq!(d.aborted_records_dropped, 1);
+    }
+
+    /// Compaction can empty a batch of an aborted transaction (and a
+    /// marker): the header still identifies it, and the fetch advances past
+    /// its whole offset range.
+    #[test]
+    fn compaction_emptied_batches_are_filtered_and_advance() {
+        let data = concat(&[
+            emptied(txn_batch(&[0, 1, 2], PID_A), 2),
+            marker(3, PID_A, false),
+            emptied(marker(4, PID_B, true), 0),
+            plain_batch(&[5]),
+        ]);
+        let d = read_committed(data, 0, &[(PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![5]);
+        assert_eq!(d.next_offset, 6);
+        assert_eq!(d.aborted_records_dropped, 0, "no record was left to drop");
+        assert_eq!(d.control_records_skipped, 1, "the emptied marker held none");
+
+        // A batch emptied entirely: no record, but progress.
+        let d = read_committed(emptied(txn_batch(&[7, 8, 9], PID_A), 2), 7, &[(PID_A, 7)]);
+        assert!(d.records.is_empty());
+        assert_eq!(d.next_offset, 10);
+    }
+
+    #[test]
+    fn truncated_tail_batch_is_ignored_under_read_committed() {
+        let tail = txn_batch(&[3, 4], PID_A);
+        let mut data = concat(&[txn_batch(&[0, 1], PID_A), marker(2, PID_A, true)]);
+        data.extend_from_slice(&tail[..tail.len() - 5]);
+        let d = read_committed(data, 0, &[(PID_A, 3)]);
+        assert_eq!(offsets_of(&d), vec![0, 1]);
+        assert_eq!(d.next_offset, 3, "the truncated batch is fetched again");
+        assert_eq!(d.aborted_records_dropped, 0);
+        assert_eq!(d.control_records_skipped, 1);
+    }
+
+    #[test]
+    fn aborted_transactions_beyond_the_fetched_range_do_not_apply() {
+        let data = concat(&[txn_batch(&[0, 1], PID_A), marker(2, PID_A, true)]);
+        let d = read_committed(data, 0, &[(PID_A, 100)]);
+        assert_eq!(offsets_of(&d), vec![0, 1]);
+    }
+
+    /// An aborted batch whose records all lie at or after the fetch offset
+    /// is counted from its header and never decompressed: corrupt record
+    /// data (with a valid CRC) does not fail the fetch.
+    #[test]
+    fn aborted_batch_is_dropped_without_decoding_its_records() {
+        let mut aborted = txn_batch(&[0, 1, 2], PID_A);
+        // Garble the first record's length varint, then fix the CRC.
+        aborted[V2_BATCH_HEADER_SIZE] = 0x7f;
+        let crc = crc32c::crc32c(&aborted[CRC_RANGE_START..]);
+        aborted[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        assert!(
+            decode_batch(&Bytes::from(aborted.clone())).is_err(),
+            "fixture must not decode"
+        );
+
+        let data = concat(&[aborted, marker(3, PID_A, false), plain_batch(&[4])]);
+        let d = read_committed(data, 0, &[(PID_A, 0)]);
+        assert_eq!(offsets_of(&d), vec![4]);
+        assert_eq!(d.aborted_records_dropped, 3);
+    }
+
+    /// The opt-out keeps the behaviour of versions before 0.25 byte for
+    /// byte: aborted records are returned, and so is every marker, as a
+    /// record whose key is the control key.
+    #[test]
+    fn read_uncommitted_returns_aborted_records_and_markers_as_before() {
+        let data = concat(&[
+            txn_batch(&[0, 1], PID_A),
+            plain_batch(&[2]),
+            marker(3, PID_A, false),
+        ]);
+        let mut filter = TransactionFilter::ReadUncommitted;
+        let d = decode_fetch_data(&Bytes::from(data), 0, &mut filter).unwrap();
+        assert_eq!(offsets_of(&d), vec![0, 1, 2, 3]);
+        assert_eq!(d.records[3].key.as_deref(), Some(&[0u8, 0, 0, 0][..]));
+        assert_eq!(d.records[3].value.as_deref(), Some(&[0u8; 6][..]));
+        assert_eq!(d.next_offset, 4);
+        assert_eq!(d.control_records_skipped, 0);
+        assert_eq!(d.aborted_records_dropped, 0);
+        assert!(d.skipped.is_empty());
+    }
+
+    /// Message format v0/v1 batches have no transaction fields: they are
+    /// never filtered.
+    #[test]
+    fn non_v2_batch_header_is_not_read_as_transactional() {
+        let mut batch = txn_batch(&[0], PID_A);
+        batch[MAGIC_OFFSET] = 1;
+        assert!(TransactionHeader::parse(&batch).is_none());
+        batch[MAGIC_OFFSET] = 2;
+        let header = TransactionHeader::parse(&batch).unwrap();
+        assert!(header.transactional && !header.control);
+        assert_eq!(header.producer_id, PID_A);
+        assert_eq!(header.records_count, 1);
+        assert!(TransactionHeader::parse(&batch[..V2_BATCH_HEADER_SIZE - 1]).is_none());
     }
 }

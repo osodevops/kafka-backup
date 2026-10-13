@@ -46,31 +46,40 @@ pub enum StorageBackendConfig {
 
     /// Azure Blob Storage
     ///
-    /// Supports multiple authentication methods:
-    /// 1. Storage Account Key (explicit `account_key`)
-    /// 2. Workload Identity (for AKS deployments)
-    /// 3. DefaultAzureCredential chain (environment, managed identity, CLI)
+    /// Authentication, in order of precedence:
+    /// 1. SAS token (`sas_token`, as copied from the portal)
+    /// 2. Storage account key (`account_key`); with `use_emulator` and no
+    ///    SAS token or key, the well-known emulator key
+    /// 3. Service principal (`client_secret` + `client_id` + `tenant_id`)
+    /// 4. Workload Identity (`use_workload_identity: true` or
+    ///    `AZURE_FEDERATED_TOKEN_FILE` set, for AKS)
+    /// 5. Managed identity via IMDS; `client_id` selects a user-assigned
+    ///    identity, otherwise the system-assigned identity is used
+    ///
+    /// No other source (Azure CLI, other environment variables) is used.
     #[serde(rename = "azure")]
     Azure {
         /// Azure storage account name
         account_name: String,
         /// Azure blob container name
         container_name: String,
-        /// Storage account key (if None, uses DefaultAzureCredential chain)
+        /// Storage account key
         #[serde(default)]
         account_key: Option<String>,
         /// Key prefix for all operations
         #[serde(default)]
         prefix: Option<String>,
         /// Custom endpoint URL for sovereign clouds (Azure Government, Azure China)
-        /// Example: "https://mystorageaccount.blob.core.usgovcloudapi.net"
+        /// Example: "https://mystorageaccount.blob.core.usgovcloudapi.net".
+        /// For the emulator: "http://127.0.0.1:10000/devstoreaccount1".
         #[serde(default)]
         endpoint: Option<String>,
         /// Enable Workload Identity authentication (for AKS)
         /// When true, uses AZURE_FEDERATED_TOKEN_FILE, AZURE_CLIENT_ID, AZURE_TENANT_ID
         #[serde(default)]
         use_workload_identity: Option<bool>,
-        /// Azure AD client ID (for Workload Identity or service principal)
+        /// Azure AD client ID: the service principal or Workload Identity
+        /// app, or the user-assigned managed identity to use with IMDS
         #[serde(default)]
         client_id: Option<String>,
         /// Azure AD tenant ID (for Workload Identity or service principal)
@@ -79,9 +88,20 @@ pub enum StorageBackendConfig {
         /// Client secret (for service principal authentication)
         #[serde(default)]
         client_secret: Option<String>,
-        /// SAS token for shared access signature authentication
+        /// SAS token for shared access signature authentication, as copied
+        /// from the portal (leading `?` optional)
         #[serde(default)]
         sas_token: Option<String>,
+        /// Use the Azure Storage emulator (Azurite): plain HTTP,
+        /// path-style URLs, the well-known emulator key unless
+        /// `account_key` or `sas_token` is set. Without `endpoint`, the
+        /// URL is `AZURITE_BLOB_STORAGE_URL` or `http://127.0.0.1:10000`.
+        #[serde(default)]
+        use_emulator: bool,
+        /// Allow plain-HTTP endpoints. Implied by `use_emulator` and by an
+        /// `endpoint` starting with `http://`.
+        #[serde(default)]
+        allow_http: bool,
     },
 
     /// Google Cloud Storage
@@ -238,6 +258,8 @@ impl StorageBackendConfig {
                     tenant_id: std::env::var("AZURE_TENANT_ID").ok(),
                     client_secret: std::env::var("AZURE_CLIENT_SECRET").ok(),
                     sas_token: std::env::var("AZURE_STORAGE_SAS_TOKEN").ok(),
+                    use_emulator: false,
+                    allow_http: false,
                 })
             }
             "gcs" | "gs" => {
@@ -537,6 +559,49 @@ container_name: kafka-backups
                 assert_eq!(account_name, "mystorageaccount");
                 assert_eq!(container_name, "kafka-backups");
             }
+            _ => panic!("Expected Azure config"),
+        }
+    }
+
+    #[test]
+    fn test_yaml_deserialization_azure_emulator_flags() {
+        let config: StorageBackendConfig = serde_yaml::from_str(
+            r#"
+backend: azure
+account_name: devstoreaccount1
+container_name: kafka-backups
+endpoint: http://127.0.0.1:10000/devstoreaccount1
+use_emulator: true
+allow_http: true
+"#,
+        )
+        .unwrap();
+        match config {
+            StorageBackendConfig::Azure {
+                use_emulator,
+                allow_http,
+                endpoint,
+                ..
+            } => {
+                assert!(use_emulator);
+                assert!(allow_http);
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("http://127.0.0.1:10000/devstoreaccount1")
+                );
+            }
+            _ => panic!("Expected Azure config"),
+        }
+
+        // Both default to false.
+        let config: StorageBackendConfig =
+            serde_yaml::from_str("backend: azure\naccount_name: a\ncontainer_name: c\n").unwrap();
+        match config {
+            StorageBackendConfig::Azure {
+                use_emulator,
+                allow_http,
+                ..
+            } => assert!(!use_emulator && !allow_http),
             _ => panic!("Expected Azure config"),
         }
     }

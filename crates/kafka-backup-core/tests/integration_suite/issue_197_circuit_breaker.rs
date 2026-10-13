@@ -36,10 +36,10 @@ use kafka_backup_core::CircuitBreaker;
 
 use super::sasl_mock_broker::{read_request, write_response};
 
-const TOPIC: &str = "issue-197-topic";
+pub(super) const TOPIC: &str = "issue-197-topic";
 
 #[derive(Clone, Debug)]
-enum ProduceMode {
+pub(super) enum ProduceMode {
     /// Always succeed with a monotonically increasing base offset.
     Ok,
     /// Kill the next `n` Produce requests (TCP RST). Use `n >= 2` to outlast
@@ -47,26 +47,30 @@ enum ProduceMode {
     /// router's produce loop sees the failure and runs eviction.
     KillRemaining(u32),
     /// Return broker error code 7 (REQUEST_TIMED_OUT) — terminal, no retry —
-    /// but only once the peer's produce counter is >= 1, so a test can assert
-    /// on the healthy partition's progress without racing the failure.
-    BrokerErrorAfterPeerProduced(Arc<AtomicUsize>),
+    /// but only once the peer's produce counter reaches the given count, so a
+    /// test can assert on the healthy partition's progress without racing the
+    /// failure.
+    BrokerErrorAfterPeerProduced(Arc<AtomicUsize>, usize),
     /// Answer the next `n` Produce requests with error code 6
     /// (NOT_LEADER_FOR_PARTITION), then succeed. Metadata is unchanged, so
     /// the router refreshes and retries against the same broker.
     NotLeaderRemaining(u32),
 }
 
-struct BrokerMock {
-    addr: std::net::SocketAddr,
+pub(super) struct BrokerMock {
+    pub(super) addr: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,
-    produce_count: Arc<AtomicUsize>,
+    pub(super) produce_count: Arc<AtomicUsize>,
     produce_timestamps_ms: Arc<Mutex<Vec<u64>>>,
     produce_mode: Arc<Mutex<ProduceMode>>,
     handle: JoinHandle<()>,
 }
 
 impl BrokerMock {
-    async fn start(broker_id: i32, peers: Arc<Mutex<Vec<(i32, std::net::SocketAddr)>>>) -> Self {
+    pub(super) async fn start(
+        broker_id: i32,
+        peers: Arc<Mutex<Vec<(i32, std::net::SocketAddr)>>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let connections = Arc::new(AtomicUsize::new(0));
@@ -118,11 +122,11 @@ impl BrokerMock {
         self.connections.load(Ordering::SeqCst)
     }
 
-    fn produce_count(&self) -> usize {
+    pub(super) fn produce_count(&self) -> usize {
         self.produce_count.load(Ordering::SeqCst)
     }
 
-    async fn set_mode(&self, mode: ProduceMode) {
+    pub(super) async fn set_mode(&self, mode: ProduceMode) {
         *self.produce_mode.lock().await = mode;
     }
 
@@ -130,7 +134,7 @@ impl BrokerMock {
         self.produce_timestamps_ms.lock().await.clone()
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         self.handle.abort();
         let _ = self.handle.await;
     }
@@ -176,8 +180,8 @@ async fn serve_broker(
                         write_response(&mut stream, api_key, api_version, correlation_id, &resp)
                             .await;
                     }
-                    ProduceMode::BrokerErrorAfterPeerProduced(peer_count) => {
-                        while peer_count.load(Ordering::SeqCst) == 0 {
+                    ProduceMode::BrokerErrorAfterPeerProduced(peer_count, wanted) => {
+                        while peer_count.load(Ordering::SeqCst) < wanted {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                         let resp = produce_error_response(TOPIC, partition_for(broker_id), 7);
@@ -283,7 +287,7 @@ fn produce_error_response(topic: &str, partition: i32, code: i16) -> ProduceResp
             .with_base_offset(-1)])])
 }
 
-fn client_config(bootstrap: &str) -> KafkaConfig {
+pub(super) fn client_config(bootstrap: &str) -> KafkaConfig {
     KafkaConfig {
         bootstrap_servers: vec![bootstrap.to_string()],
         security: SecurityConfig::default(),
@@ -308,7 +312,7 @@ fn record(offset: i64) -> BackupRecord {
     }
 }
 
-async fn write_two_partition_backup(storage_path: &std::path::Path, backup_id: &str) {
+pub(super) async fn write_two_partition_backup(storage_path: &std::path::Path, backup_id: &str) {
     let storage = create_backend(&StorageBackendConfig::Filesystem {
         path: storage_path.to_path_buf(),
     })
@@ -477,11 +481,14 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
     *peers.lock().await = vec![(1, b1.addr), (2, b2.addr)];
 
     // Partition 0 (broker 1) fails terminally — but only after partition 1
-    // (broker 2) has produced at least once, otherwise the engine can return
-    // the partition-0 error before broker 2 saw any traffic and the "healthy
-    // partition produced" assertion below races the scheduler.
+    // (broker 2) has produced all 4 of its batches (20 records, batches of
+    // 5). A failing partition stops and awaits its siblings (0.25), so a
+    // sibling batch acknowledged after the failure would be recorded as a
+    // success and close the advisory breaker again before `run()` returns;
+    // failing last keeps the breaker's end state deterministic.
     b1.set_mode(ProduceMode::BrokerErrorAfterPeerProduced(
         b2.produce_count.clone(),
+        4,
     ))
     .await;
 
@@ -504,6 +511,7 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
             max_concurrent_partitions: 2,
             produce_batch_size: 5,
             produce_acks: 1,
+            idempotent_producer: false,
             circuit_breaker: CircuitBreakerSettings {
                 enabled: breaker_enabled,
                 failure_threshold: 1,

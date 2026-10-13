@@ -24,6 +24,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use super::KafkaClient;
+use crate::config::IsolationLevel;
 use crate::error::KafkaError;
 use crate::Result;
 
@@ -300,6 +301,17 @@ fn group_coordinator_from_response(
     group_id: &str,
     response: FindCoordinatorResponse,
 ) -> Result<GroupCoordinator> {
+    coordinator_from_response("group", group_id, response)
+}
+
+/// The coordinator for `key` in a FindCoordinator response (v0-v3 single
+/// coordinator, or the v4+ list). `kind` names the key in error messages
+/// ("group", "transactional id").
+pub(super) fn coordinator_from_response(
+    kind: &str,
+    key: &str,
+    response: FindCoordinatorResponse,
+) -> Result<GroupCoordinator> {
     if response.coordinators.is_empty() {
         if response.error_code != 0 {
             return Err(KafkaError::BrokerError {
@@ -309,7 +321,7 @@ fn group_coordinator_from_response(
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| {
                         format!(
-                            "FindCoordinator failed for group {group_id} with error code {}",
+                            "FindCoordinator failed for {kind} {key} with error code {}",
                             response.error_code
                         )
                     }),
@@ -325,7 +337,7 @@ fn group_coordinator_from_response(
 
     let mut fallback = None;
     for coordinator in response.coordinators {
-        let is_match = coordinator.key.as_str() == group_id;
+        let is_match = coordinator.key.as_str() == key;
         if fallback.is_none() {
             fallback = Some(coordinator.clone());
         }
@@ -340,7 +352,7 @@ fn group_coordinator_from_response(
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| {
                         format!(
-                            "FindCoordinator failed for group {group_id} with error code {}",
+                            "FindCoordinator failed for {kind} {key} with error code {}",
                             coordinator.error_code
                         )
                     }),
@@ -356,7 +368,7 @@ fn group_coordinator_from_response(
 
     let coordinator = fallback.ok_or_else(|| {
         KafkaError::Protocol(format!(
-            "FindCoordinator returned no coordinator for group {group_id}"
+            "FindCoordinator returned no coordinator for {kind} {key}"
         ))
     })?;
     if coordinator.error_code != 0 {
@@ -367,7 +379,7 @@ fn group_coordinator_from_response(
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| {
                     format!(
-                        "FindCoordinator failed for group {group_id} with error code {}",
+                        "FindCoordinator failed for {kind} {key} with error code {}",
                         coordinator.error_code
                     )
                 }),
@@ -615,10 +627,16 @@ fn offset_commit_coordinator_error(response: &OffsetCommitResponse) -> Option<i1
         .find(|code| is_coordinator_error_code(*code))
 }
 
-/// Find offsets by timestamp
+/// Find offsets by timestamp.
+///
+/// `isolation` is the ListOffsets `isolation_level`. Timestamp lookups for
+/// offset translation use [`IsolationLevel::ReadUncommitted`] (the broker
+/// answers from the time index either way; only the `-1` "latest" sentinel
+/// differs: the last stable offset under read_committed).
 pub async fn offsets_for_times(
     client: &KafkaClient,
     requests: &[(String, i32, i64)], // (topic, partition, timestamp)
+    isolation: IsolationLevel,
 ) -> Result<Vec<TimestampOffset>> {
     // Group by topic
     let mut topics_map: HashMap<String, Vec<(i32, i64)>> = HashMap::new();
@@ -649,7 +667,7 @@ pub async fn offsets_for_times(
 
     let request = ListOffsetsRequest::default()
         .with_replica_id(kafka_protocol::messages::BrokerId(-1)) // Consumer
-        .with_isolation_level(0) // Read uncommitted
+        .with_isolation_level(isolation.as_protocol())
         .with_topics(topics);
 
     let response: ListOffsetsResponse = client.send_request(ApiKey::ListOffsets, request).await?;

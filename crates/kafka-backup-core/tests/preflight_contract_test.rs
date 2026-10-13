@@ -160,6 +160,10 @@ fn write_legacy_json_segment(
         compressed_size: 0,
         sha256: String::new(),
         uploaded_at: 0,
+        covered_start_offset: None,
+        covered_end_offset: None,
+        control_records_skipped: 0,
+        aborted_records_dropped: 0,
     }
 }
 
@@ -178,6 +182,7 @@ fn write_manifest(dir: &Path, partitions: Vec<PartitionBackup>) -> BackupManifes
             partitions,
         }],
         missing_topics: Vec::new(),
+        isolation_level: None,
     };
     let path = dir.join(BACKUP_ID).join("manifest.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -260,12 +265,22 @@ async fn full_coverage_passes_offset_recovery() {
                 segments: vec![seg0],
                 gaps: Vec::new(),
                 pruned: Vec::new(),
+                covered_through: None,
+                tail_control_records_skipped: 0,
+                tail_aborted_records_dropped: 0,
+                snapshot_end_offset: None,
+                high_watermark_at_capture: None,
             },
             PartitionBackup {
                 partition_id: 1,
                 segments: vec![seg1],
                 gaps: Vec::new(),
                 pruned: Vec::new(),
+                covered_through: None,
+                tail_control_records_skipped: 0,
+                tail_aborted_records_dropped: 0,
+                snapshot_end_offset: None,
+                high_watermark_at_capture: None,
             },
         ],
     );
@@ -301,6 +316,11 @@ async fn missing_headers_fails_recovery_but_warns_without() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -349,6 +369,11 @@ async fn null_valued_tracking_headers_do_not_count_as_coverage() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -381,6 +406,11 @@ async fn partial_coverage_fails_offset_recovery() {
             segments: vec![seg_with, seg_without],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -412,6 +442,11 @@ async fn legacy_json_segments_are_scanned_and_flagged() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -439,6 +474,11 @@ async fn legacy_json_segments_are_scanned_and_flagged() {
             segments: vec![seg2],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
     let report2 = scan(
@@ -462,6 +502,11 @@ async fn empty_backup_is_never_a_positive_pass() {
             segments: vec![],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -512,6 +557,11 @@ async fn corrupt_segment_is_detected() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -542,6 +592,11 @@ async fn missing_segment_object_is_detected() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -601,6 +656,11 @@ async fn string_encoded_headers_count_as_coverage() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -627,6 +687,11 @@ async fn time_window_limits_the_scan_to_restorable_segments() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -660,6 +725,11 @@ async fn unreadable_consumer_group_snapshot_is_not_reported_missing() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
     write_consumer_group_snapshot(dir.path(), r#"{"snapshot_time": 1, "groups": []}"#);
@@ -703,6 +773,11 @@ async fn auto_consumer_groups_requires_snapshot() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -763,6 +838,11 @@ async fn reset_request_that_can_never_act_fails() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -795,6 +875,11 @@ async fn skip_mode_never_blocks_but_warns_loudly() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -817,6 +902,11 @@ async fn auto_mode_without_recovery_reports_indeterminate_without_scanning() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -852,6 +942,11 @@ async fn validate_phase1_headers_returns_structured_report() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -878,6 +973,11 @@ async fn run_all_phases_fails_preflight_before_target_connection() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -909,6 +1009,11 @@ async fn restore_engine_fails_preflight_before_target_connection() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 
@@ -935,6 +1040,11 @@ async fn restore_engine_fails_preflight_before_target_connection() {
             segments: vec![seg2],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
     write_consumer_group_snapshot(
@@ -963,6 +1073,11 @@ async fn dry_run_embeds_preflight_and_blocks_invalid_recovery() {
             segments: vec![seg],
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }],
     );
 

@@ -35,8 +35,10 @@ pub struct SecurityCliArgs {
     #[arg(long)]
     pub security_protocol: Option<String>,
 
-    /// SASL mechanism (PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI).
-    /// Required when security_protocol is SASL_*.
+    /// SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI,
+    /// OAUTHBEARER; case-insensitive, SCRAM-SHA256 / SCRAM-SHA512 also
+    /// accepted). Required when security_protocol is SASL_*.
+    /// OAUTHBEARER needs Kafka Backup Enterprise (licence feature `oauth`).
     #[arg(long, env = "KAFKA_SASL_MECHANISM")]
     pub sasl_mechanism: Option<String>,
 
@@ -141,9 +143,10 @@ fn parse_sasl_mechanism(
         "SCRAM-SHA256" | "SCRAM-SHA-256" => Ok(Some(SaslMechanism::ScramSha256)),
         "SCRAM-SHA512" | "SCRAM-SHA-512" => Ok(Some(SaslMechanism::ScramSha512)),
         "GSSAPI" => Ok(Some(SaslMechanism::Gssapi)),
+        "OAUTHBEARER" => Ok(Some(SaslMechanism::OAuthBearer)),
         other => Err(anyhow::anyhow!(
             "unsupported sasl_mechanism '{other}' — expected one of: \
-             PLAIN, SCRAM-SHA256, SCRAM-SHA512, GSSAPI"
+             PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER"
         )),
     }
 }
@@ -179,17 +182,51 @@ mod tests {
 
     #[test]
     fn scram_variants_parse_with_and_without_intra_hyphen() {
-        for spelling in ["SCRAM-SHA256", "SCRAM-SHA-256", "scram-sha256"] {
+        for (spelling, expected) in [
+            ("SCRAM-SHA-256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA256", SaslMechanism::ScramSha256),
+            ("scram-sha-256", SaslMechanism::ScramSha256),
+            ("scram-sha256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA-512", SaslMechanism::ScramSha512),
+            ("SCRAM-SHA512", SaslMechanism::ScramSha512),
+            ("scram-sha-512", SaslMechanism::ScramSha512),
+            ("scram-sha512", SaslMechanism::ScramSha512),
+        ] {
             let mut args = default_args();
             args.security_protocol = Some("SASL_SSL".to_string());
             args.sasl_mechanism = Some(spelling.to_string());
             let sec = args.into_security_config().unwrap();
-            assert_eq!(
-                sec.sasl_mechanism,
-                Some(SaslMechanism::ScramSha256),
-                "{spelling}"
-            );
+            assert_eq!(sec.sasl_mechanism, Some(expected), "{spelling}");
         }
+    }
+
+    #[test]
+    fn cli_and_yaml_accept_the_same_mechanism_names() {
+        // Every name the YAML parser accepts must work on the command line.
+        for spelling in [
+            "PLAIN",
+            "SCRAM-SHA-256",
+            "SCRAM-SHA256",
+            "SCRAM-SHA-512",
+            "SCRAM-SHA512",
+            "GSSAPI",
+            "OAUTHBEARER",
+        ] {
+            let from_yaml: SaslMechanism =
+                serde_yaml::from_str(spelling).unwrap_or_else(|e| panic!("YAML {spelling}: {e}"));
+            let from_cli = parse_sasl_mechanism(Some(spelling), SecurityProtocol::SaslSsl)
+                .unwrap_or_else(|e| panic!("CLI {spelling}: {e}"));
+            assert_eq!(from_cli, Some(from_yaml), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn unknown_mechanism_error_lists_kafka_names() {
+        let err = parse_sasl_mechanism(Some("SCRAM-SHA-1"), SecurityProtocol::SaslSsl)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SCRAM-SHA-256"), "{err}");
+        assert!(err.contains("SCRAM-SHA-512"), "{err}");
     }
 
     #[test]
@@ -199,6 +236,23 @@ mod tests {
         args.sasl_mechanism = Some("KERBEROS-V5".to_string());
         let err = args.into_security_config().unwrap_err();
         assert!(format!("{err}").contains("unsupported sasl_mechanism"));
+    }
+
+    #[test]
+    fn oauthbearer_parses_then_fails_clearly_without_enterprise() {
+        assert_eq!(
+            parse_sasl_mechanism(Some("oauthbearer"), SecurityProtocol::SaslSsl).unwrap(),
+            Some(SaslMechanism::OAuthBearer)
+        );
+        let mut args = default_args();
+        args.security_protocol = Some("SASL_SSL".to_string());
+        args.sasl_mechanism = Some("OAUTHBEARER".to_string());
+        let err = format!("{}", args.into_security_config().unwrap_err());
+        assert!(
+            err.contains("SASL OAUTHBEARER requires Kafka Backup Enterprise"),
+            "{err}"
+        );
+        assert!(!err.contains("unsupported sasl_mechanism"), "{err}");
     }
 
     #[cfg(feature = "gssapi")]

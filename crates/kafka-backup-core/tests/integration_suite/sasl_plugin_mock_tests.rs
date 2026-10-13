@@ -174,6 +174,9 @@ async fn plugin_reauth_fires_at_80_percent_via_scheduler() {
             auth_bytes: vec![],
             session_lifetime_ms: 60_000,
         },
+        // KIP-368: Kafka only accepts a re-authentication that starts with
+        // a fresh SaslHandshake on the authenticated connection.
+        Exchange::HandshakeSuccess,
         Exchange::AuthenticateSuccess {
             auth_bytes: vec![],
             session_lifetime_ms: 60_000,
@@ -225,6 +228,11 @@ async fn plugin_reauth_fires_at_80_percent_via_scheduler() {
         captured.authenticate_payloads.len() >= 2,
         "reauth must send a second SaslAuthenticate frame (got {})",
         captured.authenticate_payloads.len()
+    );
+    assert!(
+        captured.handshakes >= 2,
+        "reauth must start with a fresh SaslHandshake (got {})",
+        captured.handshakes
     );
 
     mock.shutdown().await;

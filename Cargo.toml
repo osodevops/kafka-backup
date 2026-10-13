@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.1"
+version = "0.25.0"
 edition = "2021"
 license = "MIT"
 authors = ["OSO"]
@@ -24,6 +24,8 @@ kafka-protocol = "0.18"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
+# Cooperative cancellation for graceful backup shutdown
+tokio-util = "0.7"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -41,7 +43,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 thiserror = "2"
@@ -102,6 +104,9 @@ uuid = { version = "1", features = ["v4"] }
 
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature in core/cli
 libgssapi = "0.9"
+
+# Fault injection (core `failpoints` feature; tests only)
+fail = "0.5"
 
 # Testing
 testcontainers = "0.27"

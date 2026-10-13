@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::config::IsolationLevel;
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Top-level backup manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
@@ -32,6 +38,13 @@ pub struct BackupManifest {
     /// is `warn` (issue #167). Empty — and omitted from JSON — otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_topics: Vec<String>,
+
+    /// Transaction isolation of the most recent backup run
+    /// (`backup.isolation_level`). `None` for manifests written before 0.25,
+    /// which always read uncommitted: their segments can hold records of
+    /// aborted transactions and transaction markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_level: Option<IsolationLevel>,
 }
 
 impl BackupManifest {
@@ -45,6 +58,7 @@ impl BackupManifest {
             compression: "zstd".to_string(),
             topics: Vec::new(),
             missing_topics: Vec::new(),
+            isolation_level: None,
         }
     }
 
@@ -69,6 +83,26 @@ impl BackupManifest {
             .flat_map(|t| &t.partitions)
             .flat_map(|p| &p.segments)
             .map(|s| s.record_count)
+            .sum()
+    }
+
+    /// Transaction markers a `read_committed` backup passed over, across all
+    /// partitions (segments and trailing ranges).
+    pub fn total_control_records_skipped(&self) -> u64 {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(PartitionBackup::control_records_skipped)
+            .sum()
+    }
+
+    /// Records of aborted transactions a `read_committed` backup dropped,
+    /// across all partitions (segments and trailing ranges).
+    pub fn total_aborted_records_dropped(&self) -> u64 {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(PartitionBackup::aborted_records_dropped)
             .sum()
     }
 
@@ -169,6 +203,11 @@ impl TopicBackup {
                 segments: Vec::new(),
                 gaps: Vec::new(),
                 pruned: Vec::new(),
+                covered_through: None,
+                tail_control_records_skipped: 0,
+                tail_aborted_records_dropped: 0,
+                snapshot_end_offset: None,
+                high_watermark_at_capture: None,
             });
         }
         self.partitions
@@ -202,12 +241,98 @@ pub struct PartitionBackup {
     /// `start_offset`; omitted from JSON when empty (absent before 0.21).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<PrunedRange>,
+
+    /// Highest source offset this backup has accounted for (inclusive),
+    /// including a tail that holds no record — trailing transaction markers
+    /// or compacted-away offsets after the last segment. Only ever advanced
+    /// after the segments (or gaps) covering everything up to it were
+    /// written and listed, so it is a safe resume point.
+    ///
+    /// Absent from manifests written before 0.25 (reads as `None`; the
+    /// segments' own ranges then give the reach — see [`reach`](Self::reach)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_through: Option<i64>,
+
+    /// Transaction markers a `read_committed` backup passed over in the
+    /// trailing range after the last segment (through
+    /// [`covered_through`](Self::covered_through)). The next segment's
+    /// covered range absorbs that range and takes these counts over into its
+    /// own [`SegmentMetadata::control_records_skipped`]. 0 (and omitted)
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tail_control_records_skipped: u64,
+
+    /// Records of aborted transactions dropped in the same trailing range
+    /// (see [`tail_control_records_skipped`](Self::tail_control_records_skipped)).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tail_aborted_records_dropped: u64,
+
+    /// Snapshot runs (`stop_at_current_offsets`) only: the offset the most
+    /// recent snapshot captured as its end (exclusive) — the last stable
+    /// offset under `read_committed`, the high watermark under
+    /// `read_uncommitted`. Not recorded for a partition that was empty at
+    /// capture time. Absent before 0.25.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_end_offset: Option<i64>,
+
+    /// Snapshot runs only: the partition's high watermark when that snapshot
+    /// was captured. Above [`snapshot_end_offset`](Self::snapshot_end_offset)
+    /// when transactions were open at capture time: their records, and any
+    /// record after them, are left for a later run. Absent before 0.25.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_watermark_at_capture: Option<i64>,
 }
 
 impl PartitionBackup {
+    /// Transaction markers a `read_committed` backup passed over in this
+    /// partition: the segments' counts plus the trailing range's.
+    pub fn control_records_skipped(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.control_records_skipped)
+            .sum::<u64>()
+            + self.tail_control_records_skipped
+    }
+
+    /// Records of aborted transactions a `read_committed` backup dropped in
+    /// this partition: the segments' counts plus the trailing range's.
+    pub fn aborted_records_dropped(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.aborted_records_dropped)
+            .sum::<u64>()
+            + self.tail_aborted_records_dropped
+    }
+
     /// Get the last offset backed up for this partition
     pub fn last_offset(&self) -> Option<i64> {
         self.segments.iter().map(|s| s.end_offset).max()
+    }
+
+    /// The durable reach of this partition: the highest source offset that
+    /// is accounted for by the manifest — inside a listed segment's covered
+    /// range, a recorded [`OffsetGap`], a [`PrunedRange`], or
+    /// [`covered_through`](Self::covered_through). A backup resumes at
+    /// `reach + 1`. `None` when the partition accounts for nothing yet.
+    pub fn reach(&self) -> Option<i64> {
+        let explicit = self.explicit_reach();
+        match (explicit, self.covered_through) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Like [`reach`](Self::reach) but over the explicit intervals only
+    /// (segments, gaps, pruned ranges), ignoring `covered_through`. A new
+    /// run starts its first segment's covered range here + 1 so the
+    /// intervals stay contiguous even when the previous run ended on a
+    /// coverage-only advance.
+    pub fn explicit_reach(&self) -> Option<i64> {
+        let segments = self.segments.iter().map(SegmentMetadata::covered_end);
+        // OffsetGap.end_offset is exclusive; PrunedRange.end_offset inclusive.
+        let gaps = self.gaps.iter().map(|g| g.end_offset - 1);
+        let pruned = self.pruned.iter().map(|p| p.end_offset);
+        segments.chain(gaps).chain(pruned).max()
     }
 
     /// Add a new segment
@@ -247,6 +372,9 @@ impl PartitionBackup {
 
 /// A contiguous range of offsets deliberately deleted from a backup by
 /// retention (`kafka-backup prune` or `backup.retention`).
+///
+/// The bounds are the pruned segments' covered ranges (since 0.25; their
+/// first and last record offsets before that).
 ///
 /// The segments covering `[start_offset, end_offset]` were captured and then
 /// removed on purpose; the range is recorded so `describe`/`validate` can
@@ -341,12 +469,18 @@ pub enum OffsetGapReason {
     /// its log start offset had advanced past it: the records were deleted by
     /// retention or `DeleteRecords` before the backup reached them.
     OffsetOutOfRange,
+    /// A checkpoint written by an older version claimed these offsets were
+    /// backed up, but no listed segment holds them (they were buffered or
+    /// uploaded but never recorded in a saved manifest). The backup went
+    /// back to re-read them and the source had already deleted them.
+    ResumeBeyondDurable,
 }
 
 impl std::fmt::Display for OffsetGapReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OffsetGapReason::OffsetOutOfRange => write!(f, "offset_out_of_range"),
+            OffsetGapReason::ResumeBeyondDurable => write!(f, "resume_beyond_durable"),
         }
     }
 }
@@ -391,9 +525,52 @@ pub struct SegmentMetadata {
     /// `end_timestamp` (which is producer record time) when present.
     #[serde(default)]
     pub uploaded_at: i64,
+
+    /// First source offset this segment accounts for (inclusive). Can be
+    /// below `start_offset` when the offsets before the first record held
+    /// no record (compacted away, transaction markers). `None` for segments
+    /// written before 0.25: `start_offset` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_start_offset: Option<i64>,
+
+    /// Last source offset this segment accounts for (inclusive) — the fetch
+    /// position when it was sealed, minus one. Can be above `end_offset`
+    /// for the same reasons. `None` before 0.25: `end_offset` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_end_offset: Option<i64>,
+
+    /// Transaction markers (commit/abort control records) inside the covered
+    /// range that a `read_committed` backup passed over: they hold no data
+    /// and are not archived. 0 (and omitted) for `read_uncommitted` backups,
+    /// which archive markers as records, and for segments written before
+    /// 0.25.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub control_records_skipped: u64,
+
+    /// Records of aborted transactions inside the covered range that a
+    /// `read_committed` backup dropped. 0 (and omitted) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub aborted_records_dropped: u64,
 }
 
 impl SegmentMetadata {
+    /// First offset accounted for by this segment (see
+    /// [`covered_start_offset`](Self::covered_start_offset)).
+    pub fn covered_start(&self) -> i64 {
+        self.covered_start_offset.unwrap_or(self.start_offset)
+    }
+
+    /// Last offset accounted for by this segment (see
+    /// [`covered_end_offset`](Self::covered_end_offset)).
+    pub fn covered_end(&self) -> i64 {
+        self.covered_end_offset.unwrap_or(self.end_offset)
+    }
+
+    /// Whether the segment records its covered range (written by 0.25+).
+    pub fn has_covered_range(&self) -> bool {
+        self.covered_start_offset.is_some() && self.covered_end_offset.is_some()
+    }
+
     /// Check if this segment overlaps with a time window
     pub fn overlaps_time_window(&self, start: Option<i64>, end: Option<i64>) -> bool {
         let segment_start = self.start_timestamp;
@@ -505,6 +682,50 @@ pub struct RestoreCheckpoint {
 
     /// Restore configuration hash (to detect config changes)
     pub config_hash: String,
+
+    /// Identifier of the restore: names the copy in backup storage
+    /// (`{backup_id}/restore-checkpoints/{restore_id}.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_id: Option<String>,
+
+    /// Acknowledged progress per source partition (key
+    /// [`RestoreCheckpoint::partition_key`]), for resuming inside a
+    /// segment and reconciling the target's high watermark on resume.
+    #[serde(default)]
+    pub partitions: std::collections::BTreeMap<String, PartitionRestoreProgress>,
+
+    /// `true` once the run that wrote the checkpoint stopped on its own
+    /// (finished, or returned an error) with nothing in flight. `false`
+    /// while a run is producing: a checkpoint left that way was written by
+    /// a run that was killed, whose last requests may still land.
+    #[serde(default)]
+    pub stopped_cleanly: bool,
+}
+
+/// Acknowledged restore progress of one source partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionRestoreProgress {
+    /// Source topic.
+    pub source_topic: String,
+    /// Source partition.
+    pub source_partition: i32,
+    /// Target topic.
+    pub target_topic: String,
+    /// Target partition.
+    pub target_partition: i32,
+    /// Source offset of the last record the target acknowledged (`-1`:
+    /// none yet). Records at or below it are not produced again.
+    pub last_source_offset_acked: i64,
+    /// The target partition's high watermark after that acknowledgement
+    /// (when nothing was acknowledged yet: before the restore produced to
+    /// it). A resumed run compares the target's high watermark with it.
+    pub target_hw_after_ack: i64,
+    /// Records acknowledged.
+    #[serde(default)]
+    pub records_acked: u64,
+    /// Bytes (key + value) acknowledged.
+    #[serde(default)]
+    pub bytes_acked: u64,
 }
 
 impl RestoreCheckpoint {
@@ -520,7 +741,39 @@ impl RestoreCheckpoint {
             records_restored: 0,
             bytes_restored: 0,
             config_hash,
+            restore_id: None,
+            partitions: std::collections::BTreeMap::new(),
+            stopped_cleanly: false,
         }
+    }
+
+    /// Key of a source partition in [`RestoreCheckpoint::partitions`].
+    pub fn partition_key(source_topic: &str, source_partition: i32) -> String {
+        format!("{source_topic}:{source_partition}")
+    }
+
+    /// Record a batch the target acknowledged: `records` records and
+    /// `bytes` bytes up to source offset `last_source_offset`, after which
+    /// the target partition's high watermark is `target_hw_after_ack`.
+    pub fn record_ack(
+        &mut self,
+        progress: &PartitionRestoreProgress,
+        last_source_offset: i64,
+        target_hw_after_ack: i64,
+        records: u64,
+        bytes: u64,
+    ) {
+        let key = Self::partition_key(&progress.source_topic, progress.source_partition);
+        let entry = self
+            .partitions
+            .entry(key)
+            .or_insert_with(|| progress.clone());
+        entry.last_source_offset_acked = entry.last_source_offset_acked.max(last_source_offset);
+        entry.target_hw_after_ack = target_hw_after_ack;
+        entry.records_acked += records;
+        entry.bytes_acked += bytes;
+        self.records_restored += records;
+        self.bytes_restored += bytes;
     }
 
     /// Mark a segment as completed
@@ -609,6 +862,71 @@ pub struct RestoreReport {
     /// Name of the record filter that ran, when one was configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_filter: Option<String>,
+
+    /// Topic configuration keys left out of the restore
+    /// (`restore.unsupported_config_policy: skip`): not reported by the
+    /// target, read-only on it, or rejected by it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_configs_skipped: Vec<SkippedTopicConfig>,
+
+    /// Topic configuration values changed to fit the `restore.target_profile`
+    /// limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_configs_adjusted: Vec<AdjustedTopicConfig>,
+
+    /// Whether records were produced with an idempotent producer (a
+    /// producer id and per-partition sequence numbers, so retries were
+    /// de-duplicated by the broker).
+    #[serde(default)]
+    pub idempotent_producer: bool,
+
+    /// Set when `restore.idempotent_producer` was requested but the target
+    /// cluster denied or did not support it: why the restore fell back to
+    /// producing without a producer id (retries may have duplicated
+    /// records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_producer_fallback: Option<String>,
+}
+
+/// Why a topic configuration key was not restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicConfigSkipReason {
+    /// The target's DescribeConfigs does not list the key (for example
+    /// `message.format.version` on Kafka 4.x).
+    NotReportedByTarget,
+    /// The target lists the key as read-only.
+    ReadOnly,
+    /// The target rejected the key (see `message`).
+    Rejected,
+}
+
+/// A topic configuration key the restore left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedTopicConfig {
+    /// Target topic.
+    pub topic: String,
+    pub name: String,
+    /// The value from the backup (or `topic_config_overrides`).
+    pub value: String,
+    pub reason: TopicConfigSkipReason,
+    /// The broker's error, for `rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A topic configuration value the restore changed to fit the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdjustedTopicConfig {
+    /// Target topic.
+    pub topic: String,
+    pub name: String,
+    /// The value from the backup (or `topic_config_overrides`).
+    pub value: String,
+    /// The value applied instead.
+    pub applied: String,
+    /// The limit, e.g. `Confluent Cloud allows 1 to 2`.
+    pub limit: String,
 }
 
 /// Per-topic restore report
@@ -636,6 +954,16 @@ pub struct TopicRestoreReport {
     /// Records tombstoned by the configured record filter for this topic.
     #[serde(default)]
     pub records_tombstoned_by_filter: u64,
+
+    /// Confluent schema IDs rewritten in this topic's keys and values
+    /// (`restore.rewrite_schema_ids`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_ids_rewritten: u64,
+
+    /// Keys and values that start with the Confluent magic byte but carry a
+    /// schema ID absent from `restore.schema_id_mapping`, restored unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_ids_unmapped: u64,
 }
 
 /// Per-partition restore report
@@ -703,6 +1031,39 @@ pub struct OffsetMapping {
     /// Mapping creation timestamp
     #[serde(default)]
     pub created_at: i64,
+}
+
+/// How [`OffsetMapping::resolve_target_offset`] derived a target offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OffsetLookupPrecision {
+    /// From the per-record mapping: the target offset of the first restored
+    /// record at or after the source offset (one past the last restored
+    /// record when there is none). Exact for every kind of gap in the
+    /// restored source offsets.
+    Exact,
+    /// No per-record mapping for the partition, so the target offset was
+    /// linearly interpolated over the restored offset range. Approximate:
+    /// any gap inside the range makes it land early or late.
+    Interpolated,
+}
+
+/// A target offset found by [`OffsetMapping::resolve_target_offset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TargetOffsetLookup {
+    /// Offset on the target partition a consumer should resume from.
+    pub target_offset: i64,
+    /// Whether `target_offset` is exact or interpolated.
+    pub precision: OffsetLookupPrecision,
+}
+
+impl TargetOffsetLookup {
+    /// `true` when the offset came from the per-record mapping.
+    pub fn is_exact(&self) -> bool {
+        self.precision == OffsetLookupPrecision::Exact
+    }
 }
 
 /// Individual offset pair for detailed mapping
@@ -923,55 +1284,110 @@ impl OffsetMapping {
         }
     }
 
-    /// Lookup target offset for a given source offset
-    /// Uses detailed mappings for exact lookup, falls back to linear interpolation
+    /// Translate a committed source offset to the target offset a consumer
+    /// should resume from, saying whether the answer is exact.
+    ///
+    /// A committed offset `S` means "the next record to read is `S`". With a
+    /// per-record mapping the answer is the target offset of the first
+    /// restored record whose source offset is `>= S`, or one past the last
+    /// restored record when every restored record precedes `S` (the group had
+    /// consumed everything that was restored). That is the number of
+    /// restored records preceding `S` counted from the first target offset,
+    /// so it stays exact whatever made the restored source offsets
+    /// non-contiguous: compaction holes, records dropped by a record filter,
+    /// transaction markers and aborted records, or retention. It never
+    /// resumes a group past a record it has not consumed. When the same
+    /// source offset was restored twice (a segment re-produced after a
+    /// resumed restore) the earliest copy is used, so nothing is skipped.
+    ///
+    /// Without a per-record mapping for the partition the target offset is
+    /// linearly interpolated over the restored range and reported as
+    /// [`OffsetLookupPrecision::Interpolated`], with a warning: gaps inside
+    /// the range make it land early or late. Offsets outside the range clamp
+    /// to the first target offset or one past the last.
+    ///
+    /// Returns `None` when the partition has no target offsets at all.
+    pub fn resolve_target_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        source_offset: i64,
+    ) -> Option<TargetOffsetLookup> {
+        let key = format!("{}/{}", topic, partition);
+
+        // Per-record mapping. Kept sorted by source offset (stable for equal
+        // source offsets) by `add_detailed_batch`, so this is a binary search.
+        if let Some(detailed) = self.detailed_mappings.get(&key).filter(|d| !d.is_empty()) {
+            let idx = detailed.partition_point(|p| p.source_offset < source_offset);
+            let target_offset = match detailed.get(idx) {
+                Some(next) => next.target_offset,
+                None => detailed[detailed.len() - 1].target_offset + 1,
+            };
+            return Some(TargetOffsetLookup {
+                target_offset,
+                precision: OffsetLookupPrecision::Exact,
+            });
+        }
+
+        // Approximate fallback: linear interpolation over the range.
+        let entry = self.entries.get(&key)?;
+        let (Some(target_first), Some(target_last)) =
+            (entry.target_first_offset, entry.target_last_offset)
+        else {
+            return None;
+        };
+        let target_offset = if source_offset <= entry.source_first_offset {
+            target_first
+        } else if source_offset > entry.source_last_offset {
+            target_last + 1
+        } else {
+            let source_range = (entry.source_last_offset - entry.source_first_offset) as f64;
+            let position = (source_offset - entry.source_first_offset) as f64 / source_range;
+            target_first + (position * (target_last - target_first) as f64).floor() as i64
+        };
+        tracing::warn!(
+            "Offset mapping for {}:{} has no per-record entries; source offset {} \
+             maps to target offset {} by linear interpolation, which is approximate \
+             when the restored offsets have gaps",
+            topic,
+            partition,
+            source_offset,
+            target_offset
+        );
+        Some(TargetOffsetLookup {
+            target_offset,
+            precision: OffsetLookupPrecision::Interpolated,
+        })
+    }
+
+    /// Precision a lookup on this partition would have: `Exact` with a
+    /// per-record mapping, `Interpolated` with only a range that has target
+    /// offsets, `None` when there are no target offsets for it.
+    pub fn lookup_precision(&self, topic: &str, partition: i32) -> Option<OffsetLookupPrecision> {
+        let key = format!("{}/{}", topic, partition);
+        if self
+            .detailed_mappings
+            .get(&key)
+            .is_some_and(|d| !d.is_empty())
+        {
+            return Some(OffsetLookupPrecision::Exact);
+        }
+        let entry = self.entries.get(&key)?;
+        (entry.target_first_offset.is_some() && entry.target_last_offset.is_some())
+            .then_some(OffsetLookupPrecision::Interpolated)
+    }
+
+    /// Target offset for a committed source offset; see
+    /// [`Self::resolve_target_offset`], which also says whether the result
+    /// is exact or interpolated.
     pub fn lookup_target_offset(
         &self,
         topic: &str,
         partition: i32,
         source_offset: i64,
     ) -> Option<i64> {
-        let key = format!("{}/{}", topic, partition);
-
-        // First try detailed mapping for exact match
-        if let Some(detailed) = self.detailed_mappings.get(&key) {
-            // Binary search for the offset
-            if let Ok(idx) = detailed.binary_search_by_key(&source_offset, |p| p.source_offset) {
-                return Some(detailed[idx].target_offset);
-            }
-
-            // Find nearest offset that's <= source_offset
-            let nearest = detailed
-                .iter()
-                .filter(|p| p.source_offset <= source_offset)
-                .max_by_key(|p| p.source_offset);
-
-            if let Some(nearest) = nearest {
-                // Calculate offset delta
-                let delta = source_offset - nearest.source_offset;
-                return Some(nearest.target_offset + delta);
-            }
-        }
-
-        // Fall back to range-based interpolation
-        if let Some(entry) = self.entries.get(&key) {
-            if let (Some(target_first), Some(target_last)) =
-                (entry.target_first_offset, entry.target_last_offset)
-            {
-                // Linear interpolation within the range
-                let source_range = entry.source_last_offset - entry.source_first_offset;
-                if source_range > 0 {
-                    let target_range = target_last - target_first;
-                    let position =
-                        (source_offset - entry.source_first_offset) as f64 / source_range as f64;
-                    return Some(target_first + (position * target_range as f64) as i64);
-                } else {
-                    return Some(target_first);
-                }
-            }
-        }
-
-        None
+        self.resolve_target_offset(topic, partition, source_offset)
+            .map(|found| found.target_offset)
     }
 
     /// Find the nearest offset by timestamp
@@ -1285,9 +1701,10 @@ mod tests {
         let target = mapping.lookup_target_offset("orders", 0, 1);
         assert_eq!(target, Some(5001));
 
-        // Offset beyond range extrapolates from nearest (999 - 2 + 5002 = 5999)
+        // Offset beyond the restored range resumes one past the last
+        // restored record (never extrapolated past the target's log end)
         let target = mapping.lookup_target_offset("orders", 0, 999);
-        assert_eq!(target, Some(5999));
+        assert_eq!(target, Some(5003));
 
         // Non-existent topic/partition returns None
         let target = mapping.lookup_target_offset("unknown", 0, 1);
@@ -1657,6 +2074,305 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Source -> target lookup across gaps
+    //
+    // A committed consumer offset S means "the next record to read is S".
+    // On the target, that is the first restored record whose source offset
+    // is >= S; when every restored record is below S, it is one past the
+    // last restored record. Equivalently: target base + the number of
+    // restored records that precede S. Gaps in the restored source offsets
+    // (compaction holes, record-filter drops, transaction markers, aborted
+    // records) must never push the result past a record the group has not
+    // consumed yet.
+    // ------------------------------------------------------------------
+
+    /// Simulate a restore: `restored` source offsets (ascending) are produced
+    /// densely to the target starting at `base`, recorded the way the restore
+    /// engine records them (one `add_detailed_batch` per produce batch).
+    fn restore_sim(restored: &[i64], base: i64, batch: usize) -> OffsetMapping {
+        let mut m = OffsetMapping::new();
+        let pairs: Vec<OffsetPair> = restored
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| OffsetPair {
+                source_offset: s,
+                target_offset: base + i as i64,
+                timestamp: 1_700_000_000_000 + s,
+            })
+            .collect();
+        for chunk in pairs.chunks(batch.max(1)) {
+            m.add_detailed_batch("t", 0, chunk.to_vec());
+        }
+        m
+    }
+
+    /// Ground truth: the target offset a consumer committed at source `s`
+    /// must resume from.
+    fn expected_target(restored: &[i64], base: i64, s: i64) -> i64 {
+        base + restored.iter().filter(|&&r| r < s).count() as i64
+    }
+
+    #[test]
+    fn lookup_inside_compaction_gap_resumes_at_next_restored_record() {
+        // Source 0..=4 and 10..=14 restored; 5..=9 compacted away.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        // Inside the hole: the next record to read is source 10 = target 5.
+        // The old nearest-lower + delta rule gave 4 + 3 = 7, skipping
+        // source 10 and 11.
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 9), Some(5));
+    }
+
+    #[test]
+    fn lookup_at_gap_start_resumes_at_next_restored_record() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 5), Some(5));
+    }
+
+    #[test]
+    fn lookup_right_after_gap_is_exact() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 11), Some(6));
+    }
+
+    #[test]
+    fn lookup_at_end_of_log_is_one_past_last_restored_record() {
+        // Group fully caught up: committed offset = source high watermark.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 100, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 15), Some(110));
+    }
+
+    #[test]
+    fn lookup_beyond_end_does_not_overshoot_the_restored_log() {
+        // Records 15..=19 existed on the source (e.g. aborted transaction
+        // + marker, or produced after the snapshot) but were not restored.
+        // The old rule gave 109 + (20 - 14) = 115: five offsets past the
+        // target's log end.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 100, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(110));
+        assert_eq!(m.lookup_target_offset("t", 0, 1_000_000), Some(110));
+    }
+
+    #[test]
+    fn lookup_before_first_restored_record_starts_at_first_target() {
+        // Retention purged 0..=49 before the backup; group committed at 10.
+        let restored: Vec<i64> = (50..60).collect();
+        let m = restore_sim(&restored, 7, 100);
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(7));
+        assert_eq!(m.lookup_target_offset("t", 0, 50), Some(7));
+    }
+
+    #[test]
+    fn lookup_counts_preceding_records_across_many_compacted_holes() {
+        // Deterministic pseudo-random survivors (~40% kept) over 0..500,
+        // recorded in uneven produce batches.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut restored = Vec::new();
+        for s in 0..500i64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if (state >> 33) % 10 < 4 {
+                restored.push(s);
+            }
+        }
+        assert!(restored.len() > 100);
+        let m = restore_sim(&restored, 42, 7);
+        for s in -1..=505i64 {
+            assert_eq!(
+                m.lookup_target_offset("t", 0, s),
+                Some(expected_target(&restored, 42, s)),
+                "source offset {s}"
+            );
+        }
+    }
+
+    /// The source partition of a read_committed backup: producer A commits
+    /// one transaction and aborts another, producer B aborts one and commits
+    /// one, with plain records in between. Only the committed and plain
+    /// records are restored.
+    ///
+    /// ```text
+    ///  0 n0   1 a0   2 a1   3 n1   4 b0 (aborted)   5 a2   6 COMMIT(A)
+    ///  7 b1 (aborted)   8 ABORT(B)   9 n2   10 a3 (aborted)   11 ABORT(A)
+    /// 12 b2  13 COMMIT(B)  14 n3   — high watermark 15
+    /// ```
+    fn read_committed_restore() -> (Vec<i64>, OffsetMapping) {
+        let restored = vec![0, 1, 2, 3, 5, 9, 12, 14];
+        let mapping = restore_sim(&restored, 0, 3);
+        (restored, mapping)
+    }
+
+    #[test]
+    fn committed_offset_at_a_transaction_marker_resumes_at_the_next_restored_record() {
+        let (restored, m) = read_committed_restore();
+        // At the COMMIT marker 6: the group consumed through 5 (a2); next
+        // is n2 (source 9) = target 5.
+        assert_eq!(m.lookup_target_offset("t", 0, 6), Some(5));
+        // At the ABORT markers 8 and 11, and the COMMIT marker 13.
+        assert_eq!(m.lookup_target_offset("t", 0, 8), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 11), Some(6)); // b2
+        assert_eq!(m.lookup_target_offset("t", 0, 13), Some(7)); // n3
+        for s in [6, 8, 11, 13] {
+            assert_eq!(
+                m.lookup_target_offset("t", 0, s),
+                Some(expected_target(&restored, 0, s))
+            );
+        }
+    }
+
+    #[test]
+    fn committed_offset_just_after_a_marker_resumes_at_the_next_restored_record() {
+        let (_, m) = read_committed_restore();
+        // marker + 1 = 7 is an aborted record: still n2 (target 5).
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(5));
+        // ABORT(B) + 1 = 9 is restored: exact.
+        assert_eq!(m.lookup_target_offset("t", 0, 9), Some(5));
+        // COMMIT(B) + 1 = 14 is restored: exact.
+        assert_eq!(m.lookup_target_offset("t", 0, 14), Some(7));
+    }
+
+    #[test]
+    fn committed_offset_inside_an_aborted_transaction_resumes_at_the_next_restored_record() {
+        let (_, m) = read_committed_restore();
+        // b0 (4) was aborted: next is a2 (5) = target 4.
+        assert_eq!(m.lookup_target_offset("t", 0, 4), Some(4));
+        // a3 (10) was aborted: next is b2 (12) = target 6.
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(6));
+    }
+
+    #[test]
+    fn committed_offset_at_the_lso_or_high_watermark_resumes_at_the_target_log_end() {
+        let (_, m) = read_committed_restore();
+        // Caught up: committed at the high watermark (= LSO, no open
+        // transaction) → one past the last restored record.
+        assert_eq!(m.lookup_target_offset("t", 0, 15), Some(8));
+        // A hanging transaction from 15 kept the backup at LSO 15 while the
+        // high watermark reached 20; a group committed at 20 (it read the
+        // plain records after the open transaction with read_uncommitted)
+        // resumes at the target's log end, never past it.
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(8));
+        assert_eq!(
+            m.resolve_target_offset("t", 0, 20).unwrap().precision,
+            OffsetLookupPrecision::Exact
+        );
+    }
+
+    #[test]
+    fn lookup_record_filter_drops_resume_at_next_survivor() {
+        // Source 0..=9; a record filter dropped 3, 4 and the tail 8, 9.
+        // Dropped offsets are simply absent from the mapping.
+        let restored = vec![0, 1, 2, 5, 6, 7];
+        let m = restore_sim(&restored, 0, 2);
+        assert_eq!(m.lookup_target_offset("t", 0, 3), Some(3)); // source 5
+        assert_eq!(m.lookup_target_offset("t", 0, 4), Some(3));
+        assert_eq!(m.lookup_target_offset("t", 0, 5), Some(3));
+        assert_eq!(m.lookup_target_offset("t", 0, 8), Some(6)); // log end
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(6)); // HW
+    }
+
+    #[test]
+    fn lookup_reports_exact_precision_for_record_mappings() {
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 100);
+        let found = m.resolve_target_offset("t", 0, 7).unwrap();
+        assert_eq!(found.target_offset, 5);
+        assert_eq!(found.precision, OffsetLookupPrecision::Exact);
+        assert!(found.is_exact());
+        assert_eq!(
+            m.lookup_precision("t", 0),
+            Some(OffsetLookupPrecision::Exact)
+        );
+    }
+
+    #[test]
+    fn lookup_without_record_mappings_interpolates_and_says_so() {
+        // Range-only mapping (e.g. built by hand, or a migration seed map):
+        // the only option left is an approximation.
+        let mut m = OffsetMapping::new();
+        m.add("t", 0, 0, Some(5000), 1);
+        m.update_range("t", 0, 100, Some(5100), 2);
+
+        let mid = m.resolve_target_offset("t", 0, 50).unwrap();
+        assert_eq!(mid.target_offset, 5050);
+        assert_eq!(mid.precision, OffsetLookupPrecision::Interpolated);
+        assert!(!mid.is_exact());
+        assert_eq!(
+            m.lookup_precision("t", 0),
+            Some(OffsetLookupPrecision::Interpolated)
+        );
+
+        // Never extrapolated outside the restored range: before the first
+        // restored record -> first target; past the last -> one past it.
+        assert_eq!(m.lookup_target_offset("t", 0, -5), Some(5000));
+        assert_eq!(m.lookup_target_offset("t", 0, 0), Some(5000));
+        assert_eq!(m.lookup_target_offset("t", 0, 100), Some(5100));
+        assert_eq!(m.lookup_target_offset("t", 0, 101), Some(5101));
+        assert_eq!(m.lookup_target_offset("t", 0, 10_000), Some(5101));
+    }
+
+    #[test]
+    fn lookup_record_mappings_win_over_the_range() {
+        // Both exist for the partition (the normal restore case): the
+        // record-level answer is used, never the interpolation.
+        let restored: Vec<i64> = (0..5).chain(10..15).collect();
+        let m = restore_sim(&restored, 0, 3);
+        assert!(m.entries.contains_key("t/0"));
+        // Interpolation over source 0..=14 -> target 0..=9 would give 4 for
+        // source 7 (rounded down); the exact answer is 5.
+        let found = m.resolve_target_offset("t", 0, 7).unwrap();
+        assert_eq!(found.target_offset, 5);
+        assert_eq!(found.precision, OffsetLookupPrecision::Exact);
+    }
+
+    #[test]
+    fn lookup_unknown_partition_is_none() {
+        let m = restore_sim(&[0, 1, 2], 0, 10);
+        assert_eq!(m.resolve_target_offset("t", 1, 0), None);
+        assert_eq!(m.resolve_target_offset("other", 0, 0), None);
+        assert_eq!(m.lookup_precision("t", 1), None);
+
+        // Range without target offsets (built from a manifest only).
+        let mut ranged = OffsetMapping::new();
+        ranged.add("t", 0, 0, None, 1);
+        ranged.update_range("t", 0, 10, None, 2);
+        assert_eq!(ranged.lookup_target_offset("t", 0, 5), None);
+        assert_eq!(ranged.lookup_precision("t", 0), None);
+    }
+
+    #[test]
+    fn lookup_after_resume_reproduced_segment_does_not_skip() {
+        // Source 0..=9 -> target 0..=9, then a resumed restore re-produced
+        // source 5..=9 (target 10..=14) before continuing with 10..=19
+        // (target 15..=24). Resuming a group at source 7 must not skip
+        // anything: the earliest copy is used.
+        let mut m = OffsetMapping::new();
+        let batch = |range: std::ops::Range<i64>, base: i64| -> Vec<OffsetPair> {
+            range
+                .clone()
+                .enumerate()
+                .map(|(i, s)| OffsetPair {
+                    source_offset: s,
+                    target_offset: base + i as i64,
+                    timestamp: s,
+                })
+                .collect()
+        };
+        m.add_detailed_batch("t", 0, batch(0..10, 0));
+        m.add_detailed_batch("t", 0, batch(5..10, 10));
+        m.add_detailed_batch("t", 0, batch(10..20, 15));
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(7));
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(15));
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(25));
+    }
+
+    // ------------------------------------------------------------------
     // Offset gaps (issue #144)
     // ------------------------------------------------------------------
 
@@ -1757,6 +2473,11 @@ mod tests {
             segments: Vec::new(),
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         };
         let json = serde_json::to_string(&partition).unwrap();
         assert!(!json.contains("pruned"), "{json}");
@@ -1769,6 +2490,11 @@ mod tests {
             segments: Vec::new(),
             gaps: Vec::new(),
             pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         };
         partition.add_pruned(pruned_range(20, 29));
         partition.add_pruned(pruned_range(0, 19));
@@ -1838,6 +2564,246 @@ mod tests {
         assert_eq!(manifest.gaps().count(), 0);
     }
 
+    // ------------------------------------------------------------------
+    // Covered ranges and the durable reach (checkpoint durability)
+    // ------------------------------------------------------------------
+
+    fn segment(start: i64, end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            key: format!("b/topics/t/partition=0/segment-{start:020}.bin.zst"),
+            start_offset: start,
+            end_offset: end,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            record_count: end - start + 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            sha256: String::new(),
+            uploaded_at: 0,
+            covered_start_offset: None,
+            covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
+        }
+    }
+
+    fn covered(start: i64, end: i64, covered_start: i64, covered_end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            covered_start_offset: Some(covered_start),
+            covered_end_offset: Some(covered_end),
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
+            ..segment(start, end)
+        }
+    }
+
+    fn empty_partition() -> PartitionBackup {
+        PartitionBackup {
+            partition_id: 0,
+            segments: Vec::new(),
+            gaps: Vec::new(),
+            pruned: Vec::new(),
+            covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
+        }
+    }
+
+    #[test]
+    fn legacy_segment_covers_its_record_range() {
+        let seg = segment(10, 19);
+        assert_eq!(seg.covered_start(), 10);
+        assert_eq!(seg.covered_end(), 19);
+        assert!(!seg.has_covered_range());
+
+        // Compaction hole before the first record and markers after the last.
+        let seg = covered(12, 19, 10, 24);
+        assert_eq!(seg.covered_start(), 10);
+        assert_eq!(seg.covered_end(), 24);
+        assert!(seg.has_covered_range());
+    }
+
+    #[test]
+    fn reach_is_none_for_an_empty_partition() {
+        assert_eq!(empty_partition().reach(), None);
+        assert_eq!(empty_partition().explicit_reach(), None);
+    }
+
+    #[test]
+    fn reach_takes_the_highest_accounted_offset() {
+        let mut part = empty_partition();
+        part.segments.push(segment(0, 9));
+        assert_eq!(part.reach(), Some(9));
+
+        // A covered end beyond the last record (trailing markers / compaction).
+        part.segments.push(covered(10, 19, 10, 29));
+        assert_eq!(part.reach(), Some(29));
+
+        // An OffsetGap is end-exclusive: [30, 50) accounts through 49.
+        part.add_gap(gap(30, 50));
+        assert_eq!(part.reach(), Some(49));
+
+        // A coverage-only advance with no segment.
+        part.covered_through = Some(60);
+        assert_eq!(part.reach(), Some(60));
+        // ...is not an explicit interval (validate cannot see what it covered).
+        assert_eq!(part.explicit_reach(), Some(49));
+    }
+
+    #[test]
+    fn reach_counts_pruned_ranges_inclusive() {
+        let mut part = empty_partition();
+        part.add_pruned(pruned_range(0, 99));
+        assert_eq!(part.reach(), Some(99));
+        part.segments.push(segment(100, 149));
+        assert_eq!(part.reach(), Some(149));
+    }
+
+    #[test]
+    fn reach_is_the_max_even_with_overlapping_legacy_segments() {
+        // A legacy manifest can list overlapping segments (a key rewritten on
+        // resume with different boundaries). Reach is still the maximum.
+        let mut part = empty_partition();
+        part.segments.push(segment(0, 199));
+        part.segments.push(segment(100, 149));
+        assert_eq!(part.reach(), Some(199));
+    }
+
+    #[test]
+    fn covered_fields_are_omitted_when_unset() {
+        let json = serde_json::to_string(&segment(0, 9)).unwrap();
+        assert!(!json.contains("covered_"), "{json}");
+        let json = serde_json::to_string(&empty_partition()).unwrap();
+        assert!(!json.contains("covered_through"), "{json}");
+    }
+
+    #[test]
+    fn covered_fields_round_trip() {
+        let seg = covered(12, 19, 10, 24);
+        let back: SegmentMetadata =
+            serde_json::from_str(&serde_json::to_string(&seg).unwrap()).unwrap();
+        assert_eq!(back.covered_start_offset, Some(10));
+        assert_eq!(back.covered_end_offset, Some(24));
+
+        let mut part = empty_partition();
+        part.covered_through = Some(42);
+        let back: PartitionBackup =
+            serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
+        assert_eq!(back.covered_through, Some(42));
+    }
+
+    #[test]
+    fn manifest_written_before_covered_ranges_existed_still_parses() {
+        // A 0.23 manifest: no covered_* on segments, no covered_through.
+        let legacy = r#"{
+            "backup_id": "b",
+            "created_at": 1700000000000,
+            "compression": "zstd",
+            "topics": [{
+                "name": "t",
+                "partitions": [{
+                    "partition_id": 0,
+                    "segments": [{
+                        "key": "b/topics/t/partition=0/segment-00000000000000000000.bin.zst",
+                        "start_offset": 0,
+                        "end_offset": 9,
+                        "start_timestamp": 1,
+                        "end_timestamp": 2,
+                        "record_count": 10,
+                        "sha256": "ab",
+                        "uploaded_at": 5
+                    }]
+                }]
+            }]
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(legacy).unwrap();
+        let part = &manifest.topics[0].partitions[0];
+        assert_eq!(part.covered_through, None);
+        assert_eq!(part.segments[0].covered_start_offset, None);
+        assert_eq!(part.segments[0].covered_end(), 9);
+        assert_eq!(part.reach(), Some(9));
+    }
+
+    /// Older binaries (0.23 and earlier) must still read manifests written
+    /// with covered ranges: the structs never set `deny_unknown_fields`, so
+    /// the new keys are ignored. `OldSegment` / `OldPartition` mirror the
+    /// 0.23 field set exactly.
+    #[test]
+    fn manifest_with_covered_ranges_parses_with_the_old_field_set() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldSegment {
+            key: String,
+            start_offset: i64,
+            end_offset: i64,
+            start_timestamp: i64,
+            end_timestamp: i64,
+            record_count: i64,
+            #[serde(default)]
+            uncompressed_size: u64,
+            #[serde(default)]
+            compressed_size: u64,
+            #[serde(default)]
+            sha256: String,
+            #[serde(default)]
+            uploaded_at: i64,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldPartition {
+            partition_id: i32,
+            segments: Vec<OldSegment>,
+            #[serde(default)]
+            gaps: Vec<OffsetGap>,
+            #[serde(default)]
+            pruned: Vec<PrunedRange>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldTopic {
+            name: String,
+            partitions: Vec<OldPartition>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldManifest {
+            backup_id: String,
+            created_at: i64,
+            topics: Vec<OldTopic>,
+        }
+
+        let mut manifest = BackupManifest::new("b".to_string());
+        let part = manifest.get_or_create_topic("t").get_or_create_partition(0);
+        part.add_segment(covered(12, 19, 10, 24));
+        part.covered_through = Some(30);
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("covered_end_offset"), "{json}");
+        assert!(json.contains("covered_through"), "{json}");
+
+        let old: OldManifest = serde_json::from_str(&json).unwrap();
+        let seg = &old.topics[0].partitions[0].segments[0];
+        assert_eq!((seg.start_offset, seg.end_offset), (12, 19));
+        assert_eq!(seg.record_count, 8);
+    }
+
+    #[test]
+    fn resume_beyond_durable_gap_reason_round_trips() {
+        let gap = OffsetGap {
+            reason: OffsetGapReason::ResumeBeyondDurable,
+            ..gap(10, 20)
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        assert!(json.contains("\"resume_beyond_durable\""), "{json}");
+        let back: OffsetGap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reason, OffsetGapReason::ResumeBeyondDurable);
+        assert_eq!(
+            OffsetGapReason::ResumeBeyondDurable.to_string(),
+            "resume_beyond_durable"
+        );
+    }
+
     #[test]
     fn missing_topics_round_trip_and_omitted_when_empty() {
         let mut manifest = BackupManifest::new("m".to_string());
@@ -1854,5 +2820,67 @@ mod tests {
         let legacy = r#"{"backup_id":"old","created_at":1,"topics":[]}"#;
         let old: BackupManifest = serde_json::from_str(legacy).unwrap();
         assert!(old.missing_topics.is_empty());
+    }
+
+    #[test]
+    fn transaction_fields_are_omitted_when_unset_and_absent_in_legacy_manifests() {
+        let json = serde_json::to_string(&BackupManifest::new("m".to_string())).unwrap();
+        assert!(!json.contains("isolation_level"), "{json}");
+        let json = serde_json::to_string(&segment(0, 9)).unwrap();
+        assert!(!json.contains("control_records_skipped"), "{json}");
+        assert!(!json.contains("aborted_records_dropped"), "{json}");
+        let json = serde_json::to_string(&empty_partition()).unwrap();
+        for field in [
+            "tail_control_records_skipped",
+            "tail_aborted_records_dropped",
+            "snapshot_end_offset",
+            "high_watermark_at_capture",
+        ] {
+            assert!(!json.contains(field), "{json}");
+        }
+
+        // A 0.23 manifest reads with no isolation level (it read
+        // uncommitted) and zero counts.
+        let legacy = r#"{"backup_id":"old","created_at":1,"topics":[{"name":"t",
+            "partitions":[{"partition_id":0,"segments":[{"key":"k","start_offset":0,
+            "end_offset":9,"start_timestamp":1,"end_timestamp":2,"record_count":10}]}]}]}"#;
+        let old: BackupManifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.isolation_level, None);
+        let part = &old.topics[0].partitions[0];
+        assert_eq!(part.snapshot_end_offset, None);
+        assert_eq!(part.high_watermark_at_capture, None);
+        assert_eq!(part.control_records_skipped(), 0);
+        assert_eq!(part.aborted_records_dropped(), 0);
+    }
+
+    #[test]
+    fn transaction_fields_round_trip() {
+        let mut manifest = BackupManifest::new("m".to_string());
+        manifest.isolation_level = Some(IsolationLevel::ReadCommitted);
+        let part = manifest.get_or_create_topic("t").get_or_create_partition(0);
+        let mut seg = covered(4, 9, 0, 10);
+        seg.control_records_skipped = 2;
+        seg.aborted_records_dropped = 3;
+        part.add_segment(seg);
+        part.covered_through = Some(12);
+        part.tail_control_records_skipped = 1;
+        part.tail_aborted_records_dropped = 1;
+        part.snapshot_end_offset = Some(13);
+        part.high_watermark_at_capture = Some(20);
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            json.contains("\"isolation_level\":\"read_committed\""),
+            "{json}"
+        );
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.isolation_level, Some(IsolationLevel::ReadCommitted));
+        let part = &back.topics[0].partitions[0];
+        assert_eq!(part.control_records_skipped(), 3);
+        assert_eq!(part.aborted_records_dropped(), 4);
+        assert_eq!(part.snapshot_end_offset, Some(13));
+        assert_eq!(part.high_watermark_at_capture, Some(20));
+        assert_eq!(back.total_control_records_skipped(), 3);
+        assert_eq!(back.total_aborted_records_dropped(), 4);
     }
 }

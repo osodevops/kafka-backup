@@ -319,6 +319,7 @@ backup:
   on_missing_topic: fail           # or warn: skip absent literal topics, record them (0.22.0)
   max_concurrent_partitions: 8
   include_offset_headers: true  # default; adds x-original-offset / x-original-timestamp to every archived record
+  isolation_level: read_committed  # default (0.25); read_uncommitted = opt-out (archives aborted records + markers, up to the HW)
 
 restore:
   time_window_start: 1736899200000  # epoch millis (PITR)

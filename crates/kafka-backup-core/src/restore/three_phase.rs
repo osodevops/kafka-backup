@@ -44,12 +44,15 @@
 //! let reset_report = orchestrator.apply_offset_reset(&reset_plan).await?;
 //! ```
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{Config, RestoreOptions};
 use crate::kafka::{KafkaClient, PartitionLeaderRouter};
 use crate::manifest::{BackupManifest, OffsetMapping, RestoreReport};
+use crate::metrics::PrometheusMetrics;
 use crate::storage::create_backend;
 use crate::{Error, Result};
 
@@ -64,6 +67,8 @@ use super::preflight::{self, HeaderPreflightReport};
 pub struct ThreePhaseRestore {
     /// Restore configuration
     config: Config,
+    /// Passed to the Phase 2 restore engine (issue #173).
+    prometheus_metrics: Option<Arc<PrometheusMetrics>>,
 }
 
 /// Complete report for three-phase restore
@@ -126,7 +131,17 @@ impl OffsetResetPhaseOutcome {
 impl ThreePhaseRestore {
     /// Create a new three-phase restore orchestrator
     pub fn new(config: Config) -> Result<Self> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            prometheus_metrics: None,
+        })
+    }
+
+    /// Record the Phase 2 restore's `kafka_restore_*` metrics in
+    /// `prometheus_metrics` (see [`RestoreEngine::new_with_metrics`]).
+    pub fn with_prometheus_metrics(mut self, prometheus_metrics: Arc<PrometheusMetrics>) -> Self {
+        self.prometheus_metrics = Some(prometheus_metrics);
+        self
     }
 
     /// True if this restore configuration asks for consumer group offsets to
@@ -341,7 +356,7 @@ impl ThreePhaseRestore {
                 restore.header_preflight_external = true;
             }
         }
-        let engine = RestoreEngine::new(config)?;
+        let engine = RestoreEngine::new_with_metrics(config, self.prometheus_metrics.clone())?;
         engine.run().await
     }
 
@@ -503,6 +518,10 @@ mod tests {
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
             record_filter: None,
+            topic_configs_skipped: Vec::new(),
+            topic_configs_adjusted: Vec::new(),
+            idempotent_producer: false,
+            idempotent_producer_fallback: None,
         }
     }
 
@@ -584,6 +603,106 @@ mod tests {
         assert!(!outcome.applied());
         assert!(outcome.success());
         assert!(outcome.warnings.iter().any(|w| w.contains("dry-run")));
+    }
+
+    /// Phase 2 -> Phase 3 across gaps in the restored source offsets: every
+    /// group resumes on the first record it had not consumed, never past it.
+    ///
+    /// Source partition `orders/0` holds offsets 0..30. Restored are all but:
+    /// 5..=9 (compacted away before the backup), 15, 16 (dropped by a record
+    /// filter), 20..=23 (an aborted transaction and its marker) and 27..=29
+    /// (dropped tail). The target partition already held 100 records, so the
+    /// restore writes densely from target offset 100.
+    #[tokio::test]
+    async fn offset_reset_phase_resumes_groups_on_the_next_unconsumed_record() {
+        let gaps = |o: &i64| matches!(o, 5..=9 | 15 | 16 | 20..=23 | 27..=29);
+        let restored: Vec<i64> = (0..30).filter(|o| !gaps(o)).collect();
+        let base = 100i64;
+
+        // Phase 2, recorded as the engine does: one batch per produce request.
+        let mut mapping = OffsetMapping::new();
+        let target_log: Vec<(i64, i64)> = restored
+            .iter()
+            .enumerate()
+            .map(|(i, &src)| (base + i as i64, src))
+            .collect();
+        for chunk in target_log.chunks(4) {
+            mapping.add_detailed_batch(
+                "orders",
+                0,
+                chunk
+                    .iter()
+                    .map(|&(target, src)| crate::manifest::OffsetPair {
+                        source_offset: src,
+                        target_offset: target,
+                        timestamp: 1_700_000_000_000 + src,
+                    })
+                    .collect(),
+            );
+        }
+        let target_log_end = base + restored.len() as i64;
+
+        // Committed source offsets, one group each (as from the snapshot).
+        let commits: &[(&str, i64)] = &[
+            ("from-start", 0),
+            ("at-gap-start", 5),
+            ("inside-gap", 7),
+            ("right-after-gap", 10),
+            ("inside-filter-drop", 16),
+            ("inside-aborted-txn", 22),
+            ("at-tail-drop", 28),
+            ("at-high-watermark", 30),
+            ("beyond-the-end", 42),
+        ];
+        for (group, committed) in commits {
+            mapping.add_consumer_group_offset(group, "orders", 0, *committed, 0, None);
+        }
+        let groups: Vec<String> = commits.iter().map(|(g, _)| g.to_string()).collect();
+
+        let mut config = test_config();
+        config.restore = Some(crate::config::RestoreOptions {
+            reset_consumer_offsets: true,
+            dry_run: true,
+            consumer_groups: groups.clone(),
+            ..Default::default()
+        });
+        let mut report = restore_report_with_groups(&[]);
+        report.offset_mapping = mapping;
+        let outcome = ThreePhaseRestore::new(config)
+            .unwrap()
+            .run_offset_reset_phase(&report)
+            .await
+            .unwrap();
+        let plan = outcome.plan.expect("dry run produces a plan");
+        assert_eq!(plan.groups.len(), commits.len());
+
+        for (group, committed) in commits {
+            let group_plan = plan.groups.iter().find(|g| g.group_id == *group).unwrap();
+            assert!(group_plan.complete, "{group}");
+            let p = &group_plan.partitions[0];
+            assert!(!p.approximate, "{group}: per-record mapping is exact");
+            assert!(
+                p.target_offset <= target_log_end,
+                "{group}: resumes past the target log end ({} > {target_log_end})",
+                p.target_offset
+            );
+
+            // What a consumer reads first after the reset ...
+            let first_read = target_log
+                .iter()
+                .find(|(t, _)| *t >= p.target_offset)
+                .map(|&(_, src)| src);
+            // ... must be the first restored record it had not consumed.
+            let expected = restored.iter().copied().find(|src| src >= committed);
+            assert_eq!(first_read, expected, "{group} committed at {committed}");
+
+            // And nothing the group had not consumed is behind the reset.
+            for &(target, src) in &target_log {
+                if src >= *committed {
+                    assert!(target >= p.target_offset, "{group} would skip source {src}");
+                }
+            }
+        }
     }
 
     #[test]

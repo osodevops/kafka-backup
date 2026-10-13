@@ -20,7 +20,7 @@ mod s3;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use azure::{AzureBackend, AzureConfig};
+pub use azure::{AzureBackend, AzureConfig, EMULATOR_ACCOUNT, EMULATOR_ACCOUNT_KEY};
 pub use backend::{ObjectMetadata, StorageBackend};
 pub use config::StorageBackendConfig;
 pub use filesystem::FilesystemBackend;
@@ -100,6 +100,8 @@ pub fn create_backend_from_config(
             tenant_id,
             client_secret,
             sas_token,
+            use_emulator,
+            allow_http,
         } => {
             let azure_config = AzureConfig {
                 account_name: account_name.clone(),
@@ -112,6 +114,8 @@ pub fn create_backend_from_config(
                 tenant_id: tenant_id.clone(),
                 client_secret: client_secret.clone(),
                 sas_token: sas_token.clone(),
+                use_emulator: *use_emulator,
+                allow_http: *allow_http,
             };
             Ok(Arc::new(AzureBackend::new(azure_config)?))
         }

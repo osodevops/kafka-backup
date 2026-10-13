@@ -4,8 +4,11 @@
 //! - Phase 2: Restore data and collect offset mapping
 //! - Phase 3: Generate and apply consumer group offset resets
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use kafka_backup_core::{Config, ThreePhaseRestore};
+use kafka_backup_core::{Config, PrometheusMetrics, ThreePhaseRestore};
+use tokio::sync::broadcast;
 use tracing::info;
 
 pub async fn run(config_path: &str) -> Result<()> {
@@ -22,8 +25,35 @@ pub async fn run(config_path: &str) -> Result<()> {
         config.backup_id
     );
 
-    let orchestrator = ThreePhaseRestore::new(config)?;
-    let report = orchestrator.run_all_phases().await?;
+    // Phase 2 records the restore metrics, served like `restore` does.
+    let metrics_config = config.metrics.clone().unwrap_or_default();
+    let prometheus_metrics = Arc::new(PrometheusMetrics::with_max_labels(
+        metrics_config.max_partition_labels,
+    ));
+    let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
+        &metrics_config,
+        prometheus_metrics.clone(),
+    );
+
+    let orchestrator = ThreePhaseRestore::new(config)?.with_prometheus_metrics(prometheus_metrics);
+    let result = orchestrator.run_all_phases().await;
+
+    if let Some(metrics_server) = metrics_server {
+        // The orchestrator has no shutdown handle: a signal only ends the
+        // metrics keep-alive.
+        let (operation_shutdown_tx, _) = broadcast::channel::<()>(1);
+        let (lifecycle_shutdown_tx, mut lifecycle_shutdown_rx) = broadcast::channel::<()>(1);
+        let signal_task = super::metrics_runtime::spawn_shutdown_signal_forwarder(
+            operation_shutdown_tx,
+            lifecycle_shutdown_tx,
+        );
+        metrics_server
+            .shutdown_after_operation(&mut lifecycle_shutdown_rx)
+            .await;
+        signal_task.abort();
+    }
+
+    let report = result?;
 
     // Print summary
     println!();

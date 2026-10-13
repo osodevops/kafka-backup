@@ -406,7 +406,13 @@ async fn sasl_gssapi_backup_restore_roundtrip() {
     let mut fetched: Vec<BackupRecord> = Vec::new();
     for _ in 0..20 {
         let resp = consumer_client
-            .fetch(&restored_topic, 0, 0, 1_048_576)
+            .fetch(
+                &restored_topic,
+                0,
+                0,
+                1_048_576,
+                kafka_backup_core::IsolationLevel::ReadUncommitted,
+            )
             .await
             .expect("fetch restored topic");
         if resp.records.len() >= record_count {

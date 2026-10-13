@@ -69,12 +69,24 @@ Configuration for the Kafka cluster to read from (backup mode).
 | `topics.include` | list[string] | No | `["*"]` | Topics to include (glob patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude (glob patterns) |
 | `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER; see below). The older spellings SCRAM-SHA256 / SCRAM-SHA512 are still accepted |
 | `security.sasl_username` | string | No | - | SASL username |
 | `security.sasl_password` | string | No | - | SASL password |
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |
 | `security.ssl_certificate_location` | string | No | - | Path to client certificate |
 | `security.ssl_key_location` | string | No | - | Path to client key |
+
+`sasl_mechanism: OAUTHBEARER` (for example Confluent Cloud OAuth) parses, but
+this build ships no OAuth token provider. Without Kafka Backup Enterprise
+(licence feature `oauth`) or a custom `SaslMechanismPlugin` installed by code,
+the command fails with "SASL OAUTHBEARER requires Kafka Backup Enterprise
+(licence feature `oauth`) or a custom SaslMechanismPlugin".
+
+Unknown keys under `source.security` and `target.security` are an error, not a
+warning, because a misspelt or misplaced security setting connects with
+different credentials than intended. OAuth settings such as `security.oauth`
+are rejected with the hint "OAuth settings belong under enterprise.oauth (Kafka
+Backup Enterprise)".
 
 ### Topic Patterns
 
@@ -242,7 +254,7 @@ Configuration for the Kafka cluster to write to (restore mode).
 | `topics.include` | list[string] | No | `["*"]` | Topics to restore (glob/regex patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude |
 | `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `security.sasl_mechanism` | string | No | - | SASL mechanism |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (as for the source) |
 | `security.sasl_username` | string | No | - | SASL username |
 | `security.sasl_password` | string | No | - | SASL password |
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |
@@ -342,18 +354,42 @@ storage:
 | `account_name` | string | Yes | - | Azure storage account name |
 | `container_name` | string | Yes | - | Blob container name |
 | `prefix` | string | No | `""` | Blob prefix (folder) |
-| `endpoint` | string | No | - | Custom endpoint (sovereign clouds) |
-| `sas_token` | string | No | - | Shared access signature |
-| `account_key` | string | No | - | Storage account key (`AZURE_STORAGE_KEY` env fallback) |
-| `client_id` | string | No | - | Azure AD client ID (service principal or Workload Identity) |
+| `endpoint` | string | No | - | Custom endpoint: sovereign clouds, or the emulator (`http://127.0.0.1:10000/devstoreaccount1`) |
+| `sas_token` | string | No | - | Shared access signature, pasted as the portal shows it (leading `?` optional) |
+| `account_key` | string | No | - | Storage account key |
+| `client_id` | string | No | - | Azure AD client ID: service principal, Workload Identity, or the user-assigned managed identity to use |
 | `tenant_id` | string | No | - | Azure AD tenant ID |
 | `client_secret` | string | No | - | Service-principal secret |
 | `use_workload_identity` | bool | No | auto | AKS Workload Identity (federated token). Auto-enabled when `AZURE_FEDERATED_TOKEN_FILE` is set |
+| `use_emulator` | bool | No | `false` | Azure Storage emulator (Azurite): plain HTTP, path-style URLs, well-known emulator key unless `account_key` / `sas_token` is set |
+| `allow_http` | bool | No | `false` | Allow plain-HTTP endpoints; implied by `use_emulator` and by an `http://` endpoint |
 
-Credential precedence: `sas_token` → `account_key` → service principal (`client_secret`) →
-Workload Identity → `DefaultAzureCredential` chain (environment, managed identity, Azure CLI).
-For Workload Identity, YAML `client_id`/`tenant_id` override the webhook-injected
-`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`; the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
+Credential precedence:
+
+1. `sas_token`
+2. `account_key` (with `use_emulator` and neither set: the well-known emulator key)
+3. Service principal: `client_secret` with `client_id` and `tenant_id`
+4. Workload Identity: `use_workload_identity: true` or `AZURE_FEDERATED_TOKEN_FILE` set.
+   YAML `client_id`/`tenant_id` override the webhook-injected `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`;
+   the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
+5. Managed identity through IMDS. `client_id` selects a user-assigned identity; without it the
+   system-assigned identity is used.
+
+Nothing else is consulted: no Azure CLI, and no other environment variables for a YAML
+config (the `--path azure://` form reads `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN` and
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET`). The emulator only accepts a SAS
+token or an account key.
+
+Azurite (local testing):
+
+```yaml
+storage:
+  backend: azure
+  account_name: devstoreaccount1
+  container_name: kafka-backups     # create it first; the backend does not create containers
+  endpoint: http://127.0.0.1:10000/devstoreaccount1
+  use_emulator: true                # well-known key unless account_key / sas_token is set
+```
 
 ```yaml
 storage:
@@ -394,7 +430,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `compression_level` | int | No | `3` | Compression level (1–22; only meaningful for `zstd`) |
 | `start_offset` | string / map | No | `earliest` | Where a partition starts when there is no checkpoint: `earliest`, `latest`, or `specific: {topic: {partition: offset}}` |
 | `continuous` | bool | No | `false` | Run continuously (streaming replication) |
-| `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture HWMs at start, exit when caught up |
+| `isolation_level` | string | No | **`read_committed`** | `read_committed` archives what a `read_committed` consumer sees: no records of aborted transactions, no transaction markers, and each partition is read up to its last stable offset. `read_uncommitted` archives everything up to the high watermark, markers included, as before 0.25 — see [Transactional topics](#transactional-topics-isolation-level) |
+| `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture each partition's end offset at start (the last stable offset under `read_committed`), exit when caught up |
 | `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
 | `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
 | `segment_max_bytes` | int | No | `134217728` | Rotate a segment once it holds this many uncompressed bytes (128MB) |
@@ -402,7 +439,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
 | `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
 | `checkpoint_interval_secs` | int | No | `5` | **Deprecated (0.22.0) — no effect.** Offsets are checkpointed at the end of every backup cycle; a warning is logged if set |
-| `sync_interval_secs` | int | No | `30` | How often the manifest and the offset store are synced to remote storage (`offset_storage.sync_interval_secs` overrides it for the offset store) |
+| `sync_interval_secs` | int | No | `30` | How often the manifest is saved during a run. Offset checkpoints only move after the manifest save that lists the data, so they lag by at most this interval (the end of every cycle, an error and shutdown always save). `offset_storage.sync_interval_secs` overrides how often `offsets.db` is uploaded |
+| `shutdown_grace_secs` | int | No | `30` | On SIGTERM / Ctrl-C, how long partitions get to stop fetching, write their buffered records as a final segment and record it in the manifest before they are aborted (an aborted partition loses nothing durable; it re-reads on the next run) |
 | `include_offset_headers` | bool | No | **`true`** | Add `x-original-offset` / `x-original-timestamp` headers to every archived record — see [Offset-tracking headers](#offset-tracking-headers) |
 | `source_cluster_id` | string | No | unset | Recorded in the `x-source-cluster` header (only with `include_offset_headers`) |
 | `include_internal_topics` | bool | No | `false` | Also back up internal topics listed in `internal_topics` |
@@ -474,6 +512,84 @@ restore:
 they are produced. Offset mapping is unaffected: the source offset is stored
 natively in the segment, not only in the header.
 
+### Transactional topics (isolation level)
+
+`backup.isolation_level` decides what a backup archives from topics written
+by transactional producers (Kafka Streams exactly-once, Flink, Connect
+exactly-once source connectors, any `transactional.id` producer). It is the
+Java consumer's `isolation.level`, applied to the backup's Fetch and
+ListOffsets requests.
+
+**`read_committed` (default since 0.25)**
+
+- Records of committed transactions and non-transactional records are
+  archived, in offset order.
+- Records of aborted transactions are dropped, and transaction markers (the
+  COMMIT/ABORT control records the broker writes at the end of every
+  transaction) are skipped. Neither is a gap: the offsets they occupy are
+  inside the segments' covered ranges, so `validate` does not report holes,
+  and each segment records how many it passed over
+  (`control_records_skipped`, `aborted_records_dropped`).
+- Each partition is read up to its **last stable offset** (LSO), not its high
+  watermark. The LSO is the first offset of the oldest transaction still
+  open on the partition. Records at or after it — the open transaction's
+  records and anything written after them, transactional or not — are
+  archived by a later run, once the transaction completes. In snapshot mode
+  the captured end of each partition is its LSO; the manifest records it as
+  `snapshot_end_offset`, next to `high_watermark_at_capture`.
+- A restore therefore writes back exactly what a `read_committed` consumer
+  of the source sees, and consumer groups committed at a marker, just after
+  one, or inside an aborted transaction resume on the next committed record
+  (three-phase restore and `offset-reset` use the per-record offset mapping).
+
+**`read_uncommitted` (opt-out)** archives every record up to the high
+watermark, byte for byte as versions before 0.25 did. That includes records
+of aborted and still-open transactions **and the transaction markers, which a
+restore writes back as ordinary records** (key `00 00 00 00` or
+`00 00 00 01`, value `00 00 00 00 00 00`). Use it only for topics without
+transactional producers, or to keep an existing backup set uniform:
+
+```yaml
+backup:
+  isolation_level: read_uncommitted
+```
+
+**Existing backups are unaffected.** Nothing already stored is rewritten,
+and restoring a backup written before 0.25 behaves as before (its segments
+may hold markers and aborted records). A backup set created before 0.25 and
+continued by 0.25 reads committed from then on; the run logs a warning that
+the set now mixes both, and the manifest's `isolation_level` records the
+level of the most recent run (absent in manifests written before 0.25, which
+read uncommitted). Set `isolation_level: read_uncommitted` to keep such a set
+uniform, or start a new `backup_id`.
+
+#### Hanging transactions
+
+A transaction that is never completed — one the transaction coordinator
+lost track of (the "hanging transaction" of KIP-664), or one a producer
+keeps open under a very long `transaction.timeout.ms` — holds the LSO back,
+and with it a `read_committed` backup of that partition: the backup keeps
+succeeding but stops archiving new records there. Snapshot runs log
+`N partition(s) have open transactions: this snapshot ends at their last
+stable offset ...` at INFO (per-partition detail is at DEBUG), and every run
+exposes the distance as `kafka_backup_lso_lag` (high watermark minus LSO,
+per partition). The gauge is normally 0, or briefly above it while
+transactions are in flight; alert when it stays up:
+
+```yaml
+- alert: KafkaBackupHangingTransaction
+  expr: min_over_time(kafka_backup_lso_lag[30m]) > 0
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "{{ $labels.topic }}[{{ $labels.partition }}]: an open transaction has held the backup at the last stable offset for 45m"
+    description: "Find it with kafka-transactions.sh --bootstrap-server ... find-hanging --broker-id N and abort it (kafka-transactions.sh abort), or wait for transaction.timeout.ms."
+```
+
+Pick the window longer than your producers' `transaction.timeout.ms`. The
+gauge is subject to `metrics.max_partition_labels`.
+
 ### Performance Tuning
 
 **`max_concurrent_partitions`**: Controls how many partitions are backed up simultaneously. Higher values increase throughput but may cause resource contention (CPU, memory, network, storage I/O). Default is 8.
@@ -486,16 +602,63 @@ natively in the segment, not only in the header.
 |------|---------------|----------|
 | **One-shot** (default) | `continuous: false` | Backup current data and exit |
 | **Continuous** | `continuous: true` | Run forever, backing up new data as it arrives |
-| **Snapshot** | `stop_at_current_offsets: true` | Capture high watermarks at start, backup until caught up, then exit cleanly |
+| **Snapshot** | `stop_at_current_offsets: true` | Capture end offsets at start, backup until caught up, then exit cleanly |
 
 **Snapshot mode** (`stop_at_current_offsets: true`) is ideal for scheduled DR backups:
-1. At startup, captures high watermarks for ALL partitions (atomic snapshot point)
+1. At startup, captures the end offset of ALL partitions (atomic snapshot point): the last stable offset under `read_committed` (the default), the high watermark under `read_uncommitted`
 2. Backs up all data up to those fixed offsets
 3. Exits cleanly with exit code 0 when complete
 
 This ensures consistent "point-in-time" snapshots for disaster recovery, even with high-throughput topics.
 
 > **Note:** `stop_at_current_offsets` is incompatible with `continuous: true`. Use snapshot mode for scheduled backups (CronJobs), and continuous mode for streaming replication.
+
+### Resume and checkpoints
+
+A backup resumes each partition from what the **manifest** says is stored,
+not from a separate checkpoint:
+
+- The manifest's *reach* for a partition is the highest source offset it
+  accounts for: inside a listed segment's covered range, a recorded gap, a
+  pruned range, or the partition's `covered_through`. A run resumes at
+  `reach + 1`, beyond every listed segment, so a listed segment is never
+  rewritten.
+- Since 0.25 each segment records `covered_start_offset` /
+  `covered_end_offset`: the source offsets it accounts for, including
+  offsets before its first record or after its last that held no record
+  (compacted away, transaction markers, records of aborted transactions).
+  `covered_through` on the partition records such a trailing range when no
+  segment follows it yet. Older
+  manifests without these fields still resume from their segments' first and
+  last offsets.
+- `offsets.db` (the offset store) only records checkpoints that a saved
+  manifest already justifies: a partition's checkpoint is written after the
+  manifest listing its data, and `offsets.db` is uploaded after that
+  manifest. It is consulted only for partitions the manifest does not know
+  (backups written by older versions), and the stored copy is preferred over
+  a local database file.
+- A crash, an upload failure or an aborted shutdown therefore costs at most
+  a re-read of what was not yet recorded in a saved manifest — never a
+  silent hole. Every backend replaces `manifest.json` atomically (the
+  filesystem backend writes a temporary file and renames it), and a run
+  refuses to start over an unparseable manifest rather than overwrite it. On a fetch error the records already fetched are written as a
+  final segment before the run fails; on a graceful shutdown every partition
+  flushes within `shutdown_grace_secs`.
+
+**Upgrading from 0.23 or earlier.** Older versions could checkpoint offsets
+before the segment holding them was uploaded and listed. On the first run
+after upgrading, a partition whose `offsets.db` checkpoint is ahead of the
+manifest logs a warning (`offset checkpoint N is ahead of the manifest`) and
+re-reads from the manifest's reach + 1, once. If Kafka retention has already
+deleted those offsets, the range is recorded as an offset gap with reason
+`resume_beyond_durable`: it was never durably backed up. Segment objects
+that an older version uploaded but never listed are orphans and may be
+overwritten.
+
+Re-running a backup with an existing `backup_id` continues from the manifest
+even without `offset_storage` (it used to start over from `start_offset` and
+overwrite segment objects in place). Use a new `backup_id` for an
+independent full copy.
 
 ### Backup Retention
 
@@ -526,7 +689,7 @@ the resume position is never pruned.
 #### Kafka retention deleting data before it is fetched
 
 The offsets a backup starts from are captured before the fetch happens — for
-every partition up front in snapshot mode, and from the checkpoint on resume.
+every partition up front in snapshot mode, and from the manifest on resume.
 With many partitions, bounded `max_concurrent_partitions`, or a long gap
 between runs, retention can delete those offsets before the partition's turn
 comes up. The broker then rejects the fetch with `OFFSET_OUT_OF_RANGE`.
@@ -547,7 +710,10 @@ log start offset, resumes from there, and records the skipped range as an
 ```
 
 Records inside a gap were deleted from the source before they could be
-fetched and cannot be recovered. `kafka-backup validate` and
+fetched and cannot be recovered. A gap with reason `resume_beyond_durable`
+covers offsets an older version checkpointed without ever listing them in a
+saved manifest, which the source had deleted by the time the backup went back
+for them (see [Resume and checkpoints](#resume-and-checkpoints)). `kafka-backup validate` and
 `kafka-backup describe` list recorded gaps, and the
 `kafka_backup_offset_gaps_total` / `kafka_backup_offsets_skipped_total`
 counters let you alert on them. If gaps appear regularly, raise
@@ -603,7 +769,9 @@ backup:
 
 ## Offset Storage Configuration
 
-Configuration for the local SQLite database used to track backup progress. When present, this enables resumable incremental backups in **any** mode (one-shot, snapshot, or continuous). For continuous mode, the offset store is created automatically even without this section.
+Configuration for the local SQLite database used to track backup progress. For continuous mode, the offset store is created automatically even without this section.
+
+Since 0.25 the resume position comes from the backup manifest (see [Resume and checkpoints](#resume-and-checkpoints)); the offset store holds checkpoints that trail the manifest, is used to resume partitions only for backups written by older versions, and records the job status that `prune` reads.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -727,6 +895,9 @@ metrics:
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
 | `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
+| `kafka_backup_lso_lag` | Gauge | Per partition: high watermark minus last stable offset — offsets held back by open transactions. Stays above 0 under a [hanging transaction](#hanging-transactions) |
+| `kafka_backup_aborted_records_dropped_total` | Counter | Records of aborted transactions not archived (`isolation_level: read_committed`) |
+| `kafka_backup_control_records_skipped_total` | Counter | Transaction markers not archived (`isolation_level: read_committed`) |
 | `kafka_backup_missing_topics` | Gauge | Literal include topics absent from the cluster at the last discovery pass (`backup.on_missing_topic: warn`); returns to 0 once they exist |
 | `kafka_backup_segments_pruned_total` | Counter | Segments deliberately deleted by retention (`prune` / `backup.retention`) |
 | `kafka_backup_bytes_pruned_total` | Counter | Compressed bytes deleted by retention |
@@ -734,6 +905,23 @@ metrics:
 | `kafka_backup_storage_write_latency_seconds` | Histogram | Storage write latency |
 | `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
 | `kafka_backup_errors_total` | Counter | Errors by type |
+
+Restore metrics (`restore` and `three-phase-restore`). The `restore_id` label
+is the backup id.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kafka_restore_records_total` | Counter | Records produced to the target and acknowledged |
+| `kafka_restore_bytes_total` | Counter | Key and value bytes of those records (as `bytes_restored` in the report) |
+| `kafka_restore_partitions_completed_total` | Counter | Partitions whose restore finished (target partitions when repartitioning) |
+| `kafka_restore_errors_total` | Counter | Restore errors by `error_type`: one per failed topic, or one for a restore that failed before any topic did |
+| `kafka_restore_duration_seconds` | Histogram | Restore duration, by `status` (`success` / `failure`) |
+| `kafka_restore_progress_percent` | Gauge | Records restored as a share of the records in the segments to restore; 100 only once the restore succeeded |
+| `kafka_restore_eta_seconds` | Gauge | Estimated seconds left at the current rate |
+| `kafka_restore_throughput_records_per_sec` | Gauge | Average records per second since the restore started |
+
+The progress gauges are updated at most every 5 seconds while records flow,
+and at the end of the run.
 
 ---
 
@@ -850,18 +1038,58 @@ restore:
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `max_concurrent_partitions` | int | No | `4` | Concurrent partition restores |
-| `produce_batch_size` | int | No | `1000` | Records per produce batch |
-| `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget |
+| `produce_batch_size` | int | No | `1000` | Records per produce batch at most |
+| `produce_max_batch_bytes` | int | No | `1048576` | Uncompressed bytes per produce batch at most (1 MiB). A batch closes at whichever of `produce_batch_size` / `produce_max_batch_bytes` is reached first, and is further capped so that, compressed, it always fits the target topic's `max.message.bytes` |
+| `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget. Must be `-1` while `idempotent_producer` is on |
+| `idempotent_producer` | bool | No | `true` | Produce with an idempotent producer: one producer id per restore and a sequence number per partition, so a batch resent after a timeout or a lost connection is de-duplicated by the broker. Falls back (warning + `idempotent_producer_fallback` in the report) when the cluster denies or does not support it |
 | `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
-| `rate_limit_records_per_sec` | int | No | - | Rate limit (records/sec) |
-| `rate_limit_bytes_per_sec` | int | No | - | Rate limit (bytes/sec) |
+| `rate_limit_records_per_sec` | int | No | - | Rate limit for the **whole restore** (records/sec), shared by every partition. Before 0.25 each partition was limited to this rate separately |
+| `rate_limit_bytes_per_sec` | int | No | - | Rate limit for the whole restore (bytes/sec, the records' uncompressed encoded size), shared by every partition. Before 0.25 it was accepted but had no effect |
 | `circuit_breaker` | map | No | see [Circuit breaker](#circuit-breaker-backup-and-restore) | Kafka circuit-breaker settings (advisory) |
+
+Before a segment's records are produced, each is checked against the
+target topic's `max.message.bytes` (read once per topic with
+DescribeConfigs). A record that does not fit even alone in a compressed
+batch fails the partition with the record's source topic, partition and
+offset, and the target topic's limit; nothing of that segment is produced.
+Raise `max.message.bytes` on the target topic and resume. Without
+DescribeConfigs permission the check is skipped (a warning is logged) and
+the broker rejects such a record with `RECORD_TOO_LARGE`.
+
+#### Duplicate-safe produce (`idempotent_producer`)
+
+With `idempotent_producer: true` (the default) the restore obtains one
+producer id (`InitProducerId`, no transactional id) and stamps every batch
+with it and a per-partition sequence number. Each batch is encoded once and
+every retry resends the identical bytes, so the broker writes a batch once
+however often it is resent after a timeout, a lost connection or a leader
+change. Broker answers:
+
+- `DUPLICATE_SEQUENCE_NUMBER`: the batch was already written; it counts as
+  acknowledged and its offsets are derived from the end of the partition's
+  previous batch (exact while the restore is the partition's only writer).
+- `OUT_OF_ORDER_SEQUENCE_NUMBER`: the partition fails.
+- `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` (the broker lost the
+  producer state, for example because retention deleted the restored
+  segments holding it): the producer bumps its epoch, waits
+  `produce_timeout_ms` + 5 s from the batch's first send, and reconciles
+  the batch against the partition's high watermark before resending it.
+
+Requirements: `produce_acks: -1` (any other value with
+`idempotent_producer: true` is a configuration error) and permission to
+write idempotently (Kafka 2.5+; `IdempotentWrite` on the cluster before
+Kafka 2.8, `Write` on the topics since; `DeveloperWrite` on Confluent
+Cloud). When `InitProducerId` is denied (`CLUSTER_AUTHORIZATION_FAILED`) or
+unsupported, the restore logs a warning, sets `idempotent_producer: false`
+and `idempotent_producer_fallback` in the report, and produces without a
+producer id as before 0.25 (a retried batch may be written twice).
 
 ```yaml
 restore:
   max_concurrent_partitions: 8
   produce_batch_size: 500
-  rate_limit_records_per_sec: 10000
+  produce_max_batch_bytes: 1048576
+  rate_limit_records_per_sec: 10000   # total across all partitions
   circuit_breaker:
     enabled: true
     failure_threshold: 15
@@ -873,13 +1101,88 @@ restore:
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `checkpoint_state` | string | No | - | Path to checkpoint file |
-| `checkpoint_interval_secs` | int | No | `60` | Checkpoint save interval |
+| `checkpoint_state` | string | No | - | Path to the local checkpoint file (written atomically; created when the restore starts) |
+| `checkpoint_interval_secs` | int | No | `60` | Seconds between checkpoint saves while the restore runs (also saved after every topic) |
+| `checkpoint_storage` | string | No | `local` | `local`, `remote` (backup storage, `{backup_id}/restore-checkpoints/{restore_id}.json`) or `both` (requires `checkpoint_state`) |
+| `restore_id` | string | No | derived | Names the remote checkpoint; default derived from the backup id, target bootstrap servers and restore configuration |
+
+The checkpoint records only acknowledged work (completed segments, and per
+source partition the last acknowledged source offset and the target's high
+watermark after it). A resumed restore skips acknowledged records, verifies
+the records written after the last save against the target, and produces
+nothing twice; see the restore guide's "Resumable Restores".
 
 ```yaml
 restore:
   checkpoint_state: ./restore-checkpoint.json
   checkpoint_interval_secs: 30
+```
+
+### Topic Configuration
+
+A backup records each topic's explicit, writable, non-sensitive overrides
+(`cleanup.policy`, `retention.ms`, `min.insync.replicas`, ... and the
+`confluent.*` topic settings such as schema validation; not
+`confluent.placement.constraints`, which names the source's racks). The
+restore applies them to the topics it creates, and to existing topics under
+`existing_topic_config_policy: apply`.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `restore_topic_configs` | bool | No | `true` | Restore the captured topic overrides |
+| `existing_topic_config_policy` | string | No | `validate_only` | Topics that already exist: `validate_only` (log drift), `apply`, or `fail` on drift |
+| `topic_config_overrides` | map | No | `{}` | Per target topic, values that replace the captured ones |
+| `unsupported_config_policy` | string | No | `skip` | Configuration the target does not take: `skip` restores without it (and clamps values to the `target_profile` limits) and lists it in the report; `fail` stops the restore before changing any configuration |
+| `target_profile` | string | No | - | `confluent_cloud`: create topics with replication factor 3 (unless `default_replication_factor` is set) and keep values within Confluent Cloud's limits |
+| `target_cluster_type` | string | No | - | With `target_profile: confluent_cloud`: `basic`, `standard`, `enterprise` or `dedicated`, for the limits that depend on it. Unset: the most permissive limit |
+
+The target decides what it takes:
+
+1. A key the target's DescribeConfigs does not list, or lists read-only, is
+   skipped: for example `message.format.version` and
+   `message.downconversion.enable` on Kafka 4.x, or `confluent.*` outside
+   Confluent.
+2. With a `target_profile`, a value outside its limits is clamped (or, under
+   `fail`, rejected).
+3. The rest is applied in one request. A topic the broker rejects is left
+   unchanged by Kafka; each of its keys is then checked on its own
+   (`validate_only`) and the accepted ones are applied, so one key the target
+   refuses (for example `flush.ms` on Confluent Cloud) does not cost the
+   others.
+
+Under `fail`, everything is validated first: when any key would be skipped,
+the restore stops with the full list and no topic configuration is changed
+(topics the restore created exist, with the target's defaults).
+
+The restore report lists `topic_configs_skipped` (`topic`, `name`, `value`,
+`reason`: `not_reported_by_target`, `read_only` or `rejected`, and the
+broker's `message`) and `topic_configs_adjusted` (`value`, `applied`,
+`limit`); each is also logged at WARN and printed by `restore`.
+
+Confluent Cloud limits applied by `target_profile: confluent_cloud`, from
+[Configuration Reference for Topics in Confluent Cloud](https://docs.confluent.io/cloud/current/topics/manage.html)
+(last published 25 September 2026):
+
+| Key | Limit |
+|-----|-------|
+| `min.insync.replicas` | 1 to 2 |
+| `segment.bytes` | 52428800 (50 MiB) to 1073741824 (1 GiB) |
+| `segment.ms` | at least 14400000 (4 hours) |
+| `max.message.bytes` | at most 8388608 (8 MiB) on Basic and Standard, 20971520 (20 MiB) on Enterprise and Dedicated |
+| `max.compaction.lag.ms` | at least 604800000 (7 days) on Basic, Standard and Enterprise, 21600000 (6 hours) on Dedicated |
+| `delete.retention.ms` | at most 60566400000 |
+
+Keys Confluent Cloud does not let you edit (`flush.ms`, `flush.messages`,
+`preallocate`, `compression.type`, `message.downconversion.enable`, ...) are
+not in the profile: the broker rejects them and they are skipped. A lower
+`max.message.bytes` means records larger than it cannot be restored.
+
+```yaml
+restore:
+  create_topics: true
+  target_profile: confluent_cloud
+  target_cluster_type: dedicated
+  unsupported_config_policy: skip   # or fail
 ```
 
 ### Topic Auto-Creation
@@ -910,6 +1213,52 @@ restore:
 ```
 
 > **Note:** The number of partitions for auto-created topics is determined from the backup manifest. If the source topic had 6 partitions, the target topic will be created with 6 partitions.
+
+### Schema ID Rewrite
+
+For records in the Confluent wire format (magic byte `0`, then a 4-byte
+schema ID) restored into a different Schema Registry, the restore can swap
+each source schema ID for the target registry's ID. Kafka Backup Enterprise
+fills `schema_id_mapping` from its Schema Registry restore; set it by hand
+otherwise.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `rewrite_schema_ids` | bool | No | `false` | Rewrite the schema ID of every framed key and value, on the 1:1 and the repartition path |
+| `schema_id_mapping` | map[int]int | No | `{}` | Source schema ID → target schema ID |
+| `schema_id_rewrite_topics` | list[string] | No | `[]` (all) | Source topics to rewrite (glob, or regex with a `~` prefix); others are restored unchanged |
+| `schema_id_rewrite_strict` | bool | No | `true` | Fail on a key or value that starts with the magic byte but is shorter than 5 bytes or carries an ID not in `schema_id_mapping`, naming the topic, partition and offset. `false` restores such payloads unchanged (with the source ID) and counts the unmapped ones |
+
+Only the 4 ID bytes change; the payload after them is produced byte for
+byte. The restore report counts, per topic, `schema_ids_rewritten` and
+`schema_ids_unmapped` (framed keys and values left unchanged because their
+ID is not in the mapping, with `schema_id_rewrite_strict: false`), and the
+CLI prints them. A mapping to an ID that is not positive always fails.
+
+A raw payload that starts with a zero byte (a big-endian integer key, for
+example) looks framed. Strict mode, the default and the 0.24 behaviour,
+fails on it unless its ID happens to be mapped: use
+`schema_id_rewrite_topics` to leave topics with raw keys or values alone,
+or set `schema_id_rewrite_strict: false` for them.
+
+```yaml
+restore:
+  rewrite_schema_ids: true
+  schema_id_mapping: {100001: 1, 100002: 2}
+  schema_id_rewrite_topics: ["orders-*", "payments"]
+```
+
+The rewrite runs on every replay path in the same place, once per segment
+before records are batched and encoded (so a retried batch resends the
+same bytes):
+
+1. time window and record filter;
+2. a library embedder's `RecordTransform` (Kafka Backup Enterprise uses it
+   for Schema Registry restores), on the record as archived;
+3. the schema ID rewrite, on keys and values;
+4. the kafka-backup offset headers (`strip_offset_headers`, then
+   `include_original_offset_header` / header-based strategy);
+5. on the repartition path, partition routing by the rewritten key.
 
 ### Complete Restore Example
 
@@ -997,6 +1346,7 @@ source:
 | `AZURE_FEDERATED_TOKEN_FILE` | Projected token path injected by the AKS Workload Identity webhook; its presence enables Workload Identity |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP credentials |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
+| `KAFKA_BACKUP_LOG_FORMAT` | Log format, `text` (default) or `json`; same as `--log-format` |
 
 ---
 
@@ -1010,7 +1360,14 @@ CLI arguments override configuration file values.
 |----------|-------|-------------|
 | `--config` | `-c` | Path to configuration file |
 | `--verbose` | `-v` | Enable verbose output |
+| `--log-format` | | Log format: `text` (default) or `json` (one JSON object per line). Logs always go to **stderr**; stdout carries only command output |
 | `--format` | `-f` | Output format: text, json, yaml |
+
+Logs are written to stderr, so the stdout of `--format json` parses as JSON
+at any verbosity (`kafka-backup describe ... --format json -v | jq .`). Text
+logs are coloured only when stderr is a terminal. With `--log-format json`
+each line is an object with `timestamp`, `level`, `target`, `message` and the
+event's fields, for log aggregators.
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 
@@ -1071,7 +1428,16 @@ kafka-backup validate --path /path/to/storage --backup-id BACKUP_ID [OPTIONS]
 | `--config` | Backup configuration file — storage (including `prefix`) and `backup_id` are taken from it. Conflicts with `--path`/`--backup-id` |
 | `--path` | Path to storage location (requires `--backup-id`) |
 | `--backup-id` | Backup identifier (requires `--path`) |
-| `--deep` | Perform deep validation |
+| `--deep` | Read every segment, verify its SHA-256 against the manifest (segments written since 0.21), decode it and check record count and offsets, and check each partition's contiguity |
+| `--verify-sha256` | Read every segment and verify its SHA-256 without decoding (faster than `--deep`), plus the contiguity check |
+
+Any missing segment, size mismatch (every mode), checksum, record-count or
+offset mismatch (`--deep`), or contiguity error exits with status 1. The
+contiguity check requires every offset between a partition's first and last
+accounted offset to lie in a segment's covered range, a recorded gap or a
+pruned range, and segments not to overlap; a hole or overlap next to a
+segment written before 0.25 (which records only its first and last record,
+so a compaction hole looks the same) is a warning, not a failure.
 
 ### Prune Command
 

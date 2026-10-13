@@ -3,6 +3,23 @@
 //! This crate provides the core functionality for backing up and restoring
 //! Kafka topics to/from various storage backends.
 
+/// Fault-injection point for the chaos suite. Compiles to nothing unless the
+/// `failpoints` feature is enabled. With it, a `return(msg)` action makes the
+/// enclosing function return `Err(Error::Io(..))`; a callback action runs
+/// the callback and continues (used to simulate a crash at this point).
+macro_rules! failpoint {
+    ($name:literal) => {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!($name, |msg: Option<String>| {
+            Err($crate::Error::Io(std::io::Error::other(format!(
+                "failpoint {}: {}",
+                $name,
+                msg.unwrap_or_default()
+            ))))
+        });
+    };
+}
+
 pub mod backup;
 pub mod circuit_breaker;
 pub mod compression;
@@ -24,8 +41,9 @@ pub mod validation;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
-    CircuitBreakerSettings, Config, HeaderPreflightMode, MetricsConfig, OffsetStorageBackend,
-    OffsetStorageConfig, OffsetStrategy, RestoreOptions,
+    CircuitBreakerSettings, Config, HeaderPreflightMode, IsolationLevel, MetricsConfig,
+    OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreCheckpointStorage,
+    RestoreOptions,
 };
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
@@ -37,9 +55,9 @@ pub use kafka::{
 pub use manifest::{
     BackupManifest, BackupRecord, ConsumerGroupOffset, ConsumerGroupOffsets, DryRunPartitionReport,
     DryRunRepartitioningInfo, DryRunReport, DryRunTopicReport, OffsetGap, OffsetGapReason,
-    OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup, PartitionRestoreReport,
-    RecordHeader, RestoreCheckpoint, RestoreReport, SegmentMetadata, TopicBackup,
-    TopicRestoreReport,
+    OffsetLookupPrecision, OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup,
+    PartitionRestoreProgress, PartitionRestoreReport, RecordHeader, RestoreCheckpoint,
+    RestoreReport, SegmentMetadata, TargetOffsetLookup, TopicBackup, TopicRestoreReport,
 };
 pub use metrics::{
     create_instrumented_backend, ErrorType, InstrumentedStorageBackend, MetricsReport,

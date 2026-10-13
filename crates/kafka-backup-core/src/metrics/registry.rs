@@ -16,8 +16,9 @@ use std::time::Instant;
 
 use super::labels::{
     BackupLabels, CommitLabels, CompressionLabels, DurationLabels, ErrorLabels, ErrorType,
-    LagLabels, OperationStatus, RestoreLabels, RestoreProgressLabels, RetryLabels,
-    StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation, ThroughputLabels,
+    LagLabels, OperationStatus, RestoreErrorLabels, RestoreLabels, RestoreProgressLabels,
+    RetryLabels, StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation,
+    ThroughputLabels,
 };
 
 /// Storage latency histogram buckets (in seconds).
@@ -63,6 +64,12 @@ pub struct PrometheusMetrics {
     /// Records remaining before the captured snapshot target is reached.
     pub snapshot_records_remaining: Family<BackupLabels, Gauge>,
 
+    /// High watermark minus last stable offset, per partition, from the
+    /// latest fetch or snapshot capture: offsets held back by open
+    /// transactions. A value that stays above 0 means a hanging transaction
+    /// is stalling a `read_committed` backup of that partition.
+    pub lso_lag: Family<LagLabels, Gauge>,
+
     // ========================================
     // Throughput Metrics
     // ========================================
@@ -85,6 +92,13 @@ pub struct PrometheusMetrics {
     /// Cumulative source offsets skipped across all recorded gaps. An upper
     /// bound on records permanently missing from the backup.
     pub offsets_skipped_total: Family<BackupLabels, Counter>,
+
+    /// Records of aborted transactions a `read_committed` backup dropped.
+    pub aborted_records_dropped_total: Family<BackupLabels, Counter>,
+
+    /// Transaction markers (control records) a `read_committed` backup
+    /// passed over.
+    pub control_records_skipped_total: Family<BackupLabels, Counter>,
 
     /// Segments deliberately deleted by retention (`prune` /
     /// `backup.retention`). Each increment is one segment removed.
@@ -167,6 +181,18 @@ pub struct PrometheusMetrics {
     /// Cumulative records restored.
     pub restore_records_total: Family<RestoreProgressLabels, Counter>,
 
+    /// Cumulative bytes restored (record keys plus values, as in the
+    /// restore report).
+    pub restore_bytes_total: Family<RestoreProgressLabels, Counter>,
+
+    /// Partitions whose restore finished (target partitions on the
+    /// repartition path).
+    pub restore_partitions_completed_total: Family<RestoreProgressLabels, Counter>,
+
+    /// Restore errors by type: one per failed topic, or one for a restore
+    /// that failed before any topic did.
+    pub restore_errors_total: Family<RestoreErrorLabels, Counter>,
+
     // ========================================
     // Internal tracking
     // ========================================
@@ -215,6 +241,7 @@ impl PrometheusMetrics {
         let lag_records_sum = Family::<BackupLabels, Gauge>::default();
         let snapshot_records_target = Family::<BackupLabels, Gauge>::default();
         let snapshot_records_remaining = Family::<BackupLabels, Gauge>::default();
+        let lso_lag = Family::<LagLabels, Gauge>::default();
 
         // Throughput Metrics
         let throughput_records_per_sec =
@@ -224,6 +251,8 @@ impl PrometheusMetrics {
         let bytes_total = Family::<BackupLabels, Counter>::default();
         let offset_gaps_total = Family::<BackupLabels, Counter>::default();
         let offsets_skipped_total = Family::<BackupLabels, Counter>::default();
+        let aborted_records_dropped_total = Family::<BackupLabels, Counter>::default();
+        let control_records_skipped_total = Family::<BackupLabels, Counter>::default();
         let segments_pruned_total = Family::<BackupLabels, Counter>::default();
         let bytes_pruned_total = Family::<BackupLabels, Counter>::default();
         let missing_topics = Family::<BackupLabels, Gauge>::default();
@@ -268,6 +297,10 @@ impl PrometheusMetrics {
         let restore_throughput_records_per_sec =
             Family::<RestoreProgressLabels, Gauge<f64, AtomicU64>>::default();
         let restore_records_total = Family::<RestoreProgressLabels, Counter>::default();
+        let restore_bytes_total = Family::<RestoreProgressLabels, Counter>::default();
+        let restore_partitions_completed_total =
+            Family::<RestoreProgressLabels, Counter>::default();
+        let restore_errors_total = Family::<RestoreErrorLabels, Counter>::default();
 
         // Register all metrics with the registry
 
@@ -307,6 +340,11 @@ impl PrometheusMetrics {
             "Records this backup run has still to fetch before the captured snapshot target is reached",
             snapshot_records_remaining.clone(),
         );
+        registry.register(
+            "kafka_backup_lso_lag",
+            "High watermark minus last stable offset: offsets held back by open transactions (stays above 0 under a hanging transaction)",
+            lso_lag.clone(),
+        );
 
         // Throughput Metrics
         registry.register(
@@ -338,6 +376,16 @@ impl PrometheusMetrics {
             "kafka_backup_offsets_skipped",
             "Cumulative source offsets skipped across all recorded gaps",
             offsets_skipped_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_aborted_records_dropped",
+            "Records of aborted transactions not archived (backup.isolation_level: read_committed)",
+            aborted_records_dropped_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_control_records_skipped",
+            "Transaction markers (commit/abort control records) not archived (backup.isolation_level: read_committed)",
+            control_records_skipped_total.clone(),
         );
         registry.register(
             "kafka_backup_segments_pruned",
@@ -454,6 +502,21 @@ impl PrometheusMetrics {
             "Cumulative records restored",
             restore_records_total.clone(),
         );
+        registry.register(
+            "kafka_restore_bytes",
+            "Cumulative bytes restored (record keys and values)",
+            restore_bytes_total.clone(),
+        );
+        registry.register(
+            "kafka_restore_partitions_completed",
+            "Partitions whose restore finished",
+            restore_partitions_completed_total.clone(),
+        );
+        registry.register(
+            "kafka_restore_errors",
+            "Restore errors by type",
+            restore_errors_total.clone(),
+        );
 
         Self {
             registry: RwLock::new(registry),
@@ -464,12 +527,15 @@ impl PrometheusMetrics {
             lag_records_sum,
             snapshot_records_target,
             snapshot_records_remaining,
+            lso_lag,
             throughput_records_per_sec,
             throughput_bytes_per_sec,
             records_total,
             bytes_total,
             offset_gaps_total,
             offsets_skipped_total,
+            aborted_records_dropped_total,
+            control_records_skipped_total,
             segments_pruned_total,
             bytes_pruned_total,
             missing_topics,
@@ -491,6 +557,9 @@ impl PrometheusMetrics {
             restore_eta_seconds,
             restore_throughput_records_per_sec,
             restore_records_total,
+            restore_bytes_total,
+            restore_partitions_completed_total,
+            restore_errors_total,
             start_time: Instant::now(),
             max_partition_labels,
             partition_labels: RwLock::new(HashSet::new()),
@@ -565,6 +634,37 @@ impl PrometheusMetrics {
             return;
         }
         self.lag_seconds.get_or_create(&labels).set(lag_seconds);
+    }
+
+    /// Record a partition's LSO lag: high watermark minus last stable
+    /// offset (offsets held back by open transactions). Subject to
+    /// `max_partition_labels` like the other per-partition gauges.
+    pub fn record_lso_lag(&self, topic: &str, partition: i32, backup_id: &str, lso_lag: i64) {
+        let labels = LagLabels::new(topic, partition, backup_id);
+        if !self.check_partition_cardinality(&labels) {
+            return;
+        }
+        self.lso_lag.get_or_create(&labels).set(lso_lag.max(0));
+    }
+
+    /// Count transaction markers skipped and aborted records dropped by a
+    /// `read_committed` backup.
+    pub fn record_transaction_skips(
+        &self,
+        backup_id: &str,
+        control_records_skipped: u64,
+        aborted_records_dropped: u64,
+    ) {
+        if control_records_skipped == 0 && aborted_records_dropped == 0 {
+            return;
+        }
+        let labels = BackupLabels::new(backup_id);
+        self.control_records_skipped_total
+            .get_or_create(&labels)
+            .inc_by(control_records_skipped);
+        self.aborted_records_dropped_total
+            .get_or_create(&labels)
+            .inc_by(aborted_records_dropped);
     }
 
     /// Update maximum lag across all partitions.
@@ -850,6 +950,28 @@ impl PrometheusMetrics {
             .inc_by(count);
     }
 
+    /// Increment restore bytes counter.
+    pub fn inc_restore_bytes(&self, restore_id: &str, bytes: u64) {
+        let labels = RestoreProgressLabels::new(restore_id);
+        self.restore_bytes_total
+            .get_or_create(&labels)
+            .inc_by(bytes);
+    }
+
+    /// Count one partition whose restore finished.
+    pub fn inc_restore_partitions_completed(&self, restore_id: &str) {
+        let labels = RestoreProgressLabels::new(restore_id);
+        self.restore_partitions_completed_total
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    /// Count one restore error.
+    pub fn record_restore_error(&self, restore_id: &str, error_type: ErrorType) {
+        let labels = RestoreErrorLabels::new(restore_id, error_type);
+        self.restore_errors_total.get_or_create(&labels).inc();
+    }
+
     // ========================================
     // Utility Methods
     // ========================================
@@ -1016,6 +1138,42 @@ mod tests {
     }
 
     #[test]
+    fn transaction_skip_counters_accumulate_per_backup() {
+        let metrics = PrometheusMetrics::new();
+        metrics.record_transaction_skips("backup-001", 1, 3);
+        metrics.record_transaction_skips("backup-001", 2, 0);
+        metrics.record_transaction_skips("backup-001", 0, 0);
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded
+                .contains("kafka_backup_control_records_skipped_total{backup_id=\"backup-001\"} 3"),
+            "{encoded}"
+        );
+        assert!(
+            encoded
+                .contains("kafka_backup_aborted_records_dropped_total{backup_id=\"backup-001\"} 3"),
+            "{encoded}"
+        );
+    }
+
+    #[test]
+    fn lso_lag_is_a_per_partition_gauge_under_the_cardinality_limit() {
+        let metrics = PrometheusMetrics::with_max_labels(1);
+        metrics.record_lso_lag("txn", 0, "b", 7);
+        metrics.record_lso_lag("txn", 1, "b", 9); // over the limit: dropped
+        metrics.record_lso_lag("txn", 0, "b", 0); // the transaction resolved
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded
+                .contains("kafka_backup_lso_lag{topic=\"txn\",partition=\"0\",backup_id=\"b\"} 0"),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("partition=\"1\""), "{encoded}");
+    }
+
+    #[test]
     fn test_record_compression() {
         let metrics = PrometheusMetrics::new();
         metrics.record_compression("zstd", "backup-001", 100, 400);
@@ -1039,6 +1197,25 @@ mod tests {
         let encoded = metrics.encode();
         assert!(encoded.contains("kafka_restore_progress_percent"));
         assert!(encoded.contains("kafka_restore_eta_seconds"));
+    }
+
+    #[test]
+    fn test_restore_bytes_partitions_and_errors() {
+        let metrics = PrometheusMetrics::new();
+        metrics.inc_restore_records("restore-001", 10);
+        metrics.inc_restore_bytes("restore-001", 2048);
+        metrics.inc_restore_partitions_completed("restore-001");
+        metrics.inc_restore_partitions_completed("restore-001");
+        metrics.record_restore_error("restore-001", ErrorType::BrokerConnection);
+
+        let encoded = metrics.encode();
+        assert!(encoded.contains("kafka_restore_records_total{restore_id=\"restore-001\"} 10"));
+        assert!(encoded.contains("kafka_restore_bytes_total{restore_id=\"restore-001\"} 2048"));
+        assert!(encoded
+            .contains("kafka_restore_partitions_completed_total{restore_id=\"restore-001\"} 2"));
+        assert!(encoded.contains(
+            "kafka_restore_errors_total{restore_id=\"restore-001\",error_type=\"broker_connection\"} 1"
+        ));
     }
 
     #[test]

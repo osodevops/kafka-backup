@@ -8,14 +8,17 @@ mod fetch;
 mod header_codec;
 mod metadata;
 mod partition_router;
-mod produce;
+pub(crate) mod produce;
 pub mod sasl;
 mod scram;
 pub mod tls;
+pub mod transactions;
 
+pub use crate::config::IsolationLevel;
 pub use admin::{
-    create_topics, delete_records, describe_configs, incremental_alter_configs, ConfigChange,
-    ConfigEntry, ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
+    create_topics, delete_records, describe_configs, incremental_alter_configs,
+    incremental_alter_configs_per_resource, ConfigChange, ConfigChangeResult, ConfigEntry,
+    ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
 };
 pub use client::{KafkaClient, RESPONSE_TIMEOUT_SECS, WRITE_TIMEOUT_SECS};
 pub use connection_error::{is_connection_error, is_connection_io_kind};
@@ -24,8 +27,9 @@ pub use consumer_groups::{
     offsets_for_times, CommittedOffset, ConsumerGroup, ConsumerGroupDescription,
     ConsumerGroupMember, GroupCoordinator, TimestampOffset,
 };
-pub use fetch::FetchResponse;
+pub use fetch::{FetchResponse, SkippedBatch};
 pub use metadata::{fetch_metadata, BrokerMetadata, PartitionMetadata, TopicMetadata};
+pub(crate) use partition_router::PartitionFetcher;
 pub use partition_router::PartitionLeaderRouter;
 pub use produce::ProduceResponse;
 pub use sasl::{

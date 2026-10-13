@@ -21,8 +21,10 @@ pub async fn run(config_path: &str) -> Result<()> {
         metrics_config.max_partition_labels,
     ));
 
-    let metrics_server =
-        super::metrics_runtime::RunningMetricsServer::start(&metrics_config, prometheus_metrics);
+    let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
+        &metrics_config,
+        prometheus_metrics.clone(),
+    );
 
     // Phase 3 (consumer group offset reset) is applied after the data restore
     // when the configuration asks for it. The engine itself never commits
@@ -37,8 +39,8 @@ pub async fn run(config_path: &str) -> Result<()> {
         None
     };
 
-    // Run the restore engine
-    let engine = RestoreEngine::new(config)?;
+    // Run the restore engine with Prometheus metrics
+    let engine = RestoreEngine::new_with_metrics(config, Some(prometheus_metrics))?;
 
     // Spawn signal handler for graceful shutdown (SIGTERM + SIGINT/Ctrl-C)
     let shutdown_tx_signal = engine.shutdown_handle();
@@ -58,6 +60,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     signal_task.abort(); // Clean up signal watcher if operation finished normally
 
     let report = result?;
+    print_topic_config_summary(&report);
 
     if let Some(orchestrator) = orchestrator {
         info!(
@@ -83,6 +86,15 @@ pub async fn run(config_path: &str) -> Result<()> {
             report.records_tombstoned_by_filter,
             report.record_filter.as_deref().unwrap_or("unnamed"),
         );
+    }
+
+    for topic in &report.topics_restored {
+        if topic.schema_ids_rewritten > 0 || topic.schema_ids_unmapped > 0 {
+            println!(
+                "Schema IDs ({}): {} rewritten, {} not in schema_id_mapping (left unchanged)",
+                topic.source_topic, topic.schema_ids_rewritten, topic.schema_ids_unmapped,
+            );
+        }
     }
 
     info!("Restore completed successfully");
@@ -141,4 +153,31 @@ fn print_offset_reset_summary(outcome: &OffsetResetPhaseOutcome) {
         warn!("{}", w);
     }
     println!();
+}
+
+/// List the topic configuration that was not restored as captured.
+fn print_topic_config_summary(report: &kafka_backup_core::RestoreReport) {
+    use kafka_backup_core::manifest::TopicConfigSkipReason;
+
+    if report.topic_configs_skipped.is_empty() && report.topic_configs_adjusted.is_empty() {
+        return;
+    }
+    println!("Topic configuration not restored as captured:");
+    for s in &report.topic_configs_skipped {
+        let why = match s.reason {
+            TopicConfigSkipReason::NotReportedByTarget => "not reported by the target".to_string(),
+            TopicConfigSkipReason::ReadOnly => "read-only on the target".to_string(),
+            TopicConfigSkipReason::Rejected => format!(
+                "rejected: {}",
+                s.message.as_deref().unwrap_or("<no message>")
+            ),
+        };
+        println!("  {} {}={}: skipped ({why})", s.topic, s.name, s.value);
+    }
+    for a in &report.topic_configs_adjusted {
+        println!(
+            "  {} {}={}: applied as {} ({})",
+            a.topic, a.name, a.value, a.applied, a.limit
+        );
+    }
 }

@@ -84,6 +84,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_rejects_oauth_under_security_with_enterprise_hint() {
+        let yaml = r#"
+mode: backup
+backup_id: b
+source:
+  bootstrap_servers: ["localhost:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+    oauth:
+      token_endpoint_url: https://idp/token
+storage:
+  backend: filesystem
+  path: /tmp/b
+"#;
+        let err = parse_config(yaml).unwrap_err().to_string();
+        assert!(err.contains("source.security.oauth"), "{err}");
+        assert!(
+            err.contains("OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_dollar_without_brace_unchanged() {
         let result = expand_env_vars("price is $5");
         assert_eq!(result, "price is $5");

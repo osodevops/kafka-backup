@@ -1,14 +1,18 @@
-//! Chaos test suite entry point.
+//! Chaos suite entry point: crash-consistency of backup checkpoints.
 //!
-//! These tests simulate failure scenarios and require:
-//! - Docker for Kafka containers
-//! - Multi-broker cluster support (for some tests)
-//! - Network manipulation capabilities (for some tests)
+//! Needs Docker (testcontainers Kafka) and the `failpoints` feature:
 //!
-//! Run with: `cargo test --test chaos_tests`
-//! Run ignored tests: `cargo test --test chaos_tests -- --ignored`
+//! ```bash
+//! cargo test -p kafka-backup-core --features failpoints --test chaos_tests \
+//!     -- --ignored --nocapture
+//! # nightly depth:
+//! KAFKA_BACKUP_CHAOS_SEEDS=100 cargo test -p kafka-backup-core --features failpoints \
+//!     --test chaos_tests -- --ignored --nocapture
+//! # replay one seed:
+//! KAFKA_BACKUP_CHAOS_SEED_BASE=1234 KAFKA_BACKUP_CHAOS_SEEDS=1 cargo test ...
+//! ```
 //!
-//! Note: Most chaos tests are marked as `#[ignore]` because they
-//! require specific infrastructure that may not be available in CI.
+//! Without the feature this file compiles to an empty test binary.
+#![cfg(feature = "failpoints")]
 
 mod chaos_suite;

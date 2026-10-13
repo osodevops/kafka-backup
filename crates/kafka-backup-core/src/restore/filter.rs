@@ -8,9 +8,11 @@
 //!
 //! The engine reports how many records a filter affected
 //! (`records_dropped_by_filter` / `records_tombstoned_by_filter` in the
-//! restore report) and keeps consumer-group offset mapping exact when records
-//! are dropped by mapping each dropped source offset to the next surviving
-//! record's target offset.
+//! restore report). Dropped records are simply absent from the offset
+//! mapping; consumer-group offsets stay exact because
+//! [`OffsetMapping::resolve_target_offset`](crate::manifest::OffsetMapping::resolve_target_offset)
+//! resolves a committed offset that points at a dropped record to the next
+//! restored record, as it does for any gap.
 
 use std::fmt;
 use std::sync::Arc;
@@ -86,8 +88,7 @@ pub struct FilterOutcome {
     pub dropped: u64,
     /// Records turned into tombstones.
     pub tombstoned: u64,
-    /// `(source_offset, timestamp)` of every dropped record, in offset order —
-    /// used to keep the consumer-group offset mapping exact.
+    /// `(source_offset, timestamp)` of every dropped record, in offset order.
     pub dropped_records: Vec<(i64, i64)>,
 }
 
@@ -125,16 +126,25 @@ pub fn apply_record_filter(
     (kept, outcome)
 }
 
-/// Map each dropped source offset to a target offset, so
-/// `OffsetMapping::lookup_target_offset` stays exact when records were
-/// dropped: a committed consumer offset pointing at a dropped record must
-/// resolve to the next surviving record's target offset (or one past the
-/// last survivor when the drop was at the tail).
+/// Map each dropped source offset to a target offset: the next surviving
+/// record's target offset, or one past the last survivor when the drop was
+/// at the tail.
+///
+/// The restore engine no longer records these entries.
+/// `OffsetMapping::resolve_target_offset` already resolves a committed offset
+/// that points at a dropped record to the next restored record, and an entry
+/// for a dropped tail record would make an offset past it resolve one past
+/// the target's log end.
 ///
 /// `survivors` is `(source_offset, target_offset)` for every produced record
 /// of the same partition slice, in ascending source-offset order. Returns
 /// `(source_offset, target_offset, timestamp)` triples; empty when there were
 /// no survivors to anchor on.
+#[deprecated(
+    note = "not needed: OffsetMapping::resolve_target_offset resolves offsets of dropped \
+            records to the next restored record; recording these entries breaks the \
+            end-of-log answer"
+)]
 pub fn map_dropped_offsets(
     dropped: &[(i64, i64)],
     survivors: &[(i64, i64)],
@@ -238,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn map_dropped_offsets_points_at_the_next_survivor() {
         // survivors: source 1 -> target 100, source 3 -> target 101
         let survivors = vec![(1, 100), (3, 101)];
@@ -250,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn map_dropped_offsets_without_survivors_maps_nothing() {
         assert!(map_dropped_offsets(&[(0, 0)], &[]).is_empty());
     }

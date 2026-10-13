@@ -71,6 +71,14 @@ fn print_manifest_text(manifest: &BackupManifest) {
         );
     }
     println!("║ Compression:    {:55} ║", manifest.compression);
+    println!(
+        "║ Isolation:      {:55} ║",
+        match manifest.isolation_level {
+            Some(level) => level.to_string(),
+            // Manifests written before 0.25 always read uncommitted.
+            None => "read_uncommitted (written before 0.25)".to_string(),
+        }
+    );
     println!("╠══════════════════════════════════════════════════════════════════════╣");
     println!("║                              SUMMARY                                 ║");
     println!("╠══════════════════════════════════════════════════════════════════════╣");
@@ -90,6 +98,14 @@ fn print_manifest_text(manifest: &BackupManifest) {
                 "{} ({} source offsets not captured)",
                 total_gaps, offsets_missing
             )
+        );
+    }
+    let markers = manifest.total_control_records_skipped();
+    let aborted = manifest.total_aborted_records_dropped();
+    if markers > 0 || aborted > 0 {
+        println!(
+            "║ Not Archived:   {:55} ║",
+            format!("{markers} transaction markers, {aborted} aborted records")
         );
     }
     let total_pruned = manifest.total_pruned();
@@ -211,6 +227,20 @@ fn print_manifest_text(manifest: &BackupManifest) {
                     offset_range.1,
                     partition.segments.len()
                 );
+            }
+            if let (Some(end), Some(hw)) = (
+                partition.snapshot_end_offset,
+                partition.high_watermark_at_capture,
+            ) {
+                if hw > end {
+                    println!(
+                        "║     P{}: snapshot ended at the last stable offset {} ({} offsets in open transactions below the high watermark {}) ║",
+                        partition.partition_id,
+                        end,
+                        hw - end,
+                        hw
+                    );
+                }
             }
             for gap in &partition.gaps {
                 println!(

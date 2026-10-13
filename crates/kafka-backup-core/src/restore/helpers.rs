@@ -3,7 +3,11 @@
 //! These functions are used by both the standard restore engine and the
 //! repartitioning fan-out module.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::compression::{decompress, detect_from_extension};
 use crate::config::{OffsetStrategy, RestoreOptions};
@@ -12,7 +16,7 @@ use crate::offset_headers;
 use crate::segment::format::{BinaryRecord, MAGIC_BYTES};
 use crate::segment::SegmentReader;
 use crate::storage::StorageBackend;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Read a segment from storage, handling both binary and legacy JSON formats.
 pub async fn read_segment(
@@ -150,6 +154,203 @@ pub async fn mark_segment_completed(checkpoint: &Mutex<Option<RestoreCheckpoint>
     let mut cp = checkpoint.lock().await;
     if let Some(c) = cp.as_mut() {
         c.mark_segment_completed(key);
+    }
+}
+
+/// Segments in restore order: by first source offset (stable for ties).
+pub(crate) fn segments_in_offset_order<'a>(
+    segments: impl IntoIterator<Item = &'a SegmentMetadata>,
+) -> Vec<&'a SegmentMetadata> {
+    let mut ordered: Vec<&SegmentMetadata> = segments.into_iter().collect();
+    ordered.sort_by_key(|s| s.start_offset);
+    ordered
+}
+
+/// Remembers the highest source offset already restored for one source
+/// partition, so a record is never produced twice when a manifest written
+/// before 0.25 lists overlapping segments (a segment key rewritten on
+/// resume with different boundaries). Segments must be read in
+/// [`segments_in_offset_order`].
+#[derive(Debug, Default)]
+pub(crate) struct OverlapGuard {
+    last: Option<i64>,
+}
+
+impl OverlapGuard {
+    /// Drop records at or below the highest offset already taken, then
+    /// remember the new highest. Returns how many were dropped.
+    pub(crate) fn skip_restored(&mut self, records: &mut Vec<BackupRecord>) -> u64 {
+        let before = records.len();
+        if let Some(last) = self.last {
+            records.retain(|r| r.offset > last);
+        }
+        if let Some(max) = records.iter().map(|r| r.offset).max() {
+            self.last = Some(self.last.map_or(max, |last| last.max(max)));
+        }
+        (before - records.len()) as u64
+    }
+}
+
+/// Confluent schema IDs rewritten in one topic's keys and values, and keys
+/// and values that carried an ID absent from the mapping. Shared by the
+/// topic's partition tasks (1:1 path) or readers (repartition path).
+#[derive(Debug, Default)]
+pub(crate) struct SchemaIdCounts {
+    rewritten: AtomicU64,
+    unmapped: AtomicU64,
+}
+
+impl SchemaIdCounts {
+    fn add(&self, rewritten: u64, unmapped: u64) {
+        self.rewritten.fetch_add(rewritten, Ordering::Relaxed);
+        self.unmapped.fetch_add(unmapped, Ordering::Relaxed);
+    }
+
+    /// `(rewritten, unmapped)` for the topic's report, logged when non-zero.
+    pub(crate) fn finish(&self, source_topic: &str) -> (u64, u64) {
+        let rewritten = self.rewritten.load(Ordering::Relaxed);
+        let unmapped = self.unmapped.load(Ordering::Relaxed);
+        if rewritten > 0 {
+            info!("{source_topic}: rewrote {rewritten} Confluent schema ID(s)");
+        }
+        if unmapped > 0 {
+            warn!(
+                "{source_topic}: {unmapped} key(s)/value(s) start with the Confluent magic byte \
+                 but carry a schema ID absent from restore.schema_id_mapping; they were \
+                 restored unchanged (restore.schema_id_rewrite_strict: false)"
+            );
+        }
+        (rewritten, unmapped)
+    }
+}
+
+/// Whether `restore.rewrite_schema_ids` applies to `source_topic`: every
+/// topic, or those `schema_id_rewrite_topics` matches (glob, or regex with a
+/// `~` prefix).
+pub(crate) fn schema_id_rewrite_applies(options: &RestoreOptions, source_topic: &str) -> bool {
+    options.rewrite_schema_ids
+        && (options.schema_id_rewrite_topics.is_empty()
+            || options
+                .schema_id_rewrite_topics
+                .iter()
+                .any(|pattern| super::engine::pattern_match(pattern, source_topic)))
+}
+
+/// Rewrite the Confluent schema IDs of records about to be produced
+/// (`restore.rewrite_schema_ids`) and count them in `counts`.
+///
+/// Records of topics outside `schema_id_rewrite_topics` are left alone. With
+/// `schema_id_rewrite_strict` (the default, as in 0.24) a key or value that
+/// starts with the magic byte but is shorter than the 5-byte frame, or
+/// carries an ID absent from `schema_id_mapping`, fails the restore before
+/// any record of the batch is produced; with `schema_id_rewrite_strict:
+/// false` it is left unchanged (an unmapped ID is counted). A mapping to an
+/// ID that is not positive always fails.
+///
+/// Both restore paths call this after the record transform and before the
+/// offset headers and partition routing.
+pub(crate) fn rewrite_schema_ids(
+    records: &mut [BackupRecord],
+    source_topic: &str,
+    source_partition: i32,
+    options: &RestoreOptions,
+    counts: &SchemaIdCounts,
+) -> Result<()> {
+    if !schema_id_rewrite_applies(options, source_topic) {
+        return Ok(());
+    }
+    let (mut rewritten, mut unmapped) = (0u64, 0u64);
+    for record in records.iter_mut() {
+        let offset = record.offset;
+        for (part, payload) in [
+            ("key", record.key.as_mut()),
+            ("value", record.value.as_mut()),
+        ] {
+            let strict = options.schema_id_rewrite_strict;
+            let failure = match rewrite_confluent_payload(payload, &options.schema_id_mapping) {
+                PayloadRewrite::NotFramed => None,
+                PayloadRewrite::Rewritten => {
+                    rewritten += 1;
+                    None
+                }
+                PayloadRewrite::InvalidTarget { source, target } => Some(format!(
+                    "restore.schema_id_mapping maps schema ID {source} (in the {part} of \
+                     {source_topic} partition {source_partition} offset {offset}) to {target}; \
+                     schema IDs are positive"
+                )),
+                PayloadRewrite::Truncated if strict => Some(format!(
+                    "the {part} of {source_topic} partition {source_partition} offset {offset} \
+                     starts with the Confluent magic byte but is shorter than a schema ID frame; \
+                     restore.schema_id_rewrite_strict refuses to produce it (narrow \
+                     schema_id_rewrite_topics, or set schema_id_rewrite_strict: false, for topics \
+                     with raw keys or values)"
+                )),
+                PayloadRewrite::Truncated => None,
+                PayloadRewrite::Unmapped(id) if strict => Some(format!(
+                    "schema ID {id} in the {part} of {source_topic} partition \
+                     {source_partition} offset {offset} is not in restore.schema_id_mapping; \
+                     restore.schema_id_rewrite_strict refuses to produce it with the source \
+                     registry's ID (narrow schema_id_rewrite_topics, or set \
+                     schema_id_rewrite_strict: false, for topics with raw keys or values)"
+                )),
+                PayloadRewrite::Unmapped(_) => {
+                    unmapped += 1;
+                    None
+                }
+            };
+            if let Some(message) = failure {
+                counts.add(rewritten, unmapped);
+                return Err(Error::Validation(message));
+            }
+        }
+    }
+    counts.add(rewritten, unmapped);
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadRewrite {
+    /// Null, empty, or no magic byte 0.
+    NotFramed,
+    /// Magic byte 0 but shorter than the 5-byte frame header.
+    Truncated,
+    Rewritten,
+    /// Magic byte 0 followed by this ID, absent from the mapping.
+    Unmapped(i32),
+    /// The mapping sends `source` to an ID that is not positive.
+    InvalidTarget {
+        source: i32,
+        target: i32,
+    },
+}
+
+/// Rewrite the 4-byte schema ID following Confluent's magic byte. Avro, JSON
+/// Schema and Protobuf all share this five-byte prefix; any format-specific
+/// bytes after it are preserved verbatim.
+fn rewrite_confluent_payload(
+    payload: Option<&mut Vec<u8>>,
+    mapping: &HashMap<i32, i32>,
+) -> PayloadRewrite {
+    let Some(payload) = payload else {
+        return PayloadRewrite::NotFramed;
+    };
+    if payload.first() != Some(&0) {
+        return PayloadRewrite::NotFramed;
+    }
+    if payload.len() < 5 {
+        return PayloadRewrite::Truncated;
+    }
+    let source_id = i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    match mapping.get(&source_id) {
+        Some(&target) if target <= 0 => PayloadRewrite::InvalidTarget {
+            source: source_id,
+            target,
+        },
+        Some(target_id) => {
+            payload[1..5].copy_from_slice(&target_id.to_be_bytes());
+            PayloadRewrite::Rewritten
+        }
+        None => PayloadRewrite::Unmapped(source_id),
     }
 }
 
@@ -304,6 +505,10 @@ mod tests {
                 compressed_size: 0,
                 sha256: String::new(),
                 uploaded_at: 0,
+                covered_start_offset: None,
+                covered_end_offset: None,
+                control_records_skipped: 0,
+                aborted_records_dropped: 0,
             };
 
             let out = read_segment(&storage, &segment)
@@ -479,6 +684,76 @@ mod tests {
         );
     }
 
+    fn at(offsets: std::ops::RangeInclusive<i64>) -> Vec<BackupRecord> {
+        offsets
+            .map(|offset| BackupRecord {
+                key: None,
+                value: Some(offset.to_string().into_bytes()),
+                headers: vec![],
+                timestamp: offset,
+                offset,
+            })
+            .collect()
+    }
+
+    fn seg(key: &str, start: i64, end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            key: key.to_string(),
+            start_offset: start,
+            end_offset: end,
+            start_timestamp: start,
+            end_timestamp: end,
+            record_count: end - start + 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            sha256: String::new(),
+            uploaded_at: 0,
+            covered_start_offset: None,
+            covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
+        }
+    }
+
+    /// A pre-0.25 manifest can list overlapping segments (a key rewritten on
+    /// resume with other boundaries, kept by the merge). Restore must
+    /// produce every source offset exactly once.
+    #[test]
+    fn overlapping_segments_produce_each_source_offset_once() {
+        let segments = [seg("c", 150, 249), seg("a", 0, 199), seg("b", 100, 149)];
+        let ordered = segments_in_offset_order(segments.iter());
+        assert_eq!(
+            ordered.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        let mut guard = OverlapGuard::default();
+        let mut produced = Vec::new();
+        let mut skipped = 0;
+        for segment in ordered {
+            let mut records = at(segment.start_offset..=segment.end_offset);
+            skipped += guard.skip_restored(&mut records);
+            produced.extend(records.into_iter().map(|r| r.offset));
+        }
+        assert_eq!(produced, (0..=249).collect::<Vec<_>>());
+        assert_eq!(skipped, 50 + 50, "b entirely, and 150..=199 of c");
+    }
+
+    #[test]
+    fn overlap_guard_keeps_disjoint_segments_untouched() {
+        let mut guard = OverlapGuard::default();
+        let mut first = at(0..=9);
+        let mut second = at(12..=20);
+        assert_eq!(guard.skip_restored(&mut first), 0);
+        assert_eq!(guard.skip_restored(&mut second), 0);
+        assert_eq!(second.len(), 9);
+        let mut empty = Vec::new();
+        assert_eq!(guard.skip_restored(&mut empty), 0);
+        let mut replay = at(5..=25);
+        assert_eq!(guard.skip_restored(&mut replay), 16);
+        assert_eq!(replay.first().map(|r| r.offset), Some(21));
+    }
+
     #[test]
     fn inject_offset_headers_is_a_no_op_when_not_configured() {
         let record = BackupRecord {
@@ -490,5 +765,138 @@ mod tests {
         };
         let out = inject_offset_headers(vec![record], 0, &RestoreOptions::default());
         assert_eq!(out[0].headers, vec![header("trace-id", None)]);
+    }
+
+    fn record(key: Option<Vec<u8>>, value: Option<Vec<u8>>) -> BackupRecord {
+        BackupRecord {
+            key,
+            value,
+            headers: Vec::new(),
+            timestamp: 0,
+            offset: 3,
+        }
+    }
+
+    fn rewrite_options(mapping: &[(i32, i32)]) -> RestoreOptions {
+        RestoreOptions {
+            rewrite_schema_ids: true,
+            schema_id_mapping: mapping.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewrites_confluent_key_and_value_without_touching_payload() {
+        let mut records = vec![record(
+            Some(vec![0, 0, 0, 0, 7, 10]),
+            Some(vec![0, 0, 0, 0, 7, 20, 21]),
+        )];
+        let counts = SchemaIdCounts::default();
+        rewrite_schema_ids(&mut records, "t", 0, &rewrite_options(&[(7, 42)]), &counts).unwrap();
+        assert_eq!(records[0].key.as_deref(), Some(&[0, 0, 0, 0, 42, 10][..]));
+        assert_eq!(
+            records[0].value.as_deref(),
+            Some(&[0, 0, 0, 0, 42, 20, 21][..])
+        );
+        assert_eq!(counts.finish("t"), (2, 0));
+    }
+
+    #[test]
+    fn lenient_mode_ignores_null_short_and_non_confluent_payloads_and_counts_unmapped() {
+        let mut records = vec![
+            record(None, Some(vec![0, 1, 2])),
+            record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8])),
+        ];
+        let original = records.clone();
+        let counts = SchemaIdCounts::default();
+        let mut options = rewrite_options(&[(7, 42)]);
+        options.schema_id_rewrite_strict = false;
+        rewrite_schema_ids(&mut records, "t", 0, &options, &counts).unwrap();
+        assert_eq!(records[0].key, original[0].key);
+        assert_eq!(records[0].value, original[0].value);
+        assert_eq!(records[1].key, original[1].key);
+        assert_eq!(records[1].value, original[1].value);
+        // Only `00 00 00 00 08` is framed, with an ID the mapping lacks.
+        assert_eq!(counts.finish("t"), (0, 1));
+    }
+
+    #[test]
+    fn rewrite_is_off_unless_enabled_and_scoped_by_topic_patterns() {
+        let framed = || vec![record(None, Some(vec![0, 0, 0, 0, 7, 1]))];
+        let counts = SchemaIdCounts::default();
+
+        let mut disabled = framed();
+        let mut options = rewrite_options(&[(7, 42)]);
+        options.rewrite_schema_ids = false;
+        rewrite_schema_ids(&mut disabled, "orders", 0, &options, &counts).unwrap();
+        assert_eq!(disabled[0].value, framed()[0].value);
+
+        options.rewrite_schema_ids = true;
+        options.schema_id_rewrite_topics = vec!["payments-*".into(), "~^orders-v\\d+$".into()];
+        assert!(!schema_id_rewrite_applies(&options, "orders"));
+        assert!(schema_id_rewrite_applies(&options, "payments-eu"));
+        assert!(schema_id_rewrite_applies(&options, "orders-v2"));
+
+        let mut outside = framed();
+        rewrite_schema_ids(&mut outside, "orders", 0, &options, &counts).unwrap();
+        assert_eq!(outside[0].value, framed()[0].value);
+        let mut inside = framed();
+        rewrite_schema_ids(&mut inside, "orders-v2", 0, &options, &counts).unwrap();
+        assert_eq!(inside[0].value.as_deref(), Some(&[0, 0, 0, 0, 42, 1][..]));
+        assert_eq!(counts.finish("t"), (1, 0));
+    }
+
+    /// Strict is the default (0.24 failed on truncated and unmapped frames).
+    #[test]
+    fn strict_mode_fails_on_an_unmapped_id_naming_the_record() {
+        let options = rewrite_options(&[(7, 42)]);
+        assert!(options.schema_id_rewrite_strict);
+        let counts = SchemaIdCounts::default();
+
+        // Mapped and non-framed payloads pass.
+        let mut ok = vec![record(Some(b"plain".to_vec()), Some(vec![0, 0, 0, 0, 7]))];
+        rewrite_schema_ids(&mut ok, "orders", 2, &options, &counts).unwrap();
+
+        let mut bad = vec![record(Some(vec![0, 0, 0, 1, 0, 9]), None)];
+        let err = rewrite_schema_ids(&mut bad, "orders", 2, &options, &counts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("schema ID 256 in the key of orders partition 2 offset 3"),
+            "{err}"
+        );
+        assert!(err.contains("restore.schema_id_mapping"), "{err}");
+    }
+
+    #[test]
+    fn strict_mode_fails_on_a_truncated_frame_and_any_mode_on_a_non_positive_target() {
+        let counts = SchemaIdCounts::default();
+        let mut truncated = vec![record(None, Some(vec![0, 1, 2]))];
+        let err = rewrite_schema_ids(
+            &mut truncated,
+            "t",
+            0,
+            &rewrite_options(&[(7, 42)]),
+            &counts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shorter than a schema ID frame"), "{err}");
+
+        // Raw payloads that do not start with 0 pass, with or without a mapping.
+        let mut raw = vec![record(None, Some(vec![1, 2]))];
+        rewrite_schema_ids(&mut raw, "t", 0, &rewrite_options(&[]), &counts).unwrap();
+        assert_eq!(raw[0].value, Some(vec![1, 2]));
+
+        for strict in [true, false] {
+            let mut options = rewrite_options(&[(7, 0)]);
+            options.schema_id_rewrite_strict = strict;
+            let mut zero = vec![record(None, Some(vec![0, 0, 0, 0, 7, 1]))];
+            let err = rewrite_schema_ids(&mut zero, "t", 0, &options, &counts)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("schema IDs are positive"), "{err}");
+            assert_eq!(zero[0].value, Some(vec![0, 0, 0, 0, 7, 1]));
+        }
     }
 }

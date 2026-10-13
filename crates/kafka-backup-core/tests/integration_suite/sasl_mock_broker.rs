@@ -50,6 +50,10 @@ pub enum Exchange {
 #[derive(Debug, Default, Clone)]
 pub struct CapturedRequests {
     pub handshake_mechanism: Option<String>,
+    /// Number of `SaslHandshake` requests received. KIP-368
+    /// re-authentication starts with a fresh handshake, so a re-auth
+    /// test expects at least two.
+    pub handshakes: usize,
     pub authenticate_payloads: Vec<Vec<u8>>,
 }
 
@@ -107,7 +111,10 @@ async fn serve_connection(
         match (exchange, api_key) {
             (Exchange::HandshakeSuccess, ApiKey::SaslHandshake) => {
                 let mechanism = decode_handshake_body(&body, api_version);
-                captured.lock().await.handshake_mechanism = Some(mechanism);
+                let mut c = captured.lock().await;
+                c.handshake_mechanism = Some(mechanism);
+                c.handshakes += 1;
+                drop(c);
                 let resp = SaslHandshakeResponse::default()
                     .with_error_code(0)
                     .with_mechanisms(vec![]);
