@@ -890,6 +890,7 @@ async fn test_bug9_configurable_produce_acks() {
     // Restore with acks=1 (faster, leader-only acknowledgement)
     let mut opts = test_restore_opts();
     opts.produce_acks = 1; // Bug #9: configurable
+    opts.idempotent_producer = false; // acks other than -1 need idempotence off
     opts.produce_timeout_ms = 5_000;
     opts.topic_mapping
         .insert("bug9-orders".to_string(), "bug9-orders-acks1".to_string());

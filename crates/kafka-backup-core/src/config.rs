@@ -1034,6 +1034,16 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_acks")]
     pub produce_acks: i16,
 
+    /// Produce with an idempotent producer (default `true`): one producer id
+    /// per restore and a sequence number per partition, so a batch resent
+    /// after a timeout or a lost connection is de-duplicated by the broker
+    /// instead of written twice. Requires `produce_acks: -1`. When the
+    /// cluster denies or does not support idempotence (Kafka before 2.5,
+    /// no IdempotentWrite/Write permission), the restore logs a warning,
+    /// records it in the report and produces without a producer id.
+    #[serde(default = "default_idempotent_producer")]
+    pub idempotent_producer: bool,
+
     /// Broker-side produce timeout in milliseconds (default: 30 000).
     ///
     /// The broker waits up to this duration for the required acks before
@@ -1229,6 +1239,7 @@ impl Default for RestoreOptions {
             produce_batch_size: default_produce_batch_size(),
             produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
+            idempotent_producer: default_idempotent_producer(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_state: None,
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
@@ -1265,6 +1276,10 @@ fn default_produce_batch_size() -> usize {
 
 fn default_produce_max_batch_bytes() -> usize {
     1024 * 1024
+}
+
+fn default_idempotent_producer() -> bool {
+    true
 }
 
 fn default_produce_acks() -> i16 {
@@ -1569,6 +1584,14 @@ impl RestoreOptions {
             return Err(crate::Error::Config(
                 "produce_batch_size must be > 0".to_string(),
             ));
+        }
+        if self.idempotent_producer && self.produce_acks != -1 {
+            return Err(crate::Error::Config(format!(
+                "restore.idempotent_producer requires produce_acks: -1 (got {}). Set \
+                 produce_acks: -1, or idempotent_producer: false to produce with acks {} \
+                 without duplicate protection",
+                self.produce_acks, self.produce_acks
+            )));
         }
         if self.produce_max_batch_bytes < 1024 {
             return Err(crate::Error::Config(format!(
@@ -2045,6 +2068,44 @@ connection:
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
             ..RestoreOptions::default()
         }
+    }
+
+    #[test]
+    fn idempotent_producer_is_on_by_default_and_requires_acks_all() {
+        let opts = valid_restore_options();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_acks, -1);
+        assert!(opts.validate().is_ok());
+
+        for acks in [0, 1] {
+            let mut opts = valid_restore_options();
+            opts.produce_acks = acks;
+            let err = opts.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("idempotent_producer requires produce_acks: -1"),
+                "{err}"
+            );
+
+            opts.idempotent_producer = false;
+            assert!(opts.validate().is_ok(), "acks {acks} without idempotence");
+        }
+
+        let yaml = "produce_acks: 1\nidempotent_producer: false\n";
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert!(!opts.idempotent_producer);
+        assert!(opts.validate().is_ok());
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_max_batch_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn produce_max_batch_bytes_must_hold_a_batch() {
+        let mut opts = valid_restore_options();
+        opts.produce_max_batch_bytes = 100;
+        assert!(opts.validate().is_err());
+        opts.produce_max_batch_bytes = 8 * 1024 * 1024;
+        assert!(opts.validate().is_ok());
     }
 
     #[test]

@@ -503,6 +503,8 @@ mod tests {
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
             record_filter: None,
+            idempotent_producer: false,
+            idempotent_producer_fallback: None,
         }
     }
 

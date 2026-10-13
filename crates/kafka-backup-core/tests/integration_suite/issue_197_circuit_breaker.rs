@@ -504,6 +504,7 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
             max_concurrent_partitions: 2,
             produce_batch_size: 5,
             produce_acks: 1,
+            idempotent_producer: false,
             circuit_breaker: CircuitBreakerSettings {
                 enabled: breaker_enabled,
                 failure_threshold: 1,

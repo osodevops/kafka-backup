@@ -786,6 +786,19 @@ pub struct RestoreReport {
     /// Name of the record filter that ran, when one was configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_filter: Option<String>,
+
+    /// Whether records were produced with an idempotent producer (a
+    /// producer id and per-partition sequence numbers, so retries were
+    /// de-duplicated by the broker).
+    #[serde(default)]
+    pub idempotent_producer: bool,
+
+    /// Set when `restore.idempotent_producer` was requested but the target
+    /// cluster denied or did not support it: why the restore fell back to
+    /// producing without a producer id (retries may have duplicated
+    /// records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_producer_fallback: Option<String>,
 }
 
 /// Per-topic restore report

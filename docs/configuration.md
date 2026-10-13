@@ -1023,7 +1023,8 @@ restore:
 | `max_concurrent_partitions` | int | No | `4` | Concurrent partition restores |
 | `produce_batch_size` | int | No | `1000` | Records per produce batch at most |
 | `produce_max_batch_bytes` | int | No | `1048576` | Uncompressed bytes per produce batch at most (1 MiB). A batch closes at whichever of `produce_batch_size` / `produce_max_batch_bytes` is reached first, and is further capped so that, compressed, it always fits the target topic's `max.message.bytes` |
-| `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget |
+| `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget. Must be `-1` while `idempotent_producer` is on |
+| `idempotent_producer` | bool | No | `true` | Produce with an idempotent producer: one producer id per restore and a sequence number per partition, so a batch resent after a timeout or a lost connection is de-duplicated by the broker. Falls back (warning + `idempotent_producer_fallback` in the report) when the cluster denies or does not support it |
 | `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
 | `rate_limit_records_per_sec` | int | No | - | Rate limit for the **whole restore** (records/sec), shared by every partition. Before 0.24 each partition was limited to this rate separately |
 | `rate_limit_bytes_per_sec` | int | No | - | Rate limit for the whole restore (bytes/sec, the records' uncompressed encoded size), shared by every partition. Before 0.24 it was accepted but had no effect |
@@ -1037,6 +1038,34 @@ offset, and the target topic's limit; nothing of that segment is produced.
 Raise `max.message.bytes` on the target topic and resume. Without
 DescribeConfigs permission the check is skipped (a warning is logged) and
 the broker rejects such a record with `RECORD_TOO_LARGE`.
+
+#### Duplicate-safe produce (`idempotent_producer`)
+
+With `idempotent_producer: true` (the default) the restore obtains one
+producer id (`InitProducerId`, no transactional id) and stamps every batch
+with it and a per-partition sequence number. Each batch is encoded once and
+every retry resends the identical bytes, so the broker writes a batch once
+however often it is resent after a timeout, a lost connection or a leader
+change. Broker answers:
+
+- `DUPLICATE_SEQUENCE_NUMBER`: the batch was already written; it counts as
+  acknowledged and its offsets are derived from the end of the partition's
+  previous batch (exact while the restore is the partition's only writer).
+- `OUT_OF_ORDER_SEQUENCE_NUMBER`: the partition fails.
+- `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` (the broker lost the
+  producer state, for example because retention deleted the restored
+  segments holding it): the producer bumps its epoch, waits
+  `produce_timeout_ms` + 5 s from the batch's first send, and reconciles
+  the batch against the partition's high watermark before resending it.
+
+Requirements: `produce_acks: -1` (any other value with
+`idempotent_producer: true` is a configuration error) and permission to
+write idempotently (Kafka 2.5+; `IdempotentWrite` on the cluster before
+Kafka 2.8, `Write` on the topics since; `DeveloperWrite` on Confluent
+Cloud). When `InitProducerId` is denied (`CLUSTER_AUTHORIZATION_FAILED`) or
+unsupported, the restore logs a warning, sets `idempotent_producer: false`
+and `idempotent_producer_fallback` in the report, and produces without a
+producer id as before 0.24 (a retried batch may be written twice).
 
 ```yaml
 restore:

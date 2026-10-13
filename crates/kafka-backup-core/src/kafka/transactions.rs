@@ -13,10 +13,10 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
 use kafka_protocol::messages::{
-    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, EndTxnRequest, EndTxnResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
-    ProduceRequest, ProduceResponse as KafkaProduceResponse, ProducerId, TopicName,
-    TransactionalId,
+    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ApiVersionsRequest,
+    ApiVersionsResponse, EndTxnRequest, EndTxnResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse, ProduceRequest,
+    ProduceResponse as KafkaProduceResponse, ProducerId, TopicName, TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
@@ -172,6 +172,34 @@ pub async fn init_producer_id(
         producer_id: response.producer_id.0,
         producer_epoch: response.producer_epoch,
     })
+}
+
+/// Whether the broker behind `client` supports `InitProducerId` v3 (Kafka
+/// 2.5+), which an idempotent producer needs to bump its epoch (KIP-360),
+/// according to ApiVersions. `Ok(false)` too for a broker that answers
+/// ApiVersions v3 with `UNSUPPORTED_VERSION` or in an older format (Kafka
+/// before 2.4).
+pub async fn supports_idempotent_epoch_bump(client: &KafkaClient) -> Result<bool> {
+    const UNSUPPORTED_VERSION: i16 = 35;
+    let request = ApiVersionsRequest::default()
+        .with_client_software_name(StrBytes::from_static_str("kafka-backup"))
+        .with_client_software_version(StrBytes::from_static_str(env!("CARGO_PKG_VERSION")));
+    match client
+        .send_request::<_, ApiVersionsResponse>(ApiKey::ApiVersions, request)
+        .await
+    {
+        Ok(response) if response.error_code == UNSUPPORTED_VERSION => Ok(false),
+        Ok(response) if response.error_code != 0 => Err(broker_error(
+            response.error_code,
+            format!("ApiVersions failed: error code {}", response.error_code),
+        )),
+        Ok(response) => Ok(response
+            .api_keys
+            .iter()
+            .any(|k| k.api_key == ApiKey::InitProducerId as i16 && k.max_version >= 3)),
+        Err(crate::Error::Kafka(KafkaError::Protocol(_))) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// `AddPartitionsToTxn`: register partitions with the producer's open

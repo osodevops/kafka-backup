@@ -18,6 +18,11 @@
 //! - Issue #167: backup.on_missing_topic warn/fail behaviour
 //! - Issue #197: circuit-breaker config + scoped connection eviction
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
+//! - Restore produce path (mock broker, no Docker): idempotent produce with
+//!   byte-identical retries, the fallback, byte-capped batches, the
+//!   max.message.bytes pre-check
+//! - Idempotent restore against Kafka: produce responses lost through a
+//!   fault proxy leave zero duplicates
 //! - Read-committed backup of transactional topics (aborted records, markers,
 //!   the last stable offset), with a test-support transactional producer
 //! - strimzi-backup-operator#57: snapshot progress gauges describe the current run
@@ -38,12 +43,16 @@ pub mod issue_224_group_coordinator;
 pub mod issue_56_missing_topic;
 pub mod issue_57_incremental_snapshot_target;
 pub mod issue_67_fixes;
+pub mod kafka_fault_proxy;
 pub mod offset_mapping_gaps;
 pub mod offset_semantics;
 pub mod performance_issues;
 pub mod pitr_accuracy;
 pub mod preflight_e2e;
+pub mod produce_mock_broker;
 pub mod read_committed_backup;
+pub mod restore_idempotent_docker;
+pub mod restore_produce_path;
 pub mod sasl_gssapi_tests;
 pub mod sasl_mock_broker;
 pub mod sasl_oauth_tests;

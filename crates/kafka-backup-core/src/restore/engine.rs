@@ -168,6 +168,8 @@ pub struct RestoreEngine {
     target_config: Option<crate::config::KafkaConfig>,
     /// Restore-wide record/byte rate limit, shared by every partition.
     rate_limiter: Option<Arc<super::rate_limit::RestoreRateLimiter>>,
+    /// The restore's (idempotent) producer, started in `run()`.
+    producer: Arc<tokio::sync::RwLock<Option<Arc<super::producer::RestoreProducer>>>>,
     /// Target topic -> `max.message.bytes` (`None` when it could not be read).
     max_message_bytes: Arc<Mutex<HashMap<String, Option<usize>>>>,
 }
@@ -365,6 +367,7 @@ impl RestoreEngine {
             progress_tx,
             target_config: Some(target_config),
             rate_limiter,
+            producer: Arc::new(tokio::sync::RwLock::new(None)),
             max_message_bytes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -742,6 +745,8 @@ impl RestoreEngine {
                 records_dropped_by_filter: 0,
                 records_tombstoned_by_filter: 0,
                 record_filter: None,
+                idempotent_producer: false,
+                idempotent_producer_fallback: None,
             });
         }
 
@@ -834,8 +839,14 @@ impl RestoreEngine {
                 records_dropped_by_filter: 0,
                 records_tombstoned_by_filter: 0,
                 record_filter: None,
+                idempotent_producer: false,
+                idempotent_producer_fallback: None,
             });
         }
+
+        // Start the producer before any change to the target: one
+        // InitProducerId for the whole restore (or the fallback).
+        let producer = self.start_producer(&restore_options).await?;
 
         // Auto-create topics if configured
         let newly_created_topics = if restore_options.create_topics {
@@ -999,7 +1010,17 @@ impl RestoreEngine {
                 .record_filter
                 .as_ref()
                 .map(|f| f.name().to_string()),
+            idempotent_producer: producer.is_idempotent().await,
+            idempotent_producer_fallback: producer.fallback_reason().map(str::to_string),
         };
+        if producer.epoch_bumps() > 0 || producer.derived_batches() > 0 {
+            info!(
+                "Idempotent producer: {} epoch bump(s), {} batch(es) acknowledged with derived \
+                 offsets",
+                producer.epoch_bumps(),
+                producer.derived_batches()
+            );
+        }
 
         finalize_restore_report(report)
     }
@@ -1391,12 +1412,41 @@ impl RestoreEngine {
             .clone()
             .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
         let max_message_bytes = self.target_max_message_bytes(&router, target_topic).await;
+        let producer = self
+            .producer
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Producer not started".to_string()))?;
         Ok(super::produce_path::ProducePath::new(
-            router,
+            producer,
             self.rate_limiter.clone(),
             max_message_bytes,
             options,
         ))
+    }
+
+    /// Start the restore's producer on the target cluster's router.
+    async fn start_producer(
+        &self,
+        options: &RestoreOptions,
+    ) -> Result<Arc<super::producer::RestoreProducer>> {
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+        let producer = Arc::new(
+            super::producer::RestoreProducer::start(
+                router,
+                super::producer::ProducerSettings::from_options(options),
+                options.idempotent_producer,
+            )
+            .await?,
+        );
+        *self.producer.write().await = Some(Arc::clone(&producer));
+        Ok(producer)
     }
 
     /// The target topic's `max.message.bytes` (DescribeConfigs, cached per
@@ -1958,7 +2008,7 @@ impl RestorePartitionContext {
                     .produce(&self.target_topic, self.target_partition, batch)
                     .await
                 {
-                    Ok(sub_batch_offsets) => {
+                    Ok(produced) => {
                         self.kafka_cb.record_success();
                         self.health.mark_healthy("kafka");
 
@@ -1970,7 +2020,11 @@ impl RestorePartitionContext {
                         let mut batch_pairs: Vec<crate::manifest::OffsetPair> =
                             Vec::with_capacity(batch.len());
                         let mut record_idx = 0;
-                        for (sub_base_offset, sub_count) in &sub_batch_offsets {
+                        // A batch acknowledged through DUPLICATE_SEQUENCE_NUMBER
+                        // or reconciliation has derived offsets: the end of the
+                        // partition's previous batch, exact while this restore
+                        // is the partition's only writer.
+                        for (sub_base_offset, sub_count) in &produced.sub_batches {
                             for j in 0..*sub_count {
                                 let record = &batch[record_idx];
                                 let target_offset = sub_base_offset + j as i64;
@@ -2315,6 +2369,8 @@ mod tests {
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
             record_filter: None,
+            idempotent_producer: false,
+            idempotent_producer_fallback: None,
         };
 
         let err = finalize_restore_report(report).expect_err(

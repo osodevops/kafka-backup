@@ -177,6 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every repartitioning writer, as is `rate_limit_bytes_per_sec`.
   Configurations tuned around the old behaviour should multiply the value
   by `max_concurrent_partitions` to keep the same throughput.
+- **`restore.produce_acks` other than `-1` now needs
+  `restore.idempotent_producer: false`.** An idempotent producer requires
+  acks=all; a configuration with `produce_acks: 0` or `1` and the new
+  default `idempotent_producer: true` fails validation with a message
+  saying which setting to change.
 
 ### Added
 - `backup.isolation_level` (`read_committed` default, `read_uncommitted`)
@@ -258,6 +263,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `KafkaError::RecordTooLarge` naming the source topic, partition and
   offset, the record's size and the target topic's limit. Without
   DescribeConfigs permission the check is skipped with a warning.
+- **Idempotent restore produce (`restore.idempotent_producer`, default
+  `true`).** A restore obtains one producer id (`InitProducerId` v3, no
+  transactional id) and stamps every batch with it and a per-partition
+  sequence number (advancing by the batch's record count, wrapping past
+  `i32::MAX` to 0 as Kafka does; one batch in flight per partition). Each
+  batch, and each timestamp sub-batch, is encoded exactly once, and every
+  resend — `KafkaClient::send_request`'s reconnect-and-retry, the partition
+  router's NOT_LEADER / connection retries, and a new retry of
+  `REQUEST_TIMED_OUT`, `NOT_ENOUGH_REPLICAS(_AFTER_APPEND)` and
+  `LEADER_NOT_AVAILABLE` — sends the identical bytes, so the broker writes
+  the batch once. Previously a produce whose response was lost (connection
+  reset, timeout) was resent as a new batch and duplicated.
+  - `DUPLICATE_SEQUENCE_NUMBER` counts as acknowledged; the batch's
+    offsets (and its offset-mapping entries) are derived from the end of
+    the partition's previous batch, which is exact while the restore is the
+    partition's only writer.
+  - `OUT_OF_ORDER_SEQUENCE_NUMBER` fails the partition.
+  - `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` re-initialise the
+    producer with an epoch bump (KIP-360; a local bump if the request
+    fails), restart every partition's sequence at 0, and reconcile the
+    in-doubt batch against the partition's high watermark once
+    `produce_timeout_ms` + 5 s have passed since it was first sent:
+    unchanged = resend, advanced by exactly the batch = acknowledged,
+    anything else = another writer, fatal.
+  - When `InitProducerId` is denied (`CLUSTER_AUTHORIZATION_FAILED`) or not
+    supported (ApiVersions shows no InitProducerId v3, i.e. Kafka before
+    2.5), the restore logs a warning, produces without a producer id (the
+    old behaviour), and reports it: `RestoreReport` gains
+    `idempotent_producer` and `idempotent_producer_fallback` (the reason).
 
 ### API
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
@@ -266,6 +300,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RecordTooLarge` (it is `#[non_exhaustive]`). `restore::repartition::
   restore_topic_repartitioned` is now crate-private (it takes the engine's
   internal produce plumbing).
+- `RestoreOptions` gains `idempotent_producer`; `RestoreReport` gains
+  `idempotent_producer` and `idempotent_producer_fallback` (serde
+  defaults, so older reports still parse). New:
+  `PartitionLeaderRouter::produce_encoded` (send one encoded batch,
+  retrying with the same bytes), `kafka::transactions::
+  supports_idempotent_epoch_bump`, `ProducerBatch::NON_IDEMPOTENT`.
 
 ## [0.23.8] - 2026-10-09
 

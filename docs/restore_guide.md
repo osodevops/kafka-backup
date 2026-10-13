@@ -254,6 +254,7 @@ restore:
 | `produce_max_batch_bytes` | usize | 1048576 | Uncompressed bytes per produce batch at most; also capped below the target topic's `max.message.bytes` |
 | `rate_limit_records_per_sec` | u64 | None | Rate limit for the whole restore (records/sec), shared by all partitions |
 | `rate_limit_bytes_per_sec` | u64 | None | Rate limit for the whole restore (bytes/sec), shared by all partitions |
+| `idempotent_producer` | bool | true | Idempotent produce: retries are de-duplicated by the broker (requires `produce_acks: -1`; falls back with a warning when not permitted) |
 | `checkpoint_state` | path | None | Checkpoint file for resume |
 | `checkpoint_interval_secs` | u64 | 60 | Checkpoint save interval |
 | `reset_consumer_offsets` | bool | false | Auto-reset consumer offsets |

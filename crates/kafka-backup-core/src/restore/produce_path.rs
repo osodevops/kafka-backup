@@ -10,10 +10,10 @@ use crate::error::KafkaError;
 use crate::kafka::produce::{
     batch_bytes_within_max_message_bytes, find_oversized_record, plan_batches, records_encoded_size,
 };
-use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::BackupRecord;
 use crate::Result;
 
+use super::producer::{ProducedBatch, RestoreProducer};
 use super::rate_limit::RestoreRateLimiter;
 
 /// Where a record came from, for error messages.
@@ -26,7 +26,7 @@ pub(crate) struct RecordOrigin<'a> {
 /// Per-topic produce settings and shared state.
 #[derive(Clone)]
 pub(crate) struct ProducePath {
-    router: Arc<PartitionLeaderRouter>,
+    producer: Arc<RestoreProducer>,
     rate_limiter: Option<Arc<RestoreRateLimiter>>,
     /// The target topic's `max.message.bytes`, when it could be read.
     max_message_bytes: Option<usize>,
@@ -34,19 +34,17 @@ pub(crate) struct ProducePath {
     /// Uncompressed byte cap of a batch: `produce_max_batch_bytes`, lowered
     /// to fit `max.message.bytes` after compression.
     max_batch_bytes: usize,
-    acks: i16,
-    timeout_ms: i32,
 }
 
 impl ProducePath {
     pub(crate) fn new(
-        router: Arc<PartitionLeaderRouter>,
+        producer: Arc<RestoreProducer>,
         rate_limiter: Option<Arc<RestoreRateLimiter>>,
         max_message_bytes: Option<usize>,
         options: &crate::config::RestoreOptions,
     ) -> Self {
         Self {
-            router,
+            producer,
             rate_limiter,
             max_message_bytes,
             max_batch_records: options.produce_batch_size,
@@ -54,8 +52,6 @@ impl ProducePath {
                 options.produce_max_batch_bytes,
                 max_message_bytes,
             ),
-            acks: options.produce_acks,
-            timeout_ms: options.produce_timeout_ms,
         }
     }
 
@@ -103,24 +99,21 @@ impl ProducePath {
     }
 
     /// Wait for the restore-wide rate limit, then produce `batch` to
-    /// `topic`/`partition`. Returns `(base offset, record count)` per
+    /// `topic`/`partition` with the restore producer (idempotent unless it
+    /// fell back). The result lists `(base offset, record count)` per
     /// produced sub-batch, in order.
     pub(crate) async fn produce(
         &self,
         topic: &str,
         partition: i32,
         batch: &[BackupRecord],
-    ) -> Result<Vec<(i64, usize)>> {
+    ) -> Result<ProducedBatch> {
         if let Some(limiter) = &self.rate_limiter {
             limiter
                 .acquire(batch.len() as u64, records_encoded_size(batch) as u64)
                 .await;
         }
-        let response = self
-            .router
-            .produce(topic, partition, batch.to_vec(), self.acks, self.timeout_ms)
-            .await?;
-        Ok(response.sub_batch_offsets)
+        self.producer.produce(topic, partition, batch).await
     }
 }
 

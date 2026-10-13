@@ -177,7 +177,6 @@ pub(crate) fn plan_batches(
 /// The next sequence number after `sequence` advanced by `increment`
 /// records, wrapping past `i32::MAX` to 0 the way the Kafka producer and
 /// broker do (`DefaultRecordBatch.incrementSequence`).
-#[allow(dead_code)] // used by the idempotent restore producer
 pub(crate) fn increment_sequence(sequence: i32, increment: i32) -> i32 {
     if sequence > i32::MAX - increment {
         increment - (i32::MAX - sequence) - 1
