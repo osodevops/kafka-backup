@@ -1,6 +1,6 @@
 //! Read-committed backup of transactional topics (O5 / F3).
 //!
-//! Before 0.24 a backup read uncommitted: records of aborted transactions and
+//! Before 0.25 a backup read uncommitted: records of aborted transactions and
 //! every transaction marker were archived, and a restore wrote the markers
 //! back as ordinary records (key `00 00 00 0x`, value `00 00 00 00 00 00`).
 //! Consumer groups committed at or after a marker resumed on an aborted
@@ -149,7 +149,7 @@ async fn produce_plain(client: &KafkaClient, topic: &str, key: &str, value: &str
 }
 
 /// Every record in `topic[0]` from offset 0, read as Kafka Backup read
-/// before 0.24 (read_uncommitted: markers come back as records).
+/// before 0.25 (read_uncommitted: markers come back as records).
 async fn read_raw(client: &KafkaClient, topic: &str) -> Vec<BackupRecord> {
     read_all(client, topic, IsolationLevel::ReadUncommitted).await
 }
@@ -654,7 +654,7 @@ async fn hanging_transaction_holds_the_backup_at_the_last_stable_offset() {
 }
 
 /// `backup.isolation_level: read_uncommitted` is the opt-out: it archives
-/// the raw log as before 0.24, markers and aborted records included, and a
+/// the raw log as before 0.25, markers and aborted records included, and a
 /// restore writes them all back.
 #[tokio::test]
 #[ignore = "requires Docker"]

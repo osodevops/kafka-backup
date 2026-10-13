@@ -54,7 +54,7 @@ backup:
   # Transactional topics (default: read_committed). Archives what a
   # read_committed consumer sees: no aborted records, no transaction markers,
   # each partition read up to its last stable offset. read_uncommitted archives
-  # everything up to the high watermark (markers included) as before 0.24.
+  # everything up to the high watermark (markers included) as before 0.25.
   isolation_level: read_committed
 
   # Offset-tracking headers (default: true). Adds x-original-offset and

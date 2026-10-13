@@ -75,8 +75,8 @@ fn print_manifest_text(manifest: &BackupManifest) {
         "║ Isolation:      {:55} ║",
         match manifest.isolation_level {
             Some(level) => level.to_string(),
-            // Manifests written before 0.24 always read uncommitted.
-            None => "read_uncommitted (written before 0.24)".to_string(),
+            // Manifests written before 0.25 always read uncommitted.
+            None => "read_uncommitted (written before 0.25)".to_string(),
         }
     );
     println!("╠══════════════════════════════════════════════════════════════════════╣");

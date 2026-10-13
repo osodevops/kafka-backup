@@ -2787,7 +2787,7 @@ fn describe_isolation_level(isolation: IsolationLevel) -> String {
              transaction markers are not archived, and each partition is read up to its last \
              stable offset (records of open transactions are archived once they commit); set \
              backup.isolation_level: read_uncommitted to archive everything up to the high \
-             watermark as versions before 0.24 did"
+             watermark as versions before 0.25 did"
                 .to_string()
         }
         IsolationLevel::ReadUncommitted => {
@@ -2806,7 +2806,7 @@ fn warn_on_isolation_change(
     stored: Option<IsolationLevel>,
     configured: IsolationLevel,
 ) -> bool {
-    // Manifests written before 0.24 have no field: they read uncommitted.
+    // Manifests written before 0.25 have no field: they read uncommitted.
     let previous = stored.unwrap_or(IsolationLevel::ReadUncommitted);
     if previous == configured {
         return false;
@@ -2818,7 +2818,7 @@ fn warn_on_isolation_change(
         backup_id,
         previous,
         if stored.is_none() {
-            " (versions before 0.24)"
+            " (versions before 0.25)"
         } else {
             ""
         },

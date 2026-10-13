@@ -482,7 +482,7 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
 
     // Partition 0 (broker 1) fails terminally — but only after partition 1
     // (broker 2) has produced all 4 of its batches (20 records, batches of
-    // 5). A failing partition stops and awaits its siblings (0.24), so a
+    // 5). A failing partition stops and awaits its siblings (0.25), so a
     // sibling batch acknowledged after the failure would be recorded as a
     // success and close the advisory breaker again before `run()` returns;
     // failing last keeps the breaker's end state deterministic.

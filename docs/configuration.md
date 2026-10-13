@@ -430,7 +430,7 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `compression_level` | int | No | `3` | Compression level (1–22; only meaningful for `zstd`) |
 | `start_offset` | string / map | No | `earliest` | Where a partition starts when there is no checkpoint: `earliest`, `latest`, or `specific: {topic: {partition: offset}}` |
 | `continuous` | bool | No | `false` | Run continuously (streaming replication) |
-| `isolation_level` | string | No | **`read_committed`** | `read_committed` archives what a `read_committed` consumer sees: no records of aborted transactions, no transaction markers, and each partition is read up to its last stable offset. `read_uncommitted` archives everything up to the high watermark, markers included, as before 0.24 — see [Transactional topics](#transactional-topics-isolation-level) |
+| `isolation_level` | string | No | **`read_committed`** | `read_committed` archives what a `read_committed` consumer sees: no records of aborted transactions, no transaction markers, and each partition is read up to its last stable offset. `read_uncommitted` archives everything up to the high watermark, markers included, as before 0.25 — see [Transactional topics](#transactional-topics-isolation-level) |
 | `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture each partition's end offset at start (the last stable offset under `read_committed`), exit when caught up |
 | `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
 | `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
@@ -520,7 +520,7 @@ exactly-once source connectors, any `transactional.id` producer). It is the
 Java consumer's `isolation.level`, applied to the backup's Fetch and
 ListOffsets requests.
 
-**`read_committed` (default since 0.24)**
+**`read_committed` (default since 0.25)**
 
 - Records of committed transactions and non-transactional records are
   archived, in offset order.
@@ -543,7 +543,7 @@ ListOffsets requests.
   (three-phase restore and `offset-reset` use the per-record offset mapping).
 
 **`read_uncommitted` (opt-out)** archives every record up to the high
-watermark, byte for byte as versions before 0.24 did. That includes records
+watermark, byte for byte as versions before 0.25 did. That includes records
 of aborted and still-open transactions **and the transaction markers, which a
 restore writes back as ordinary records** (key `00 00 00 00` or
 `00 00 00 01`, value `00 00 00 00 00 00`). Use it only for topics without
@@ -555,11 +555,11 @@ backup:
 ```
 
 **Existing backups are unaffected.** Nothing already stored is rewritten,
-and restoring a backup written before 0.24 behaves as before (its segments
-may hold markers and aborted records). A backup set created before 0.24 and
-continued by 0.24 reads committed from then on; the run logs a warning that
+and restoring a backup written before 0.25 behaves as before (its segments
+may hold markers and aborted records). A backup set created before 0.25 and
+continued by 0.25 reads committed from then on; the run logs a warning that
 the set now mixes both, and the manifest's `isolation_level` records the
-level of the most recent run (absent in manifests written before 0.24, which
+level of the most recent run (absent in manifests written before 0.25, which
 read uncommitted). Set `isolation_level: read_uncommitted` to keep such a set
 uniform, or start a new `backup_id`.
 
@@ -623,7 +623,7 @@ not from a separate checkpoint:
   pruned range, or the partition's `covered_through`. A run resumes at
   `reach + 1`, beyond every listed segment, so a listed segment is never
   rewritten.
-- Since 0.24 each segment records `covered_start_offset` /
+- Since 0.25 each segment records `covered_start_offset` /
   `covered_end_offset`: the source offsets it accounts for, including
   offsets before its first record or after its last that held no record
   (compacted away, transaction markers, records of aborted transactions).
@@ -771,7 +771,7 @@ backup:
 
 Configuration for the local SQLite database used to track backup progress. For continuous mode, the offset store is created automatically even without this section.
 
-Since 0.24 the resume position comes from the backup manifest (see [Resume and checkpoints](#resume-and-checkpoints)); the offset store holds checkpoints that trail the manifest, is used to resume partitions only for backups written by older versions, and records the job status that `prune` reads.
+Since 0.25 the resume position comes from the backup manifest (see [Resume and checkpoints](#resume-and-checkpoints)); the offset store holds checkpoints that trail the manifest, is used to resume partitions only for backups written by older versions, and records the job status that `prune` reads.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -1043,8 +1043,8 @@ restore:
 | `produce_acks` | int | No | `-1` | Producer acks: `-1` all in-sync replicas (safest), `1` leader only, `0` fire-and-forget. Must be `-1` while `idempotent_producer` is on |
 | `idempotent_producer` | bool | No | `true` | Produce with an idempotent producer: one producer id per restore and a sequence number per partition, so a batch resent after a timeout or a lost connection is de-duplicated by the broker. Falls back (warning + `idempotent_producer_fallback` in the report) when the cluster denies or does not support it |
 | `produce_timeout_ms` | int | No | `30000` | Broker-side produce timeout in milliseconds |
-| `rate_limit_records_per_sec` | int | No | - | Rate limit for the **whole restore** (records/sec), shared by every partition. Before 0.24 each partition was limited to this rate separately |
-| `rate_limit_bytes_per_sec` | int | No | - | Rate limit for the whole restore (bytes/sec, the records' uncompressed encoded size), shared by every partition. Before 0.24 it was accepted but had no effect |
+| `rate_limit_records_per_sec` | int | No | - | Rate limit for the **whole restore** (records/sec), shared by every partition. Before 0.25 each partition was limited to this rate separately |
+| `rate_limit_bytes_per_sec` | int | No | - | Rate limit for the whole restore (bytes/sec, the records' uncompressed encoded size), shared by every partition. Before 0.25 it was accepted but had no effect |
 | `circuit_breaker` | map | No | see [Circuit breaker](#circuit-breaker-backup-and-restore) | Kafka circuit-breaker settings (advisory) |
 
 Before a segment's records are produced, each is checked against the
@@ -1082,7 +1082,7 @@ Kafka 2.8, `Write` on the topics since; `DeveloperWrite` on Confluent
 Cloud). When `InitProducerId` is denied (`CLUSTER_AUTHORIZATION_FAILED`) or
 unsupported, the restore logs a warning, sets `idempotent_producer: false`
 and `idempotent_producer_fallback` in the report, and produces without a
-producer id as before 0.24 (a retried batch may be written twice).
+producer id as before 0.25 (a retried batch may be written twice).
 
 ```yaml
 restore:
@@ -1436,7 +1436,7 @@ offset mismatch (`--deep`), or contiguity error exits with status 1. The
 contiguity check requires every offset between a partition's first and last
 accounted offset to lie in a segment's covered range, a recorded gap or a
 pruned range, and segments not to overlap; a hole or overlap next to a
-segment written before 0.24 (which records only its first and last record,
+segment written before 0.25 (which records only its first and last record,
 so a compaction hole looks the same) is a warning, not a failure.
 
 ### Prune Command

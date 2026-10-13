@@ -69,7 +69,7 @@ pub struct SkippedBatch {
 /// transaction marker are filtered out here, the way the Java consumer
 /// filters them.
 /// [`IsolationLevel::ReadUncommitted`] returns every record, markers
-/// included, as versions before 0.24 did.
+/// included, as versions before 0.25 did.
 pub async fn fetch(
     client: &KafkaClient,
     topic: &str,
@@ -271,7 +271,7 @@ impl AbortedTransactions {
 /// How `decode_fetch_data` treats transactional data.
 pub(crate) enum TransactionFilter {
     /// Return every record, control records (markers) included — the
-    /// behaviour of versions before 0.24.
+    /// behaviour of versions before 0.25.
     ReadUncommitted,
     /// Return what a `read_committed` consumer sees.
     ReadCommitted(AbortedTransactions),
@@ -769,7 +769,7 @@ mod tests {
         batch[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
     }
 
-    /// Decode as a `read_uncommitted` fetch (the behaviour before 0.24).
+    /// Decode as a `read_uncommitted` fetch (the behaviour before 0.25).
     fn parse(data: Vec<u8>, fetch_offset: i64) -> (Vec<BackupRecord>, i64) {
         let decoded = decode_fetch_data(
             &Bytes::from(data),
@@ -1319,7 +1319,7 @@ mod tests {
         assert_eq!(d.aborted_records_dropped, 3);
     }
 
-    /// The opt-out keeps the behaviour of versions before 0.24 byte for
+    /// The opt-out keeps the behaviour of versions before 0.25 byte for
     /// byte: aborted records are returned, and so is every marker, as a
     /// record whose key is the control key.
     #[test]

@@ -45,7 +45,7 @@
 //! (`CLUSTER_AUTHORIZATION_FAILED`, `UNSUPPORTED_VERSION`, a broker older
 //! than Kafka 2.5), the producer logs a warning, records the reason for the
 //! restore report, and produces without a producer id (the behaviour before
-//! 0.24: a retried batch may be written twice).
+//! 0.25: a retried batch may be written twice).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -168,7 +168,7 @@ pub(crate) fn segments_in_offset_order<'a>(
 
 /// Remembers the highest source offset already restored for one source
 /// partition, so a record is never produced twice when a manifest written
-/// before 0.24 lists overlapping segments (a segment key rewritten on
+/// before 0.25 lists overlapping segments (a segment key rewritten on
 /// resume with different boundaries). Segments must be read in
 /// [`segments_in_offset_order`].
 #[derive(Debug, Default)]
@@ -715,7 +715,7 @@ mod tests {
         }
     }
 
-    /// A pre-0.24 manifest can list overlapping segments (a key rewritten on
+    /// A pre-0.25 manifest can list overlapping segments (a key rewritten on
     /// resume with other boundaries, kept by the merge). Restore must
     /// produce every source offset exactly once.
     #[test]

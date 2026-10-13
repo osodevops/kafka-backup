@@ -118,7 +118,7 @@ impl SqliteOffsetStore {
     /// manifest save that justifies its checkpoints, whereas a non-empty
     /// local file can be a stale leftover (a crashed run on the same host, a
     /// re-attached volume) that is ahead of what storage durably holds.
-    /// Before 0.24 a non-empty local database always won.
+    /// Before 0.25 a non-empty local database always won.
     ///
     /// Returns `true` when the remote copy was loaded.
     pub async fn try_load_from_storage(

@@ -40,7 +40,7 @@ pub struct BackupManifest {
     pub missing_topics: Vec<String>,
 
     /// Transaction isolation of the most recent backup run
-    /// (`backup.isolation_level`). `None` for manifests written before 0.24,
+    /// (`backup.isolation_level`). `None` for manifests written before 0.25,
     /// which always read uncommitted: their segments can hold records of
     /// aborted transactions and transaction markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +248,7 @@ pub struct PartitionBackup {
     /// after the segments (or gaps) covering everything up to it were
     /// written and listed, so it is a safe resume point.
     ///
-    /// Absent from manifests written before 0.24 (reads as `None`; the
+    /// Absent from manifests written before 0.25 (reads as `None`; the
     /// segments' own ranges then give the reach — see [`reach`](Self::reach)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_through: Option<i64>,
@@ -271,14 +271,14 @@ pub struct PartitionBackup {
     /// recent snapshot captured as its end (exclusive) — the last stable
     /// offset under `read_committed`, the high watermark under
     /// `read_uncommitted`. Not recorded for a partition that was empty at
-    /// capture time. Absent before 0.24.
+    /// capture time. Absent before 0.25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_end_offset: Option<i64>,
 
     /// Snapshot runs only: the partition's high watermark when that snapshot
     /// was captured. Above [`snapshot_end_offset`](Self::snapshot_end_offset)
     /// when transactions were open at capture time: their records, and any
-    /// record after them, are left for a later run. Absent before 0.24.
+    /// record after them, are left for a later run. Absent before 0.25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_watermark_at_capture: Option<i64>,
 }
@@ -373,7 +373,7 @@ impl PartitionBackup {
 /// A contiguous range of offsets deliberately deleted from a backup by
 /// retention (`kafka-backup prune` or `backup.retention`).
 ///
-/// The bounds are the pruned segments' covered ranges (since 0.24; their
+/// The bounds are the pruned segments' covered ranges (since 0.25; their
 /// first and last record offsets before that).
 ///
 /// The segments covering `[start_offset, end_offset]` were captured and then
@@ -529,13 +529,13 @@ pub struct SegmentMetadata {
     /// First source offset this segment accounts for (inclusive). Can be
     /// below `start_offset` when the offsets before the first record held
     /// no record (compacted away, transaction markers). `None` for segments
-    /// written before 0.24: `start_offset` applies.
+    /// written before 0.25: `start_offset` applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_start_offset: Option<i64>,
 
     /// Last source offset this segment accounts for (inclusive) — the fetch
     /// position when it was sealed, minus one. Can be above `end_offset`
-    /// for the same reasons. `None` before 0.24: `end_offset` applies.
+    /// for the same reasons. `None` before 0.25: `end_offset` applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_end_offset: Option<i64>,
 
@@ -543,7 +543,7 @@ pub struct SegmentMetadata {
     /// range that a `read_committed` backup passed over: they hold no data
     /// and are not archived. 0 (and omitted) for `read_uncommitted` backups,
     /// which archive markers as records, and for segments written before
-    /// 0.24.
+    /// 0.25.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub control_records_skipped: u64,
 
@@ -566,7 +566,7 @@ impl SegmentMetadata {
         self.covered_end_offset.unwrap_or(self.end_offset)
     }
 
-    /// Whether the segment records its covered range (written by 0.24+).
+    /// Whether the segment records its covered range (written by 0.25+).
     pub fn has_covered_range(&self) -> bool {
         self.covered_start_offset.is_some() && self.covered_end_offset.is_some()
     }

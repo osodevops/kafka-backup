@@ -519,7 +519,7 @@ impl CircuitBreakerSettings {
 #[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     /// Archive only what a `read_committed` consumer sees (default since
-    /// 0.24): records of committed transactions and non-transactional
+    /// 0.25): records of committed transactions and non-transactional
     /// records. Records of aborted transactions and the transaction markers
     /// (commit/abort control records) are not archived, and a partition is
     /// read up to its last stable offset (LSO), not its high watermark — the
@@ -529,7 +529,7 @@ pub enum IsolationLevel {
     #[serde(alias = "READ_COMMITTED")]
     ReadCommitted,
     /// Archive every record up to the high watermark, as versions before
-    /// 0.24 did: records of aborted and open transactions are archived, and
+    /// 0.25 did: records of aborted and open transactions are archived, and
     /// so are the transaction markers, which a restore writes back as
     /// ordinary records. Only for topics without transactional producers, or
     /// to keep an existing backup set uniform.
@@ -592,7 +592,7 @@ pub struct BackupOptions {
     /// (default) archives what a `read_committed` consumer sees and stops at
     /// the last stable offset; `read_uncommitted` archives everything up to
     /// the high watermark, including aborted records and transaction
-    /// markers, as versions before 0.24 did. See [`IsolationLevel`].
+    /// markers, as versions before 0.25 did. See [`IsolationLevel`].
     #[serde(default)]
     pub isolation_level: IsolationLevel,
 
@@ -1075,7 +1075,7 @@ pub struct RestoreOptions {
     pub strip_offset_headers: bool,
 
     /// Rate limit in records per second for the whole restore: one token
-    /// bucket shared by every partition (before 0.24 each partition was
+    /// bucket shared by every partition (before 0.25 each partition was
     /// limited to this rate on its own).
     #[serde(default)]
     pub rate_limit_records_per_sec: Option<u64>,
@@ -1438,7 +1438,7 @@ fn default_idempotent_producer() -> bool {
     true
 }
 
-// Options added in 0.24 are left out of the serialized options at their
+// Options added in 0.25 are left out of the serialized options at their
 // defaults: the restore checkpoint's config hash is taken over them, and a
 // checkpoint written by an earlier release must keep its hash.
 fn is_default_produce_max_batch_bytes(value: &usize) -> bool {
@@ -2395,12 +2395,12 @@ schema_id_rewrite_strict: true
     }
 
     /// The restore checkpoint's config hash is taken over the serialized
-    /// options. Every option added in 0.24 is left out at its default, so the
+    /// options. Every option added in 0.25 is left out at its default, so the
     /// serialized defaults are exactly the 0.23.x keys, in the 0.23.x order,
     /// and a checkpoint written by 0.23.x is still resumed after an upgrade.
     /// A non-default value is serialized, so changing it starts over.
     #[test]
-    fn options_added_in_0_24_are_not_serialized_at_their_defaults() {
+    fn options_added_in_0_25_are_not_serialized_at_their_defaults() {
         const KEYS_0_23: &[&str] = &[
             "time_window_start",
             "time_window_end",
@@ -2448,7 +2448,7 @@ schema_id_rewrite_strict: true
         };
 
         assert_eq!(top_level_keys(&RestoreOptions::default()), KEYS_0_23);
-        // Deserialising the 0.23.x form yields the 0.24 defaults.
+        // Deserialising the 0.23.x form yields the 0.25 defaults.
         let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
         let back: RestoreOptions = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
@@ -2459,7 +2459,7 @@ schema_id_rewrite_strict: true
         );
         assert_eq!(back.checkpoint_storage, RestoreCheckpointStorage::Local);
 
-        // Each 0.24 option, set away from its default, is serialized.
+        // Each 0.25 option, set away from its default, is serialized.
         type Tweak = fn(&mut RestoreOptions);
         let tweaks: Vec<(&str, Tweak)> = vec![
             ("produce_max_batch_bytes", |o| {

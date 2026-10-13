@@ -213,7 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and restored, reads up to the high watermark).
   - **Existing backups are unaffected:** nothing stored is rewritten and
     restoring an older backup behaves as before. A backup set written before
-    0.24 and continued by 0.24 reads committed from then on; the run logs a
+    0.25 and continued by 0.25 reads committed from then on; the run logs a
     warning that the set mixes both. Set `read_uncommitted` to keep it
     uniform, or start a new `backup_id`.
   - **Hanging transactions:** an open transaction that never completes holds
@@ -320,7 +320,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `validate --verify-sha256` (hash without decoding), and a contiguity
   check with `--deep` / `--verify-sha256`: every offset must be in a
   segment's covered range, a recorded gap or a pruned range (holes next to
-  pre-0.24 segments only warn).
+  pre-0.25 segments only warn).
 - `failpoints` feature on `kafka-backup-core` (the `fail` crate) and a chaos
   test that crashes backups at random failpoints and checks the stored data
   has no loss and no duplicates (`KAFKA_BACKUP_CHAOS_SEEDS`, default 10).

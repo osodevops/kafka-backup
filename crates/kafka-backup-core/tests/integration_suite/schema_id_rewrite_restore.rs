@@ -274,7 +274,7 @@ fn restore_config(
         include_original_offset_header: false,
         produce_batch_size: 4,
         produce_acks: 1,
-        // acks other than -1 need idempotence off (0.24)
+        // acks other than -1 need idempotence off (0.25)
         idempotent_producer: false,
         rewrite_schema_ids: true,
         schema_id_mapping: MAPPING.into_iter().collect(),

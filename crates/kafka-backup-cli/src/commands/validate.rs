@@ -33,7 +33,7 @@ pub(crate) struct ValidationReport {
     /// segment's covered range, no recorded gap, no pruned range — or
     /// segments whose covered ranges overlap. Integrity failures.
     pub(crate) contiguity_errors: Vec<String>,
-    /// The same, next to a segment written before 0.24 (which records only
+    /// The same, next to a segment written before 0.25 (which records only
     /// its first and last record, so a compaction hole looks like a hole).
     /// Reported, not failed.
     pub(crate) contiguity_warnings: Vec<String>,
@@ -101,7 +101,7 @@ impl ValidationReport {
 
         if !self.contiguity_warnings.is_empty() {
             println!(
-                "\nContiguity warnings (next to segments written before 0.24, which record only \
+                "\nContiguity warnings (next to segments written before 0.25, which record only \
                  their first and last record — compaction holes look the same; not failed):"
             );
             for w in &self.contiguity_warnings {
@@ -418,14 +418,14 @@ struct Interval {
     start: i64,
     end: i64,
     what: String,
-    /// A segment written before 0.24: only its first/last record are known.
+    /// A segment written before 0.25: only its first/last record are known.
     legacy: bool,
 }
 
 /// Every offset between the partition's first and last accounted offset
 /// must be inside a segment's covered range, a recorded gap or a pruned
 /// range, and segments must not overlap. Holes or overlaps touching a
-/// pre-0.24 segment only warn.
+/// pre-0.25 segment only warn.
 fn check_contiguity(
     topic: &str,
     partition: &kafka_backup_core::manifest::PartitionBackup,

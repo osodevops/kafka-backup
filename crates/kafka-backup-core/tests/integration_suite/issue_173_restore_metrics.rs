@@ -61,7 +61,7 @@ fn restore_config(bootstrap: &str, storage: &std::path::Path, backup_id: &str) -
             max_concurrent_partitions: 2,
             produce_batch_size: 5,
             produce_acks: 1,
-            // acks other than -1 need idempotence off (0.24)
+            // acks other than -1 need idempotence off (0.25)
             idempotent_producer: false,
             ..Default::default()
         }),
