@@ -190,6 +190,9 @@ pub async fn restore_topic_repartitioned(
                 &filter_tombstoned,
             )
             .await;
+            if result.is_err() {
+                cancel.store(true, Ordering::Relaxed);
+            }
             drop(permit);
             result
         }));
@@ -264,6 +267,16 @@ pub async fn restore_topic_repartitioned(
 
     if let Some(first_err) = reader_errors.into_iter().next() {
         return Err(first_err);
+    }
+
+    for partition in &partitions_to_restore {
+        for segment in &partition.segments {
+            let in_window =
+                segment.overlaps_time_window(options.time_window_start, options.time_window_end);
+            if in_window {
+                helpers::mark_segment_completed(&checkpoint, &segment.key).await;
+            }
+        }
     }
 
     Ok(TopicRestoreReport {
@@ -378,8 +391,6 @@ async fn run_reader(
                 return Ok(());
             }
         }
-
-        helpers::mark_segment_completed(checkpoint, &segment.key).await;
     }
 
     debug!("Reader for {}:{} finished", source_topic, source_partition);
@@ -406,6 +417,9 @@ async fn run_writer(
     let mut batch: Vec<BackupRecord> = Vec::with_capacity(batch_size);
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         // Drain up to batch_size records, blocking on the first one
         if batch.is_empty() {
             match rx.recv().await {
@@ -436,6 +450,9 @@ async fn run_writer(
             })
             .sum();
 
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         match router
             .produce(
                 target_topic,

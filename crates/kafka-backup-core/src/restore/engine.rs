@@ -941,6 +941,11 @@ impl RestoreEngine {
                     if !self.health.is_operational() {
                         return Err(e);
                     }
+                    if restore_options.record_transform.is_some()
+                        || restore_options.rewrite_schema_ids
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -1296,7 +1301,7 @@ impl RestoreEngine {
         let semaphore = Arc::new(Semaphore::new(options.max_concurrent_partitions));
 
         // Restore each partition concurrently
-        let mut handles = Vec::new();
+        let mut handles = tokio::task::JoinSet::new();
 
         for partition_backup in partitions_to_restore {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -1333,11 +1338,11 @@ impl RestoreEngine {
                 offset_mapping: Arc::clone(&self.offset_mapping),
             };
 
-            handles.push(tokio::spawn(async move {
+            handles.spawn(async move {
                 let result = ctx.restore_partition().await;
                 drop(permit);
                 result
-            }));
+            });
         }
 
         // Wait for all partitions
@@ -1347,10 +1352,18 @@ impl RestoreEngine {
         let mut dropped_by_filter = 0u64;
         let mut tombstoned_by_filter = 0u64;
 
-        for handle in handles {
-            let report = handle.await.map_err(|e| {
-                Error::Io(std::io::Error::other(format!("Task join error: {}", e)))
-            })??;
+        while let Some(joined) = handles.join_next().await {
+            let result = joined
+                .map_err(|e| Error::Io(std::io::Error::other(format!("Task join error: {e}"))))
+                .and_then(|r| r);
+            let report = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    handles.abort_all();
+                    while handles.join_next().await.is_some() {}
+                    return Err(error);
+                }
+            };
 
             total_records += report.records;
             total_bytes += report.bytes;
