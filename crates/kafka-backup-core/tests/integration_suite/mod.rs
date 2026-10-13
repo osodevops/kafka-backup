@@ -18,6 +18,8 @@
 //! - Issue #167: backup.on_missing_topic warn/fail behaviour
 //! - Issue #197: circuit-breaker config + scoped connection eviction
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
+//! - Read-committed backup of transactional topics (aborted records, markers,
+//!   the last stable offset), with a test-support transactional producer
 //! - strimzi-backup-operator#57: snapshot progress gauges describe the current run
 
 pub mod azure_azurite;
@@ -41,6 +43,7 @@ pub mod offset_semantics;
 pub mod performance_issues;
 pub mod pitr_accuracy;
 pub mod preflight_e2e;
+pub mod read_committed_backup;
 pub mod sasl_gssapi_tests;
 pub mod sasl_mock_broker;
 pub mod sasl_oauth_tests;
@@ -49,4 +52,5 @@ pub mod sasl_test_fixtures;
 pub mod sasl_tests;
 pub mod snapshot_backup;
 pub mod tls_tests;
+pub mod transactional_producer;
 pub mod validation;
