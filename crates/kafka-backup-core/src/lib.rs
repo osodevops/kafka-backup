@@ -42,7 +42,8 @@ pub mod validation;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
     CircuitBreakerSettings, Config, HeaderPreflightMode, IsolationLevel, MetricsConfig,
-    OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreOptions,
+    OffsetStorageBackend, OffsetStorageConfig, OffsetStrategy, RestoreCheckpointStorage,
+    RestoreOptions,
 };
 pub use error::{Error, Result};
 pub use health::{HealthCheck, HealthStatus};
@@ -55,8 +56,8 @@ pub use manifest::{
     BackupManifest, BackupRecord, ConsumerGroupOffset, ConsumerGroupOffsets, DryRunPartitionReport,
     DryRunRepartitioningInfo, DryRunReport, DryRunTopicReport, OffsetGap, OffsetGapReason,
     OffsetLookupPrecision, OffsetMapping, OffsetMappingEntry, OffsetPair, PartitionBackup,
-    PartitionRestoreReport, RecordHeader, RestoreCheckpoint, RestoreReport, SegmentMetadata,
-    TargetOffsetLookup, TopicBackup, TopicRestoreReport,
+    PartitionRestoreProgress, PartitionRestoreReport, RecordHeader, RestoreCheckpoint,
+    RestoreReport, SegmentMetadata, TargetOffsetLookup, TopicBackup, TopicRestoreReport,
 };
 pub use metrics::{
     create_instrumented_backend, ErrorType, InstrumentedStorageBackend, MetricsReport,

@@ -987,6 +987,19 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
 
+/// Where a restore keeps its checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestoreCheckpointStorage {
+    /// The local `checkpoint_state` file.
+    #[default]
+    Local,
+    /// Backup storage only.
+    Remote,
+    /// The local file and backup storage.
+    Both,
+}
+
 /// Restore-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOptions {
@@ -1041,11 +1054,15 @@ pub struct RestoreOptions {
     #[serde(default)]
     pub strip_offset_headers: bool,
 
-    /// Rate limit in records per second
+    /// Rate limit in records per second for the whole restore: one token
+    /// bucket shared by every partition (before 0.24 each partition was
+    /// limited to this rate on its own).
     #[serde(default)]
     pub rate_limit_records_per_sec: Option<u64>,
 
-    /// Rate limit in bytes per second
+    /// Rate limit in bytes per second for the whole restore, shared by
+    /// every partition. Bytes are the records' uncompressed encoded size
+    /// (key, value, headers and record framing).
     #[serde(default)]
     pub rate_limit_bytes_per_sec: Option<u64>,
 
@@ -1056,6 +1073,14 @@ pub struct RestoreOptions {
     /// Batch size for producing to target cluster (number of records)
     #[serde(default = "default_produce_batch_size")]
     pub produce_batch_size: usize,
+
+    /// Maximum uncompressed size of one produce batch in bytes (default
+    /// 1 MiB). A batch closes at `produce_batch_size` records or at this
+    /// size, whichever comes first; it is further capped below the target
+    /// topic's `max.message.bytes`. A single record larger than the batch
+    /// cap is sent in a batch of its own.
+    #[serde(default = "default_produce_max_batch_bytes")]
+    pub produce_max_batch_bytes: usize,
 
     /// Producer acknowledgement level sent to the broker.
     ///
@@ -1069,6 +1094,16 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_acks")]
     pub produce_acks: i16,
 
+    /// Produce with an idempotent producer (default `true`): one producer id
+    /// per restore and a sequence number per partition, so a batch resent
+    /// after a timeout or a lost connection is de-duplicated by the broker
+    /// instead of written twice. Requires `produce_acks: -1`. When the
+    /// cluster denies or does not support idempotence (Kafka before 2.5,
+    /// no IdempotentWrite/Write permission), the restore logs a warning,
+    /// records it in the report and produces without a producer id.
+    #[serde(default = "default_idempotent_producer")]
+    pub idempotent_producer: bool,
+
     /// Broker-side produce timeout in milliseconds (default: 30 000).
     ///
     /// The broker waits up to this duration for the required acks before
@@ -1078,13 +1113,28 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_timeout_ms")]
     pub produce_timeout_ms: i32,
 
-    /// Checkpoint state file path for resumable restores
+    /// Checkpoint state file path for resumable restores (written
+    /// atomically: temp file, fsync, rename).
     #[serde(default)]
     pub checkpoint_state: Option<std::path::PathBuf>,
 
-    /// Checkpoint interval in seconds
+    /// Seconds between checkpoint saves while a restore runs (the
+    /// checkpoint is also saved after every topic).
     #[serde(default = "default_restore_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+
+    /// Where the restore checkpoint is kept: `local` (default, the
+    /// `checkpoint_state` file), `remote` (backup storage, at
+    /// `{backup_id}/restore-checkpoints/{restore_id}.json`, so a restarted
+    /// pod without the local file resumes) or `both`.
+    #[serde(default)]
+    pub checkpoint_storage: RestoreCheckpointStorage,
+
+    /// Names the remote checkpoint. Default: derived from the backup id,
+    /// the target bootstrap servers and the restore configuration, so a
+    /// re-run of the same restore finds its checkpoint.
+    #[serde(default)]
+    pub restore_id: Option<String>,
 
     /// Consumer groups to reset offsets for (requires reset_consumer_offsets)
     #[serde(default)]
@@ -1300,10 +1350,14 @@ impl Default for RestoreOptions {
             rate_limit_bytes_per_sec: None,
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
+            idempotent_producer: default_idempotent_producer(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_state: None,
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
+            checkpoint_storage: RestoreCheckpointStorage::default(),
+            restore_id: None,
             consumer_groups: Vec::new(),
             reset_consumer_offsets: false,
             offset_report: None,
@@ -1338,6 +1392,14 @@ fn default_max_concurrent_partitions() -> usize {
 
 fn default_produce_batch_size() -> usize {
     1000
+}
+
+fn default_produce_max_batch_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_idempotent_producer() -> bool {
+    true
 }
 
 fn default_produce_acks() -> i16 {
@@ -1642,6 +1704,46 @@ impl RestoreOptions {
             return Err(crate::Error::Config(
                 "produce_batch_size must be > 0".to_string(),
             ));
+        }
+        if self.idempotent_producer && self.produce_acks != -1 {
+            return Err(crate::Error::Config(format!(
+                "restore.idempotent_producer requires produce_acks: -1 (got {}). Set \
+                 produce_acks: -1, or idempotent_producer: false to produce with acks {} \
+                 without duplicate protection",
+                self.produce_acks, self.produce_acks
+            )));
+        }
+        if self.checkpoint_storage == RestoreCheckpointStorage::Both
+            && self.checkpoint_state.is_none()
+        {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_storage: both requires restore.checkpoint_state (the local \
+                 file)"
+                    .to_string(),
+            ));
+        }
+        if self.checkpoint_interval_secs == 0 {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if let Some(id) = &self.restore_id {
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err(crate::Error::Config(format!(
+                    "restore.restore_id may only contain letters, digits, '-', '_' and '.', got \
+                     {id:?}"
+                )));
+            }
+        }
+        if self.produce_max_batch_bytes < 1024 {
+            return Err(crate::Error::Config(format!(
+                "produce_max_batch_bytes must be at least 1024, got {}",
+                self.produce_max_batch_bytes
+            )));
         }
 
         if self.target_cluster_type.is_some()
@@ -2195,6 +2297,7 @@ connection:
         RestoreOptions {
             max_concurrent_partitions: default_max_concurrent_partitions(),
             produce_batch_size: default_produce_batch_size(),
+            produce_max_batch_bytes: default_produce_max_batch_bytes(),
             produce_acks: default_produce_acks(),
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
@@ -2234,6 +2337,73 @@ schema_id_rewrite_strict: true
         let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
         assert!(!json.contains("schema_id_rewrite_topics"), "{json}");
         assert!(!json.contains("schema_id_rewrite_strict"), "{json}");
+    }
+
+    #[test]
+    fn idempotent_producer_is_on_by_default_and_requires_acks_all() {
+        let opts = valid_restore_options();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_acks, -1);
+        assert!(opts.validate().is_ok());
+
+        for acks in [0, 1] {
+            let mut opts = valid_restore_options();
+            opts.produce_acks = acks;
+            let err = opts.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("idempotent_producer requires produce_acks: -1"),
+                "{err}"
+            );
+
+            opts.idempotent_producer = false;
+            assert!(opts.validate().is_ok(), "acks {acks} without idempotence");
+        }
+
+        let yaml = "produce_acks: 1\nidempotent_producer: false\n";
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert!(!opts.idempotent_producer);
+        assert!(opts.validate().is_ok());
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert!(opts.idempotent_producer);
+        assert_eq!(opts.produce_max_batch_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn restore_checkpoint_storage_options_validate() {
+        let opts: RestoreOptions =
+            serde_yaml::from_str("checkpoint_storage: remote\nrestore_id: orders-dr.1\n").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Remote);
+        assert!(opts.validate().is_ok(), "remote needs no local file");
+
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Local);
+        assert_eq!(opts.restore_id, None);
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_storage = RestoreCheckpointStorage::Both;
+        let err = opts.validate().unwrap_err().to_string();
+        assert!(err.contains("requires restore.checkpoint_state"), "{err}");
+        opts.checkpoint_state = Some("/tmp/cp.json".into());
+        assert!(opts.validate().is_ok());
+
+        let mut opts = valid_restore_options();
+        opts.restore_id = Some("../escape".to_string());
+        assert!(opts.validate().is_err());
+        opts.restore_id = Some(String::new());
+        assert!(opts.validate().is_err());
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_interval_secs = 0;
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn produce_max_batch_bytes_must_hold_a_batch() {
+        let mut opts = valid_restore_options();
+        opts.produce_max_batch_bytes = 100;
+        assert!(opts.validate().is_err());
+        opts.produce_max_batch_bytes = 8 * 1024 * 1024;
+        assert!(opts.validate().is_ok());
     }
 
     #[test]

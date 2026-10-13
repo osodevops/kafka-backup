@@ -6,16 +6,15 @@
 //! based on their key — just like a native Kafka producer.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{RepartitioningStrategy, RestoreOptions, TopicRepartitioning};
 use crate::health::HealthCheck;
+use crate::kafka::produce::{record_size_upper_bound, RECORD_BATCH_OVERHEAD};
 use crate::kafka::PartitionLeaderRouter;
 use crate::manifest::{
     BackupRecord, PartitionRestoreReport, RestoreCheckpoint, SegmentMetadata, TopicBackup,
@@ -26,6 +25,7 @@ use crate::storage::StorageBackend;
 use crate::{Error, Result};
 
 use super::helpers;
+use super::produce_path::{ProducePath, RecordOrigin};
 use super::telemetry::RestoreTelemetry;
 
 /// Kafka's default seed for murmur2 hashing (0x9747b28c).
@@ -33,6 +33,50 @@ const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
 
 /// Channel capacity for backpressure between reader and writer tasks.
 const CHANNEL_CAPACITY: usize = 1_000;
+
+/// One record on its way from a reader to a writer, with the
+/// acknowledgement tracker of the segment it came from.
+type Routed = (BackupRecord, Arc<SegmentAck>);
+
+/// Tracks the records of one segment across the writers they were routed
+/// to: the segment is marked complete in the checkpoint only once every
+/// one of them was acknowledged by the target, so a resume never skips a
+/// segment whose records were merely queued.
+pub(crate) struct SegmentAck {
+    key: String,
+    remaining: AtomicUsize,
+    checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
+}
+
+impl SegmentAck {
+    fn new(key: &str, records: usize, checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>) -> Self {
+        Self {
+            key: key.to_string(),
+            remaining: AtomicUsize::new(records),
+            checkpoint,
+        }
+    }
+
+    /// `count` of the segment's records were acknowledged.
+    async fn acknowledge(&self, count: usize) {
+        if self.remaining.fetch_sub(count, Ordering::AcqRel) == count {
+            helpers::mark_segment_completed(&self.checkpoint, &self.key).await;
+        }
+    }
+}
+
+/// Acknowledge the records of a produced batch, segment by segment.
+async fn acknowledge_segments(acks: &[Arc<SegmentAck>]) {
+    let mut i = 0;
+    while i < acks.len() {
+        let mut j = i + 1;
+        while j < acks.len() && Arc::ptr_eq(&acks[i], &acks[j]) {
+            j += 1;
+        }
+        acks[i].acknowledge(j - i).await;
+        i = j;
+    }
+}
 
 /// Partitioner that routes records to target partitions.
 pub struct Partitioner {
@@ -79,50 +123,16 @@ impl Partitioner {
 ///
 /// N source-partition reader tasks feed M target-partition writer tasks
 /// through bounded channels, with the `Partitioner` routing each record
-/// to the correct channel based on its key.
-///
-/// Records no restore metrics; `RestoreEngine` restores repartitioned
-/// topics with its own metrics and progress events.
+/// to the correct channel based on its key. Produced batches, segments and
+/// completed target partitions are reported to `telemetry`.
 #[allow(clippy::too_many_arguments)]
-pub async fn restore_topic_repartitioned(
+pub(crate) async fn restore_topic_repartitioned(
     topic_backup: &TopicBackup,
     target_topic: &str,
     repart_config: &TopicRepartitioning,
     options: &RestoreOptions,
     router: Arc<PartitionLeaderRouter>,
-    storage: Arc<dyn StorageBackend>,
-    metrics: Arc<PerformanceMetrics>,
-    health: Arc<HealthCheck>,
-    kafka_cb: Arc<CircuitBreaker>,
-    storage_cb: Arc<CircuitBreaker>,
-    checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
-) -> Result<TopicRestoreReport> {
-    restore_topic_repartitioned_with_telemetry(
-        topic_backup,
-        target_topic,
-        repart_config,
-        options,
-        router,
-        storage,
-        metrics,
-        health,
-        kafka_cb,
-        storage_cb,
-        checkpoint,
-        Arc::new(RestoreTelemetry::disabled()),
-    )
-    .await
-}
-
-/// [`restore_topic_repartitioned`], reporting produced batches, segments
-/// and completed target partitions to the engine's telemetry.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn restore_topic_repartitioned_with_telemetry(
-    topic_backup: &TopicBackup,
-    target_topic: &str,
-    repart_config: &TopicRepartitioning,
-    options: &RestoreOptions,
-    router: Arc<PartitionLeaderRouter>,
+    produce_path: ProducePath,
     storage: Arc<dyn StorageBackend>,
     metrics: Arc<PerformanceMetrics>,
     health: Arc<HealthCheck>,
@@ -173,9 +183,8 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
     }
 
     // Create M bounded channels (one per target partition)
-    let mut senders: Vec<mpsc::Sender<BackupRecord>> =
-        Vec::with_capacity(num_target_partitions as usize);
-    let mut receivers: Vec<Option<mpsc::Receiver<BackupRecord>>> =
+    let mut senders: Vec<mpsc::Sender<Routed>> = Vec::with_capacity(num_target_partitions as usize);
+    let mut receivers: Vec<Option<mpsc::Receiver<Routed>>> =
         Vec::with_capacity(num_target_partitions as usize);
 
     for _ in 0..num_target_partitions {
@@ -250,31 +259,32 @@ pub(crate) async fn restore_topic_repartitioned_with_telemetry(
         let rx = receivers[target_partition as usize]
             .take()
             .expect("receiver already taken");
-        let router = Arc::clone(&router);
+        let produce_path = produce_path.clone();
+        let source_topic = topic_backup.name.clone();
         let target_topic = target_topic.to_string();
         let cancel = Arc::clone(&cancel);
         let kafka_cb = Arc::clone(&kafka_cb);
         let health = Arc::clone(&health);
         let metrics = Arc::clone(&metrics);
-        let options = options.clone();
         let telemetry = Arc::clone(&telemetry);
 
         writer_handles.push(tokio::spawn(async move {
             run_writer(
                 rx,
-                &router,
+                &produce_path,
+                &source_topic,
                 &target_topic,
                 target_partition,
                 &cancel,
                 &kafka_cb,
                 &health,
                 &metrics,
-                &options,
                 &telemetry,
             )
             .await
         }));
     }
+    drop(router);
 
     // Join all reader tasks
     let mut reader_errors = Vec::new();
@@ -334,13 +344,13 @@ async fn run_reader(
     source_topic: &str,
     source_partition: i32,
     segments: &[SegmentMetadata],
-    senders: &[mpsc::Sender<BackupRecord>],
+    senders: &[mpsc::Sender<Routed>],
     partitioner: &Partitioner,
     cancel: &Arc<AtomicBool>,
     storage: &dyn StorageBackend,
     storage_cb: &CircuitBreaker,
     health: &HealthCheck,
-    checkpoint: &Mutex<Option<RestoreCheckpoint>>,
+    checkpoint: &Arc<Mutex<Option<RestoreCheckpoint>>>,
     options: &RestoreOptions,
     schema_ids: &helpers::SchemaIdCounts,
     filter_dropped: &AtomicU64,
@@ -434,7 +444,13 @@ async fn run_reader(
             return Err(e);
         }
 
-        // Route each record through the partitioner
+        // Route each record through the partitioner. The segment is marked
+        // complete by the writers, once all its records are acknowledged.
+        let ack = Arc::new(SegmentAck::new(
+            &segment.key,
+            records_to_send.len(),
+            Arc::clone(checkpoint),
+        ));
         for record in records_to_send {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
@@ -442,7 +458,7 @@ async fn run_reader(
 
             let target_partition = partitioner.partition(record.key.as_deref());
             if senders[target_partition as usize]
-                .send(record)
+                .send((record, Arc::clone(&ack)))
                 .await
                 .is_err()
             {
@@ -450,55 +466,82 @@ async fn run_reader(
                 return Ok(());
             }
         }
-
-        helpers::mark_segment_completed(checkpoint, &segment.key).await;
     }
 
     debug!("Reader for {}:{} finished", source_topic, source_partition);
     Ok(())
 }
 
-/// Writer task: receives records from a channel and produces them in batches.
+/// Writer task: receives records from a channel and produces them in
+/// batches capped by record count and encoded bytes.
 #[allow(clippy::too_many_arguments)]
 async fn run_writer(
-    mut rx: mpsc::Receiver<BackupRecord>,
-    router: &PartitionLeaderRouter,
+    mut rx: mpsc::Receiver<Routed>,
+    produce_path: &ProducePath,
+    source_topic: &str,
     target_topic: &str,
     target_partition: i32,
     cancel: &Arc<AtomicBool>,
     kafka_cb: &CircuitBreaker,
     health: &HealthCheck,
     metrics: &PerformanceMetrics,
-    options: &RestoreOptions,
     telemetry: &RestoreTelemetry,
 ) -> Result<PartitionRestoreReport> {
-    let batch_size = options.produce_batch_size;
+    let batch_size = produce_path.max_batch_records();
+    let max_batch_bytes = produce_path.max_batch_bytes();
     let mut total_records = 0u64;
     let mut total_bytes = 0u64;
 
     let mut batch: Vec<BackupRecord> = Vec::with_capacity(batch_size);
+    // The segment tracker of each record in `batch`.
+    let mut acks: Vec<Arc<SegmentAck>> = Vec::with_capacity(batch_size);
+    // A record drained from the channel that did not fit the previous batch.
+    let mut carry: Option<Routed> = None;
 
     loop {
-        // Drain up to batch_size records, blocking on the first one
-        if batch.is_empty() {
-            match rx.recv().await {
-                Some(record) => batch.push(record),
+        // Start the batch with the carried record, else block on the first one
+        let mut batch_encoded = RECORD_BATCH_OVERHEAD;
+        let first = match carry.take() {
+            Some(routed) => routed,
+            None => match rx.recv().await {
+                Some(routed) => routed,
                 None => break, // channel closed, all readers done
-            }
-        }
+            },
+        };
+        batch_encoded += record_size_upper_bound(&first.0);
+        batch.push(first.0);
+        acks.push(first.1);
 
-        // Non-blocking drain to fill the batch
+        // Non-blocking drain to fill the batch up to both caps
         while batch.len() < batch_size {
             match rx.try_recv() {
-                Ok(record) => batch.push(record),
+                Ok(routed) => {
+                    let size = record_size_upper_bound(&routed.0);
+                    if batch_encoded + size > max_batch_bytes {
+                        carry = Some(routed);
+                        break;
+                    }
+                    batch_encoded += size;
+                    batch.push(routed.0);
+                    acks.push(routed.1);
+                }
                 Err(_) => break,
             }
         }
 
-        // Apply rate limiting
-        if let Some(rate) = options.rate_limit_records_per_sec {
-            let delay = Duration::from_secs_f64(batch.len() as f64 / rate as f64);
-            tokio::time::sleep(delay).await;
+        // The fan-out path has no single source partition per writer; the
+        // error names the record's source offset and the target partition.
+        if let Err(e) = produce_path.check_record_sizes(
+            &batch,
+            RecordOrigin {
+                source_topic,
+                source_partition: -1,
+            },
+            target_topic,
+            target_partition,
+        ) {
+            cancel.store(true, Ordering::Relaxed);
+            return Err(e);
         }
 
         let batch_bytes: u64 = batch
@@ -509,19 +552,15 @@ async fn run_writer(
             })
             .sum();
 
-        match router
-            .produce(
-                target_topic,
-                target_partition,
-                batch.clone(),
-                options.produce_acks,
-                options.produce_timeout_ms,
-            )
+        // Produce (after the restore-wide rate limit)
+        match produce_path
+            .produce(target_topic, target_partition, &batch)
             .await
         {
             Ok(_) => {
                 kafka_cb.record_success();
                 health.mark_healthy("kafka");
+                acknowledge_segments(&acks).await;
 
                 total_records += batch.len() as u64;
                 total_bytes += batch_bytes;
@@ -538,6 +577,7 @@ async fn run_writer(
         }
 
         batch.clear();
+        acks.clear();
     }
 
     debug!(
@@ -601,6 +641,33 @@ mod tests {
             let partition = positive % 6;
             assert!((0..6).contains(&partition));
         }
+    }
+
+    // ── Segment acknowledgement ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn segment_is_completed_only_once_every_record_is_acknowledged() {
+        let checkpoint = Arc::new(Mutex::new(Some(RestoreCheckpoint::new(
+            "b".to_string(),
+            "h".to_string(),
+        ))));
+        let completed = |cp: &Option<RestoreCheckpoint>| {
+            let mut keys = cp.as_ref().unwrap().segments_completed.clone();
+            keys.sort();
+            keys
+        };
+        let a = Arc::new(SegmentAck::new("seg-a", 3, Arc::clone(&checkpoint)));
+        let b = Arc::new(SegmentAck::new("seg-b", 2, Arc::clone(&checkpoint)));
+
+        // Writer 1 acknowledges two records of a and one of b.
+        acknowledge_segments(&[a.clone(), a.clone(), b.clone()]).await;
+        assert!(completed(&*checkpoint.lock().await).is_empty());
+
+        // Writer 2 acknowledges the rest of b, then the rest of a.
+        acknowledge_segments(std::slice::from_ref(&b)).await;
+        assert_eq!(completed(&*checkpoint.lock().await), vec!["seg-b"]);
+        acknowledge_segments(std::slice::from_ref(&a)).await;
+        assert_eq!(completed(&*checkpoint.lock().await), vec!["seg-a", "seg-b"]);
     }
 
     // ── Partitioner behavior ───────────────────────────────────────────

@@ -134,6 +134,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged and listed in the restore report (`topic_configs_skipped`).
   `restore.unsupported_config_policy: fail` stops the restore instead,
   before any configuration is changed.
+- `restore.rate_limit_bytes_per_sec` was validated but never applied. It
+  now limits the restore's produce rate (see Changed).
+- A produce batch whose records span more than ~24.8 days of timestamps is
+  sent as several sub-batches; a retry after a lost connection resent the
+  sub-batches the broker had already acknowledged, duplicating them. Each
+  sub-batch is now encoded once and retried on its own with identical
+  bytes.
+- **Restore checkpoints could claim work that was never acknowledged, and
+  a resume could duplicate or skip records.**
+  - The checkpoint file was written with a plain `write` (a crash could
+    leave it truncated) and only after each topic; `checkpoint_interval_secs`
+    had no effect and `records_restored` / `bytes_restored` were never
+    updated. It is now written atomically (temp file, fsync, rename,
+    directory fsync), at `checkpoint_interval_secs`, after every topic and
+    when the run stops, and its totals count acknowledged records.
+  - The repartitioning path marked a segment complete as soon as its
+    records were queued for the writers; a crash then skipped records that
+    were never produced. A segment is now complete only once every one of
+    its records was acknowledged.
+  - `restore_topic` returned on the first failing partition while the
+    others kept producing in the background (and kept updating the
+    checkpoint after the error). A failing partition now stops its
+    siblings after their in-flight batch and all are awaited, so the
+    checkpoint holds exactly the acknowledged work; partition tasks are
+    also aborted if the run itself is cancelled.
+  - Resuming inside a partially restored segment re-produced the whole
+    segment. Each source partition now records the source offset of its
+    last acknowledged record and the target's high watermark after it; a
+    resume skips acknowledged records, and verifies the records written
+    after the last save (the high-watermark difference) record by record
+    against the target before skipping them, so it writes no duplicates
+    and misses nothing. A target changed by another writer (records that
+    do not match, more extra records than the backup has left, or a high
+    watermark below the recorded one) fails the resume with a clear error.
+    A resume after a crash first waits out the interrupted run's in-flight
+    window (`checkpoint_interval_secs` + `produce_timeout_ms` + 5 s after
+    its last save). `purge_topics` is no longer applied again on resume.
+  - #160: the checkpoint file is written as soon as the restore starts.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -202,6 +240,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use `Config::check_security_sections` on raw YAML.
 - **API (semver minor):** `SaslMechanism` is now `#[non_exhaustive]`.
   Matches on it outside this crate need a wildcard arm.
+- **`restore.rate_limit_records_per_sec` is now a restore-wide limit.** It
+  was applied per partition (each partition slept `batch / rate` before
+  every batch, so eight concurrent partitions ran at eight times the
+  configured rate). It is now one token bucket shared by every partition
+  and every repartitioning writer, as is `rate_limit_bytes_per_sec`.
+  Configurations tuned around the old behaviour should multiply the value
+  by `max_concurrent_partitions` to keep the same throughput.
+- **`restore.produce_acks` other than `-1` now needs
+  `restore.idempotent_producer: false`.** An idempotent producer requires
+  acks=all; a configuration with `produce_acks: 0` or `1` and the new
+  default `idempotent_producer: true` fails validation with a message
+  saying which setting to change.
 
 ### Added
 - `backup.isolation_level` (`read_committed` default, `read_uncommitted`)
@@ -270,6 +320,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **API (semver minor):** `StorageBackendConfig::Azure` and `AzureConfig`
   gain the `use_emulator` and `allow_http` fields. Code that builds them
   field by field must set both (`false` keeps the previous behaviour).
+- **`restore.produce_max_batch_bytes`** (default 1 MiB): produce batches are
+  capped by uncompressed encoded size as well as by `produce_batch_size`
+  records, and further capped so that a compressed batch always fits the
+  target topic's `max.message.bytes`. Restores of large records into
+  Confluent Cloud (2 MiB default limit, 8 MiB maximum) no longer fail with
+  `RECORD_TOO_LARGE` because a 1000-record batch outgrew the limit.
+- **`max.message.bytes` pre-check.** The target topic's
+  `max.message.bytes` is read once per topic (DescribeConfigs). Before a
+  segment's records are produced, any record that does not fit even alone
+  in a compressed batch fails the partition with a
+  `KafkaError::RecordTooLarge` naming the source topic, partition and
+  offset, the record's size and the target topic's limit. Without
+  DescribeConfigs permission the check is skipped with a warning.
+- **Idempotent restore produce (`restore.idempotent_producer`, default
+  `true`).** A restore obtains one producer id (`InitProducerId` v3, no
+  transactional id) and stamps every batch with it and a per-partition
+  sequence number (advancing by the batch's record count, wrapping past
+  `i32::MAX` to 0 as Kafka does; one batch in flight per partition). Each
+  batch, and each timestamp sub-batch, is encoded exactly once, and every
+  resend — `KafkaClient::send_request`'s reconnect-and-retry, the partition
+  router's NOT_LEADER / connection retries, and a new retry of
+  `REQUEST_TIMED_OUT`, `NOT_ENOUGH_REPLICAS(_AFTER_APPEND)` and
+  `LEADER_NOT_AVAILABLE` — sends the identical bytes, so the broker writes
+  the batch once. Previously a produce whose response was lost (connection
+  reset, timeout) was resent as a new batch and duplicated.
+  - `DUPLICATE_SEQUENCE_NUMBER` counts as acknowledged; the batch's
+    offsets (and its offset-mapping entries) are derived from the end of
+    the partition's previous batch, which is exact while the restore is the
+    partition's only writer.
+  - `OUT_OF_ORDER_SEQUENCE_NUMBER` fails the partition.
+  - `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` re-initialise the
+    producer with an epoch bump (KIP-360; a local bump if the request
+    fails), restart every partition's sequence at 0, and reconcile the
+    in-doubt batch against the partition's high watermark once
+    `produce_timeout_ms` + 5 s have passed since it was first sent:
+    unchanged = resend, advanced by exactly the batch = acknowledged,
+    anything else = another writer, fatal.
+  - When `InitProducerId` is denied (`CLUSTER_AUTHORIZATION_FAILED`) or not
+    supported (ApiVersions shows no InitProducerId v3, i.e. Kafka before
+    2.5), the restore logs a warning, produces without a producer id (the
+    old behaviour), and reports it: `RestoreReport` gains
+    `idempotent_producer` and `idempotent_producer_fallback` (the reason).
+- **`restore.checkpoint_storage`** (`local` default, `remote`, `both`):
+  keep the restore checkpoint in backup storage at
+  `{backup_id}/restore-checkpoints/{restore_id}.json` so a restarted pod
+  without the local file resumes. **`restore.restore_id`** names it
+  (default: derived from the backup id, the target bootstrap servers and
+  the restore configuration).
 
 - `--log-format text|json` (global; also `KAFKA_BACKUP_LOG_FORMAT`): `json`
   writes one JSON object per log line to stderr (#188).
@@ -314,6 +412,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`UnsupportedConfigPolicy`, `TargetProfile`, `TargetClusterType`).
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
+- `RestoreOptions` gains `produce_max_batch_bytes`; `KafkaError` gains
+  `RecordTooLarge` (it is `#[non_exhaustive]`). `restore::repartition::
+  restore_topic_repartitioned` is now crate-private (it takes the engine's
+  internal produce plumbing).
+- `RestoreOptions` gains `idempotent_producer`; `RestoreReport` gains
+  `idempotent_producer` and `idempotent_producer_fallback` (serde
+  defaults, so older reports still parse). New:
+  `PartitionLeaderRouter::produce_encoded` (send one encoded batch,
+  retrying with the same bytes), `kafka::transactions::
+  supports_idempotent_epoch_bump`, `ProducerBatch::NON_IDEMPOTENT`.
+- `RestoreCheckpoint` gains `restore_id`, `partitions` (per source
+  partition `PartitionRestoreProgress`: `last_source_offset_acked`,
+  `target_hw_after_ack`, counters) and `stopped_cleanly`, all with serde
+  defaults so older checkpoint files still load; new
+  `RestoreCheckpoint::partition_key` and `record_ack`. `RestoreOptions`
+  gains `checkpoint_storage` (`RestoreCheckpointStorage`) and `restore_id`;
+  `checkpoint_interval_secs: 0` is now rejected.
 
 ## [0.23.8] - 2026-10-09
 

@@ -147,6 +147,7 @@ impl RestoreTelemetry {
     }
 
     /// Telemetry that records nothing anywhere (no metrics, no subscribers).
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self::new("", None)
     }

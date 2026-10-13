@@ -520,6 +520,8 @@ mod tests {
             record_filter: None,
             topic_configs_skipped: Vec::new(),
             topic_configs_adjusted: Vec::new(),
+            idempotent_producer: false,
+            idempotent_producer_fallback: None,
         }
     }
 

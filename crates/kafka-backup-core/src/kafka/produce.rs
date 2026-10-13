@@ -8,10 +8,11 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    NO_PARTITION_LEADER_EPOCH,
 };
 use tracing::{debug, trace};
 
+use super::transactions::ProducerBatch;
 use super::KafkaClient;
 use crate::error::KafkaError;
 use crate::manifest::BackupRecord;
@@ -41,80 +42,294 @@ pub struct ProduceResponse {
 /// when built against that release. i32::MAX ms ≈ 24.8 days.
 const MAX_TIMESTAMP_DELTA_MS: i64 = i32::MAX as i64;
 
-/// Split records into sub-batches where all timestamps within a sub-batch
-/// are within MAX_TIMESTAMP_DELTA_MS of each other (tracking min/max).
-/// Records maintain their original order.
-fn split_by_timestamp(records: Vec<BackupRecord>) -> Vec<Vec<BackupRecord>> {
-    if records.is_empty() {
-        return vec![];
-    }
+/// Size of a v2 record batch header: base offset (8), batch length (4),
+/// partition leader epoch (4), magic (1), CRC (4), attributes (2), last
+/// offset delta (4), first and max timestamp (8 + 8), producer id (8),
+/// producer epoch (2), base sequence (4) and record count (4).
+pub(crate) const RECORD_BATCH_OVERHEAD: usize = 61;
 
+/// Bytes of a zig-zag varlong, the encoding of every length and delta inside
+/// a v2 record.
+fn varint_size(value: i64) -> usize {
+    let mut zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    let mut size = 1;
+    while zigzag >= 0x80 {
+        zigzag >>= 7;
+        size += 1;
+    }
+    size
+}
+
+/// A nullable byte field: varint length (`-1` for null) plus the bytes.
+fn nullable_bytes_size(len: Option<usize>) -> usize {
+    match len {
+        None => varint_size(-1),
+        Some(len) => varint_size(len as i64) + len,
+    }
+}
+
+/// Size of `record` encoded inside an uncompressed v2 batch, given its
+/// timestamp and offset deltas from the batch's first record.
+fn encoded_record_size(record: &BackupRecord, timestamp_delta: i64, offset_delta: i64) -> usize {
+    let headers: usize = record
+        .headers
+        .iter()
+        .map(|h| {
+            varint_size(h.key.len() as i64)
+                + h.key.len()
+                + nullable_bytes_size(h.value.as_ref().map(Vec::len))
+        })
+        .sum();
+    let body = 1 // attributes
+        + varint_size(timestamp_delta)
+        + varint_size(offset_delta)
+        + nullable_bytes_size(record.key.as_ref().map(Vec::len))
+        + nullable_bytes_size(record.value.as_ref().map(Vec::len))
+        + varint_size(record.headers.len() as i64)
+        + headers;
+    varint_size(body as i64) + body
+}
+
+/// Upper bound of `record`'s encoded size in any batch (worst-case deltas).
+pub(crate) fn record_size_upper_bound(record: &BackupRecord) -> usize {
+    encoded_record_size(record, i64::MAX, i64::from(i32::MAX))
+}
+
+/// Exact size of an uncompressed batch holding only `record`.
+pub(crate) fn single_record_batch_size(record: &BackupRecord) -> usize {
+    RECORD_BATCH_OVERHEAD + encoded_record_size(record, 0, 0)
+}
+
+/// Uncompressed bytes of `records` as the restore counts them for
+/// `produce_max_batch_bytes` and `rate_limit_bytes_per_sec`: the upper bound
+/// of each record's encoded size (key, value, headers and framing).
+pub(crate) fn records_encoded_size(records: &[BackupRecord]) -> usize {
+    records.iter().map(record_size_upper_bound).sum()
+}
+
+/// Largest batch, in uncompressed bytes, that is guaranteed to stay within
+/// `max_message_bytes` once compressed: zstd can grow incompressible data
+/// by up to `len / 256` plus a small frame overhead (`ZSTD_compressBound`).
+pub(crate) fn batch_bytes_within_max_message_bytes(max_message_bytes: usize) -> usize {
+    max_message_bytes
+        .saturating_sub(max_message_bytes / 256 + 128)
+        .max(RECORD_BATCH_OVERHEAD + 1)
+}
+
+/// The first record of `records` that cannot be produced to a topic whose
+/// `max.message.bytes` is `max_message_bytes`, even alone in a
+/// zstd-compressed batch: `(index, compressed single-record batch size)`.
+/// Only records too large for an uncompressed batch are compressed to
+/// check, so the common case costs one size computation per record.
+pub(crate) fn find_oversized_record(
+    records: &[BackupRecord],
+    max_message_bytes: usize,
+) -> Result<Option<(usize, usize)>> {
+    let uncompressed_limit = batch_bytes_within_max_message_bytes(max_message_bytes);
+    for (i, record) in records.iter().enumerate() {
+        if single_record_batch_size(record) <= uncompressed_limit {
+            continue;
+        }
+        let compressed = encode_batch(
+            std::slice::from_ref(record),
+            &ProducerBatch::NON_IDEMPOTENT,
+            Compression::Zstd,
+        )?
+        .len();
+        if compressed > max_message_bytes {
+            return Ok(Some((i, compressed)));
+        }
+    }
+    Ok(None)
+}
+
+/// Split `records` into consecutive produce batches holding at most
+/// `max_records` records and at most `max_bytes` uncompressed bytes
+/// ([`RECORD_BATCH_OVERHEAD`] plus [`record_size_upper_bound`] per record).
+///
+/// A record that alone exceeds `max_bytes` gets a batch of its own; callers
+/// check records against the target's `max.message.bytes` beforehand.
+pub(crate) fn plan_batches(
+    records: &[BackupRecord],
+    max_records: usize,
+    max_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_records = max_records.max(1);
     let mut batches = Vec::new();
-    let mut current_batch = Vec::new();
-    let mut ts_min = records[0].timestamp;
+    let mut start = 0;
+    let mut bytes = RECORD_BATCH_OVERHEAD;
+    for (i, record) in records.iter().enumerate() {
+        let size = record_size_upper_bound(record);
+        let count = i - start;
+        if count > 0 && (count >= max_records || bytes + size > max_bytes) {
+            batches.push(start..i);
+            start = i;
+            bytes = RECORD_BATCH_OVERHEAD;
+        }
+        bytes += size;
+    }
+    if start < records.len() {
+        batches.push(start..records.len());
+    }
+    batches
+}
+
+/// The next sequence number after `sequence` advanced by `increment`
+/// records, wrapping past `i32::MAX` to 0 the way the Kafka producer and
+/// broker do (`DefaultRecordBatch.incrementSequence`).
+pub(crate) fn increment_sequence(sequence: i32, increment: i32) -> i32 {
+    if sequence > i32::MAX - increment {
+        increment - (i32::MAX - sequence) - 1
+    } else {
+        sequence + increment
+    }
+}
+
+/// Ranges of `records` whose timestamps all lie within
+/// [`MAX_TIMESTAMP_DELTA_MS`] of each other (tracking min/max). Records keep
+/// their order.
+pub(crate) fn split_by_timestamp_ranges(records: &[BackupRecord]) -> Vec<std::ops::Range<usize>> {
+    let Some(first) = records.first() else {
+        return vec![];
+    };
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut ts_min = first.timestamp;
     let mut ts_max = ts_min;
 
-    for record in records {
+    for (i, record) in records.iter().enumerate() {
         let new_min = ts_min.min(record.timestamp);
         let new_max = ts_max.max(record.timestamp);
 
-        if !current_batch.is_empty() && (new_max - new_min) > MAX_TIMESTAMP_DELTA_MS {
-            batches.push(current_batch);
-            current_batch = Vec::new();
+        if i > start && (new_max - new_min) > MAX_TIMESTAMP_DELTA_MS {
+            ranges.push(start..i);
+            start = i;
             ts_min = record.timestamp;
             ts_max = record.timestamp;
         } else {
             ts_min = new_min;
             ts_max = new_max;
         }
-
-        current_batch.push(record);
     }
 
-    batches.push(current_batch);
-    batches
+    ranges.push(start..records.len());
+    ranges
 }
 
-/// Convert BackupRecords to kafka-protocol Records.
-fn build_kafka_records(records: Vec<BackupRecord>) -> Vec<Record> {
-    records
+/// Split records into sub-batches where all timestamps within a sub-batch
+/// are within MAX_TIMESTAMP_DELTA_MS of each other (tracking min/max).
+/// Records maintain their original order.
+#[cfg(test)]
+fn split_by_timestamp(records: Vec<BackupRecord>) -> Vec<Vec<BackupRecord>> {
+    split_by_timestamp_ranges(&records)
         .into_iter()
+        .map(|range| records[range].to_vec())
+        .collect()
+}
+
+/// Convert BackupRecords to kafka-protocol Records stamped with the
+/// producer fields of `batch`. Record `i` gets offset delta `i` and sequence
+/// `base_sequence + i`, so the encoder writes them as one batch whose base
+/// sequence is `batch.base_sequence`.
+pub(crate) fn build_kafka_records(records: &[BackupRecord], batch: &ProducerBatch) -> Vec<Record> {
+    records
+        .iter()
         .enumerate()
         .map(|(i, r)| {
             let headers: IndexMap<StrBytes, Option<Bytes>> = r
                 .headers
-                .into_iter()
+                .iter()
                 // `None` is a null header value and must be produced as
                 // such (issue #155) — it is not the same as an empty value.
-                .map(|h| (StrBytes::from_string(h.key), h.value.map(Bytes::from)))
+                .map(|h| {
+                    (
+                        StrBytes::from_string(h.key.clone()),
+                        h.value.clone().map(Bytes::from),
+                    )
+                })
                 .collect();
 
             Record {
-                transactional: false,
+                transactional: batch.transactional,
                 control: false,
                 // KIP-534 batch attribute; only set by the broker's log cleaner
                 // on tombstone/abort-marker batches, never on produced records.
                 delete_horizon: false,
                 partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                producer_id: NO_PRODUCER_ID,
-                producer_epoch: NO_PRODUCER_EPOCH,
+                producer_id: batch.producer.producer_id,
+                producer_epoch: batch.producer.producer_epoch,
                 timestamp_type: TimestampType::Creation,
                 offset: i as i64,
-                sequence: i as i32, // Must match offset so all records land in a single batch
+                // offset - sequence is constant, so every record lands in a
+                // single batch.
+                sequence: batch.base_sequence.wrapping_add(i as i32),
                 timestamp: r.timestamp,
-                key: r.key.map(Bytes::from),
-                value: r.value.map(Bytes::from),
+                key: r.key.clone().map(Bytes::from),
+                value: r.value.clone().map(Bytes::from),
                 headers,
             }
         })
         .collect()
 }
 
-/// Produce records to a topic/partition.
+/// Encode `records` once as a single v2 record batch.
+pub(crate) fn encode_batch(
+    records: &[BackupRecord],
+    batch: &ProducerBatch,
+    compression: Compression,
+) -> Result<Bytes> {
+    if records.is_empty() {
+        return Err(KafkaError::Protocol("cannot encode an empty record batch".to_string()).into());
+    }
+    let kafka_records = build_kafka_records(records, batch);
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        kafka_records.iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression,
+        },
+    )
+    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
+    Ok(buf.freeze())
+}
+
+/// Send one already-encoded record batch to `topic`/`partition` on
+/// `client` and return the base offset the broker assigned. `client`
+/// retries a lost connection once with the identical request bytes.
+pub(crate) async fn produce_encoded(
+    client: &KafkaClient,
+    topic: &str,
+    partition: i32,
+    batch: Bytes,
+    acks: i16,
+    timeout_ms: i32,
+) -> Result<i64> {
+    let partition_data = kafka_protocol::messages::produce_request::PartitionProduceData::default()
+        .with_index(partition)
+        .with_records(Some(batch));
+
+    let topic_data = kafka_protocol::messages::produce_request::TopicProduceData::default()
+        .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+        .with_partition_data(vec![partition_data]);
+
+    let request = ProduceRequest::default()
+        .with_acks(acks)
+        .with_timeout_ms(timeout_ms)
+        .with_topic_data(vec![topic_data]);
+
+    let response: KafkaProduceResponse = client.send_request(ApiKey::Produce, request).await?;
+    Ok(parse_produce_response(&response, topic, partition)?.base_offset)
+}
+
+/// Produce records to a topic/partition without a producer id.
 ///
 /// Records spanning more than ~24.8 days of timestamps are automatically
-/// split into sub-batches sent as separate produce requests (record batch v2
-/// stores timestamp deltas as i32).
+/// split into sub-batches sent as separate produce requests (see
+/// [`MAX_TIMESTAMP_DELTA_MS`]). Each sub-batch is encoded once; a retry
+/// resends identical bytes and an acknowledged sub-batch is never resent.
 pub async fn produce(
     client: &KafkaClient,
     topic: &str,
@@ -132,75 +347,37 @@ pub async fn produce(
         });
     }
 
-    let record_count = records.len();
-    let sub_batches = split_by_timestamp(records);
-
-    if sub_batches.len() > 1 {
+    let ranges = split_by_timestamp_ranges(&records);
+    if ranges.len() > 1 {
         debug!(
             "Split {} records into {} sub-batches for {}:{} (timestamp range exceeds i32::MAX ms)",
-            record_count,
-            sub_batches.len(),
+            records.len(),
+            ranges.len(),
             topic,
             partition
         );
     }
 
-    let mut first_base_offset: Option<i64> = None;
-    let mut total_produced = 0;
-    let mut sub_batch_offsets = Vec::with_capacity(sub_batches.len());
-
-    for sub_batch in sub_batches {
-        let sub_batch_len = sub_batch.len();
-        let kafka_records = build_kafka_records(sub_batch);
-
-        let options = RecordEncodeOptions {
-            version: 2,
-            compression: Compression::Zstd,
-        };
-
-        let mut records_buf = BytesMut::new();
-        RecordBatchEncoder::encode(&mut records_buf, kafka_records.iter(), &options)
-            .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
-
-        let records_bytes = records_buf.freeze();
-
-        let partition_data =
-            kafka_protocol::messages::produce_request::PartitionProduceData::default()
-                .with_index(partition)
-                .with_records(Some(records_bytes));
-
-        let topic_data = kafka_protocol::messages::produce_request::TopicProduceData::default()
-            .with_name(TopicName(StrBytes::from_string(topic.to_string())))
-            .with_partition_data(vec![partition_data]);
-
-        let request = ProduceRequest::default()
-            .with_acks(acks)
-            .with_timeout_ms(timeout_ms)
-            .with_topic_data(vec![topic_data]);
-
-        let response: KafkaProduceResponse = client.send_request(ApiKey::Produce, request).await?;
-
-        let produce_result = parse_produce_response(&response, topic, partition)?;
-
-        sub_batch_offsets.push((produce_result.base_offset, sub_batch_len));
-        if first_base_offset.is_none() {
-            first_base_offset = Some(produce_result.base_offset);
-        }
-        total_produced += sub_batch_len;
-
+    let mut sub_batch_offsets = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let sub_batch = &records[range];
+        let bytes = encode_batch(sub_batch, &ProducerBatch::NON_IDEMPOTENT, Compression::Zstd)?;
+        let base_offset =
+            produce_encoded(client, topic, partition, bytes, acks, timeout_ms).await?;
         trace!(
             "Produced {} records to {}:{} at offset {}",
-            sub_batch_len,
+            sub_batch.len(),
             topic,
             partition,
-            produce_result.base_offset
+            base_offset
         );
+        sub_batch_offsets.push((base_offset, sub_batch.len()));
     }
 
     Ok(ProduceResponse {
-        base_offset: first_base_offset.unwrap_or(-1),
+        base_offset: sub_batch_offsets[0].0,
         error_code: 0,
-        record_count: total_produced,
+        record_count: records.len(),
         sub_batch_offsets,
     })
 }
@@ -223,11 +400,16 @@ fn parse_produce_response(
                 return Err(KafkaError::BrokerError {
                     code: partition_response.error_code,
                     message: format!(
-                        "Produce error for {}:{}: code {} (base_offset={}, log_append_time={}, log_start_offset={})",
+                        "Produce error for {}:{}: code {} (base_offset={}, log_append_time={}, log_start_offset={}){}",
                         topic, partition, partition_response.error_code,
                         partition_response.base_offset,
                         partition_response.log_append_time_ms,
                         partition_response.log_start_offset,
+                        partition_response
+                            .error_message
+                            .as_ref()
+                            .map(|m| format!(": {}", m.as_str()))
+                            .unwrap_or_default(),
                     ),
                 }
                 .into());
@@ -280,7 +462,7 @@ mod tests {
             },
         ];
 
-        let records = build_kafka_records(vec![record]);
+        let records = build_kafka_records(&[record], &ProducerBatch::NON_IDEMPOTENT);
         let headers = &records[0].headers;
 
         assert_eq!(headers.len(), 3);
@@ -296,6 +478,210 @@ mod tests {
             headers.get(&StrBytes::from_static_str("tenant")),
             Some(&Some(Bytes::from_static(b"42")))
         );
+    }
+
+    fn sized_record(key_len: usize, value_len: usize) -> BackupRecord {
+        BackupRecord {
+            key: Some(vec![b'k'; key_len]),
+            value: Some(vec![b'v'; value_len]),
+            headers: vec![RecordHeader {
+                key: "h".to_string(),
+                value: None,
+            }],
+            timestamp: 1_700_000_000_000,
+            offset: 0,
+        }
+    }
+
+    fn encoded_len(records: &[BackupRecord]) -> usize {
+        encode_batch(records, &ProducerBatch::NON_IDEMPOTENT, Compression::None)
+            .unwrap()
+            .len()
+    }
+
+    /// The size helpers agree with what the encoder actually writes.
+    #[test]
+    fn single_record_batch_size_is_exact_and_the_upper_bound_holds() {
+        for (k, v) in [(0, 0), (3, 10), (100, 5_000), (1, 70_000)] {
+            let record = sized_record(k, v);
+            assert_eq!(
+                single_record_batch_size(&record),
+                encoded_len(std::slice::from_ref(&record)),
+                "key {k} value {v}"
+            );
+        }
+        let mut null_record = sized_record(0, 0);
+        null_record.key = None;
+        null_record.value = None;
+        assert_eq!(
+            single_record_batch_size(&null_record),
+            encoded_len(std::slice::from_ref(&null_record))
+        );
+
+        // Spread timestamps and many records: the bound covers the real size.
+        let records: Vec<BackupRecord> = (0..500)
+            .map(|i| {
+                let mut r = sized_record(8, 100 + i % 37);
+                r.timestamp = 1_700_000_000_000 + (i as i64) * 3_600_000;
+                r
+            })
+            .collect();
+        let bound = RECORD_BATCH_OVERHEAD + records_encoded_size(&records);
+        let actual = encoded_len(&records);
+        assert!(actual <= bound, "actual {actual} > bound {bound}");
+    }
+
+    #[test]
+    fn plan_batches_caps_by_record_count() {
+        let records: Vec<BackupRecord> = (0..25).map(|_| sized_record(1, 10)).collect();
+        let batches = plan_batches(&records, 10, usize::MAX);
+        assert_eq!(batches, vec![0..10, 10..20, 20..25]);
+    }
+
+    #[test]
+    fn plan_batches_caps_by_encoded_bytes() {
+        // ~1 KiB records, 10 KiB cap: no batch may exceed the cap.
+        let records: Vec<BackupRecord> = (0..100).map(|_| sized_record(16, 1_000)).collect();
+        let cap = 10 * 1024;
+        let batches = plan_batches(&records, 1_000, cap);
+        assert!(batches.len() > 1);
+        let mut covered = 0;
+        for range in &batches {
+            assert_eq!(range.start, covered, "batches are contiguous");
+            covered = range.end;
+            let batch = &records[range.clone()];
+            assert!(RECORD_BATCH_OVERHEAD + records_encoded_size(batch) <= cap);
+            assert!(encoded_len(batch) <= cap);
+        }
+        assert_eq!(covered, records.len());
+        // Every batch but the last is full: one more record would not fit.
+        for range in &batches[..batches.len() - 1] {
+            let with_next = &records[range.start..range.end + 1];
+            assert!(RECORD_BATCH_OVERHEAD + records_encoded_size(with_next) > cap);
+        }
+    }
+
+    #[test]
+    fn plan_batches_gives_an_oversized_record_its_own_batch() {
+        let records = vec![
+            sized_record(1, 10),
+            sized_record(1, 50_000),
+            sized_record(1, 10),
+            sized_record(1, 10),
+        ];
+        let batches = plan_batches(&records, 1_000, 4_096);
+        assert_eq!(batches, vec![0..1, 1..2, 2..4]);
+        assert!(plan_batches(&[], 10, 4_096).is_empty());
+    }
+
+    #[test]
+    fn oversized_record_is_found_by_its_compressed_size() {
+        let max = 4_096;
+        // Compressible: 40 KB of the same byte compresses far below 4 KiB,
+        // so the broker accepts it and it must not be rejected.
+        let compressible = sized_record(1, 40_000);
+        // Incompressible: pseudo-random bytes stay above the limit.
+        let mut incompressible = sized_record(1, 0);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        incompressible.value = Some(
+            (0..8_000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect(),
+        );
+        let small = sized_record(1, 100);
+
+        assert_eq!(
+            find_oversized_record(&[small.clone(), compressible.clone()], max).unwrap(),
+            None
+        );
+        let found = find_oversized_record(&[small, compressible, incompressible], max).unwrap();
+        let (index, size) = found.expect("incompressible record is too large");
+        assert_eq!(index, 2);
+        assert!(size > max);
+    }
+
+    #[test]
+    fn batch_cap_leaves_room_for_compression_overhead() {
+        let max = 1_048_576;
+        let cap = batch_bytes_within_max_message_bytes(max);
+        assert!(cap < max);
+        assert!(cap > max - 8_192);
+        assert_eq!(
+            batch_bytes_within_max_message_bytes(10),
+            RECORD_BATCH_OVERHEAD + 1
+        );
+    }
+
+    #[test]
+    fn sequence_numbers_wrap_to_zero_past_i32_max() {
+        assert_eq!(increment_sequence(0, 1), 1);
+        assert_eq!(increment_sequence(41, 1000), 1041);
+        assert_eq!(increment_sequence(i32::MAX - 10, 10), i32::MAX);
+        assert_eq!(increment_sequence(i32::MAX, 1), 0);
+        assert_eq!(increment_sequence(i32::MAX - 2, 5), 2);
+        assert_eq!(increment_sequence(i32::MAX - 999, 1_000), 0);
+    }
+
+    /// A batch whose sequences cross `i32::MAX` is still encoded as one
+    /// batch carrying its base sequence (the broker derives the rest).
+    #[test]
+    fn a_batch_crossing_the_sequence_wrap_is_one_batch() {
+        use super::super::transactions::ProducerIdAndEpoch;
+        use kafka_protocol::records::RecordBatchDecoder;
+
+        let records: Vec<BackupRecord> = (0..5).map(|_| sized_record(1, 10)).collect();
+        let batch = ProducerBatch {
+            producer: ProducerIdAndEpoch {
+                producer_id: 9,
+                producer_epoch: 2,
+            },
+            base_sequence: i32::MAX - 1,
+            transactional: false,
+        };
+        let bytes = encode_batch(&records, &batch, Compression::Zstd).unwrap();
+        let infos = RecordBatchDecoder::decode_batch_info(&mut bytes.clone()).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].base_sequence, i32::MAX - 1);
+        assert_eq!(infos[0].record_count, 5);
+        assert_eq!(infos[0].producer_id, 9);
+    }
+
+    #[test]
+    fn non_idempotent_batch_has_no_producer_id_or_sequence() {
+        use kafka_protocol::records::RecordBatchDecoder;
+
+        let bytes = encode_batch(
+            &[sized_record(1, 10), sized_record(1, 10)],
+            &ProducerBatch::NON_IDEMPOTENT,
+            Compression::Zstd,
+        )
+        .unwrap();
+        let info = &RecordBatchDecoder::decode_batch_info(&mut bytes.clone()).unwrap()[0];
+        assert_eq!(info.producer_id, -1);
+        assert_eq!(info.producer_epoch, -1);
+        assert_eq!(info.base_sequence, -1);
+    }
+
+    #[test]
+    fn split_by_timestamp_ranges_cover_every_record_in_order() {
+        let day_ms: i64 = 86_400_000;
+        let records: Vec<BackupRecord> = (0..50)
+            .map(|i| make_record(1_700_000_000_000 + i * day_ms))
+            .collect();
+        let ranges = split_by_timestamp_ranges(&records);
+        assert!(ranges.len() >= 2);
+        let mut next = 0;
+        for range in &ranges {
+            assert_eq!(range.start, next);
+            next = range.end;
+        }
+        assert_eq!(next, records.len());
+        assert!(split_by_timestamp_ranges(&[]).is_empty());
     }
 
     #[test]
@@ -346,7 +732,7 @@ mod tests {
             .map(|i| make_record(1_700_000_000_000 + i * 1000))
             .collect();
 
-        let kafka_records = build_kafka_records(records);
+        let kafka_records = build_kafka_records(&records, &ProducerBatch::NON_IDEMPOTENT);
 
         let options = RecordEncodeOptions {
             version: 2,
@@ -380,7 +766,7 @@ mod tests {
 
         let mut all_encoded = BytesMut::new();
         for sub_batch in sub_batches {
-            let kafka_records = build_kafka_records(sub_batch);
+            let kafka_records = build_kafka_records(&sub_batch, &ProducerBatch::NON_IDEMPOTENT);
             let options = RecordEncodeOptions {
                 version: 2,
                 compression: Compression::None,
@@ -404,7 +790,7 @@ mod tests {
             .map(|i| make_record(1_700_000_000_000 + i * 100))
             .collect();
 
-        let kafka_records = build_kafka_records(records);
+        let kafka_records = build_kafka_records(&records, &ProducerBatch::NON_IDEMPOTENT);
 
         let options = RecordEncodeOptions {
             version: 2,
@@ -463,7 +849,10 @@ mod tests {
         use kafka_protocol::records::{RecordBatchDecoder, RecordBatchEncoder};
 
         let now = 1_787_086_231_121i64;
-        let kafka_records = build_kafka_records(vec![make_record(0), make_record(now)]);
+        let kafka_records = build_kafka_records(
+            &[make_record(0), make_record(now)],
+            &ProducerBatch::NON_IDEMPOTENT,
+        );
         let options = RecordEncodeOptions {
             version: 2,
             compression: Compression::None,

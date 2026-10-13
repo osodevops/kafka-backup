@@ -61,6 +61,8 @@ fn restore_config(bootstrap: &str, storage: &std::path::Path, backup_id: &str) -
             max_concurrent_partitions: 2,
             produce_batch_size: 5,
             produce_acks: 1,
+            // acks other than -1 need idempotence off (0.24)
+            idempotent_producer: false,
             ..Default::default()
         }),
         offset_storage: None,
@@ -216,6 +218,7 @@ async fn failed_restore_counts_errors_and_a_failure_duration() {
     // Partition 0 (broker 1) fails terminally once partition 1 has produced.
     b1.set_mode(ProduceMode::BrokerErrorAfterPeerProduced(
         b2.produce_count.clone(),
+        1,
     ))
     .await;
     let tmp = TempDir::new().unwrap();

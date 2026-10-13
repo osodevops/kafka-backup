@@ -9,20 +9,17 @@
 //! [`encode_producer_batch`] and sent by [`produce_encoded_batch`], so a
 //! retry resends identical bytes — what the broker's sequence check expects.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use indexmap::IndexMap;
 use kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
 use kafka_protocol::messages::{
-    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, EndTxnRequest, EndTxnResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
-    ProduceRequest, ProduceResponse as KafkaProduceResponse, ProducerId, TopicName,
-    TransactionalId,
+    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ApiVersionsRequest,
+    ApiVersionsResponse, EndTxnRequest, EndTxnResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse, ProduceRequest,
+    ProduceResponse as KafkaProduceResponse, ProducerId, TopicName, TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH,
-};
+use kafka_protocol::records::Compression;
 use std::sync::Arc;
 
 use super::consumer_groups::coordinator_from_response;
@@ -71,6 +68,15 @@ pub struct ProducerBatch {
     pub base_sequence: i32,
     /// Whether the batch is part of a transaction.
     pub transactional: bool,
+}
+
+impl ProducerBatch {
+    /// A batch without a producer id: no broker-side de-duplication.
+    pub const NON_IDEMPOTENT: ProducerBatch = ProducerBatch {
+        producer: ProducerIdAndEpoch::NONE,
+        base_sequence: -1,
+        transactional: false,
+    };
 }
 
 /// Whether a broker error code is worth retrying for the transactional
@@ -166,6 +172,34 @@ pub async fn init_producer_id(
         producer_id: response.producer_id.0,
         producer_epoch: response.producer_epoch,
     })
+}
+
+/// Whether the broker behind `client` supports `InitProducerId` v3 (Kafka
+/// 2.5+), which an idempotent producer needs to bump its epoch (KIP-360),
+/// according to ApiVersions. `Ok(false)` too for a broker that answers
+/// ApiVersions v3 with `UNSUPPORTED_VERSION` or in an older format (Kafka
+/// before 2.4).
+pub async fn supports_idempotent_epoch_bump(client: &KafkaClient) -> Result<bool> {
+    const UNSUPPORTED_VERSION: i16 = 35;
+    let request = ApiVersionsRequest::default()
+        .with_client_software_name(StrBytes::from_static_str("kafka-backup"))
+        .with_client_software_version(StrBytes::from_static_str(env!("CARGO_PKG_VERSION")));
+    match client
+        .send_request::<_, ApiVersionsResponse>(ApiKey::ApiVersions, request)
+        .await
+    {
+        Ok(response) if response.error_code == UNSUPPORTED_VERSION => Ok(false),
+        Ok(response) if response.error_code != 0 => Err(broker_error(
+            response.error_code,
+            format!("ApiVersions failed: error code {}", response.error_code),
+        )),
+        Ok(response) => Ok(response
+            .api_keys
+            .iter()
+            .any(|k| k.api_key == ApiKey::InitProducerId as i16 && k.max_version >= 3)),
+        Err(crate::Error::Kafka(KafkaError::Protocol(_))) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// `AddPartitionsToTxn`: register partitions with the producer's open
@@ -270,50 +304,7 @@ pub fn encode_producer_batch(
         CompressionType::Zstd => Compression::Zstd,
         CompressionType::Lz4 => Compression::Lz4,
     };
-    if records.is_empty() {
-        return Err(KafkaError::Protocol("cannot encode an empty record batch".to_string()).into());
-    }
-    let kafka_records: Vec<Record> = records
-        .iter()
-        .enumerate()
-        .map(|(i, r)| Record {
-            transactional: batch.transactional,
-            control: false,
-            delete_horizon: false,
-            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-            producer_id: batch.producer.producer_id,
-            producer_epoch: batch.producer.producer_epoch,
-            timestamp_type: TimestampType::Creation,
-            offset: i as i64,
-            // offset - sequence is constant, so the encoder writes a single
-            // batch whose base sequence is `base_sequence`.
-            sequence: batch.base_sequence.wrapping_add(i as i32),
-            timestamp: r.timestamp,
-            key: r.key.clone().map(Bytes::from),
-            value: r.value.clone().map(Bytes::from),
-            headers: r
-                .headers
-                .iter()
-                .map(|h| {
-                    (
-                        StrBytes::from_string(h.key.clone()),
-                        h.value.clone().map(Bytes::from),
-                    )
-                })
-                .collect(),
-        })
-        .collect();
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        kafka_records.iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression,
-        },
-    )
-    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
-    Ok(buf.freeze())
+    super::produce::encode_batch(records, batch, compression)
 }
 
 /// Produce one encoded batch (see [`encode_producer_batch`]) to the

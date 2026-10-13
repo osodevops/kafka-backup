@@ -1,5 +1,6 @@
 //! Restore engine module.
 
+pub(crate) mod checkpoint;
 pub mod engine;
 pub mod filter;
 pub(crate) mod helpers;
@@ -7,6 +8,9 @@ pub mod offset_automation;
 pub mod offset_reset;
 pub mod offset_rollback;
 pub mod preflight;
+pub(crate) mod produce_path;
+pub(crate) mod producer;
+pub(crate) mod rate_limit;
 pub mod repartition;
 mod telemetry;
 pub mod three_phase;
