@@ -1084,8 +1084,16 @@ restore:
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `checkpoint_state` | string | No | - | Path to checkpoint file |
-| `checkpoint_interval_secs` | int | No | `60` | Checkpoint save interval |
+| `checkpoint_state` | string | No | - | Path to the local checkpoint file (written atomically; created when the restore starts) |
+| `checkpoint_interval_secs` | int | No | `60` | Seconds between checkpoint saves while the restore runs (also saved after every topic) |
+| `checkpoint_storage` | string | No | `local` | `local`, `remote` (backup storage, `{backup_id}/restore-checkpoints/{restore_id}.json`) or `both` (requires `checkpoint_state`) |
+| `restore_id` | string | No | derived | Names the remote checkpoint; default derived from the backup id, target bootstrap servers and restore configuration |
+
+The checkpoint records only acknowledged work (completed segments, and per
+source partition the last acknowledged source offset and the target's high
+watermark after it). A resumed restore skips acknowledged records, verifies
+the records written after the last save against the target, and produces
+nothing twice; see the restore guide's "Resumable Restores".
 
 ```yaml
 restore:

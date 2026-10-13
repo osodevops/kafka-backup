@@ -940,6 +940,19 @@ pub enum ExistingTopicConfigPolicy {
     Fail,
 }
 
+/// Where a restore keeps its checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestoreCheckpointStorage {
+    /// The local `checkpoint_state` file.
+    #[default]
+    Local,
+    /// Backup storage only.
+    Remote,
+    /// The local file and backup storage.
+    Both,
+}
+
 /// Restore-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreOptions {
@@ -1053,13 +1066,28 @@ pub struct RestoreOptions {
     #[serde(default = "default_produce_timeout_ms")]
     pub produce_timeout_ms: i32,
 
-    /// Checkpoint state file path for resumable restores
+    /// Checkpoint state file path for resumable restores (written
+    /// atomically: temp file, fsync, rename).
     #[serde(default)]
     pub checkpoint_state: Option<std::path::PathBuf>,
 
-    /// Checkpoint interval in seconds
+    /// Seconds between checkpoint saves while a restore runs (the
+    /// checkpoint is also saved after every topic).
     #[serde(default = "default_restore_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+
+    /// Where the restore checkpoint is kept: `local` (default, the
+    /// `checkpoint_state` file), `remote` (backup storage, at
+    /// `{backup_id}/restore-checkpoints/{restore_id}.json`, so a restarted
+    /// pod without the local file resumes) or `both`.
+    #[serde(default)]
+    pub checkpoint_storage: RestoreCheckpointStorage,
+
+    /// Names the remote checkpoint. Default: derived from the backup id,
+    /// the target bootstrap servers and the restore configuration, so a
+    /// re-run of the same restore finds its checkpoint.
+    #[serde(default)]
+    pub restore_id: Option<String>,
 
     /// Consumer groups to reset offsets for (requires reset_consumer_offsets)
     #[serde(default)]
@@ -1243,6 +1271,8 @@ impl Default for RestoreOptions {
             produce_timeout_ms: default_produce_timeout_ms(),
             checkpoint_state: None,
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
+            checkpoint_storage: RestoreCheckpointStorage::default(),
+            restore_id: None,
             consumer_groups: Vec::new(),
             reset_consumer_offsets: false,
             offset_report: None,
@@ -1592,6 +1622,32 @@ impl RestoreOptions {
                  without duplicate protection",
                 self.produce_acks, self.produce_acks
             )));
+        }
+        if self.checkpoint_storage == RestoreCheckpointStorage::Both
+            && self.checkpoint_state.is_none()
+        {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_storage: both requires restore.checkpoint_state (the local \
+                 file)"
+                    .to_string(),
+            ));
+        }
+        if self.checkpoint_interval_secs == 0 {
+            return Err(crate::Error::Config(
+                "restore.checkpoint_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if let Some(id) = &self.restore_id {
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err(crate::Error::Config(format!(
+                    "restore.restore_id may only contain letters, digits, '-', '_' and '.', got \
+                     {id:?}"
+                )));
+            }
         }
         if self.produce_max_batch_bytes < 1024 {
             return Err(crate::Error::Config(format!(
@@ -2097,6 +2153,35 @@ connection:
         let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
         assert!(opts.idempotent_producer);
         assert_eq!(opts.produce_max_batch_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn restore_checkpoint_storage_options_validate() {
+        let opts: RestoreOptions =
+            serde_yaml::from_str("checkpoint_storage: remote\nrestore_id: orders-dr.1\n").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Remote);
+        assert!(opts.validate().is_ok(), "remote needs no local file");
+
+        let opts: RestoreOptions = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(opts.checkpoint_storage, RestoreCheckpointStorage::Local);
+        assert_eq!(opts.restore_id, None);
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_storage = RestoreCheckpointStorage::Both;
+        let err = opts.validate().unwrap_err().to_string();
+        assert!(err.contains("requires restore.checkpoint_state"), "{err}");
+        opts.checkpoint_state = Some("/tmp/cp.json".into());
+        assert!(opts.validate().is_ok());
+
+        let mut opts = valid_restore_options();
+        opts.restore_id = Some("../escape".to_string());
+        assert!(opts.validate().is_err());
+        opts.restore_id = Some(String::new());
+        assert!(opts.validate().is_err());
+
+        let mut opts = valid_restore_options();
+        opts.checkpoint_interval_secs = 0;
+        assert!(opts.validate().is_err());
     }
 
     #[test]

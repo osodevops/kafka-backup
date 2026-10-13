@@ -6,7 +6,7 @@
 //! based on their key — just like a native Kafka producer.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, info, warn};
@@ -32,6 +32,50 @@ const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
 
 /// Channel capacity for backpressure between reader and writer tasks.
 const CHANNEL_CAPACITY: usize = 1_000;
+
+/// One record on its way from a reader to a writer, with the
+/// acknowledgement tracker of the segment it came from.
+type Routed = (BackupRecord, Arc<SegmentAck>);
+
+/// Tracks the records of one segment across the writers they were routed
+/// to: the segment is marked complete in the checkpoint only once every
+/// one of them was acknowledged by the target, so a resume never skips a
+/// segment whose records were merely queued.
+pub(crate) struct SegmentAck {
+    key: String,
+    remaining: AtomicUsize,
+    checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
+}
+
+impl SegmentAck {
+    fn new(key: &str, records: usize, checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>) -> Self {
+        Self {
+            key: key.to_string(),
+            remaining: AtomicUsize::new(records),
+            checkpoint,
+        }
+    }
+
+    /// `count` of the segment's records were acknowledged.
+    async fn acknowledge(&self, count: usize) {
+        if self.remaining.fetch_sub(count, Ordering::AcqRel) == count {
+            helpers::mark_segment_completed(&self.checkpoint, &self.key).await;
+        }
+    }
+}
+
+/// Acknowledge the records of a produced batch, segment by segment.
+async fn acknowledge_segments(acks: &[Arc<SegmentAck>]) {
+    let mut i = 0;
+    while i < acks.len() {
+        let mut j = i + 1;
+        while j < acks.len() && Arc::ptr_eq(&acks[i], &acks[j]) {
+            j += 1;
+        }
+        acks[i].acknowledge(j - i).await;
+        i = j;
+    }
+}
 
 /// Partitioner that routes records to target partitions.
 pub struct Partitioner {
@@ -134,9 +178,8 @@ pub(crate) async fn restore_topic_repartitioned(
     }
 
     // Create M bounded channels (one per target partition)
-    let mut senders: Vec<mpsc::Sender<BackupRecord>> =
-        Vec::with_capacity(num_target_partitions as usize);
-    let mut receivers: Vec<Option<mpsc::Receiver<BackupRecord>>> =
+    let mut senders: Vec<mpsc::Sender<Routed>> = Vec::with_capacity(num_target_partitions as usize);
+    let mut receivers: Vec<Option<mpsc::Receiver<Routed>>> =
         Vec::with_capacity(num_target_partitions as usize);
 
     for _ in 0..num_target_partitions {
@@ -285,13 +328,13 @@ async fn run_reader(
     source_topic: &str,
     source_partition: i32,
     segments: &[SegmentMetadata],
-    senders: &[mpsc::Sender<BackupRecord>],
+    senders: &[mpsc::Sender<Routed>],
     partitioner: &Partitioner,
     cancel: &Arc<AtomicBool>,
     storage: &dyn StorageBackend,
     storage_cb: &CircuitBreaker,
     health: &HealthCheck,
-    checkpoint: &Mutex<Option<RestoreCheckpoint>>,
+    checkpoint: &Arc<Mutex<Option<RestoreCheckpoint>>>,
     options: &RestoreOptions,
     filter_dropped: &AtomicU64,
     filter_tombstoned: &AtomicU64,
@@ -369,7 +412,13 @@ async fn run_reader(
         let stripped = helpers::strip_offset_headers(filtered, options);
         let records_to_send = helpers::inject_offset_headers(stripped, source_partition, options);
 
-        // Route each record through the partitioner
+        // Route each record through the partitioner. The segment is marked
+        // complete by the writers, once all its records are acknowledged.
+        let ack = Arc::new(SegmentAck::new(
+            &segment.key,
+            records_to_send.len(),
+            Arc::clone(checkpoint),
+        ));
         for record in records_to_send {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
@@ -377,7 +426,7 @@ async fn run_reader(
 
             let target_partition = partitioner.partition(record.key.as_deref());
             if senders[target_partition as usize]
-                .send(record)
+                .send((record, Arc::clone(&ack)))
                 .await
                 .is_err()
             {
@@ -385,8 +434,6 @@ async fn run_reader(
                 return Ok(());
             }
         }
-
-        helpers::mark_segment_completed(checkpoint, &segment.key).await;
     }
 
     debug!("Reader for {}:{} finished", source_topic, source_partition);
@@ -397,7 +444,7 @@ async fn run_reader(
 /// batches capped by record count and encoded bytes.
 #[allow(clippy::too_many_arguments)]
 async fn run_writer(
-    mut rx: mpsc::Receiver<BackupRecord>,
+    mut rx: mpsc::Receiver<Routed>,
     produce_path: &ProducePath,
     source_topic: &str,
     target_topic: &str,
@@ -413,36 +460,37 @@ async fn run_writer(
     let mut total_bytes = 0u64;
 
     let mut batch: Vec<BackupRecord> = Vec::with_capacity(batch_size);
+    // The segment tracker of each record in `batch`.
+    let mut acks: Vec<Arc<SegmentAck>> = Vec::with_capacity(batch_size);
     // A record drained from the channel that did not fit the previous batch.
-    let mut carry: Option<BackupRecord> = None;
+    let mut carry: Option<Routed> = None;
 
     loop {
         // Start the batch with the carried record, else block on the first one
         let mut batch_encoded = RECORD_BATCH_OVERHEAD;
-        if let Some(record) = carry.take() {
-            batch_encoded += record_size_upper_bound(&record);
-            batch.push(record);
-        } else {
-            match rx.recv().await {
-                Some(record) => {
-                    batch_encoded += record_size_upper_bound(&record);
-                    batch.push(record);
-                }
+        let first = match carry.take() {
+            Some(routed) => routed,
+            None => match rx.recv().await {
+                Some(routed) => routed,
                 None => break, // channel closed, all readers done
-            }
-        }
+            },
+        };
+        batch_encoded += record_size_upper_bound(&first.0);
+        batch.push(first.0);
+        acks.push(first.1);
 
         // Non-blocking drain to fill the batch up to both caps
         while batch.len() < batch_size {
             match rx.try_recv() {
-                Ok(record) => {
-                    let size = record_size_upper_bound(&record);
+                Ok(routed) => {
+                    let size = record_size_upper_bound(&routed.0);
                     if batch_encoded + size > max_batch_bytes {
-                        carry = Some(record);
+                        carry = Some(routed);
                         break;
                     }
                     batch_encoded += size;
-                    batch.push(record);
+                    batch.push(routed.0);
+                    acks.push(routed.1);
                 }
                 Err(_) => break,
             }
@@ -479,6 +527,7 @@ async fn run_writer(
             Ok(_) => {
                 kafka_cb.record_success();
                 health.mark_healthy("kafka");
+                acknowledge_segments(&acks).await;
 
                 total_records += batch.len() as u64;
                 total_bytes += batch_bytes;
@@ -494,6 +543,7 @@ async fn run_writer(
         }
 
         batch.clear();
+        acks.clear();
     }
 
     debug!(
@@ -557,6 +607,33 @@ mod tests {
             let partition = positive % 6;
             assert!((0..6).contains(&partition));
         }
+    }
+
+    // ── Segment acknowledgement ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn segment_is_completed_only_once_every_record_is_acknowledged() {
+        let checkpoint = Arc::new(Mutex::new(Some(RestoreCheckpoint::new(
+            "b".to_string(),
+            "h".to_string(),
+        ))));
+        let completed = |cp: &Option<RestoreCheckpoint>| {
+            let mut keys = cp.as_ref().unwrap().segments_completed.clone();
+            keys.sort();
+            keys
+        };
+        let a = Arc::new(SegmentAck::new("seg-a", 3, Arc::clone(&checkpoint)));
+        let b = Arc::new(SegmentAck::new("seg-b", 2, Arc::clone(&checkpoint)));
+
+        // Writer 1 acknowledges two records of a and one of b.
+        acknowledge_segments(&[a.clone(), a.clone(), b.clone()]).await;
+        assert!(completed(&*checkpoint.lock().await).is_empty());
+
+        // Writer 2 acknowledges the rest of b, then the rest of a.
+        acknowledge_segments(std::slice::from_ref(&b)).await;
+        assert_eq!(completed(&*checkpoint.lock().await), vec!["seg-b"]);
+        acknowledge_segments(std::slice::from_ref(&a)).await;
+        assert_eq!(completed(&*checkpoint.lock().await), vec!["seg-a", "seg-b"]);
     }
 
     // ── Partitioner behavior ───────────────────────────────────────────

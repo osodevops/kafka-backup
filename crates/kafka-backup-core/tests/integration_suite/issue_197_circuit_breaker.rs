@@ -47,9 +47,10 @@ enum ProduceMode {
     /// router's produce loop sees the failure and runs eviction.
     KillRemaining(u32),
     /// Return broker error code 7 (REQUEST_TIMED_OUT) — terminal, no retry —
-    /// but only once the peer's produce counter is >= 1, so a test can assert
-    /// on the healthy partition's progress without racing the failure.
-    BrokerErrorAfterPeerProduced(Arc<AtomicUsize>),
+    /// but only once the peer's produce counter reaches the given count, so a
+    /// test can assert on the healthy partition's progress without racing the
+    /// failure.
+    BrokerErrorAfterPeerProduced(Arc<AtomicUsize>, usize),
     /// Answer the next `n` Produce requests with error code 6
     /// (NOT_LEADER_FOR_PARTITION), then succeed. Metadata is unchanged, so
     /// the router refreshes and retries against the same broker.
@@ -176,8 +177,8 @@ async fn serve_broker(
                         write_response(&mut stream, api_key, api_version, correlation_id, &resp)
                             .await;
                     }
-                    ProduceMode::BrokerErrorAfterPeerProduced(peer_count) => {
-                        while peer_count.load(Ordering::SeqCst) == 0 {
+                    ProduceMode::BrokerErrorAfterPeerProduced(peer_count, wanted) => {
+                        while peer_count.load(Ordering::SeqCst) < wanted {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                         let resp = produce_error_response(TOPIC, partition_for(broker_id), 7);
@@ -477,11 +478,14 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
     *peers.lock().await = vec![(1, b1.addr), (2, b2.addr)];
 
     // Partition 0 (broker 1) fails terminally — but only after partition 1
-    // (broker 2) has produced at least once, otherwise the engine can return
-    // the partition-0 error before broker 2 saw any traffic and the "healthy
-    // partition produced" assertion below races the scheduler.
+    // (broker 2) has produced all 4 of its batches (20 records, batches of
+    // 5). A failing partition stops and awaits its siblings (0.24), so a
+    // sibling batch acknowledged after the failure would be recorded as a
+    // success and close the advisory breaker again before `run()` returns;
+    // failing last keeps the breaker's end state deterministic.
     b1.set_mode(ProduceMode::BrokerErrorAfterPeerProduced(
         b2.produce_count.clone(),
+        4,
     ))
     .await;
 

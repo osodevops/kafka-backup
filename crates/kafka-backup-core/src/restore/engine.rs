@@ -23,6 +23,8 @@ use crate::metrics::PerformanceMetrics;
 use crate::storage::{create_backend, StorageBackend};
 use crate::{Error, Result};
 
+use super::checkpoint::CheckpointStore;
+
 /// Progress update sent during restore
 #[derive(Debug, Clone)]
 pub struct RestoreProgress {
@@ -170,6 +172,8 @@ pub struct RestoreEngine {
     rate_limiter: Option<Arc<super::rate_limit::RestoreRateLimiter>>,
     /// The restore's (idempotent) producer, started in `run()`.
     producer: Arc<tokio::sync::RwLock<Option<Arc<super::producer::RestoreProducer>>>>,
+    /// Where the restore checkpoint is saved, when checkpointing is on.
+    checkpoint_store: Arc<tokio::sync::RwLock<Option<Arc<CheckpointStore>>>>,
     /// Target topic -> `max.message.bytes` (`None` when it could not be read).
     max_message_bytes: Arc<Mutex<HashMap<String, Option<usize>>>>,
 }
@@ -368,6 +372,7 @@ impl RestoreEngine {
             target_config: Some(target_config),
             rate_limiter,
             producer: Arc::new(tokio::sync::RwLock::new(None)),
+            checkpoint_store: Arc::new(tokio::sync::RwLock::new(None)),
             max_message_bytes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -758,31 +763,10 @@ impl RestoreEngine {
         // restore options (including any record-filter fingerprint), so a
         // resumed run with a changed configuration starts over instead of
         // silently skipping segments the new configuration would treat
-        // differently.
-        if let Some(checkpoint_path) = &restore_options.checkpoint_state {
-            let expected_hash = restore_config_hash(&restore_options);
-            if checkpoint_path.exists() {
-                self.load_checkpoint(checkpoint_path).await?;
-                let mut guard = self.checkpoint.lock().await;
-                if let Some(cp) = guard.as_mut() {
-                    if cp.config_hash != expected_hash {
-                        warn!(
-                            "Restore configuration changed since the checkpoint was written \
-                             (config hash mismatch); restarting from the beginning"
-                        );
-                        *cp = RestoreCheckpoint::new(
-                            self.config.backup_id.clone(),
-                            expected_hash.clone(),
-                        );
-                    }
-                }
-            } else {
-                *self.checkpoint.lock().await = Some(RestoreCheckpoint::new(
-                    self.config.backup_id.clone(),
-                    expected_hash,
-                ));
-            }
-        }
+        // differently. The seeded checkpoint is saved at once (#160), then
+        // every checkpoint_interval_secs and after every topic.
+        let resuming = self.open_checkpoint(&restore_options).await?;
+        let _periodic_saver = self.spawn_periodic_checkpoint_saver(&restore_options).await;
 
         // Phase 1 header preflight (issue #137): prove tracking-metadata
         // coverage BEFORE connecting to the target and before any mutation
@@ -894,8 +878,15 @@ impl RestoreEngine {
             None
         };
 
-        // Purge target topics before restore if requested (Issue #67 bug 10)
-        if restore_options.purge_topics {
+        // Purge target topics before restore if requested (Issue #67 bug 10).
+        // Never when resuming: it would delete the records the checkpoint
+        // says are restored.
+        if restore_options.purge_topics && resuming {
+            warn!(
+                "purge_topics is set but the restore is resuming from a checkpoint with progress; \
+                 the target topics are not purged again"
+            );
+        } else if restore_options.purge_topics {
             self.purge_topics_before_restore(&topics_to_restore, &restore_options)
                 .await?;
         }
@@ -950,16 +941,18 @@ impl RestoreEngine {
                     self.metrics.record_error();
 
                     if !self.health.is_operational() {
+                        // Every partition task of the topic has stopped:
+                        // the checkpoint holds exactly the acknowledged work.
+                        self.save_checkpoint(true).await?;
                         return Err(e);
                     }
                 }
             }
 
-            // Save checkpoint periodically
-            if let Some(checkpoint_path) = &restore_options.checkpoint_state {
-                self.save_checkpoint(checkpoint_path).await?;
-            }
+            // Save the checkpoint after every topic
+            self.save_checkpoint(false).await?;
         }
+        self.save_checkpoint(true).await?;
 
         if let Some(snapshot) = &auto_consumer_group_snapshot {
             let mut mapping = self.offset_mapping.lock().await;
@@ -1320,37 +1313,64 @@ impl RestoreEngine {
             });
         }
 
-        // Create semaphore to limit concurrent partition restores
+        // Get the router from the RwLock
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+
+        // Determine target partitions (may be remapped). A target partition
+        // fed by several source partitions cannot attribute its high
+        // watermark to one of them, so its unsaved tail is not reconciled.
+        let targets: Vec<(&crate::manifest::PartitionBackup, i32)> = partitions_to_restore
+            .iter()
+            .map(|p| {
+                let target = options
+                    .partition_mapping
+                    .get(&p.partition_id)
+                    .copied()
+                    .unwrap_or(p.partition_id);
+                (*p, target)
+            })
+            .collect();
+        let mut sources_per_target: HashMap<i32, usize> = HashMap::new();
+        for (_, target) in &targets {
+            *sources_per_target.entry(*target).or_default() += 1;
+        }
+        let checkpointing = self.checkpoint_store.read().await.is_some();
+        if checkpointing {
+            if sources_per_target.values().any(|n| *n > 1) {
+                warn!(
+                    "{}: several source partitions are mapped onto one target partition; a resume \
+                     of those partitions skips by source offset only, so records acknowledged after \
+                     the last checkpoint save may be produced again",
+                    target_topic
+                );
+            }
+            self.record_partition_baselines(&router, &topic_backup.name, &target_topic, &targets)
+                .await?;
+        }
+
+        // Partition tasks stop (after their in-flight batch) once one fails,
+        // and are all awaited before the topic returns, so the checkpoint
+        // holds only acknowledged work when the error surfaces.
         let semaphore = Arc::new(Semaphore::new(options.max_concurrent_partitions));
-
-        // Restore each partition concurrently
+        let cancel = tokio_util::sync::CancellationToken::new();
         let mut handles = Vec::new();
+        // If this future is dropped (the run is cancelled), the partition
+        // tasks stop too instead of producing on in the background.
+        let mut abort_guard = AbortAllOnDrop(Vec::new());
 
-        for partition_backup in partitions_to_restore {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            // Determine target partition (may be remapped)
-            let target_partition = options
-                .partition_mapping
-                .get(&partition_backup.partition_id)
-                .copied()
-                .unwrap_or(partition_backup.partition_id);
-
-            // Get the router from the RwLock
-            let router = self
-                .router
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
-
+        for (partition_backup, target_partition) in targets.iter().copied() {
             let ctx = RestorePartitionContext {
                 source_topic: topic_backup.name.clone(),
                 target_topic: target_topic.clone(),
                 source_partition: partition_backup.partition_id,
                 target_partition,
                 segments: partition_backup.segments.clone(),
-                router,
+                router: Arc::clone(&router),
                 produce_path: produce_path.clone(),
                 storage: self.storage.clone(),
                 options: options.clone(),
@@ -1360,13 +1380,25 @@ impl RestoreEngine {
                 storage_cb: Arc::clone(&self.storage_circuit_breaker),
                 checkpoint: Arc::clone(&self.checkpoint),
                 offset_mapping: Arc::clone(&self.offset_mapping),
+                cancel: cancel.clone(),
+                reconcile_tail: checkpointing && sources_per_target[&target_partition] == 1,
             };
+            let semaphore = Arc::clone(&semaphore);
+            let cancel = cancel.clone();
 
-            handles.push(tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.expect("semaphore open");
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
                 let result = ctx.restore_partition().await;
-                drop(permit);
-                result
-            }));
+                if result.is_err() {
+                    cancel.cancel();
+                }
+                result.map(Some)
+            });
+            abort_guard.0.push(handle.abort_handle());
+            handles.push(handle);
         }
 
         // Wait for all partitions
@@ -1375,17 +1407,35 @@ impl RestoreEngine {
         let mut total_bytes = 0u64;
         let mut dropped_by_filter = 0u64;
         let mut tombstoned_by_filter = 0u64;
+        let mut first_error = None;
 
         for handle in handles {
-            let report = handle.await.map_err(|e| {
-                Error::Io(std::io::Error::other(format!("Task join error: {}", e)))
-            })??;
+            let report = match handle.await {
+                Ok(Ok(Some(report))) => report,
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => {
+                    cancel.cancel();
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+                Err(e) => {
+                    cancel.cancel();
+                    first_error.get_or_insert(Error::Io(std::io::Error::other(format!(
+                        "Task join error: {}",
+                        e
+                    ))));
+                    continue;
+                }
+            };
 
             total_records += report.records;
             total_bytes += report.bytes;
             dropped_by_filter += report.records_dropped_by_filter;
             tombstoned_by_filter += report.records_tombstoned_by_filter;
             partition_reports.push(report);
+        }
+        if let Some(e) = first_error {
+            return Err(e);
         }
 
         Ok(TopicRestoreReport {
@@ -1397,6 +1447,71 @@ impl RestoreEngine {
             records_dropped_by_filter: dropped_by_filter,
             records_tombstoned_by_filter: tombstoned_by_filter,
         })
+    }
+
+    /// Record, before anything is produced, the target high watermark of
+    /// every partition of the topic that has no checkpointed progress yet,
+    /// and save the checkpoint: a run killed before its first periodic save
+    /// can then still tell which records it already wrote.
+    async fn record_partition_baselines(
+        &self,
+        router: &PartitionLeaderRouter,
+        source_topic: &str,
+        target_topic: &str,
+        targets: &[(&crate::manifest::PartitionBackup, i32)],
+    ) -> Result<()> {
+        let missing: Vec<(i32, i32)> = {
+            let guard = self.checkpoint.lock().await;
+            let Some(cp) = guard.as_ref() else {
+                return Ok(());
+            };
+            targets
+                .iter()
+                .filter(|(p, _)| {
+                    !cp.partitions
+                        .contains_key(&RestoreCheckpoint::partition_key(
+                            source_topic,
+                            p.partition_id,
+                        ))
+                })
+                .map(|(p, target)| (p.partition_id, *target))
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let requests: Vec<(String, i32)> = missing
+            .iter()
+            .map(|(_, target)| (target_topic.to_string(), *target))
+            .collect();
+        let high_watermarks = router
+            .batch_get_latest_offsets(&requests, IsolationLevel::ReadUncommitted)
+            .await?;
+        {
+            let mut guard = self.checkpoint.lock().await;
+            if let Some(cp) = guard.as_mut() {
+                for (source_partition, target_partition) in &missing {
+                    let hw = high_watermarks
+                        .get(&(target_topic.to_string(), *target_partition))
+                        .copied()
+                        .unwrap_or(0);
+                    cp.partitions.insert(
+                        RestoreCheckpoint::partition_key(source_topic, *source_partition),
+                        crate::manifest::PartitionRestoreProgress {
+                            source_topic: source_topic.to_string(),
+                            source_partition: *source_partition,
+                            target_topic: target_topic.to_string(),
+                            target_partition: *target_partition,
+                            last_source_offset_acked: -1,
+                            target_hw_after_ack: hw,
+                            records_acked: 0,
+                            bytes_acked: 0,
+                        },
+                    );
+                }
+            }
+        }
+        self.save_checkpoint(false).await
     }
 
     /// The produce plumbing for one target topic.
@@ -1487,33 +1602,107 @@ impl RestoreEngine {
         value
     }
 
-    /// Load checkpoint from file
-    async fn load_checkpoint(&self, path: &std::path::Path) -> Result<()> {
-        let data = tokio::fs::read_to_string(path).await?;
-        let checkpoint: RestoreCheckpoint = serde_json::from_str(&data)?;
+    /// Set up checkpointing for this run: load the saved checkpoint (or
+    /// seed a new one), wait out the in-doubt window of an interrupted
+    /// previous run, and save it at once so the file exists from the start
+    /// (#160). Returns whether the run resumes earlier progress.
+    async fn open_checkpoint(&self, options: &RestoreOptions) -> Result<bool> {
+        let expected_hash = restore_config_hash(options);
+        let target_servers = self
+            .config
+            .target
+            .as_ref()
+            .map(|t| t.bootstrap_servers.clone())
+            .unwrap_or_default();
+        let restore_id = options.restore_id.clone().unwrap_or_else(|| {
+            super::checkpoint::default_restore_id(
+                &self.config.backup_id,
+                &target_servers,
+                &expected_hash,
+            )
+        });
+        let Some(store) = CheckpointStore::from_options(
+            options,
+            Arc::clone(&self.storage),
+            &self.config.backup_id,
+            &restore_id,
+        )
+        .map(Arc::new) else {
+            return Ok(false);
+        };
 
-        info!(
-            "Loaded checkpoint: {} segments completed, {} records restored",
-            checkpoint.segments_completed.len(),
-            checkpoint.records_restored
-        );
-
+        let mut checkpoint = match store.load().await? {
+            Some(cp) if cp.config_hash == expected_hash => {
+                info!(
+                    "Loaded restore checkpoint from {}: {} segments completed, {} records \
+                     restored",
+                    store.describe(),
+                    cp.segments_completed.len(),
+                    cp.records_restored
+                );
+                let wait = super::checkpoint::in_doubt_wait(
+                    &cp,
+                    options,
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                cp
+            }
+            Some(_) => {
+                warn!(
+                    "Restore configuration changed since the checkpoint was written \
+                     (config hash mismatch); restarting from the beginning"
+                );
+                RestoreCheckpoint::new(self.config.backup_id.clone(), expected_hash)
+            }
+            None => RestoreCheckpoint::new(self.config.backup_id.clone(), expected_hash),
+        };
+        let resuming =
+            !checkpoint.segments_completed.is_empty() || !checkpoint.partitions.is_empty();
+        checkpoint.restore_id = Some(restore_id);
+        checkpoint.stopped_cleanly = false;
         *self.checkpoint.lock().await = Some(checkpoint);
-        Ok(())
+        store.save(&self.checkpoint).await?;
+        info!("Restore checkpoint: {}", store.describe());
+        *self.checkpoint_store.write().await = Some(store);
+        Ok(resuming)
     }
 
-    /// Save checkpoint to file
-    async fn save_checkpoint(&self, path: &std::path::Path) -> Result<()> {
-        let mut checkpoint = self.checkpoint.lock().await;
+    /// Save the checkpoint every `checkpoint_interval_secs` until the
+    /// returned guard is dropped.
+    async fn spawn_periodic_checkpoint_saver(
+        &self,
+        options: &RestoreOptions,
+    ) -> Option<AbortOnDrop> {
+        let store = self.checkpoint_store.read().await.clone()?;
+        let checkpoint = Arc::clone(&self.checkpoint);
+        let interval = Duration::from_secs(options.checkpoint_interval_secs.max(1));
+        Some(AbortOnDrop(tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = store.save(&checkpoint).await {
+                    warn!("Periodic restore checkpoint save failed: {}", e);
+                }
+            }
+        })))
+    }
 
-        if let Some(cp) = checkpoint.as_mut() {
-            cp.touch();
-            let json = serde_json::to_string_pretty(cp)?;
-            tokio::fs::write(path, json).await?;
-            debug!("Checkpoint saved to {:?}", path);
+    /// Save the checkpoint now (no-op without checkpointing). `stopped`
+    /// marks that nothing is in flight any more.
+    async fn save_checkpoint(&self, stopped: bool) -> Result<()> {
+        let Some(store) = self.checkpoint_store.read().await.clone() else {
+            return Ok(());
+        };
+        if stopped {
+            if let Some(cp) = self.checkpoint.lock().await.as_mut() {
+                cp.stopped_cleanly = true;
+            }
         }
-
-        Ok(())
+        store.save(&self.checkpoint).await
     }
 
     /// Write offset mapping report
@@ -1800,7 +1989,6 @@ struct RestorePartitionContext {
     source_partition: i32,
     target_partition: i32,
     segments: Vec<SegmentMetadata>,
-    #[allow(dead_code)]
     router: Arc<PartitionLeaderRouter>,
     produce_path: super::produce_path::ProducePath,
     storage: Arc<dyn StorageBackend>,
@@ -1811,6 +1999,12 @@ struct RestorePartitionContext {
     storage_cb: Arc<CircuitBreaker>,
     checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
     offset_mapping: Arc<Mutex<OffsetMapping>>,
+    /// Set when a sibling partition failed: stop after the batch in flight.
+    cancel: tokio_util::sync::CancellationToken,
+    /// Reconcile the unsaved tail against the target's high watermark on
+    /// resume (off when checkpointing is off or the target partition is
+    /// shared with another source partition).
+    reconcile_tail: bool,
 }
 
 impl RestorePartitionContext {
@@ -1843,13 +2037,59 @@ impl RestorePartitionContext {
             });
         }
 
-        // Check which segments are already completed (for resume)
-        let completed_segments: HashSet<String> = {
+        // Check which segments are already completed, and the partition's
+        // acknowledged progress (for resume)
+        let progress_key =
+            RestoreCheckpoint::partition_key(&self.source_topic, self.source_partition);
+        let (completed_segments, progress): (HashSet<String>, _) = {
             let checkpoint = self.checkpoint.lock().await;
             checkpoint
                 .as_ref()
-                .map(|cp| cp.segments_completed.iter().cloned().collect())
+                .map(|cp| {
+                    (
+                        cp.segments_completed.iter().cloned().collect(),
+                        cp.partitions.get(&progress_key).cloned(),
+                    )
+                })
                 .unwrap_or_default()
+        };
+        // Without recorded progress (checkpointing off) there is no high
+        // watermark to reconcile against.
+        let reconcile_tail = self.reconcile_tail && progress.is_some();
+        let progress = progress.unwrap_or_else(|| crate::manifest::PartitionRestoreProgress {
+            source_topic: self.source_topic.clone(),
+            source_partition: self.source_partition,
+            target_topic: self.target_topic.clone(),
+            target_partition: self.target_partition,
+            last_source_offset_acked: -1,
+            target_hw_after_ack: 0,
+            records_acked: 0,
+            bytes_acked: 0,
+        });
+        // Records at or below this source offset were acknowledged by an
+        // earlier run.
+        let resume_after = progress.last_source_offset_acked;
+        // Records acknowledged after the last checkpoint save: the target's
+        // high watermark beyond the recorded one. Verified and skipped.
+        let mut tail = if reconcile_tail {
+            let (_, high_watermark) = self
+                .router
+                .get_offsets(
+                    &self.target_topic,
+                    self.target_partition,
+                    IsolationLevel::ReadUncommitted,
+                )
+                .await?;
+            match super::checkpoint::unsaved_tail(&progress, high_watermark)? {
+                0 => None,
+                n => Some(super::checkpoint::TailVerifier::new(
+                    progress.clone(),
+                    Arc::clone(&self.router),
+                    n,
+                )),
+            }
+        } else {
+            None
         };
 
         let mut total_records = 0u64;
@@ -1871,6 +2111,10 @@ impl RestorePartitionContext {
                 continue;
             }
 
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
             let mut records = match self.read_segment(segment).await {
                 Ok(r) => {
                     self.storage_cb.record_success();
@@ -1884,6 +2128,24 @@ impl RestorePartitionContext {
                     return Err(e);
                 }
             };
+
+            // Resume inside a segment: skip what an earlier run had
+            // acknowledged.
+            if resume_after >= 0 {
+                let before = records.len();
+                records.retain(|r| r.offset > resume_after);
+                if records.len() < before {
+                    info!(
+                        "{}:{}: resuming after source offset {} ({} record(s) of {} already \
+                         restored)",
+                        self.source_topic,
+                        self.source_partition,
+                        resume_after,
+                        before - records.len(),
+                        segment.key
+                    );
+                }
+            }
 
             // A legacy manifest can list overlapping segments: never
             // produce a source offset twice.
@@ -1972,14 +2234,27 @@ impl RestorePartitionContext {
                 );
             }
 
+            // Records the interrupted run wrote after its last checkpoint
+            // save: verified against the target, mapped and acknowledged
+            // without producing them again.
+            if let Some(verifier) = tail.as_mut().filter(|t| t.remaining() > 0) {
+                let (written, base) = verifier.match_written(&records_to_produce).await?;
+                if written > 0 {
+                    let already: Vec<BackupRecord> = records_to_produce.drain(..written).collect();
+                    self.acknowledge(&progress, &already, &[(base, written)])
+                        .await;
+                    total_records += written as u64;
+                    total_bytes += record_bytes(&already);
+                }
+            }
+            if records_to_produce.is_empty() {
+                segments_processed += 1;
+                self.mark_segment_completed(&segment.key).await;
+                continue;
+            }
+
             // Track bytes
-            let batch_bytes: u64 = records_to_produce
-                .iter()
-                .map(|r| {
-                    r.key.as_ref().map(|k| k.len()).unwrap_or(0) as u64
-                        + r.value.as_ref().map(|v| v.len()).unwrap_or(0) as u64
-                })
-                .sum();
+            let batch_bytes: u64 = record_bytes(&records_to_produce);
 
             // A record larger than the target topic's max.message.bytes
             // fails the partition before anything of this segment is sent.
@@ -1998,7 +2273,12 @@ impl RestorePartitionContext {
             // mapped: `OffsetMapping::resolve_target_offset` resolves a
             // committed offset that points at one to the next restored
             // record, as it does for any other gap.
+            let mut cancelled = false;
             for range in self.produce_path.plan(&records_to_produce) {
+                if self.cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 let batch = &records_to_produce[range];
 
                 // Produce (routed to the partition leader, after the
@@ -2052,6 +2332,8 @@ impl RestorePartitionContext {
                             self.target_partition,
                             batch_pairs,
                         );
+                        self.record_ack(&progress, batch, &produced.sub_batches)
+                            .await;
                     }
                     Err(e) => {
                         self.kafka_cb.record_failure();
@@ -2066,11 +2348,26 @@ impl RestorePartitionContext {
                 self.health.record_records(batch.len() as u64);
             }
 
+            if cancelled {
+                // The segment stays incomplete; the checkpoint has the
+                // acknowledged part of it.
+                break;
+            }
+
             total_bytes += batch_bytes;
             segments_processed += 1;
 
-            // Mark segment as completed
+            // Mark segment as completed: all its records are acknowledged
             self.mark_segment_completed(&segment.key).await;
+        }
+
+        if self.cancel.is_cancelled() {
+            debug!(
+                "{}:{}: stopped because another partition of the topic failed",
+                self.source_topic, self.source_partition
+            );
+        } else if let Some(verifier) = &tail {
+            verifier.finish()?;
         }
 
         info!(
@@ -2118,6 +2415,57 @@ impl RestorePartitionContext {
         super::helpers::mark_segment_completed(&self.checkpoint, key).await;
     }
 
+    /// Record an acknowledged batch in the checkpoint: its last source
+    /// offset and the target partition's high watermark after it.
+    async fn record_ack(
+        &self,
+        progress: &crate::manifest::PartitionRestoreProgress,
+        batch: &[BackupRecord],
+        sub_batches: &[(i64, usize)],
+    ) {
+        let (Some(last_source), Some((base, count))) =
+            (batch.iter().map(|r| r.offset).max(), sub_batches.last())
+        else {
+            return;
+        };
+        if let Some(cp) = self.checkpoint.lock().await.as_mut() {
+            cp.record_ack(
+                progress,
+                last_source,
+                base + *count as i64,
+                batch.len() as u64,
+                record_bytes(batch),
+            );
+        }
+    }
+
+    /// Map and acknowledge records found already written to the target by
+    /// an interrupted run.
+    async fn acknowledge(
+        &self,
+        progress: &crate::manifest::PartitionRestoreProgress,
+        records: &[BackupRecord],
+        sub_batches: &[(i64, usize)],
+    ) {
+        let (base, _) = sub_batches[0];
+        let pairs = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| crate::manifest::OffsetPair {
+                source_offset: self.extract_source_offset(r),
+                target_offset: base + i as i64,
+                timestamp: r.timestamp,
+            })
+            .collect();
+        self.offset_mapping.lock().await.add_detailed_batch(
+            &self.target_topic,
+            self.target_partition,
+            pairs,
+        );
+        self.record_ack(progress, records, sub_batches).await;
+        self.metrics.record_records(records.len() as u64);
+    }
+
     fn filter_segments_by_time(&self) -> Vec<&SegmentMetadata> {
         self.segments
             .iter()
@@ -2154,6 +2502,37 @@ impl RestorePartitionContext {
             .filter(|h| h.key == crate::offset_headers::X_ORIGINAL_TIMESTAMP)
             .find_map(|h| decode_i64_header(h.value.as_deref()))
             .unwrap_or(record.timestamp)
+    }
+}
+
+/// Key plus value bytes of `records`, as the restore report counts them.
+fn record_bytes(records: &[BackupRecord]) -> u64 {
+    records
+        .iter()
+        .map(|r| {
+            r.key.as_ref().map(|k| k.len()).unwrap_or(0) as u64
+                + r.value.as_ref().map(|v| v.len()).unwrap_or(0) as u64
+        })
+        .sum()
+}
+
+/// Aborts tasks still running when dropped.
+struct AbortAllOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortAllOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Aborts a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

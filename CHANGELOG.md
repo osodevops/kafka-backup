@@ -102,6 +102,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-batches the broker had already acknowledged, duplicating them. Each
   sub-batch is now encoded once and retried on its own with identical
   bytes.
+- **Restore checkpoints could claim work that was never acknowledged, and
+  a resume could duplicate or skip records.**
+  - The checkpoint file was written with a plain `write` (a crash could
+    leave it truncated) and only after each topic; `checkpoint_interval_secs`
+    had no effect and `records_restored` / `bytes_restored` were never
+    updated. It is now written atomically (temp file, fsync, rename,
+    directory fsync), at `checkpoint_interval_secs`, after every topic and
+    when the run stops, and its totals count acknowledged records.
+  - The repartitioning path marked a segment complete as soon as its
+    records were queued for the writers; a crash then skipped records that
+    were never produced. A segment is now complete only once every one of
+    its records was acknowledged.
+  - `restore_topic` returned on the first failing partition while the
+    others kept producing in the background (and kept updating the
+    checkpoint after the error). A failing partition now stops its
+    siblings after their in-flight batch and all are awaited, so the
+    checkpoint holds exactly the acknowledged work; partition tasks are
+    also aborted if the run itself is cancelled.
+  - Resuming inside a partially restored segment re-produced the whole
+    segment. Each source partition now records the source offset of its
+    last acknowledged record and the target's high watermark after it; a
+    resume skips acknowledged records, and verifies the records written
+    after the last save (the high-watermark difference) record by record
+    against the target before skipping them, so it writes no duplicates
+    and misses nothing. A target changed by another writer (records that
+    do not match, more extra records than the backup has left, or a high
+    watermark below the recorded one) fails the resume with a clear error.
+    A resume after a crash first waits out the interrupted run's in-flight
+    window (`checkpoint_interval_secs` + `produce_timeout_ms` + 5 s after
+    its last save). `purge_topics` is no longer applied again on resume.
+  - #160: the checkpoint file is written as soon as the restore starts.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -292,6 +323,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     2.5), the restore logs a warning, produces without a producer id (the
     old behaviour), and reports it: `RestoreReport` gains
     `idempotent_producer` and `idempotent_producer_fallback` (the reason).
+- **`restore.checkpoint_storage`** (`local` default, `remote`, `both`):
+  keep the restore checkpoint in backup storage at
+  `{backup_id}/restore-checkpoints/{restore_id}.json` so a restarted pod
+  without the local file resumes. **`restore.restore_id`** names it
+  (default: derived from the backup id, the target bootstrap servers and
+  the restore configuration).
 
 ### API
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
@@ -306,6 +343,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PartitionLeaderRouter::produce_encoded` (send one encoded batch,
   retrying with the same bytes), `kafka::transactions::
   supports_idempotent_epoch_bump`, `ProducerBatch::NON_IDEMPOTENT`.
+- `RestoreCheckpoint` gains `restore_id`, `partitions` (per source
+  partition `PartitionRestoreProgress`: `last_source_offset_acked`,
+  `target_hw_after_ack`, counters) and `stopped_cleanly`, all with serde
+  defaults so older checkpoint files still load; new
+  `RestoreCheckpoint::partition_key` and `record_ack`. `RestoreOptions`
+  gains `checkpoint_storage` (`RestoreCheckpointStorage`) and `restore_id`;
+  `checkpoint_interval_secs: 0` is now rejected.
 
 ## [0.23.8] - 2026-10-09
 

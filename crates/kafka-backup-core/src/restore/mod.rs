@@ -1,5 +1,6 @@
 //! Restore engine module.
 
+pub(crate) mod checkpoint;
 pub mod engine;
 pub mod filter;
 pub(crate) mod helpers;

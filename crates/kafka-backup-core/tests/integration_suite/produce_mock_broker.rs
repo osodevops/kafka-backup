@@ -21,6 +21,7 @@ use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::describe_configs_response::{
     DescribeConfigsResourceResult, DescribeConfigsResult,
 };
+use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
 use kafka_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
@@ -29,12 +30,14 @@ use kafka_protocol::messages::metadata_response::{
 };
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsResponse, BrokerId, DescribeConfigsResponse, InitProducerIdResponse,
-    ListOffsetsRequest, ListOffsetsResponse, MetadataResponse, ProduceRequest, ProduceResponse,
-    ProducerId, RequestHeader, ResponseHeader, TopicName,
+    ApiKey, ApiVersionsResponse, BrokerId, DescribeConfigsResponse, FetchRequest, FetchResponse,
+    InitProducerIdResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataResponse,
+    ProduceRequest, ProduceResponse, ProducerId, RequestHeader, ResponseHeader, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
-use kafka_protocol::records::RecordBatchDecoder;
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -48,6 +51,8 @@ pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
 /// What the broker does with the next Produce request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
+    /// No fault: handle the request normally (a placeholder in a queue).
+    Pass,
     /// Append the batch, then close the connection without answering.
     ApplyThenDrop,
     /// Close the connection without appending.
@@ -65,6 +70,8 @@ pub enum Fault {
 pub struct StoredRecord {
     pub key: Option<Bytes>,
     pub value: Option<Bytes>,
+    pub headers: Vec<(String, Option<Bytes>)>,
+    pub timestamp: i64,
     pub producer_id: i64,
 }
 
@@ -206,6 +213,8 @@ impl MockBroker {
             log.push(StoredRecord {
                 key: None,
                 value: Some(Bytes::copy_from_slice(v)),
+                headers: vec![],
+                timestamp: 0,
                 producer_id: -1,
             });
         }
@@ -273,6 +282,12 @@ fn append(state: &mut MockState, partition: i32, batch: &Bytes) -> Result<i64, i
         log.push(StoredRecord {
             key: r.key,
             value: r.value,
+            headers: r
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            timestamp: r.timestamp,
             producer_id: info.producer_id,
         });
     }
@@ -399,6 +414,39 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
                     .encode(&mut out, version)
                     .unwrap();
             }
+            ApiKey::Fetch => {
+                let request = FetchRequest::decode(&mut body, version).unwrap();
+                let state = state.lock().unwrap();
+                let topics = request
+                    .topics
+                    .iter()
+                    .map(|t| {
+                        let partitions = t
+                            .partitions
+                            .iter()
+                            .map(|p| {
+                                let log = state.logs.get(&p.partition).cloned().unwrap_or_default();
+                                let hw = log.len() as i64;
+                                let start = p.fetch_offset.max(0) as usize;
+                                let records = encode_log(&log, start, 100);
+                                PartitionData::default()
+                                    .with_partition_index(p.partition)
+                                    .with_high_watermark(hw)
+                                    .with_last_stable_offset(hw)
+                                    .with_log_start_offset(0)
+                                    .with_records(Some(records))
+                            })
+                            .collect();
+                        FetchableTopicResponse::default()
+                            .with_topic(t.topic.clone())
+                            .with_partitions(partitions)
+                    })
+                    .collect();
+                FetchResponse::default()
+                    .with_responses(topics)
+                    .encode(&mut out, version)
+                    .unwrap();
+            }
             ApiKey::Produce => {
                 let request = ProduceRequest::decode(&mut body, version).unwrap();
                 let topic = &request.topic_data[0];
@@ -445,7 +493,9 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
                         state.producers.clear();
                         append(&mut state, partition, &batch)
                     }
-                    None => append(&mut state.lock().unwrap(), partition, &batch),
+                    None | Some(Fault::Pass) => {
+                        append(&mut state.lock().unwrap(), partition, &batch)
+                    }
                 };
                 let (code, base) = match result {
                     Ok(base) => (0, base),
@@ -465,6 +515,48 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
         }
         write_frame(&mut stream, api_key, version, correlation_id, &out).await;
     }
+}
+
+/// Up to `max` records of `log` from offset `start`, as one record batch.
+fn encode_log(log: &[StoredRecord], start: usize, max: usize) -> Bytes {
+    let records: Vec<Record> = log
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max)
+        .map(|(offset, r)| Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            timestamp_type: TimestampType::Creation,
+            offset: offset as i64,
+            sequence: offset as i32,
+            timestamp: r.timestamp,
+            key: r.key.clone(),
+            value: r.value.clone(),
+            headers: r
+                .headers
+                .iter()
+                .map(|(k, v)| (StrBytes::from_string(k.clone()), v.clone()))
+                .collect(),
+        })
+        .collect();
+    let mut buf = BytesMut::new();
+    if !records.is_empty() {
+        RecordBatchEncoder::encode(
+            &mut buf,
+            records.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap();
+    }
+    buf.freeze()
 }
 
 async fn read_request(stream: &mut TcpStream) -> Option<(ApiKey, i16, i32, Bytes)> {

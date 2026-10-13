@@ -4,6 +4,8 @@
 //!   connection after the broker appended the batch): with the idempotent
 //!   producer the target matches the source exactly; without it, the
 //!   retried batches are duplicated (control).
+//! - A restore killed mid-run (its runtime dropped) resumes from the
+//!   checkpoint with zero duplicates and nothing missing.
 //!
 //! Requires Docker (`#[ignore]`). Containers use random ports.
 
@@ -190,4 +192,112 @@ async fn lost_produce_responses_duplicate_batches_without_idempotence() {
         target_total > source_total,
         "expected duplicates without idempotence: {target_total} vs {source_total}"
     );
+}
+
+/// Kill a running restore by dropping its runtime mid-run, then resume from
+/// the checkpoint: the target ends up exactly equal to the source (count
+/// and content), with nothing duplicated and nothing missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn killed_restore_resumes_from_the_checkpoint_with_zero_duplicates() {
+    // RUST_LOG=kafka_backup_core=info shows the resume reconciliation.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+    let cluster = KafkaTestCluster::start().await.expect("start kafka");
+    cluster
+        .wait_for_ready(Duration::from_secs(60))
+        .await
+        .expect("kafka ready");
+    let topic = "restore-kill-resume";
+    create_target_topic(&cluster, topic).await;
+
+    let dir = TempDir::new().unwrap();
+    let source = source_records(1_500);
+    write_topic_backup(dir.path(), "kill-resume", topic, &source, 250).await;
+    let checkpoint = dir.path().join("restore-checkpoint.json");
+    let options = RestoreOptions {
+        checkpoint_state: Some(checkpoint.clone()),
+        checkpoint_interval_secs: 1,
+        produce_timeout_ms: 2_000,
+        // Slow enough (about 3 s for 4500 records) to kill it mid-way.
+        rate_limit_records_per_sec: Some(1_500),
+        ..restore_options(true)
+    };
+    let config = || {
+        topic_restore_config(
+            &cluster.bootstrap_servers,
+            dir.path(),
+            "kill-resume",
+            topic,
+            options.clone(),
+        )
+    };
+
+    // First run on its own runtime, dropped once a third of the records
+    // are in the target.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let first = config();
+    runtime.spawn(async move {
+        let _ = RestoreEngine::new(first).unwrap().run().await;
+    });
+    let client = cluster.create_client();
+    client.connect().await.expect("connect");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if written(&client, topic).await >= 1_500 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restore made no progress"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    runtime.shutdown_background();
+    let at_kill = written(&client, topic).await;
+    assert!(
+        at_kill < 4_500,
+        "killed mid-run ({at_kill} records written)"
+    );
+    assert!(checkpoint.exists(), "checkpoint saved before the kill");
+
+    // Resume.
+    let report = RestoreEngine::new(config())
+        .unwrap()
+        .run()
+        .await
+        .expect("resume succeeds");
+    assert!(report.errors.is_empty());
+
+    for p in 0..PARTITIONS {
+        let target = read_partition(&client, topic, p).await;
+        assert_eq!(target.len(), source[&p].len(), "partition {p}: exact count");
+        assert_eq!(
+            digest(&target),
+            digest(&source[&p]),
+            "partition {p}: content and order"
+        );
+    }
+}
+
+/// Records in `topic` across all partitions (sum of high watermarks).
+async fn written(client: &KafkaClient, topic: &str) -> i64 {
+    let mut total = 0;
+    for p in 0..PARTITIONS {
+        total += client
+            .get_offsets(topic, p, IsolationLevel::ReadUncommitted)
+            .await
+            .map(|(_, hw)| hw)
+            .unwrap_or(0);
+    }
+    total
 }

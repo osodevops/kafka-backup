@@ -21,6 +21,9 @@
 //! - Restore produce path (mock broker, no Docker): idempotent produce with
 //!   byte-identical retries, the fallback, byte-capped batches, the
 //!   max.message.bytes pre-check
+//! - Restore checkpoint (mock broker): written at start, only acknowledged
+//!   work, kill-and-resume with zero duplicates, another-writer detection,
+//!   remote copy, sibling cancellation, repartitioned segment completion
 //! - Idempotent restore against Kafka: produce responses lost through a
 //!   fault proxy leave zero duplicates
 //! - Read-committed backup of transactional topics (aborted records, markers,
@@ -51,6 +54,7 @@ pub mod pitr_accuracy;
 pub mod preflight_e2e;
 pub mod produce_mock_broker;
 pub mod read_committed_backup;
+pub mod restore_checkpoint_resume;
 pub mod restore_idempotent_docker;
 pub mod restore_produce_path;
 pub mod sasl_gssapi_tests;

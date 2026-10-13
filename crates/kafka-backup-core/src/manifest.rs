@@ -682,6 +682,50 @@ pub struct RestoreCheckpoint {
 
     /// Restore configuration hash (to detect config changes)
     pub config_hash: String,
+
+    /// Identifier of the restore: names the copy in backup storage
+    /// (`{backup_id}/restore-checkpoints/{restore_id}.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_id: Option<String>,
+
+    /// Acknowledged progress per source partition (key
+    /// [`RestoreCheckpoint::partition_key`]), for resuming inside a
+    /// segment and reconciling the target's high watermark on resume.
+    #[serde(default)]
+    pub partitions: std::collections::BTreeMap<String, PartitionRestoreProgress>,
+
+    /// `true` once the run that wrote the checkpoint stopped on its own
+    /// (finished, or returned an error) with nothing in flight. `false`
+    /// while a run is producing: a checkpoint left that way was written by
+    /// a run that was killed, whose last requests may still land.
+    #[serde(default)]
+    pub stopped_cleanly: bool,
+}
+
+/// Acknowledged restore progress of one source partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionRestoreProgress {
+    /// Source topic.
+    pub source_topic: String,
+    /// Source partition.
+    pub source_partition: i32,
+    /// Target topic.
+    pub target_topic: String,
+    /// Target partition.
+    pub target_partition: i32,
+    /// Source offset of the last record the target acknowledged (`-1`:
+    /// none yet). Records at or below it are not produced again.
+    pub last_source_offset_acked: i64,
+    /// The target partition's high watermark after that acknowledgement
+    /// (when nothing was acknowledged yet: before the restore produced to
+    /// it). A resumed run compares the target's high watermark with it.
+    pub target_hw_after_ack: i64,
+    /// Records acknowledged.
+    #[serde(default)]
+    pub records_acked: u64,
+    /// Bytes (key + value) acknowledged.
+    #[serde(default)]
+    pub bytes_acked: u64,
 }
 
 impl RestoreCheckpoint {
@@ -697,7 +741,39 @@ impl RestoreCheckpoint {
             records_restored: 0,
             bytes_restored: 0,
             config_hash,
+            restore_id: None,
+            partitions: std::collections::BTreeMap::new(),
+            stopped_cleanly: false,
         }
+    }
+
+    /// Key of a source partition in [`RestoreCheckpoint::partitions`].
+    pub fn partition_key(source_topic: &str, source_partition: i32) -> String {
+        format!("{source_topic}:{source_partition}")
+    }
+
+    /// Record a batch the target acknowledged: `records` records and
+    /// `bytes` bytes up to source offset `last_source_offset`, after which
+    /// the target partition's high watermark is `target_hw_after_ack`.
+    pub fn record_ack(
+        &mut self,
+        progress: &PartitionRestoreProgress,
+        last_source_offset: i64,
+        target_hw_after_ack: i64,
+        records: u64,
+        bytes: u64,
+    ) {
+        let key = Self::partition_key(&progress.source_topic, progress.source_partition);
+        let entry = self
+            .partitions
+            .entry(key)
+            .or_insert_with(|| progress.clone());
+        entry.last_source_offset_acked = entry.last_source_offset_acked.max(last_source_offset);
+        entry.target_hw_after_ack = target_hw_after_ack;
+        entry.records_acked += records;
+        entry.bytes_acked += bytes;
+        self.records_restored += records;
+        self.bytes_restored += bytes;
     }
 
     /// Mark a segment as completed
