@@ -165,7 +165,7 @@ source:
     - broker-1:9092
     - broker-2:9092
   security:
-    sasl_mechanism: plain  # or none
+    sasl_mechanism: PLAIN  # or SCRAM-SHA-256 / SCRAM-SHA-512; omit for none
     sasl_username: "user"
     sasl_password: "pass"
     security_protocol: "SASL_SSL"  # or PLAINTEXT/TLS

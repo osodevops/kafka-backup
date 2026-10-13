@@ -95,6 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where directories cannot be fsynced). A crash or concurrent writer can no
   longer leave a truncated manifest, offset database or segment. Leftover
   temp files are never listed as keys.
+- **`sasl_mechanism: SCRAM-SHA-512` (and `SCRAM-SHA-256`) was rejected.**
+  The docs, the example configs and Kafka itself (`sasl.mechanism`) spell
+  the SCRAM mechanisms `SCRAM-SHA-256` / `SCRAM-SHA-512`, but the YAML parser
+  only accepted `SCRAM-SHA256` / `SCRAM-SHA512`, so a config copied from the
+  docs failed with `unknown variant`. Both spellings are now accepted, in
+  YAML and in `--sasl-mechanism` (which already accepted both, and now lists
+  Kafka's names in its help and errors). Serialised configs keep the old
+  spelling, so they still load in earlier releases.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and

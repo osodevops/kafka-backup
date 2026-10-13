@@ -325,12 +325,19 @@ impl Default for ConnectionConfig {
 ///
 /// `#[non_exhaustive]`: match on it with a wildcard arm, as more
 /// mechanisms may be added.
+///
+/// SCRAM accepts Kafka's own names (`SCRAM-SHA-256`, `SCRAM-SHA-512`, as in
+/// `sasl.mechanism`) and the `SCRAM-SHA256` / `SCRAM-SHA512` spellings
+/// earlier releases required. Serialisation keeps the latter, so configs
+/// written by this version still load in older ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 #[non_exhaustive]
 pub enum SaslMechanism {
     Plain,
+    #[serde(alias = "SCRAM-SHA-256")]
     ScramSha256,
+    #[serde(alias = "SCRAM-SHA-512")]
     ScramSha512,
     /// SASL/GSSAPI (Kerberos). The enum variant is always present, but
     /// constructing a working client requires the `gssapi` cargo feature
@@ -1859,6 +1866,77 @@ sasl_mechanism: OAUTHBEARER
         );
         // The automatic SCREAMING-KEBAB-CASE spelling must not be accepted.
         assert!(serde_yaml::from_str::<SaslMechanism>("O-AUTH-BEARER").is_err());
+    }
+
+    #[test]
+    fn test_sasl_mechanism_accepts_kafka_canonical_and_legacy_scram_spellings() {
+        // Kafka's own names (`sasl.mechanism=SCRAM-SHA-512`, used throughout
+        // the docs) and the spellings this crate has always accepted.
+        for (spelling, expected) in [
+            ("SCRAM-SHA-256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA-512", SaslMechanism::ScramSha512),
+            ("SCRAM-SHA512", SaslMechanism::ScramSha512),
+            ("PLAIN", SaslMechanism::Plain),
+            ("GSSAPI", SaslMechanism::Gssapi),
+            ("OAUTHBEARER", SaslMechanism::OAuthBearer),
+        ] {
+            let parsed: SaslMechanism = serde_yaml::from_str(spelling)
+                .unwrap_or_else(|e| panic!("{spelling} must parse: {e}"));
+            assert_eq!(parsed, expected, "{spelling}");
+
+            let yaml = format!(
+                "security_protocol: SASL_SSL\nsasl_mechanism: {spelling}\n\
+                 sasl_username: u\nsasl_password: p\n"
+            );
+            let cfg: SecurityConfig = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("security block with {spelling}: {e}"));
+            assert_eq!(cfg.sasl_mechanism, Some(expected), "{spelling}");
+        }
+        // Not a mechanism name in either spelling.
+        assert!(serde_yaml::from_str::<SaslMechanism>("SCRAM-SHA-1").is_err());
+        assert!(serde_yaml::from_str::<SaslMechanism>("SCRAM").is_err());
+    }
+
+    #[test]
+    fn test_sasl_mechanism_serialized_spelling_is_unchanged() {
+        // Serialisation keeps the spelling earlier releases wrote and read,
+        // so a config written by this version still loads in older ones.
+        for (mechanism, spelling) in [
+            (SaslMechanism::ScramSha256, "SCRAM-SHA256"),
+            (SaslMechanism::ScramSha512, "SCRAM-SHA512"),
+        ] {
+            let out = serde_yaml::to_string(&mechanism).expect("serialize");
+            assert_eq!(out.trim(), spelling);
+            let back: SaslMechanism = serde_yaml::from_str(&out).expect("roundtrip");
+            assert_eq!(back, mechanism);
+        }
+    }
+
+    #[test]
+    fn test_full_config_with_canonical_scram_name_parses() {
+        // The shape used in docs/configuration.md and the example configs.
+        let yaml = r#"
+mode: backup
+backup_id: scram-canonical
+source:
+  bootstrap_servers: ["kafka:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: SCRAM-SHA-512
+    sasl_username: user
+    sasl_password: secret
+storage:
+  backend: filesystem
+  path: /tmp/scram-canonical
+"#;
+        let (config, warnings) =
+            Config::from_yaml_with_warnings(yaml).expect("canonical SCRAM name parses");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            config.source.unwrap().security.sasl_mechanism,
+            Some(SaslMechanism::ScramSha512)
+        );
     }
 
     const SECURITY_LINT_BASE: &str = r#"

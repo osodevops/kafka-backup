@@ -69,7 +69,7 @@ Configuration for the Kafka cluster to read from (backup mode).
 | `topics.include` | list[string] | No | `["*"]` | Topics to include (glob patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude (glob patterns) |
 | `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER; see below) |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER; see below). The older spellings SCRAM-SHA256 / SCRAM-SHA512 are still accepted |
 | `security.sasl_username` | string | No | - | SASL username |
 | `security.sasl_password` | string | No | - | SASL password |
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |
