@@ -635,6 +635,18 @@ pub struct BackupOptions {
     /// thresholds (failure=5, reset=30s, success=2).
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerSettings,
+
+    /// On a graceful shutdown (SIGTERM / Ctrl-C), how long partition tasks
+    /// get to stop fetching, write their buffered records as a final segment
+    /// and record it in the manifest before they are aborted. An aborted
+    /// partition loses nothing durable: its unsaved progress is re-read on
+    /// the next run. Default: 30 seconds.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+}
+
+fn default_shutdown_grace_secs() -> u64 {
+    30
 }
 
 /// Retention policy for a backup set (issue #169).
@@ -738,6 +750,7 @@ impl Default for BackupOptions {
             require_topic_configs: false,
             retention: None,
             circuit_breaker: CircuitBreakerSettings::default(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
         }
     }
 }

@@ -153,6 +153,40 @@ pub async fn mark_segment_completed(checkpoint: &Mutex<Option<RestoreCheckpoint>
     }
 }
 
+/// Segments in restore order: by first source offset (stable for ties).
+pub(crate) fn segments_in_offset_order<'a>(
+    segments: impl IntoIterator<Item = &'a SegmentMetadata>,
+) -> Vec<&'a SegmentMetadata> {
+    let mut ordered: Vec<&SegmentMetadata> = segments.into_iter().collect();
+    ordered.sort_by_key(|s| s.start_offset);
+    ordered
+}
+
+/// Remembers the highest source offset already restored for one source
+/// partition, so a record is never produced twice when a manifest written
+/// before 0.24 lists overlapping segments (a segment key rewritten on
+/// resume with different boundaries). Segments must be read in
+/// [`segments_in_offset_order`].
+#[derive(Debug, Default)]
+pub(crate) struct OverlapGuard {
+    last: Option<i64>,
+}
+
+impl OverlapGuard {
+    /// Drop records at or below the highest offset already taken, then
+    /// remember the new highest. Returns how many were dropped.
+    pub(crate) fn skip_restored(&mut self, records: &mut Vec<BackupRecord>) -> u64 {
+        let before = records.len();
+        if let Some(last) = self.last {
+            records.retain(|r| r.offset > last);
+        }
+        if let Some(max) = records.iter().map(|r| r.offset).max() {
+            self.last = Some(self.last.map_or(max, |last| last.max(max)));
+        }
+        (before - records.len()) as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +338,8 @@ mod tests {
                 compressed_size: 0,
                 sha256: String::new(),
                 uploaded_at: 0,
+                covered_start_offset: None,
+                covered_end_offset: None,
             };
 
             let out = read_segment(&storage, &segment)
@@ -477,6 +513,74 @@ mod tests {
             out[0].headers[5].value.as_deref(),
             Some(&4i32.to_le_bytes()[..])
         );
+    }
+
+    fn at(offsets: std::ops::RangeInclusive<i64>) -> Vec<BackupRecord> {
+        offsets
+            .map(|offset| BackupRecord {
+                key: None,
+                value: Some(offset.to_string().into_bytes()),
+                headers: vec![],
+                timestamp: offset,
+                offset,
+            })
+            .collect()
+    }
+
+    fn seg(key: &str, start: i64, end: i64) -> SegmentMetadata {
+        SegmentMetadata {
+            key: key.to_string(),
+            start_offset: start,
+            end_offset: end,
+            start_timestamp: start,
+            end_timestamp: end,
+            record_count: end - start + 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            sha256: String::new(),
+            uploaded_at: 0,
+            covered_start_offset: None,
+            covered_end_offset: None,
+        }
+    }
+
+    /// A pre-0.24 manifest can list overlapping segments (a key rewritten on
+    /// resume with other boundaries, kept by the merge). Restore must
+    /// produce every source offset exactly once.
+    #[test]
+    fn overlapping_segments_produce_each_source_offset_once() {
+        let segments = [seg("c", 150, 249), seg("a", 0, 199), seg("b", 100, 149)];
+        let ordered = segments_in_offset_order(segments.iter());
+        assert_eq!(
+            ordered.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        let mut guard = OverlapGuard::default();
+        let mut produced = Vec::new();
+        let mut skipped = 0;
+        for segment in ordered {
+            let mut records = at(segment.start_offset..=segment.end_offset);
+            skipped += guard.skip_restored(&mut records);
+            produced.extend(records.into_iter().map(|r| r.offset));
+        }
+        assert_eq!(produced, (0..=249).collect::<Vec<_>>());
+        assert_eq!(skipped, 50 + 50, "b entirely, and 150..=199 of c");
+    }
+
+    #[test]
+    fn overlap_guard_keeps_disjoint_segments_untouched() {
+        let mut guard = OverlapGuard::default();
+        let mut first = at(0..=9);
+        let mut second = at(12..=20);
+        assert_eq!(guard.skip_restored(&mut first), 0);
+        assert_eq!(guard.skip_restored(&mut second), 0);
+        assert_eq!(second.len(), 9);
+        let mut empty = Vec::new();
+        assert_eq!(guard.skip_restored(&mut empty), 0);
+        let mut replay = at(5..=25);
+        assert_eq!(guard.skip_restored(&mut replay), 16);
+        assert_eq!(replay.first().map(|r| r.offset), Some(21));
     }
 
     #[test]

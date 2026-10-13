@@ -235,9 +235,14 @@ kafka-backup validate --path ./backups --backup-id quickstart-backup-001 --deep
 ```
 
 Additional checks:
-- Reads and parses every segment
-- Validates CRC checksums
-- Verifies record counts match manifest
+- Verifies each segment's SHA-256 against the manifest
+- Reads and parses every segment, validating CRC checksums
+- Verifies record counts and offsets match the manifest
+- Checks that each partition's offsets are contiguous (every hole is a
+  recorded gap or pruned range)
+
+Any mismatch makes the command exit with status 1. For a faster check that
+only hashes the stored bytes, use `--verify-sha256` instead of `--deep`.
 
 ---
 

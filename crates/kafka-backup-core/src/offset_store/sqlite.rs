@@ -111,26 +111,49 @@ impl SqliteOffsetStore {
         Ok(row.map(|(status,)| status))
     }
 
-    /// Try to load database from storage if local doesn't exist
+    /// Load the remote copy of the database when one exists, replacing the
+    /// local file; keep the local database only when there is no remote copy.
+    ///
+    /// The remote copy is authoritative: it is uploaded only after the
+    /// manifest save that justifies its checkpoints, whereas a non-empty
+    /// local file can be a stale leftover (a crashed run on the same host, a
+    /// re-attached volume) that is ahead of what storage durably holds.
+    /// Before 0.24 a non-empty local database always won.
+    ///
+    /// Returns `true` when the remote copy was loaded.
     pub async fn try_load_from_storage(
         &self,
         storage: &dyn StorageBackend,
         s3_key: &str,
     ) -> Result<bool> {
-        // Check if local database already has data
-        let pool = self.pool.read().await;
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM offsets")
-            .fetch_one(&*pool)
-            .await?;
-        drop(pool);
-
-        if count.0 > 0 {
-            debug!("Local database already has {} offset records", count.0);
-            return Ok(false);
+        let loaded = self.load_from_storage(storage, s3_key).await?;
+        if !loaded {
+            let pool = self.pool.read().await;
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM offsets")
+                .fetch_one(&*pool)
+                .await?;
+            if count.0 > 0 {
+                debug!(
+                    "No remote offset database; keeping the local one ({} offset records)",
+                    count.0
+                );
+            }
         }
+        Ok(loaded)
+    }
 
-        // Try to load from storage
-        self.load_from_storage(storage, s3_key).await
+    /// Remove `{db}-wal` / `{db}-shm` left next to the database file. A WAL
+    /// from the old file must never be replayed onto a replaced one.
+    async fn remove_wal_files(&self) {
+        for suffix in ["-wal", "-shm"] {
+            let mut path = self.config.db_path.clone().into_os_string();
+            path.push(suffix);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => debug!("Removed stale {:?}", path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("Could not remove {:?}: {}", path, e),
+            }
+        }
     }
 }
 
@@ -289,7 +312,10 @@ impl OffsetStore for SqliteOffsetStore {
             let pool = self.pool.read().await;
             pool.close().await;
         }
+        self.remove_wal_files().await;
         tokio::fs::rename(&temp_path, &self.config.db_path).await?;
+        // Unflushed writes belonged to the replaced database.
+        self.pending.write().await.clear();
 
         // Reconnect to the replaced database
         let new_pool = Self::open_pool(&self.config).await?;
@@ -448,6 +474,72 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    }
+
+    async fn store_at(path: std::path::PathBuf) -> SqliteOffsetStore {
+        SqliteOffsetStore::new(OffsetStoreConfig {
+            db_path: path,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The remote copy is written only after the manifest that justifies it
+    /// (checkpoint durability), so a non-empty local database — left by a
+    /// crashed run on the same host, or a restored volume — must not win
+    /// over it.
+    #[tokio::test]
+    async fn try_load_prefers_the_remote_copy_over_a_non_empty_local_db() {
+        use crate::storage::MemoryBackend;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = MemoryBackend::new();
+
+        // Remote: checkpoint 50.
+        let remote = store_at(temp_dir.path().join("remote.db")).await;
+        remote.set_offset("b", "t", 0, 50).await.unwrap();
+        remote
+            .sync_to_storage(&storage, "b/offsets.db")
+            .await
+            .unwrap();
+
+        // Local (stale, different content): checkpoint 100.
+        let local = store_at(temp_dir.path().join("local.db")).await;
+        local.set_offset("b", "t", 0, 100).await.unwrap();
+        local.checkpoint().await.unwrap();
+
+        let loaded = local
+            .try_load_from_storage(&storage, "b/offsets.db")
+            .await
+            .unwrap();
+        assert!(loaded, "the remote copy must be loaded");
+        assert_eq!(local.get_offset("b", "t", 0).await.unwrap(), Some(50));
+
+        // The replaced database keeps working (schema, writes, re-sync).
+        local.set_offset("b", "t", 1, 7).await.unwrap();
+        local
+            .sync_to_storage(&storage, "b/offsets.db")
+            .await
+            .unwrap();
+        assert_eq!(local.get_offset("b", "t", 1).await.unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn try_load_keeps_the_local_db_when_there_is_no_remote_copy() {
+        use crate::storage::MemoryBackend;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = MemoryBackend::new();
+
+        let local = store_at(temp_dir.path().join("local.db")).await;
+        local.set_offset("b", "t", 0, 100).await.unwrap();
+        local.checkpoint().await.unwrap();
+
+        let loaded = local
+            .try_load_from_storage(&storage, "b/offsets.db")
+            .await
+            .unwrap();
+        assert!(!loaded);
+        assert_eq!(local.get_offset("b", "t", 0).await.unwrap(), Some(100));
     }
 
     /// Regression test for Issue #62: after load_from_storage() replaces the

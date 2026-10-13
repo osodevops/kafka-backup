@@ -21,6 +21,7 @@ kafka-protocol.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+tokio-util.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -98,12 +99,19 @@ uuid.workspace = true
 # `brew install krb5` on macOS).
 libgssapi = { workspace = true, optional = true }
 
+# Fault injection for the chaos suite — only with the `failpoints` feature.
+fail = { workspace = true, optional = true }
+
 [features]
 default = []
 # Enables SASL/GSSAPI (Kerberos) authentication via the
 # `SaslMechanismPlugin` extension trait. Adds a build-time dependency
 # on the system krb5 development libraries.
 gssapi = ["dep:libgssapi"]
+# Compiles the `fail` crate's failpoints into the backup path (segment put,
+# manifest put, offsets sync, fetch) for crash/chaos testing. Never enable in
+# release builds.
+failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
 crc32c = "0.6"

@@ -25,6 +25,7 @@ pub use consumer_groups::{
 };
 pub use fetch::FetchResponse;
 pub use metadata::{fetch_metadata, BrokerMetadata, PartitionMetadata, TopicMetadata};
+pub(crate) use partition_router::PartitionFetcher;
 pub use partition_router::PartitionLeaderRouter;
 pub use produce::ProduceResponse;
 pub use sasl::{
