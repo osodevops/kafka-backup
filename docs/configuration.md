@@ -354,18 +354,42 @@ storage:
 | `account_name` | string | Yes | - | Azure storage account name |
 | `container_name` | string | Yes | - | Blob container name |
 | `prefix` | string | No | `""` | Blob prefix (folder) |
-| `endpoint` | string | No | - | Custom endpoint (sovereign clouds) |
-| `sas_token` | string | No | - | Shared access signature |
-| `account_key` | string | No | - | Storage account key (`AZURE_STORAGE_KEY` env fallback) |
-| `client_id` | string | No | - | Azure AD client ID (service principal or Workload Identity) |
+| `endpoint` | string | No | - | Custom endpoint: sovereign clouds, or the emulator (`http://127.0.0.1:10000/devstoreaccount1`) |
+| `sas_token` | string | No | - | Shared access signature, pasted as the portal shows it (leading `?` optional) |
+| `account_key` | string | No | - | Storage account key |
+| `client_id` | string | No | - | Azure AD client ID: service principal, Workload Identity, or the user-assigned managed identity to use |
 | `tenant_id` | string | No | - | Azure AD tenant ID |
 | `client_secret` | string | No | - | Service-principal secret |
 | `use_workload_identity` | bool | No | auto | AKS Workload Identity (federated token). Auto-enabled when `AZURE_FEDERATED_TOKEN_FILE` is set |
+| `use_emulator` | bool | No | `false` | Azure Storage emulator (Azurite): plain HTTP, path-style URLs, well-known emulator key unless `account_key` / `sas_token` is set |
+| `allow_http` | bool | No | `false` | Allow plain-HTTP endpoints; implied by `use_emulator` and by an `http://` endpoint |
 
-Credential precedence: `sas_token` → `account_key` → service principal (`client_secret`) →
-Workload Identity → `DefaultAzureCredential` chain (environment, managed identity, Azure CLI).
-For Workload Identity, YAML `client_id`/`tenant_id` override the webhook-injected
-`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`; the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
+Credential precedence:
+
+1. `sas_token`
+2. `account_key` (with `use_emulator` and neither set: the well-known emulator key)
+3. Service principal: `client_secret` with `client_id` and `tenant_id`
+4. Workload Identity: `use_workload_identity: true` or `AZURE_FEDERATED_TOKEN_FILE` set.
+   YAML `client_id`/`tenant_id` override the webhook-injected `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`;
+   the token file always comes from `AZURE_FEDERATED_TOKEN_FILE`.
+5. Managed identity through IMDS. `client_id` selects a user-assigned identity; without it the
+   system-assigned identity is used.
+
+Nothing else is consulted: no Azure CLI, and no other environment variables for a YAML
+config (the `--path azure://` form reads `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN` and
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET`). The emulator only accepts a SAS
+token or an account key.
+
+Azurite (local testing):
+
+```yaml
+storage:
+  backend: azure
+  account_name: devstoreaccount1
+  container_name: kafka-backups     # create it first; the backend does not create containers
+  endpoint: http://127.0.0.1:10000/devstoreaccount1
+  use_emulator: true                # well-known key unless account_key / sas_token is set
+```
 
 ```yaml
 storage:

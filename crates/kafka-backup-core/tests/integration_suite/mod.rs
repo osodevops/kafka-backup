@@ -4,6 +4,7 @@
 //! real Kafka brokers for testing against actual broker behavior.
 //!
 //! Test categories:
+//! - Azure: Azure Blob backend against Azurite (account key, SAS, backup/restore)
 //! - PITR Accuracy: Point-in-time recovery precision tests
 //! - Offset Semantics: Consumer group offset handling tests
 //! - TLS Security: SSL/TLS certificate handling tests
@@ -19,6 +20,7 @@
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
 //! - strimzi-backup-operator#57: snapshot progress gauges describe the current run
 
+pub mod azure_azurite;
 pub mod common;
 pub mod group_coordinator_mock;
 pub mod issue_144_offset_out_of_range;
