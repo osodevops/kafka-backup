@@ -906,6 +906,23 @@ metrics:
 | `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
 | `kafka_backup_errors_total` | Counter | Errors by type |
 
+Restore metrics (`restore` and `three-phase-restore`). The `restore_id` label
+is the backup id.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kafka_restore_records_total` | Counter | Records produced to the target and acknowledged |
+| `kafka_restore_bytes_total` | Counter | Key and value bytes of those records (as `bytes_restored` in the report) |
+| `kafka_restore_partitions_completed_total` | Counter | Partitions whose restore finished (target partitions when repartitioning) |
+| `kafka_restore_errors_total` | Counter | Restore errors by `error_type`: one per failed topic, or one for a restore that failed before any topic did |
+| `kafka_restore_duration_seconds` | Histogram | Restore duration, by `status` (`success` / `failure`) |
+| `kafka_restore_progress_percent` | Gauge | Records restored as a share of the records in the segments to restore; 100 only once the restore succeeded |
+| `kafka_restore_eta_seconds` | Gauge | Estimated seconds left at the current rate |
+| `kafka_restore_throughput_records_per_sec` | Gauge | Average records per second since the restore started |
+
+The progress gauges are updated at most every 5 seconds while records flow,
+and at the end of the run.
+
 ---
 
 ## Restore Configuration
@@ -1168,6 +1185,7 @@ source:
 | `AZURE_FEDERATED_TOKEN_FILE` | Projected token path injected by the AKS Workload Identity webhook; its presence enables Workload Identity |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP credentials |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
+| `KAFKA_BACKUP_LOG_FORMAT` | Log format, `text` (default) or `json`; same as `--log-format` |
 
 ---
 
@@ -1181,7 +1199,14 @@ CLI arguments override configuration file values.
 |----------|-------|-------------|
 | `--config` | `-c` | Path to configuration file |
 | `--verbose` | `-v` | Enable verbose output |
+| `--log-format` | | Log format: `text` (default) or `json` (one JSON object per line). Logs always go to **stderr**; stdout carries only command output |
 | `--format` | `-f` | Output format: text, json, yaml |
+
+Logs are written to stderr, so the stdout of `--format json` parses as JSON
+at any verbosity (`kafka-backup describe ... --format json -v | jq .`). Text
+logs are coloured only when stderr is a terminal. With `--log-format json`
+each line is an object with `timestamp`, `level`, `target`, `message` and the
+event's fields, for log aggregators.
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 

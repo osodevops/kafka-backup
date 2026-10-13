@@ -21,8 +21,10 @@ pub async fn run(config_path: &str) -> Result<()> {
         metrics_config.max_partition_labels,
     ));
 
-    let metrics_server =
-        super::metrics_runtime::RunningMetricsServer::start(&metrics_config, prometheus_metrics);
+    let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
+        &metrics_config,
+        prometheus_metrics.clone(),
+    );
 
     // Phase 3 (consumer group offset reset) is applied after the data restore
     // when the configuration asks for it. The engine itself never commits
@@ -37,8 +39,8 @@ pub async fn run(config_path: &str) -> Result<()> {
         None
     };
 
-    // Run the restore engine
-    let engine = RestoreEngine::new(config)?;
+    // Run the restore engine with Prometheus metrics
+    let engine = RestoreEngine::new_with_metrics(config, Some(prometheus_metrics))?;
 
     // Spawn signal handler for graceful shutdown (SIGTERM + SIGINT/Ctrl-C)
     let shutdown_tx_signal = engine.shutdown_handle();

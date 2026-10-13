@@ -26,6 +26,7 @@ use crate::storage::StorageBackend;
 use crate::{Error, Result};
 
 use super::helpers;
+use super::telemetry::RestoreTelemetry;
 
 /// Kafka's default seed for murmur2 hashing (0x9747b28c).
 const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
@@ -79,6 +80,9 @@ impl Partitioner {
 /// N source-partition reader tasks feed M target-partition writer tasks
 /// through bounded channels, with the `Partitioner` routing each record
 /// to the correct channel based on its key.
+///
+/// Records no restore metrics; `RestoreEngine` restores repartitioned
+/// topics with its own metrics and progress events.
 #[allow(clippy::too_many_arguments)]
 pub async fn restore_topic_repartitioned(
     topic_backup: &TopicBackup,
@@ -92,6 +96,40 @@ pub async fn restore_topic_repartitioned(
     kafka_cb: Arc<CircuitBreaker>,
     storage_cb: Arc<CircuitBreaker>,
     checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
+) -> Result<TopicRestoreReport> {
+    restore_topic_repartitioned_with_telemetry(
+        topic_backup,
+        target_topic,
+        repart_config,
+        options,
+        router,
+        storage,
+        metrics,
+        health,
+        kafka_cb,
+        storage_cb,
+        checkpoint,
+        Arc::new(RestoreTelemetry::disabled()),
+    )
+    .await
+}
+
+/// [`restore_topic_repartitioned`], reporting produced batches, segments
+/// and completed target partitions to the engine's telemetry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_topic_repartitioned_with_telemetry(
+    topic_backup: &TopicBackup,
+    target_topic: &str,
+    repart_config: &TopicRepartitioning,
+    options: &RestoreOptions,
+    router: Arc<PartitionLeaderRouter>,
+    storage: Arc<dyn StorageBackend>,
+    metrics: Arc<PerformanceMetrics>,
+    health: Arc<HealthCheck>,
+    kafka_cb: Arc<CircuitBreaker>,
+    storage_cb: Arc<CircuitBreaker>,
+    checkpoint: Arc<Mutex<Option<RestoreCheckpoint>>>,
+    telemetry: Arc<RestoreTelemetry>,
 ) -> Result<TopicRestoreReport> {
     let num_target_partitions = repart_config.target_partitions;
     info!(
@@ -172,6 +210,7 @@ pub async fn restore_topic_repartitioned(
         let health = Arc::clone(&health);
         let checkpoint = Arc::clone(&checkpoint);
         let options = options.clone();
+        let telemetry = Arc::clone(&telemetry);
 
         reader_handles.push(tokio::spawn(async move {
             let result = run_reader(
@@ -188,6 +227,7 @@ pub async fn restore_topic_repartitioned(
                 &options,
                 &filter_dropped,
                 &filter_tombstoned,
+                &telemetry,
             )
             .await;
             drop(permit);
@@ -212,6 +252,7 @@ pub async fn restore_topic_repartitioned(
         let health = Arc::clone(&health);
         let metrics = Arc::clone(&metrics);
         let options = options.clone();
+        let telemetry = Arc::clone(&telemetry);
 
         writer_handles.push(tokio::spawn(async move {
             run_writer(
@@ -224,6 +265,7 @@ pub async fn restore_topic_repartitioned(
                 &health,
                 &metrics,
                 &options,
+                &telemetry,
             )
             .await
         }));
@@ -253,6 +295,7 @@ pub async fn restore_topic_repartitioned(
                 total_records += report.records;
                 total_bytes += report.bytes;
                 partition_reports.push(report);
+                telemetry.partition_completed();
             }
             Ok(Err(e)) => reader_errors.push(e),
             Err(e) => reader_errors.push(Error::Io(std::io::Error::other(format!(
@@ -293,6 +336,7 @@ async fn run_reader(
     options: &RestoreOptions,
     filter_dropped: &AtomicU64,
     filter_tombstoned: &AtomicU64,
+    telemetry: &RestoreTelemetry,
 ) -> Result<()> {
     // Filter segments by time window
     let filtered_segments: Vec<&SegmentMetadata> = segments
@@ -326,6 +370,7 @@ async fn run_reader(
             Ok(r) => {
                 storage_cb.record_success();
                 health.mark_healthy("storage");
+                telemetry.segment_processed();
                 r
             }
             Err(e) => {
@@ -403,6 +448,7 @@ async fn run_writer(
     health: &HealthCheck,
     metrics: &PerformanceMetrics,
     options: &RestoreOptions,
+    telemetry: &RestoreTelemetry,
 ) -> Result<PartitionRestoreReport> {
     let batch_size = options.produce_batch_size;
     let mut total_records = 0u64;
@@ -459,6 +505,7 @@ async fn run_writer(
                 total_bytes += batch_bytes;
                 metrics.record_records(batch.len() as u64);
                 health.record_records(batch.len() as u64);
+                telemetry.record_produced(target_topic, target_partition, &batch);
             }
             Err(e) => {
                 kafka_cb.record_failure();

@@ -103,6 +103,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   YAML and in `--sasl-mechanism` (which already accepted both, and now lists
   Kafka's names in its help and errors). Serialised configs keep the old
   spelling, so they still load in earlier releases.
+- **Restore metrics were never recorded (#173).** `RestoreEngine` did not
+  receive the Prometheus registry, so every `kafka_restore_*` series stayed
+  empty during `restore` and `three-phase-restore`, and the progress channel
+  (`RestoreEngine::progress_receiver`, used by the operator) never sent
+  anything. Both the 1:1 and the repartition path now count produced records
+  and bytes, completed partitions, errors (by type), the duration (by
+  status) and progress (percentage, ETA, throughput), and send a
+  `RestoreProgress` event once the totals are known, after the first batch,
+  at most every 5 seconds while records flow, and at the end.
+  `three-phase-restore` now serves `/metrics` like `restore` does.
+- **CLI logs went to stdout (#188),** so `--format json` output was preceded
+  by log lines and did not parse. All logs now go to stderr; stdout carries
+  only command output. Text logs are coloured only when stderr is a
+  terminal.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -240,7 +254,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gain the `use_emulator` and `allow_http` fields. Code that builds them
   field by field must set both (`false` keeps the previous behaviour).
 
+- `--log-format text|json` (global; also `KAFKA_BACKUP_LOG_FORMAT`): `json`
+  writes one JSON object per log line to stderr (#188).
+- Restore metrics `kafka_restore_bytes_total`,
+  `kafka_restore_partitions_completed_total` and
+  `kafka_restore_errors_total{error_type}` (#173).
+
 ### API
+- `RestoreEngine::new_with_metrics(config, Option<Arc<PrometheusMetrics>>)`
+  and `RestoreEngine::prometheus_metrics()`, as on `BackupEngine`;
+  `ThreePhaseRestore::with_prometheus_metrics`.
+- `PrometheusMetrics::{inc_restore_bytes, inc_restore_partitions_completed,
+  record_restore_error}` and `RestoreErrorLabels`.
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
 

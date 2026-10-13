@@ -16,8 +16,9 @@ use std::time::Instant;
 
 use super::labels::{
     BackupLabels, CommitLabels, CompressionLabels, DurationLabels, ErrorLabels, ErrorType,
-    LagLabels, OperationStatus, RestoreLabels, RestoreProgressLabels, RetryLabels,
-    StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation, ThroughputLabels,
+    LagLabels, OperationStatus, RestoreErrorLabels, RestoreLabels, RestoreProgressLabels,
+    RetryLabels, StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation,
+    ThroughputLabels,
 };
 
 /// Storage latency histogram buckets (in seconds).
@@ -180,6 +181,18 @@ pub struct PrometheusMetrics {
     /// Cumulative records restored.
     pub restore_records_total: Family<RestoreProgressLabels, Counter>,
 
+    /// Cumulative bytes restored (record keys plus values, as in the
+    /// restore report).
+    pub restore_bytes_total: Family<RestoreProgressLabels, Counter>,
+
+    /// Partitions whose restore finished (target partitions on the
+    /// repartition path).
+    pub restore_partitions_completed_total: Family<RestoreProgressLabels, Counter>,
+
+    /// Restore errors by type: one per failed topic, or one for a restore
+    /// that failed before any topic did.
+    pub restore_errors_total: Family<RestoreErrorLabels, Counter>,
+
     // ========================================
     // Internal tracking
     // ========================================
@@ -284,6 +297,10 @@ impl PrometheusMetrics {
         let restore_throughput_records_per_sec =
             Family::<RestoreProgressLabels, Gauge<f64, AtomicU64>>::default();
         let restore_records_total = Family::<RestoreProgressLabels, Counter>::default();
+        let restore_bytes_total = Family::<RestoreProgressLabels, Counter>::default();
+        let restore_partitions_completed_total =
+            Family::<RestoreProgressLabels, Counter>::default();
+        let restore_errors_total = Family::<RestoreErrorLabels, Counter>::default();
 
         // Register all metrics with the registry
 
@@ -485,6 +502,21 @@ impl PrometheusMetrics {
             "Cumulative records restored",
             restore_records_total.clone(),
         );
+        registry.register(
+            "kafka_restore_bytes",
+            "Cumulative bytes restored (record keys and values)",
+            restore_bytes_total.clone(),
+        );
+        registry.register(
+            "kafka_restore_partitions_completed",
+            "Partitions whose restore finished",
+            restore_partitions_completed_total.clone(),
+        );
+        registry.register(
+            "kafka_restore_errors",
+            "Restore errors by type",
+            restore_errors_total.clone(),
+        );
 
         Self {
             registry: RwLock::new(registry),
@@ -525,6 +557,9 @@ impl PrometheusMetrics {
             restore_eta_seconds,
             restore_throughput_records_per_sec,
             restore_records_total,
+            restore_bytes_total,
+            restore_partitions_completed_total,
+            restore_errors_total,
             start_time: Instant::now(),
             max_partition_labels,
             partition_labels: RwLock::new(HashSet::new()),
@@ -915,6 +950,28 @@ impl PrometheusMetrics {
             .inc_by(count);
     }
 
+    /// Increment restore bytes counter.
+    pub fn inc_restore_bytes(&self, restore_id: &str, bytes: u64) {
+        let labels = RestoreProgressLabels::new(restore_id);
+        self.restore_bytes_total
+            .get_or_create(&labels)
+            .inc_by(bytes);
+    }
+
+    /// Count one partition whose restore finished.
+    pub fn inc_restore_partitions_completed(&self, restore_id: &str) {
+        let labels = RestoreProgressLabels::new(restore_id);
+        self.restore_partitions_completed_total
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    /// Count one restore error.
+    pub fn record_restore_error(&self, restore_id: &str, error_type: ErrorType) {
+        let labels = RestoreErrorLabels::new(restore_id, error_type);
+        self.restore_errors_total.get_or_create(&labels).inc();
+    }
+
     // ========================================
     // Utility Methods
     // ========================================
@@ -1140,6 +1197,25 @@ mod tests {
         let encoded = metrics.encode();
         assert!(encoded.contains("kafka_restore_progress_percent"));
         assert!(encoded.contains("kafka_restore_eta_seconds"));
+    }
+
+    #[test]
+    fn test_restore_bytes_partitions_and_errors() {
+        let metrics = PrometheusMetrics::new();
+        metrics.inc_restore_records("restore-001", 10);
+        metrics.inc_restore_bytes("restore-001", 2048);
+        metrics.inc_restore_partitions_completed("restore-001");
+        metrics.inc_restore_partitions_completed("restore-001");
+        metrics.record_restore_error("restore-001", ErrorType::BrokerConnection);
+
+        let encoded = metrics.encode();
+        assert!(encoded.contains("kafka_restore_records_total{restore_id=\"restore-001\"} 10"));
+        assert!(encoded.contains("kafka_restore_bytes_total{restore_id=\"restore-001\"} 2048"));
+        assert!(encoded
+            .contains("kafka_restore_partitions_completed_total{restore_id=\"restore-001\"} 2"));
+        assert!(encoded.contains(
+            "kafka_restore_errors_total{restore_id=\"restore-001\",error_type=\"broker_connection\"} 1"
+        ));
     }
 
     #[test]

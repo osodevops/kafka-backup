@@ -36,10 +36,10 @@ use kafka_backup_core::CircuitBreaker;
 
 use super::sasl_mock_broker::{read_request, write_response};
 
-const TOPIC: &str = "issue-197-topic";
+pub(super) const TOPIC: &str = "issue-197-topic";
 
 #[derive(Clone, Debug)]
-enum ProduceMode {
+pub(super) enum ProduceMode {
     /// Always succeed with a monotonically increasing base offset.
     Ok,
     /// Kill the next `n` Produce requests (TCP RST). Use `n >= 2` to outlast
@@ -56,17 +56,20 @@ enum ProduceMode {
     NotLeaderRemaining(u32),
 }
 
-struct BrokerMock {
-    addr: std::net::SocketAddr,
+pub(super) struct BrokerMock {
+    pub(super) addr: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,
-    produce_count: Arc<AtomicUsize>,
+    pub(super) produce_count: Arc<AtomicUsize>,
     produce_timestamps_ms: Arc<Mutex<Vec<u64>>>,
     produce_mode: Arc<Mutex<ProduceMode>>,
     handle: JoinHandle<()>,
 }
 
 impl BrokerMock {
-    async fn start(broker_id: i32, peers: Arc<Mutex<Vec<(i32, std::net::SocketAddr)>>>) -> Self {
+    pub(super) async fn start(
+        broker_id: i32,
+        peers: Arc<Mutex<Vec<(i32, std::net::SocketAddr)>>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let connections = Arc::new(AtomicUsize::new(0));
@@ -118,11 +121,11 @@ impl BrokerMock {
         self.connections.load(Ordering::SeqCst)
     }
 
-    fn produce_count(&self) -> usize {
+    pub(super) fn produce_count(&self) -> usize {
         self.produce_count.load(Ordering::SeqCst)
     }
 
-    async fn set_mode(&self, mode: ProduceMode) {
+    pub(super) async fn set_mode(&self, mode: ProduceMode) {
         *self.produce_mode.lock().await = mode;
     }
 
@@ -130,7 +133,7 @@ impl BrokerMock {
         self.produce_timestamps_ms.lock().await.clone()
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         self.handle.abort();
         let _ = self.handle.await;
     }
@@ -283,7 +286,7 @@ fn produce_error_response(topic: &str, partition: i32, code: i16) -> ProduceResp
             .with_base_offset(-1)])])
 }
 
-fn client_config(bootstrap: &str) -> KafkaConfig {
+pub(super) fn client_config(bootstrap: &str) -> KafkaConfig {
     KafkaConfig {
         bootstrap_servers: vec![bootstrap.to_string()],
         security: SecurityConfig::default(),
@@ -308,7 +311,7 @@ fn record(offset: i64) -> BackupRecord {
     }
 }
 
-async fn write_two_partition_backup(storage_path: &std::path::Path, backup_id: &str) {
+pub(super) async fn write_two_partition_backup(storage_path: &std::path::Path, backup_id: &str) {
     let storage = create_backend(&StorageBackendConfig::Filesystem {
         path: storage_path.to_path_buf(),
     })

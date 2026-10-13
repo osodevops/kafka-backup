@@ -46,8 +46,9 @@ pub use instrumented_storage::{
 };
 pub use labels::{
     BackupLabels, CommitLabels, CompressionLabels, DurationLabels, ErrorLabels, ErrorType,
-    LagLabels, OperationStatus, RestoreLabels, RestoreProgressLabels, RetryLabels,
-    StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation, ThroughputLabels,
+    LagLabels, OperationStatus, RestoreErrorLabels, RestoreLabels, RestoreProgressLabels,
+    RetryLabels, StorageBytesLabels, StorageErrorLabels, StorageLabels, StorageOperation,
+    ThroughputLabels,
 };
 pub use registry::{PrometheusMetrics, TimerGuard};
 pub use server::{MetricsServer, MetricsServerConfig};
