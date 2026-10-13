@@ -11,11 +11,10 @@ use super::telemetry::{RestoreOutcome, RestorePlan, RestoreTelemetry};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{
     Config, ExistingTopicConfigPolicy, IsolationLevel, Mode, OffsetStrategy, RestoreOptions,
+    UnsupportedConfigPolicy,
 };
 use crate::health::HealthCheck;
-use crate::kafka::{
-    ConfigChange, ConfigOp, ConfigResourceType, PartitionLeaderRouter, TopicToCreate,
-};
+use crate::kafka::{ConfigResourceType, PartitionLeaderRouter, TopicToCreate};
 use crate::manifest::{
     BackupManifest, BackupRecord, DryRunPartitionReport, DryRunRepartitioningInfo, DryRunReport,
     DryRunTopicReport, OffsetMapping, PartitionRestoreReport, RestoreCheckpoint, RestoreReport,
@@ -719,6 +718,8 @@ impl RestoreEngine {
                 records_dropped_by_filter: 0,
                 records_tombstoned_by_filter: 0,
                 record_filter: None,
+                topic_configs_skipped: Vec::new(),
+                topic_configs_adjusted: Vec::new(),
             });
         }
 
@@ -811,6 +812,8 @@ impl RestoreEngine {
                 records_dropped_by_filter: 0,
                 records_tombstoned_by_filter: 0,
                 record_filter: None,
+                topic_configs_skipped: Vec::new(),
+                topic_configs_adjusted: Vec::new(),
             });
         }
 
@@ -828,10 +831,12 @@ impl RestoreEngine {
             HashSet::new()
         };
 
-        if restore_options.restore_topic_configs {
+        let topic_configs = if restore_options.restore_topic_configs {
             self.restore_topic_configs(&topics_to_restore, &restore_options, &newly_created_topics)
-                .await?;
-        }
+                .await?
+        } else {
+            super::topic_configs::TopicConfigOutcome::default()
+        };
 
         // Auto-load consumer groups from snapshot if requested (Issue #51 / #67 bug 5)
         let auto_consumer_group_snapshot = if restore_options.auto_consumer_groups
@@ -984,6 +989,8 @@ impl RestoreEngine {
                 .record_filter
                 .as_ref()
                 .map(|f| f.name().to_string()),
+            topic_configs_skipped: topic_configs.skipped,
+            topic_configs_adjusted: topic_configs.adjusted,
         };
 
         finalize_restore_report(report)
@@ -1465,7 +1472,10 @@ impl RestoreEngine {
             .iter()
             .filter(|(name, _)| !existing_names.contains(*name))
             .map(|(name, &partition_count)| {
-                let replication_factor = options.default_replication_factor.unwrap_or(-1);
+                let replication_factor = super::topic_configs::default_replication_factor(
+                    options.default_replication_factor,
+                    options.target_profile,
+                );
                 TopicToCreate {
                     name: name.clone(),
                     num_partitions: partition_count,
@@ -1512,18 +1522,22 @@ impl RestoreEngine {
         Ok(missing_names)
     }
 
+    /// Restore the captured topic configuration (plus `topic_config_overrides`)
+    /// to the topics that get it: newly created ones, and existing ones under
+    /// `existing_topic_config_policy: apply`. What the target does not take
+    /// is handled by `unsupported_config_policy` (see `restore::topic_configs`).
     async fn restore_topic_configs(
         &self,
         topics_to_restore: &[TopicBackup],
         options: &RestoreOptions,
         newly_created: &HashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<super::topic_configs::TopicConfigOutcome> {
         let with_configs: Vec<_> = topics_to_restore
             .iter()
             .filter(|topic| !topic.configurations.is_empty())
             .collect();
         if with_configs.is_empty() {
-            return Ok(());
+            return Ok(super::topic_configs::TopicConfigOutcome::default());
         }
 
         let router = self
@@ -1544,7 +1558,8 @@ impl RestoreEngine {
             .map(|topic| (ConfigResourceType::Topic, target_name(topic)))
             .collect();
         let current = router.describe_configs(&resources).await?;
-        let mut changes = Vec::new();
+        let mut outcome = super::topic_configs::TopicConfigOutcome::default();
+        let mut plans = Vec::new();
         let mut fail_drift = Vec::new();
 
         for topic in with_configs {
@@ -1569,6 +1584,17 @@ impl RestoreEngine {
             if let Some(overrides) = options.topic_config_overrides.get(&target) {
                 desired.extend(overrides.clone());
             }
+            // Keys the target does not list as writable cannot be restored
+            // (nor drift); values outside the profile limits are compared and
+            // applied as clamped.
+            let (mut desired, unsupported) =
+                super::topic_configs::prefilter(&target, desired, current_entries);
+            let adjusted = super::topic_configs::apply_profile(
+                &target,
+                &mut desired,
+                options.target_profile,
+                options.target_cluster_type,
+            );
             let drift: Vec<String> = desired
                 .iter()
                 .filter(|(name, value)| {
@@ -1582,24 +1608,16 @@ impl RestoreEngine {
                 })
                 .collect();
 
-            if drift.is_empty() {
-                continue;
-            }
-
             let should_apply = newly_created.contains(&target)
                 || options.existing_topic_config_policy == ExistingTopicConfigPolicy::Apply;
             if should_apply {
-                changes.push(ConfigChange {
-                    resource_type: ConfigResourceType::Topic,
-                    resource_name: target,
-                    ops: desired
-                        .iter()
-                        .map(|(name, value)| ConfigOp::Set {
-                            name: name.clone(),
-                            value: value.clone(),
-                        })
-                        .collect(),
-                });
+                outcome.skipped.extend(unsupported);
+                outcome.adjusted.extend(adjusted);
+                if !drift.is_empty() {
+                    plans.push((target, desired));
+                }
+            } else if drift.is_empty() {
+                continue;
             } else if options.existing_topic_config_policy == ExistingTopicConfigPolicy::Fail {
                 fail_drift.push(format!("{target}: {}", drift.join(", ")));
             } else {
@@ -1617,8 +1635,20 @@ impl RestoreEngine {
                 fail_drift.join("; ")
             )));
         }
-        router.incremental_alter_configs(&changes).await?;
-        Ok(())
+        let policy = options.unsupported_config_policy;
+        if policy == UnsupportedConfigPolicy::Fail {
+            if !outcome.skipped.is_empty() {
+                return Err(super::topic_configs::fail_error(&outcome.skipped));
+            }
+            if !outcome.adjusted.is_empty() {
+                return Err(super::topic_configs::limits_error(&outcome.adjusted));
+            }
+        }
+        let rejected =
+            super::topic_configs::apply_topic_configs(router.as_ref(), plans, policy).await?;
+        outcome.skipped.extend(rejected);
+        outcome.log();
+        Ok(outcome)
     }
 
     /// Wait for newly created topics to be ready (partitions available)
@@ -2228,6 +2258,8 @@ mod tests {
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
             record_filter: None,
+            topic_configs_skipped: Vec::new(),
+            topic_configs_adjusted: Vec::new(),
         };
 
         let err = finalize_restore_report(report).expect_err(

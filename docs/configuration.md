@@ -1070,6 +1070,73 @@ restore:
   checkpoint_interval_secs: 30
 ```
 
+### Topic Configuration
+
+A backup records each topic's explicit, writable, non-sensitive overrides
+(`cleanup.policy`, `retention.ms`, `min.insync.replicas`, ... and the
+`confluent.*` topic settings such as schema validation; not
+`confluent.placement.constraints`, which names the source's racks). The
+restore applies them to the topics it creates, and to existing topics under
+`existing_topic_config_policy: apply`.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `restore_topic_configs` | bool | No | `true` | Restore the captured topic overrides |
+| `existing_topic_config_policy` | string | No | `validate_only` | Topics that already exist: `validate_only` (log drift), `apply`, or `fail` on drift |
+| `topic_config_overrides` | map | No | `{}` | Per target topic, values that replace the captured ones |
+| `unsupported_config_policy` | string | No | `skip` | Configuration the target does not take: `skip` restores without it (and clamps values to the `target_profile` limits) and lists it in the report; `fail` stops the restore before changing any configuration |
+| `target_profile` | string | No | - | `confluent_cloud`: create topics with replication factor 3 (unless `default_replication_factor` is set) and keep values within Confluent Cloud's limits |
+| `target_cluster_type` | string | No | - | With `target_profile: confluent_cloud`: `basic`, `standard`, `enterprise` or `dedicated`, for the limits that depend on it. Unset: the most permissive limit |
+
+The target decides what it takes:
+
+1. A key the target's DescribeConfigs does not list, or lists read-only, is
+   skipped: for example `message.format.version` and
+   `message.downconversion.enable` on Kafka 4.x, or `confluent.*` outside
+   Confluent.
+2. With a `target_profile`, a value outside its limits is clamped (or, under
+   `fail`, rejected).
+3. The rest is applied in one request. A topic the broker rejects is left
+   unchanged by Kafka; each of its keys is then checked on its own
+   (`validate_only`) and the accepted ones are applied, so one key the target
+   refuses (for example `flush.ms` on Confluent Cloud) does not cost the
+   others.
+
+Under `fail`, everything is validated first: when any key would be skipped,
+the restore stops with the full list and no topic configuration is changed
+(topics the restore created exist, with the target's defaults).
+
+The restore report lists `topic_configs_skipped` (`topic`, `name`, `value`,
+`reason`: `not_reported_by_target`, `read_only` or `rejected`, and the
+broker's `message`) and `topic_configs_adjusted` (`value`, `applied`,
+`limit`); each is also logged at WARN and printed by `restore`.
+
+Confluent Cloud limits applied by `target_profile: confluent_cloud`, from
+[Configuration Reference for Topics in Confluent Cloud](https://docs.confluent.io/cloud/current/topics/manage.html)
+(last published 25 September 2026):
+
+| Key | Limit |
+|-----|-------|
+| `min.insync.replicas` | 1 to 2 |
+| `segment.bytes` | 52428800 (50 MiB) to 1073741824 (1 GiB) |
+| `segment.ms` | at least 14400000 (4 hours) |
+| `max.message.bytes` | at most 8388608 (8 MiB) on Basic and Standard, 20971520 (20 MiB) on Enterprise and Dedicated |
+| `max.compaction.lag.ms` | at least 604800000 (7 days) on Basic, Standard and Enterprise, 21600000 (6 hours) on Dedicated |
+| `delete.retention.ms` | at most 60566400000 |
+
+Keys Confluent Cloud does not let you edit (`flush.ms`, `flush.messages`,
+`preallocate`, `compression.type`, `message.downconversion.enable`, ...) are
+not in the profile: the broker rejects them and they are skipped. A lower
+`max.message.bytes` means records larger than it cannot be restored.
+
+```yaml
+restore:
+  create_topics: true
+  target_profile: confluent_cloud
+  target_cluster_type: dedicated
+  unsupported_config_policy: skip   # or fail
+```
+
 ### Topic Auto-Creation
 
 | Option | Type | Required | Default | Description |

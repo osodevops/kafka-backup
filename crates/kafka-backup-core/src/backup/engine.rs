@@ -1663,7 +1663,18 @@ fn plan_snapshot_ranges(
         .collect()
 }
 
+/// Topic configuration a backup captures (explicit, writable,
+/// non-sensitive overrides only). A restore applies a key only when the
+/// target lists it as writable, so keys some targets lack
+/// (`message.format.version` on Kafka 4.x, `confluent.*` outside Confluent)
+/// are captured anyway and skipped there.
 fn is_recovery_topic_config(name: &str) -> bool {
+    // Confluent Platform / Cloud topic settings (schema validation, subject
+    // name strategies, tiering), except replica placement, which names the
+    // source cluster's racks.
+    if let Some(confluent) = name.strip_prefix("confluent.") {
+        return confluent != "placement.constraints";
+    }
     matches!(
         name,
         "cleanup.policy"
@@ -3262,7 +3273,20 @@ mod tests {
     fn topic_config_capture_allowlist_excludes_unknown_entries() {
         assert!(super::is_recovery_topic_config("cleanup.policy"));
         assert!(super::is_recovery_topic_config("min.insync.replicas"));
+        assert!(super::is_recovery_topic_config("message.format.version"));
         assert!(!super::is_recovery_topic_config("vendor.secret.option"));
+        // Confluent topic settings, but not the source's rack placement.
+        assert!(super::is_recovery_topic_config(
+            "confluent.value.schema.validation"
+        ));
+        assert!(super::is_recovery_topic_config(
+            "confluent.key.subject.name.strategy"
+        ));
+        assert!(super::is_recovery_topic_config("confluent.tier.enable"));
+        assert!(!super::is_recovery_topic_config(
+            "confluent.placement.constraints"
+        ));
+        assert!(!super::is_recovery_topic_config("confluent"));
     }
 
     #[test]

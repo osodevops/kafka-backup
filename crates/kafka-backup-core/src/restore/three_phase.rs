@@ -518,6 +518,8 @@ mod tests {
             records_dropped_by_filter: 0,
             records_tombstoned_by_filter: 0,
             record_filter: None,
+            topic_configs_skipped: Vec::new(),
+            topic_configs_adjusted: Vec::new(),
         }
     }
 

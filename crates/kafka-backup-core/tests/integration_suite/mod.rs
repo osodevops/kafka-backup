@@ -10,6 +10,7 @@
 //! - TLS Security: SSL/TLS certificate handling tests
 //! - Snapshot Backup: stop_at_current_offsets feature tests
 //! - Performance Issues: Issue #29 constant lag and throughput tests
+//! - Topic configuration restore into Kafka 4.x: skip / fail policies
 //! - Issue #144: OFFSET_OUT_OF_RANGE recovery and data-gap recording
 //! - Issue #146: connection-error classification and reconnect (no Docker)
 //! - Issue #148: consumer group offsets applied in Phase 3 after restore
@@ -56,5 +57,6 @@ pub mod sasl_tests;
 pub mod schema_id_rewrite_restore;
 pub mod snapshot_backup;
 pub mod tls_tests;
+pub mod topic_config_compat;
 pub mod transactional_producer;
 pub mod validation;

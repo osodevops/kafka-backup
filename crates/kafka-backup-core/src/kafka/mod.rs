@@ -15,8 +15,9 @@ pub mod transactions;
 
 pub use crate::config::IsolationLevel;
 pub use admin::{
-    create_topics, delete_records, describe_configs, incremental_alter_configs, ConfigChange,
-    ConfigEntry, ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
+    create_topics, delete_records, describe_configs, incremental_alter_configs,
+    incremental_alter_configs_per_resource, ConfigChange, ConfigChangeResult, ConfigEntry,
+    ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
 };
 pub use client::{KafkaClient, RESPONSE_TIMEOUT_SECS, WRITE_TIMEOUT_SECS};
 pub use connection_error::{is_connection_error, is_connection_io_kind};

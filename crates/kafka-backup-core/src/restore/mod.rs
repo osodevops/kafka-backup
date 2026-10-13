@@ -10,6 +10,7 @@ pub mod preflight;
 pub mod repartition;
 mod telemetry;
 pub mod three_phase;
+mod topic_configs;
 
 pub use engine::{RestoreEngine, RestoreProgress};
 pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};
