@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and records it within the new `backup.shutdown_grace_secs` (default 30),
     and the manifest is saved before the checkpoints and job status;
   - writing a segment key the manifest already lists fails loudly.
+- The filesystem storage backend writes objects atomically (a temporary
+  file in the same directory, fsynced, then renamed into place). It used to
+  truncate the target first, so a crash mid-write could leave an empty
+  `manifest.json`, which the next run overwrote with only its own segments.
+  Leftover temporary files are ignored by listings.
+- A backup run whose stored `manifest.json` is unparseable now fails with a
+  clear error instead of overwriting it (which orphaned every listed
+  segment).
 - The stored `offsets.db` is preferred over a non-empty local database file
   (which could be a stale leftover ahead of storage). A stale SQLite WAL is
   never replayed onto the loaded copy.

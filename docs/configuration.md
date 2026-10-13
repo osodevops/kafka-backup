@@ -523,7 +523,9 @@ not from a separate checkpoint:
   a local database file.
 - A crash, an upload failure or an aborted shutdown therefore costs at most
   a re-read of what was not yet recorded in a saved manifest — never a
-  silent hole. On a fetch error the records already fetched are written as a
+  silent hole. Every backend replaces `manifest.json` atomically (the
+  filesystem backend writes a temporary file and renames it), and a run
+  refuses to start over an unparseable manifest rather than overwrite it. On a fetch error the records already fetched are written as a
   final segment before the run fails; on a graceful shutdown every partition
   flushes within `shutdown_grace_secs`.
 

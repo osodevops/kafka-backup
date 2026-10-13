@@ -37,6 +37,31 @@ impl FilesystemBackend {
     }
 }
 
+/// Marks the temporary files `put` writes before renaming them into place.
+const TEMP_MARKER: &str = ".kb-tmp-";
+
+/// `{dir}/.{name}.kb-tmp-{pid}-{n}`: same directory (so the rename is
+/// atomic), hidden, and unique per process and call.
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}{TEMP_MARKER}{}-{n}", std::process::id()))
+}
+
+/// A temp file from an in-progress or abandoned `put`.
+fn is_temp_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .map(|n| {
+            let n = n.to_string_lossy();
+            n.starts_with('.') && n.contains(TEMP_MARKER)
+        })
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
     fn backend_name(&self) -> &str {
@@ -53,19 +78,36 @@ impl StorageBackend for FilesystemBackend {
             })?;
         }
 
-        // Write data to file
-        let mut file = fs::File::create(&path).await.map_err(|e| {
-            StorageError::Backend(format!("Failed to create file {}: {}", path.display(), e))
-        })?;
-
-        file.write_all(&data).await.map_err(|e| {
-            StorageError::Backend(format!("Failed to write to file {}: {}", path.display(), e))
-        })?;
-
-        file.flush().await.map_err(|e| {
-            StorageError::Backend(format!("Failed to flush file {}: {}", path.display(), e))
-        })?;
-
+        // Write a temporary file next to the target, make it durable, then
+        // rename it into place: readers see the old object or the new one,
+        // never a truncated one — like an object-store PUT. A crash before
+        // the rename leaves only a temp file, which `list` ignores.
+        let tmp = temp_path(&path);
+        let written = async {
+            let mut file = fs::File::create(&tmp).await.map_err(|e| {
+                StorageError::Backend(format!("Failed to create file {}: {}", tmp.display(), e))
+            })?;
+            file.write_all(&data).await.map_err(|e| {
+                StorageError::Backend(format!("Failed to write to file {}: {}", tmp.display(), e))
+            })?;
+            file.sync_all().await.map_err(|e| {
+                StorageError::Backend(format!("Failed to sync file {}: {}", tmp.display(), e))
+            })?;
+            drop(file);
+            fs::rename(&tmp, &path).await.map_err(|e| {
+                StorageError::Backend(format!(
+                    "Failed to move {} into place at {}: {}",
+                    tmp.display(),
+                    path.display(),
+                    e
+                ))
+            })
+        }
+        .await;
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        written?;
         Ok(())
     }
 
@@ -117,6 +159,8 @@ impl StorageBackend for FilesystemBackend {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
+                } else if is_temp_file(&path) {
+                    continue;
                 } else if let Some(key) = self.path_to_key(&path) {
                     results.push(key);
                 }
@@ -227,6 +271,53 @@ impl StorageBackend for FilesystemBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A put replaces the object atomically: it writes a temporary file next
+    /// to the target and renames it into place, so a crash mid-write can
+    /// never leave a truncated object (e.g. an empty manifest.json) behind.
+    #[tokio::test]
+    async fn put_replaces_atomically_and_leaves_no_temp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(temp_dir.path().to_path_buf());
+
+        backend
+            .put("b/manifest.json", Bytes::from("v1"))
+            .await
+            .unwrap();
+        backend
+            .put("b/manifest.json", Bytes::from("version-2"))
+            .await
+            .unwrap();
+        assert_eq!(backend.get("b/manifest.json").await.unwrap(), "version-2");
+
+        let names: Vec<String> = std::fs::read_dir(temp_dir.path().join("b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["manifest.json".to_string()]);
+    }
+
+    /// What a crash between writing the temporary file and renaming it
+    /// leaves behind: the old object intact and a stray temp file that
+    /// listings ignore.
+    #[tokio::test]
+    async fn abandoned_temp_file_is_invisible() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(temp_dir.path().to_path_buf());
+        backend
+            .put("b/manifest.json", Bytes::from("good"))
+            .await
+            .unwrap();
+
+        let stray = temp_dir
+            .path()
+            .join("b")
+            .join(format!(".manifest.json{}1-1", TEMP_MARKER));
+        std::fs::write(&stray, b"").unwrap();
+
+        assert_eq!(backend.get("b/manifest.json").await.unwrap(), "good");
+        assert_eq!(backend.list("b").await.unwrap(), vec!["b/manifest.json"]);
+    }
 
     #[tokio::test]
     async fn test_put_and_get() {

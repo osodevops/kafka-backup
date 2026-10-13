@@ -933,23 +933,8 @@ impl BackupEngine {
     }
 
     /// The manifest stored by earlier runs, or `None` for a new backup set.
-    /// A read error is returned (#218); an unparseable manifest is logged
-    /// and treated as absent, as the save path does.
     async fn load_stored_manifest(&self) -> Result<Option<BackupManifest>> {
-        let key = format!("{}/manifest.json", self.config.backup_id);
-        let Some(data) = crate::storage::get_if_exists(self.storage.as_ref(), &key).await? else {
-            return Ok(None);
-        };
-        match serde_json::from_slice(&data) {
-            Ok(manifest) => Ok(Some(manifest)),
-            Err(e) => {
-                warn!(
-                    "Stored manifest {} is unparseable ({}); resuming from the offset store",
-                    key, e
-                );
-                Ok(None)
-            }
-        }
+        load_stored_manifest(self.storage.as_ref(), &self.config.backup_id).await
     }
 
     /// Bring offset-store checkpoints in line with the stored manifest. A
@@ -2217,6 +2202,27 @@ async fn join_segment_flush(
     handle
         .await
         .map_err(|e| Error::Compression(format!("segment flush task failed: {e}")))?
+}
+
+/// Load `{backup_id}/manifest.json` at startup. Missing means a new backup
+/// set. A read error fails (#218), and so does an unparseable manifest: it
+/// is the only record of which segments the set holds, and saving over it
+/// would orphan every one of them.
+async fn load_stored_manifest(
+    storage: &dyn StorageBackend,
+    backup_id: &str,
+) -> Result<Option<BackupManifest>> {
+    let key = format!("{}/manifest.json", backup_id);
+    let Some(data) = crate::storage::get_if_exists(storage, &key).await? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&data).map(Some).map_err(|e| {
+        Error::Manifest(format!(
+            "stored manifest {key} is unparseable ({e}); refusing to back up, because saving \
+             would replace it and orphan every segment it lists. Restore it (e.g. from bucket \
+             versioning) or use a new backup_id"
+        ))
+    })
 }
 
 async fn save_manifest_snapshot(
@@ -3645,6 +3651,30 @@ mod tests {
         assert!(result.is_err(), "a failed manifest read must fail the save");
         assert_eq!(storage.puts().len(), puts, "no PUT after a failed read");
         assert_eq!(stored_topics(&storage).await, vec!["alpha"]);
+    }
+
+    #[tokio::test]
+    async fn stored_manifest_loading_distinguishes_missing_unreadable_and_corrupt() {
+        let storage = crate::storage::testing::FaultyStorage::new();
+        assert!(load_stored_manifest(&storage, "b").await.unwrap().is_none());
+
+        save_manifest_snapshot(&storage, "b", manifest_with("alpha"))
+            .await
+            .unwrap();
+        let loaded = load_stored_manifest(&storage, "b").await.unwrap().unwrap();
+        assert_eq!(loaded.topics[0].name, "alpha");
+
+        storage.deny_reads("b/manifest.json");
+        assert!(load_stored_manifest(&storage, "b").await.is_err());
+        storage.heal();
+
+        // A torn or corrupt manifest must stop the run, not be overwritten.
+        storage
+            .put("b/manifest.json", Bytes::from_static(b""))
+            .await
+            .unwrap();
+        let err = load_stored_manifest(&storage, "b").await.unwrap_err();
+        assert!(err.to_string().contains("unparseable"), "{err}");
     }
 
     #[tokio::test]
