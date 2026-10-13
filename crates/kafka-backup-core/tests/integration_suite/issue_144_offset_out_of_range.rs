@@ -177,7 +177,10 @@ async fn test_backup_recovers_from_offset_out_of_range_and_records_gap() {
         .expect("DeleteRecords should succeed");
 
     for p in 0..PARTITIONS {
-        let (earliest, latest) = client.get_offsets(topic, p).await.expect("get_offsets");
+        let (earliest, latest) = client
+            .get_offsets(topic, p, kafka_backup_core::IsolationLevel::ReadUncommitted)
+            .await
+            .expect("get_offsets");
         assert_eq!(earliest, new_log_start, "partition {p}: log start offset");
         assert_eq!(
             latest,

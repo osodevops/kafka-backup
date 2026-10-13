@@ -51,6 +51,8 @@ pub struct SealedSegment {
     end_timestamp: i64,
     covered_start: i64,
     covered_end: i64,
+    control_records_skipped: u64,
+    aborted_records_dropped: u64,
 }
 
 impl SealedSegment {
@@ -172,6 +174,8 @@ impl SegmentFlusher {
             uploaded_at,
             covered_start_offset: Some(sealed.covered_start),
             covered_end_offset: Some(sealed.covered_end),
+            control_records_skipped: sealed.control_records_skipped,
+            aborted_records_dropped: sealed.aborted_records_dropped,
         };
 
         info!(
@@ -216,6 +220,11 @@ pub struct SegmentWriter {
     /// Highest source offset passed so far (records added or fetch position
     /// advanced via [`extend_coverage`](SegmentWriter::extend_coverage)).
     coverage_end: Option<i64>,
+    /// Transaction markers passed over since the last seal (see
+    /// [`note_skipped`](SegmentWriter::note_skipped)).
+    pending_control_skipped: u64,
+    /// Aborted records dropped since the last seal.
+    pending_aborted_dropped: u64,
 }
 
 impl SegmentWriter {
@@ -252,6 +261,8 @@ impl SegmentWriter {
             uncompressed_bytes: 0,
             coverage_start: None,
             coverage_end: None,
+            pending_control_skipped: 0,
+            pending_aborted_dropped: 0,
         }
     }
 
@@ -278,6 +289,24 @@ impl SegmentWriter {
                     .map_or(last_offset, |e| e.max(last_offset)),
             );
         }
+    }
+
+    /// Record transaction markers and aborted records a `read_committed`
+    /// fetch passed over at offsets the next sealed segment will cover (call
+    /// before adding the records that follow them). They are attributed to
+    /// that segment's [`SegmentMetadata::control_records_skipped`] /
+    /// [`SegmentMetadata::aborted_records_dropped`]; until then they are
+    /// reported by [`pending_skipped`](Self::pending_skipped).
+    pub fn note_skipped(&mut self, control_records: u64, aborted_records: u64) {
+        self.pending_control_skipped += control_records;
+        self.pending_aborted_dropped += aborted_records;
+    }
+
+    /// `(control records, aborted records)` noted since the last seal: the
+    /// counts of the [`uncovered_tail`](Self::uncovered_tail) when nothing
+    /// is buffered.
+    pub fn pending_skipped(&self) -> (u64, u64) {
+        (self.pending_control_skipped, self.pending_aborted_dropped)
     }
 
     /// First source offset the next sealed segment will account for.
@@ -308,6 +337,8 @@ impl SegmentWriter {
         );
         self.coverage_start = Some(offset);
         self.coverage_end = Some(offset - 1);
+        // Counts noted before the gap stay pending: the next sealed segment
+        // takes them over, so no count is lost.
     }
 
     /// Add a record to the current segment
@@ -421,6 +452,8 @@ impl SegmentWriter {
             end_timestamp: self.end_timestamp.unwrap_or(0),
             covered_start,
             covered_end,
+            control_records_skipped: std::mem::take(&mut self.pending_control_skipped),
+            aborted_records_dropped: std::mem::take(&mut self.pending_aborted_dropped),
         };
         self.reset();
         self.coverage_start = Some(covered_end + 1);
@@ -676,6 +709,57 @@ mod tests {
         assert_eq!(writer.uncovered_tail(), None);
         writer.add_record(rec(40)).unwrap();
         assert_eq!(writer.seal("a").unwrap().covered(), (40, 40));
+    }
+
+    #[tokio::test]
+    async fn skipped_transaction_records_are_attributed_to_the_next_sealed_segment() {
+        let mut writer = memory_writer();
+        writer.begin_coverage(0, -1);
+        // Offsets 0..=2 an aborted transaction, 3 its marker, then records.
+        writer.note_skipped(1, 3);
+        writer.add_record(rec(4)).unwrap();
+        writer.add_record(rec(5)).unwrap();
+        // A commit marker after the records, in the same fetch.
+        writer.note_skipped(1, 0);
+        writer.extend_coverage(6);
+        assert_eq!(writer.pending_skipped(), (2, 3));
+        let meta = writer.flush("a").await.unwrap().unwrap();
+        assert_eq!((meta.covered_start(), meta.covered_end()), (0, 6));
+        assert_eq!(
+            (meta.control_records_skipped, meta.aborted_records_dropped),
+            (2, 3)
+        );
+        assert_eq!(writer.pending_skipped(), (0, 0), "taken by the seal");
+
+        // A marker-only tail: reported with the uncovered tail, then taken
+        // over by the segment that absorbs it.
+        writer.note_skipped(1, 0);
+        writer.extend_coverage(7);
+        assert_eq!(writer.uncovered_tail(), Some((7, 7)));
+        assert_eq!(writer.pending_skipped(), (1, 0));
+        writer.add_record(rec(8)).unwrap();
+        let meta = writer.flush("b").await.unwrap().unwrap();
+        assert_eq!((meta.covered_start(), meta.covered_end()), (7, 8));
+        assert_eq!(meta.control_records_skipped, 1);
+    }
+
+    #[test]
+    fn counts_noted_before_a_gap_are_carried_to_the_next_segment() {
+        let mut writer = memory_writer();
+        writer.begin_coverage(0, -1);
+        writer.note_skipped(1, 2);
+        writer.extend_coverage(3);
+        writer.skip_coverage_to(10);
+        assert_eq!(writer.pending_skipped(), (1, 2));
+        writer.add_record(rec(10)).unwrap();
+        let sealed = writer.seal("a").unwrap();
+        assert_eq!(
+            (
+                sealed.control_records_skipped,
+                sealed.aborted_records_dropped
+            ),
+            (1, 2)
+        );
     }
 
     #[tokio::test]

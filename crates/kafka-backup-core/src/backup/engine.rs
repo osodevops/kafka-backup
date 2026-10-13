@@ -11,10 +11,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
-use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset, TopicSelection};
+use crate::config::{
+    BackupOptions, CompressionType, Config, IsolationLevel, Mode, StartOffset, TopicSelection,
+};
 use crate::error::KafkaError;
 use crate::health::HealthCheck;
-use crate::kafka::{ConfigResourceType, PartitionFetcher, PartitionLeaderRouter, TopicMetadata};
+use crate::kafka::{
+    ConfigResourceType, FetchResponse, PartitionFetcher, PartitionLeaderRouter, TopicMetadata,
+};
 use crate::manifest::{
     BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, PartitionBackup, SegmentMetadata,
 };
@@ -46,6 +50,10 @@ pub struct BackupEngine {
 /// `(topic, partition)`.
 type PartitionKey = (String, i32);
 
+/// Transaction markers and aborted records a `read_committed` backup passed
+/// over in a range of offsets: `(control records, aborted records)`.
+type TxnSkips = (u64, u64);
+
 /// What a saved manifest accounts for in one partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DurableReach {
@@ -54,15 +62,27 @@ struct DurableReach {
     /// [`PartitionBackup::explicit_reach`]: the next segment's covered range
     /// starts at `explicit + 1`, absorbing a trailing coverage-only advance.
     explicit: Option<i64>,
+    /// Transaction records skipped in that trailing coverage-only range
+    /// ([`PartitionBackup::tail_control_records_skipped`] /
+    /// [`PartitionBackup::tail_aborted_records_dropped`]); the next segment
+    /// takes them over.
+    tail: TxnSkips,
 }
 
 impl DurableReach {
+    /// Combine with a newer staged value: the furthest reach wins, and the
+    /// tail counts belong to it (the newer value on a tie).
     fn merge(self, other: DurableReach) -> DurableReach {
         DurableReach {
             reach: self.reach.max(other.reach),
             explicit: match (self.explicit, other.explicit) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
+            },
+            tail: if self.reach > other.reach {
+                self.tail
+            } else {
+                other.tail
             },
         }
     }
@@ -139,6 +159,10 @@ impl ManifestPersistence {
                     let entry = DurableReach {
                         reach,
                         explicit: partition.explicit_reach(),
+                        tail: (
+                            partition.tail_control_records_skipped,
+                            partition.tail_aborted_records_dropped,
+                        ),
                     };
                     durable
                         .entry((topic.name.clone(), partition.partition_id))
@@ -200,20 +224,26 @@ impl ManifestPersistence {
             part.covered_through
                 .map_or(covered_end, |c| c.max(covered_end)),
         );
+        // The segment absorbed any trailing range (and took its counts).
+        part.tail_control_records_skipped = 0;
+        part.tail_aborted_records_dropped = 0;
         self.listed_keys.lock().insert(key);
         self.stage_locked(
             (topic.to_string(), partition),
             DurableReach {
                 reach: covered_end,
                 explicit: Some(covered_end),
+                tail: (0, 0),
             },
         );
     }
 
     /// Stage a coverage-only advance: every offset through `covered_end`
     /// is in a staged segment or held no record. Only valid with nothing
-    /// buffered and no upload in flight for the partition.
-    async fn stage_coverage(&self, topic: &str, partition: i32, covered_end: i64) {
+    /// buffered and no upload in flight for the partition. `tail` counts the
+    /// transaction records skipped in the trailing range since the last
+    /// segment.
+    async fn stage_coverage(&self, topic: &str, partition: i32, covered_end: i64, tail: TxnSkips) {
         let mut manifest = self.manifest.lock().await;
         let part = manifest
             .get_or_create_topic(topic)
@@ -222,18 +252,26 @@ impl ManifestPersistence {
             part.covered_through
                 .map_or(covered_end, |c| c.max(covered_end)),
         );
+        (
+            part.tail_control_records_skipped,
+            part.tail_aborted_records_dropped,
+        ) = tail;
         self.stage_locked(
             (topic.to_string(), partition),
             DurableReach {
                 reach: covered_end,
                 explicit: None,
+                tail,
             },
         );
     }
 
     /// Stage a recorded offset gap. Its end (exclusive) is accounted for, so
-    /// it must only be staged after everything before it.
-    async fn stage_gap(&self, topic: &str, partition: i32, gap: OffsetGap) {
+    /// it must only be staged after everything before it. `tail` counts the
+    /// transaction records skipped since the last segment (just before the
+    /// gap); they stay with the partition until the next segment takes them
+    /// over.
+    async fn stage_gap(&self, topic: &str, partition: i32, gap: OffsetGap, tail: TxnSkips) {
         let last = gap.end_offset - 1;
         let mut manifest = self.manifest.lock().await;
         let part = manifest
@@ -241,11 +279,16 @@ impl ManifestPersistence {
             .get_or_create_partition(partition);
         part.add_gap(gap);
         part.covered_through = Some(part.covered_through.map_or(last, |c| c.max(last)));
+        (
+            part.tail_control_records_skipped,
+            part.tail_aborted_records_dropped,
+        ) = tail;
         self.stage_locked(
             (topic.to_string(), partition),
             DurableReach {
                 reach: last,
                 explicit: Some(last),
+                tail,
             },
         );
     }
@@ -462,6 +505,7 @@ impl BackupEngine {
 
         // Initialize offset store for continuous backups or when explicitly configured
         let backup_opts = config.backup.clone().unwrap_or_default();
+        manifest.isolation_level = Some(backup_opts.isolation_level);
 
         // Initialize circuit breakers (Kafka breaker from backup options —
         // advisory health signal; see CircuitBreakerSettings / issue #197).
@@ -613,7 +657,14 @@ impl BackupEngine {
 
         // The stored manifest is the source of truth for where every
         // partition resumes (I3). A failed read fails the run (#218).
+        let isolation = self
+            .config
+            .backup
+            .as_ref()
+            .map(|b| b.isolation_level)
+            .unwrap_or_default();
         if let Some(stored) = self.load_stored_manifest().await? {
+            warn_on_isolation_change(&self.config.backup_id, stored.isolation_level, isolation);
             self.manifest_persistence.seed(&stored);
         }
         self.reconcile_checkpoints().await?;
@@ -644,6 +695,7 @@ impl BackupEngine {
             backup_opts.max_concurrent_partitions, backup_opts.poll_interval_ms
         );
         info!("{}", describe_offset_headers(&backup_opts));
+        info!("{}", describe_isolation_level(backup_opts.isolation_level));
 
         // Run backup loop
         loop {
@@ -688,10 +740,21 @@ impl BackupEngine {
             let snapshot_ranges: Option<HashMap<(String, i32), SnapshotRange>> =
                 if backup_opts.stop_at_current_offsets {
                     Some(
-                        self.capture_snapshot_offsets(&topics_metadata, &backup_opts.start_offset)
-                            .await?,
+                        self.capture_snapshot_offsets(
+                            &topics_metadata,
+                            &backup_opts.start_offset,
+                            backup_opts.isolation_level,
+                        )
+                        .await?,
                     )
                 } else {
+                    if backup_opts.isolation_level == IsolationLevel::ReadCommitted {
+                        // Partitions caught up to their LSO do not fetch, so
+                        // refresh the LSO lag of every partition here (two
+                        // batched requests per broker) to keep a hanging
+                        // transaction visible.
+                        self.observe_lso_lag(&topics_metadata).await;
+                    }
                     None
                 };
 
@@ -1338,9 +1401,11 @@ impl BackupEngine {
     /// Capture current offsets for all partitions (snapshot mode).
     ///
     /// Returns the planned offset range for each partition: the log start and
-    /// high watermark at capture time plus the offset this run resumes from.
-    /// The high watermarks provide a consistent snapshot point - all partitions
-    /// will backup to the same logical point in time.
+    /// end offset at capture time plus the offset this run resumes from. The
+    /// end offsets provide a consistent snapshot point - all partitions will
+    /// backup to the same logical point in time. Under read_committed the end
+    /// is the last stable offset (records of open transactions are left for a
+    /// later run); the manifest records it next to the high watermark.
     ///
     /// Uses batched ListOffsets requests (one per broker per timestamp) instead
     /// of per-partition requests. For 8,660 partitions across 3 brokers, this
@@ -1354,26 +1419,40 @@ impl BackupEngine {
         &self,
         topics_metadata: &[TopicMetadata],
         start_offset: &StartOffset,
+        isolation: IsolationLevel,
     ) -> Result<HashMap<(String, i32), SnapshotRange>> {
         info!(
-            "Snapshot mode: capturing offsets for {} topics",
-            topics_metadata.len()
+            "Snapshot mode: capturing offsets for {} topics (isolation={})",
+            topics_metadata.len(),
+            isolation
         );
 
         let snapshot_start = Instant::now();
 
-        // Build the full list of (topic, partition) pairs
-        let all_partitions: Vec<(String, i32)> = topics_metadata
-            .iter()
-            .flat_map(|t| {
-                t.partitions
-                    .iter()
-                    .map(move |p| (t.name.clone(), p.partition_id))
-            })
-            .collect();
+        let all_partitions = all_partitions(topics_metadata);
 
-        // Batch fetch all offsets (grouped by leader broker)
-        let offsets = self.router.batch_get_all_offsets(&all_partitions).await?;
+        // Batch fetch all offsets (grouped by leader broker). Under
+        // read_committed the end is the last stable offset: records of
+        // transactions still open are left for a later run.
+        let offsets = self
+            .router
+            .batch_get_all_offsets(&all_partitions, isolation)
+            .await?;
+        // The high watermark at capture time, recorded next to the end. Read
+        // after the LSO, so it is never below it.
+        let high_watermarks: HashMap<(String, i32), i64> = match isolation {
+            IsolationLevel::ReadUncommitted => offsets
+                .iter()
+                .map(|(key, (_, latest))| (key.clone(), *latest))
+                .collect(),
+            IsolationLevel::ReadCommitted => {
+                self.router
+                    .batch_get_latest_offsets(&all_partitions, IsolationLevel::ReadUncommitted)
+                    .await?
+            }
+        };
+        self.record_snapshot_capture(&offsets, &high_watermarks)
+            .await;
 
         let checkpoints = self.load_checkpoints().await?;
         let ranges = plan_snapshot_ranges(offsets, &checkpoints, start_offset);
@@ -1401,6 +1480,86 @@ impl BackupEngine {
         }
 
         Ok(ranges)
+    }
+
+    /// Record the snapshot's end and the high watermark at capture time in
+    /// the manifest, set the LSO-lag gauges, and log partitions held back by
+    /// open transactions.
+    async fn record_snapshot_capture(
+        &self,
+        offsets: &HashMap<(String, i32), (i64, i64)>,
+        high_watermarks: &HashMap<(String, i32), i64>,
+    ) {
+        let mut held_back = Vec::new();
+        {
+            let mut manifest = self.manifest.lock().await;
+            for ((topic, partition), (earliest, end)) in offsets {
+                let high_watermark = high_watermarks
+                    .get(&(topic.clone(), *partition))
+                    .copied()
+                    .unwrap_or(*end)
+                    .max(*end);
+                if high_watermark > *end {
+                    held_back.push((topic.clone(), *partition, *end, high_watermark));
+                }
+                // An empty partition has nothing to record (and large
+                // clusters have many): keep it out of the manifest.
+                if *end <= *earliest && high_watermark <= *end {
+                    continue;
+                }
+                let part = manifest
+                    .get_or_create_topic(topic)
+                    .get_or_create_partition(*partition);
+                part.snapshot_end_offset = Some(*end);
+                part.high_watermark_at_capture = Some(high_watermark);
+            }
+        }
+        if let Some(ref prom) = self.prometheus_metrics {
+            for ((topic, partition), (_, end)) in offsets {
+                let high_watermark = high_watermarks
+                    .get(&(topic.clone(), *partition))
+                    .copied()
+                    .unwrap_or(*end);
+                prom.record_lso_lag(
+                    topic,
+                    *partition,
+                    &self.config.backup_id,
+                    high_watermark - end,
+                );
+            }
+        }
+        log_open_transactions(&held_back);
+    }
+
+    /// Refresh `kafka_backup_lso_lag` for every partition (non-snapshot
+    /// read_committed runs). Best effort: a failure only logs.
+    async fn observe_lso_lag(&self, topics_metadata: &[TopicMetadata]) {
+        let Some(ref prom) = self.prometheus_metrics else {
+            return;
+        };
+        let partitions = all_partitions(topics_metadata);
+        let observed = async {
+            let lso = self
+                .router
+                .batch_get_latest_offsets(&partitions, IsolationLevel::ReadCommitted)
+                .await?;
+            let hw = self
+                .router
+                .batch_get_latest_offsets(&partitions, IsolationLevel::ReadUncommitted)
+                .await?;
+            Ok::<_, Error>((lso, hw))
+        }
+        .await;
+        match observed {
+            Ok((lso, hw)) => {
+                for ((topic, partition), lso) in &lso {
+                    if let Some(hw) = hw.get(&(topic.clone(), *partition)) {
+                        prom.record_lso_lag(topic, *partition, &self.config.backup_id, hw - lso);
+                    }
+                }
+            }
+            Err(e) => debug!("Could not refresh the LSO lag (non-fatal): {}", e),
+        }
     }
 
     /// Last durable offset per partition: the manifest reach, or — only for
@@ -1432,7 +1591,9 @@ struct SnapshotRange {
     /// First offset this run fetches: the successor of the checkpointed offset
     /// when one exists, otherwise the configured start position.
     start: i64,
-    /// High watermark at capture time; the run stops here.
+    /// End offset at capture time — the last stable offset under
+    /// read_committed, the high watermark under read_uncommitted; the run
+    /// stops here.
     latest: i64,
 }
 
@@ -1679,9 +1840,11 @@ impl BackupPartitionContext {
                 (range.earliest, range.start, range.latest)
             }
             None => {
+                // Under read_committed "latest" is the last stable offset:
+                // the run stops where an open transaction begins.
                 let (earliest, latest) = self
                     .router
-                    .partition_offsets(&self.topic, self.partition)
+                    .partition_offsets(&self.topic, self.partition, self.isolation())
                     .await?;
                 let start_offset = self.resolve_start_offset(earliest).await?;
                 (earliest, start_offset, latest)
@@ -1694,8 +1857,13 @@ impl BackupPartitionContext {
         // manifest: the offsets we go back for may already be gone.
         if self.resume_beyond_durable && earliest > start_offset && start_offset < end_offset {
             let gap_start = pw.writer.coverage_start().unwrap_or(start_offset);
-            self.record_offset_gap(gap_start, earliest, OffsetGapReason::ResumeBeyondDurable)
-                .await;
+            self.record_offset_gap(
+                gap_start,
+                earliest,
+                OffsetGapReason::ResumeBeyondDurable,
+                pw.writer.pending_skipped(),
+            )
+            .await;
             pw.writer.skip_coverage_to(earliest);
             start_offset = earliest;
         }
@@ -1722,8 +1890,14 @@ impl BackupPartitionContext {
         }
 
         let mut current_offset = start_offset;
+        // LSO and high watermark from the latest fetch response.
+        let mut last_stable = None;
 
-        // Fetch and store records in segments
+        // Fetch and store records in segments. Under read_committed the
+        // end is a last stable offset, which the fetch never reads past, and
+        // a fetch whose batches were all filtered out (markers, aborted
+        // records) still advances `next_offset`, so this terminates exactly
+        // as it does at a high watermark.
         while current_offset < end_offset {
             if self.cancel.is_cancelled() {
                 info!(
@@ -1735,7 +1909,7 @@ impl BackupPartitionContext {
 
             let fetch_result = self.fetch_records(current_offset, end_offset).await;
 
-            let (records, next_offset) = match fetch_result {
+            let fetched = match fetch_result {
                 Ok(data) => data,
                 Err(e) => {
                     // OFFSET_OUT_OF_RANGE (issue #144): the offset we want was
@@ -1753,7 +1927,7 @@ impl BackupPartitionContext {
                         );
                         match self
                             .router
-                            .partition_offsets(&self.topic, self.partition)
+                            .partition_offsets(&self.topic, self.partition, self.isolation())
                             .await
                         {
                             Ok((new_earliest, _)) if new_earliest > current_offset => {
@@ -1774,6 +1948,7 @@ impl BackupPartitionContext {
                                     gap_start,
                                     gap_end,
                                     OffsetGapReason::OffsetOutOfRange,
+                                    pw.writer.pending_skipped(),
                                 )
                                 .await;
                                 pw.writer.skip_coverage_to(new_earliest);
@@ -1829,16 +2004,47 @@ impl BackupPartitionContext {
             self.kafka_cb.record_success();
             self.health.mark_healthy("kafka");
 
+            let records = &fetched.records;
+            let next_offset = fetched.next_offset;
+            if fetched.last_stable_offset >= 0 {
+                last_stable = Some((fetched.last_stable_offset, fetched.high_watermark));
+            }
+            if let Some(ref prom) = self.prometheus_metrics {
+                if fetched.last_stable_offset >= 0 {
+                    prom.record_lso_lag(
+                        &self.topic,
+                        self.partition,
+                        &self.backup_id,
+                        fetched.high_watermark - fetched.last_stable_offset,
+                    );
+                }
+                prom.record_transaction_skips(
+                    &self.backup_id,
+                    fetched.control_records_skipped,
+                    fetched.aborted_records_dropped,
+                );
+            }
+
             // A fetch can return zero records yet still advance the offset:
             // on compacted topics the log cleaner may have removed every
-            // record in the fetched batches. Only "no records and no
-            // progress" means we have reached the end of available data.
+            // record in the fetched batches, and under read_committed every
+            // batch may have been a marker or aborted. Only "no records and
+            // no progress" means we have reached the end of available data.
             if records.is_empty() && next_offset <= current_offset {
                 break;
             }
 
-            // Convert to binary records and add to writer
-            for record in &records {
+            // Convert to binary records and add to writer. Batches the
+            // read_committed filter passed over are counted against the
+            // segment whose covered range holds them: those before a record
+            // are noted before it is added (and so before any rotation it
+            // triggers).
+            let mut skipped = fetched.skipped.iter().peekable();
+            for record in records {
+                while let Some(batch) = skipped.next_if(|b| b.last_offset < record.offset) {
+                    pw.writer
+                        .note_skipped(batch.control_records, batch.aborted_records);
+                }
                 let binary_record = to_binary_record(record, &self.options);
                 pw.writer.add_record(binary_record)?;
 
@@ -1851,9 +2057,15 @@ impl BackupPartitionContext {
                 }
             }
 
+            for batch in skipped {
+                pw.writer
+                    .note_skipped(batch.control_records, batch.aborted_records);
+            }
+
             // Everything below next_offset has been added or held no record
-            // (compacted away, markers). Extend coverage after the records,
-            // so a rotation mid-batch never claims offsets of the next segment.
+            // (compacted away, markers, aborted records). Extend coverage
+            // after the records, so a rotation mid-batch never claims offsets
+            // of the next segment.
             pw.writer.extend_coverage(next_offset - 1);
 
             // Stage a finished upload promptly so the checkpoint can advance.
@@ -1907,6 +2119,21 @@ impl BackupPartitionContext {
         self.drain(&mut pw).await?;
         self.manifest_persistence.save_progress().await?;
 
+        if let Some((lso, high_watermark)) = last_stable {
+            if self.isolation() == IsolationLevel::ReadCommitted && lso < high_watermark {
+                // Debug only: transactions in flight are normal; a hanging
+                // one shows as a kafka_backup_lso_lag that stays up.
+                debug!(
+                    "{}:{}: stopped at the last stable offset {}; {} offsets below the high                      watermark {} belong to open transactions and are backed up once they                      complete",
+                    self.topic,
+                    self.partition,
+                    lso,
+                    high_watermark - lso,
+                    high_watermark
+                );
+            }
+        }
+
         if self.snapshot.is_some() {
             info!(
                 "Completed snapshot backup of {}:{} - {} segments (reached target offset {})",
@@ -1945,10 +2172,12 @@ impl BackupPartitionContext {
         match durable {
             // Resuming at the manifest reach: the first new segment covers
             // from the last explicit interval, absorbing a trailing
-            // coverage-only advance, so the intervals stay contiguous.
+            // coverage-only advance, so the intervals stay contiguous. It
+            // also takes over the transaction records counted in that range.
             Some(d) if d.reach + 1 == start_offset => {
                 let first_uncovered = d.explicit.map_or(start_offset, |e| e + 1);
                 writer.begin_coverage(first_uncovered.min(start_offset), d.reach);
+                writer.note_skipped(d.tail.0, d.tail.1);
             }
             _ => writer.begin_coverage(start_offset, start_offset - 1),
         }
@@ -1997,7 +2226,12 @@ impl BackupPartitionContext {
         if let Some((_, end)) = pw.writer.uncovered_tail() {
             if pw.staged_tail.is_none_or(|staged| end > staged) {
                 self.manifest_persistence
-                    .stage_coverage(&self.topic, self.partition, end)
+                    .stage_coverage(
+                        &self.topic,
+                        self.partition,
+                        end,
+                        pw.writer.pending_skipped(),
+                    )
                     .await;
                 pw.staged_tail = Some(end);
                 self.manifest_persistence.save_progress().await?;
@@ -2059,7 +2293,13 @@ impl BackupPartitionContext {
     /// from this backup: staged into the manifest (the caller has already
     /// staged everything before it), Prometheus counters, snapshot progress,
     /// and a best-effort manifest save so the gap survives a crash.
-    async fn record_offset_gap(&self, start_offset: i64, end_offset: i64, reason: OffsetGapReason) {
+    async fn record_offset_gap(
+        &self,
+        start_offset: i64,
+        end_offset: i64,
+        reason: OffsetGapReason,
+        tail: TxnSkips,
+    ) {
         let gap = OffsetGap {
             start_offset,
             end_offset,
@@ -2089,7 +2329,7 @@ impl BackupPartitionContext {
         );
 
         self.manifest_persistence
-            .stage_gap(&self.topic, self.partition, gap)
+            .stage_gap(&self.topic, self.partition, gap, tail)
             .await;
 
         if let Some(ref prom) = self.prometheus_metrics {
@@ -2127,17 +2367,24 @@ impl BackupPartitionContext {
         }
     }
 
-    async fn fetch_records(
-        &self,
-        start_offset: i64,
-        _end_offset: i64,
-    ) -> Result<(Vec<BackupRecord>, i64)> {
+    /// The configured transaction isolation for this partition's reads.
+    fn isolation(&self) -> IsolationLevel {
+        self.options.isolation_level
+    }
+
+    async fn fetch_records(&self, start_offset: i64, _end_offset: i64) -> Result<FetchResponse> {
         let max_bytes = effective_fetch_max_bytes(&self.options);
 
         // Fetch records using router (automatically routes to partition leader)
         let fetched = self
             .router
-            .fetch_partition(&self.topic, self.partition, start_offset, max_bytes)
+            .fetch_partition(
+                &self.topic,
+                self.partition,
+                start_offset,
+                max_bytes,
+                self.isolation(),
+            )
             .await?;
         failpoint!("backup::fetch::after");
         Ok(fetched)
@@ -2265,13 +2512,20 @@ async fn save_manifest_snapshot(
 ///   - Partitions only in current  → appended
 ///   - Partitions in both: segments deduplicated by (key, start_offset); existing wins on
 ///     conflict. Output sorted by start_offset. Offset gaps are unioned, deduplicated by
-///     start_offset. `covered_through` is the maximum of the two sides.
+///     start_offset. `covered_through` is the maximum of the two sides, and the trailing
+///     range's transaction counts come from the side that reaches furthest. The snapshot
+///     end and high watermark at capture come from `current` when it captured them.
+/// - `isolation_level` is the current run's.
 fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> BackupManifest {
     use std::collections::HashMap as HM;
 
     // Latest discovery pass wins: the field must be copied here or every
     // save_manifest (which starts from the stored manifest) would drop it.
     existing.missing_topics = current.missing_topics.clone();
+    // The most recent run's isolation level.
+    if current.isolation_level.is_some() {
+        existing.isolation_level = current.isolation_level;
+    }
 
     for cur_topic in current.topics {
         if let Some(ex_topic) = existing
@@ -2339,6 +2593,22 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                     for gap in cur_part.gaps {
                         ex_part.add_gap(gap);
                     }
+                    // The trailing range's transaction counts belong to the
+                    // side that reaches furthest: this run's when it staged
+                    // anything at or past the stored reach (a segment that
+                    // absorbed the stored tail has reset them to 0).
+                    let current_reaches_further =
+                        match (ex_part.covered_through, cur_part.covered_through) {
+                            (_, None) => false,
+                            (None, Some(_)) => true,
+                            (Some(a), Some(b)) => b >= a,
+                        };
+                    if current_reaches_further {
+                        ex_part.tail_control_records_skipped =
+                            cur_part.tail_control_records_skipped;
+                        ex_part.tail_aborted_records_dropped =
+                            cur_part.tail_aborted_records_dropped;
+                    }
                     // Coverage only ever moves forward: a stale in-memory
                     // value must not pull the stored reach back.
                     ex_part.covered_through =
@@ -2346,6 +2616,11 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                             (Some(a), Some(b)) => Some(a.max(b)),
                             (a, b) => a.or(b),
                         };
+                    // The most recent snapshot capture wins.
+                    if cur_part.snapshot_end_offset.is_some() {
+                        ex_part.snapshot_end_offset = cur_part.snapshot_end_offset;
+                        ex_part.high_watermark_at_capture = cur_part.high_watermark_at_capture;
+                    }
                 } else {
                     ex_topic.partitions.push(cur_part);
                 }
@@ -2490,6 +2765,93 @@ fn describe_offset_headers(options: &BackupOptions) -> String {
         offset_headers::X_ORIGINAL_OFFSET,
         offset_headers::X_ORIGINAL_TIMESTAMP,
     )
+}
+
+/// One-line startup summary of the transaction isolation the backup reads
+/// with.
+fn describe_isolation_level(isolation: IsolationLevel) -> String {
+    match isolation {
+        IsolationLevel::ReadCommitted => {
+            "isolation_level=read_committed (default): records of aborted transactions and \
+             transaction markers are not archived, and each partition is read up to its last \
+             stable offset (records of open transactions are archived once they commit); set \
+             backup.isolation_level: read_uncommitted to archive everything up to the high \
+             watermark as versions before 0.24 did"
+                .to_string()
+        }
+        IsolationLevel::ReadUncommitted => {
+            "isolation_level=read_uncommitted: every record up to the high watermark is archived, \
+             including records of aborted and open transactions and the transaction markers, \
+             which a restore writes back as ordinary records"
+                .to_string()
+        }
+    }
+}
+
+/// Warn when a backup set continues with a different isolation level than
+/// its earlier runs: the archive then mixes both.
+fn warn_on_isolation_change(
+    backup_id: &str,
+    stored: Option<IsolationLevel>,
+    configured: IsolationLevel,
+) -> bool {
+    // Manifests written before 0.24 have no field: they read uncommitted.
+    let previous = stored.unwrap_or(IsolationLevel::ReadUncommitted);
+    if previous == configured {
+        return false;
+    }
+    warn!(
+        "Backup set {} was written with isolation_level={}{} and continues with {}: segments \
+         written so far keep what they captured{}. Set backup.isolation_level: {} to keep the \
+         set uniform, or use a new backup_id",
+        backup_id,
+        previous,
+        if stored.is_none() {
+            " (versions before 0.24)"
+        } else {
+            ""
+        },
+        configured,
+        if previous == IsolationLevel::ReadUncommitted {
+            " (including any aborted records and transaction markers)"
+        } else {
+            ""
+        },
+        previous
+    );
+    true
+}
+
+/// Every `(topic, partition)` of the given topics.
+fn all_partitions(topics_metadata: &[TopicMetadata]) -> Vec<(String, i32)> {
+    topics_metadata
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| (t.name.clone(), p.partition_id))
+        })
+        .collect()
+}
+
+/// Log the partitions whose last stable offset was below the high watermark
+/// at snapshot capture: open transactions held the snapshot back there.
+fn log_open_transactions(held_back: &[(String, i32, i64, i64)]) {
+    if held_back.is_empty() {
+        return;
+    }
+    let held_offsets: i64 = held_back.iter().map(|(_, _, lso, hw)| hw - lso).sum();
+    info!(
+        "{} partition(s) have open transactions: this snapshot ends at their last stable offset, \
+         {} offsets below the high watermark are left for a later run (first: {}:{} LSO {} HW \
+         {}). A gap that never closes is a hanging transaction; alert on kafka_backup_lso_lag",
+        held_back.len(),
+        held_offsets,
+        held_back[0].0,
+        held_back[0].1,
+        held_back[0].2,
+        held_back[0].3
+    );
 }
 
 /// Convert a fetched record into the on-disk segment representation.
@@ -2996,6 +3358,8 @@ mod tests {
             uploaded_at: 0,
             covered_start_offset: None,
             covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
         }
     }
 
@@ -3006,6 +3370,10 @@ mod tests {
             gaps: Vec::new(),
             pruned: Vec::new(),
             covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }
     }
 
@@ -3532,6 +3900,94 @@ mod tests {
     }
 
     #[test]
+    fn merge_takes_the_current_isolation_level_and_snapshot_capture() {
+        let manifest = |isolation: Option<IsolationLevel>, capture: Option<(i64, i64)>| {
+            let mut part = make_partition(0, vec![make_segment("seg-a", 0, 9)]);
+            if let Some((end, hw)) = capture {
+                part.snapshot_end_offset = Some(end);
+                part.high_watermark_at_capture = Some(hw);
+            }
+            let mut m = BackupManifest::new("test".to_string());
+            m.isolation_level = isolation;
+            m.topics.push(make_topic("orders", Some(1), vec![part]));
+            m
+        };
+
+        // A legacy stored manifest continued by a read_committed run.
+        let merged = merge_manifests(
+            manifest(None, None),
+            manifest(Some(IsolationLevel::ReadCommitted), Some((10, 14))),
+        );
+        assert_eq!(merged.isolation_level, Some(IsolationLevel::ReadCommitted));
+        let part = &merged.topics[0].partitions[0];
+        assert_eq!(
+            (part.snapshot_end_offset, part.high_watermark_at_capture),
+            (Some(10), Some(14))
+        );
+
+        // A current side without a capture keeps the stored one.
+        let merged = merge_manifests(
+            manifest(Some(IsolationLevel::ReadCommitted), Some((10, 14))),
+            manifest(Some(IsolationLevel::ReadUncommitted), None),
+        );
+        assert_eq!(
+            merged.isolation_level,
+            Some(IsolationLevel::ReadUncommitted)
+        );
+        assert_eq!(merged.topics[0].partitions[0].snapshot_end_offset, Some(10));
+    }
+
+    #[test]
+    fn merge_keeps_the_tail_counts_of_the_side_that_reaches_furthest() {
+        let with_tail = |covered: Option<i64>, tail: (u64, u64)| {
+            let mut part = make_partition(0, vec![make_segment("seg-a", 0, 9)]);
+            part.covered_through = covered;
+            part.tail_control_records_skipped = tail.0;
+            part.tail_aborted_records_dropped = tail.1;
+            let mut m = BackupManifest::new("test".to_string());
+            m.topics.push(make_topic("orders", Some(1), vec![part]));
+            m
+        };
+        let tail_of = |m: &BackupManifest| {
+            let p = &m.topics[0].partitions[0];
+            (
+                p.tail_control_records_skipped,
+                p.tail_aborted_records_dropped,
+            )
+        };
+
+        // This run absorbed the stored tail into a segment: reset.
+        let merged = merge_manifests(with_tail(Some(15), (1, 3)), with_tail(Some(30), (0, 0)));
+        assert_eq!(tail_of(&merged), (0, 0));
+        // This run staged nothing for the partition: the stored tail stays.
+        let merged = merge_manifests(with_tail(Some(15), (1, 3)), with_tail(None, (0, 0)));
+        assert_eq!(tail_of(&merged), (1, 3));
+        // A stale in-memory value does not overwrite a further stored one.
+        let merged = merge_manifests(with_tail(Some(30), (2, 0)), with_tail(Some(15), (1, 3)));
+        assert_eq!(tail_of(&merged), (2, 0));
+    }
+
+    #[test]
+    fn isolation_change_on_a_continued_backup_set_is_reported() {
+        use IsolationLevel::{ReadCommitted, ReadUncommitted};
+        // Legacy manifests read uncommitted.
+        assert!(warn_on_isolation_change("b", None, ReadCommitted));
+        assert!(!warn_on_isolation_change("b", None, ReadUncommitted));
+        assert!(!warn_on_isolation_change(
+            "b",
+            Some(ReadCommitted),
+            ReadCommitted
+        ));
+        assert!(warn_on_isolation_change(
+            "b",
+            Some(ReadCommitted),
+            ReadUncommitted
+        ));
+        assert!(describe_isolation_level(ReadCommitted).contains("read_uncommitted"));
+        assert!(describe_isolation_level(ReadUncommitted).contains("transaction markers"));
+    }
+
+    #[test]
     fn effective_offset_sync_secs_precedence() {
         use crate::config::{BackupOptions, OffsetStorageConfig};
         let backup = BackupOptions {
@@ -3698,7 +4154,7 @@ mod tests {
     mod durability {
         use super::*;
         use crate::error::StorageError;
-        use crate::kafka::PartitionFetcher;
+        use crate::kafka::{PartitionFetcher, SkippedBatch};
         use crate::offset_store::OffsetStoreConfig;
         use crate::storage::testing::FaultyStorage;
         use std::collections::VecDeque;
@@ -3715,6 +4171,8 @@ mod tests {
                 key: format!("b/topics/t/partition=0/segment-{start:020}.bin.zst"),
                 covered_start_offset: Some(cs),
                 covered_end_offset: Some(ce),
+                control_records_skipped: 0,
+                aborted_records_dropped: 0,
                 ..make_segment("unused", start, end)
             }
         }
@@ -3881,7 +4339,7 @@ mod tests {
             h.persistence
                 .stage_segment("t", 0, seg_covering(10, 19, 10, 24))
                 .await;
-            h.persistence.stage_coverage("t", 1, 5).await;
+            h.persistence.stage_coverage("t", 1, 5, (0, 0)).await;
             assert!(h.persistence.save_now().await.is_err());
 
             h.storage.heal_puts();
@@ -3905,17 +4363,19 @@ mod tests {
                 h.persistence.durable_reach(&tpk(0)),
                 Some(DurableReach {
                     reach: 9,
-                    explicit: Some(9)
+                    explicit: Some(9),
+                    tail: (0, 0)
                 })
             );
             // A coverage-only advance moves the reach but is not explicit.
-            h.persistence.stage_coverage("t", 0, 15).await;
+            h.persistence.stage_coverage("t", 0, 15, (0, 0)).await;
             h.persistence.save_now().await.unwrap();
             assert_eq!(
                 h.persistence.durable_reach(&tpk(0)),
                 Some(DurableReach {
                     reach: 15,
-                    explicit: Some(9)
+                    explicit: Some(9),
+                    tail: (0, 0)
                 })
             );
         }
@@ -3923,7 +4383,9 @@ mod tests {
         #[tokio::test]
         async fn staged_gap_advances_coverage_through_its_end() {
             let h = harness(Duration::from_secs(3600)).await;
-            h.persistence.stage_gap("t", 0, make_gap(10, 30)).await;
+            h.persistence
+                .stage_gap("t", 0, make_gap(10, 30), (0, 0))
+                .await;
             h.persistence.save_now().await.unwrap();
             assert_eq!(h.store.get_offset(BID, "t", 0).await.unwrap(), Some(29));
             let stored = stored_manifest(&h.storage).await;
@@ -3941,11 +4403,11 @@ mod tests {
                     .stage_segment("t", 0, seg_covering(start, end, start, end + 2))
                     .await;
                 h.persistence
-                    .stage_coverage("t", 1, (i as i64 + 1) * 3)
+                    .stage_coverage("t", 1, (i as i64 + 1) * 3, (0, 0))
                     .await;
                 h.persistence.end_cycle().await.unwrap();
             }
-            h.persistence.stage_coverage("t", 0, 40).await;
+            h.persistence.stage_coverage("t", 0, 40, (0, 0)).await;
             h.persistence.finalize(Some("completed")).await.unwrap();
 
             assert!(
@@ -3991,7 +4453,8 @@ mod tests {
                 h.persistence.durable_reach(&tpk(0)),
                 Some(DurableReach {
                     reach: 120,
-                    explicit: Some(99)
+                    explicit: Some(99),
+                    tail: (0, 0)
                 })
             );
             assert_eq!(h.persistence.durable_reach(&tpk(1)), None);
@@ -4084,7 +4547,27 @@ mod tests {
 
         // -- the partition loop, against a scripted fetcher -----------------
 
-        type Step = std::result::Result<(Vec<i64>, i64), Error>;
+        type Step = std::result::Result<FetchResponse, Error>;
+
+        fn record_at(o: i64) -> BackupRecord {
+            BackupRecord {
+                key: Some(format!("k{o}").into_bytes()),
+                value: Some(format!("v{o}").into_bytes()),
+                headers: vec![],
+                timestamp: 1_000 + o,
+                offset: o,
+            }
+        }
+
+        /// A fetch returning records at `offsets`, positioned at `next`.
+        fn response(offsets: Vec<i64>, next: i64) -> FetchResponse {
+            FetchResponse {
+                records: offsets.into_iter().map(record_at).collect(),
+                next_offset: next,
+                last_stable_offset: -1,
+                ..FetchResponse::default()
+            }
+        }
 
         /// Returns scripted fetch results in order, then "nothing new".
         struct ScriptedFetcher {
@@ -4092,15 +4575,30 @@ mod tests {
             offsets: (i64, i64),
             fetches: AtomicUsize,
             on_fetch: Option<Box<dyn Fn(usize) + Send + Sync>>,
+            isolation_seen: parking_lot::Mutex<Vec<IsolationLevel>>,
         }
 
         impl ScriptedFetcher {
-            fn new(steps: Vec<Step>, offsets: (i64, i64)) -> Self {
+            fn new(
+                steps: Vec<std::result::Result<(Vec<i64>, i64), Error>>,
+                offsets: (i64, i64),
+            ) -> Self {
+                Self::with_responses(
+                    steps
+                        .into_iter()
+                        .map(|step| step.map(|(o, next)| response(o, next)))
+                        .collect(),
+                    offsets,
+                )
+            }
+
+            fn with_responses(steps: Vec<Step>, offsets: (i64, i64)) -> Self {
                 Self {
                     steps: parking_lot::Mutex::new(steps.into()),
                     offsets,
                     fetches: AtomicUsize::new(0),
                     on_fetch: None,
+                    isolation_seen: parking_lot::Mutex::new(Vec::new()),
                 }
             }
         }
@@ -4113,31 +4611,26 @@ mod tests {
                 _partition: i32,
                 offset: i64,
                 _max_bytes: i32,
-            ) -> Result<(Vec<BackupRecord>, i64)> {
+                isolation: IsolationLevel,
+            ) -> Result<FetchResponse> {
                 let n = self.fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                self.isolation_seen.lock().push(isolation);
                 if let Some(hook) = &self.on_fetch {
                     hook(n);
                 }
                 match self.steps.lock().pop_front() {
-                    Some(Ok((offsets, next))) => Ok((
-                        offsets
-                            .into_iter()
-                            .map(|o| BackupRecord {
-                                key: Some(format!("k{o}").into_bytes()),
-                                value: Some(format!("v{o}").into_bytes()),
-                                headers: vec![],
-                                timestamp: 1_000 + o,
-                                offset: o,
-                            })
-                            .collect(),
-                        next,
-                    )),
-                    Some(Err(e)) => Err(e),
-                    None => Ok((vec![], offset)),
+                    Some(step) => step,
+                    None => Ok(response(vec![], offset)),
                 }
             }
 
-            async fn partition_offsets(&self, _topic: &str, _partition: i32) -> Result<(i64, i64)> {
+            async fn partition_offsets(
+                &self,
+                _topic: &str,
+                _partition: i32,
+                isolation: IsolationLevel,
+            ) -> Result<(i64, i64)> {
+                self.isolation_seen.lock().push(isolation);
                 Ok(self.offsets)
             }
         }
@@ -4533,6 +5026,272 @@ mod tests {
                 !h.storage.puts().iter().any(|k| k.ends_with(".bin.zst")),
                 "the listed segment must not be overwritten"
             );
+        }
+
+        // -- read_committed: markers and aborted records --------------------
+
+        fn skip(last_offset: i64, control_records: u64, aborted_records: u64) -> SkippedBatch {
+            SkippedBatch {
+                last_offset,
+                control_records,
+                aborted_records,
+            }
+        }
+
+        /// A read_committed fetch returning `offsets` and passing over
+        /// `skipped`, with the given LSO and high watermark.
+        fn txn_response(
+            offsets: Vec<i64>,
+            next: i64,
+            skipped: Vec<SkippedBatch>,
+            lso_hw: (i64, i64),
+        ) -> FetchResponse {
+            FetchResponse {
+                control_records_skipped: skipped.iter().map(|s| s.control_records).sum(),
+                aborted_records_dropped: skipped.iter().map(|s| s.aborted_records).sum(),
+                skipped,
+                last_stable_offset: lso_hw.0,
+                high_watermark: lso_hw.1,
+                ..response(offsets, next)
+            }
+        }
+
+        fn segment_counts(m: &BackupManifest) -> Vec<((i64, i64), (u64, u64))> {
+            m.topics[0].partitions[0]
+                .segments
+                .iter()
+                .map(|s| {
+                    (
+                        (s.covered_start(), s.covered_end()),
+                        (s.control_records_skipped, s.aborted_records_dropped),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn transaction_skips_are_counted_against_the_segment_covering_them() {
+            let h = harness(Duration::from_secs(0)).await;
+            // 0..=2 aborted, 3 their ABORT marker, 4 5 committed, 6 COMMIT,
+            // 7 8 9 records, 10 a trailing COMMIT. Segments rotate at 3
+            // records: the first ends at 7.
+            let fetcher = Arc::new(ScriptedFetcher::with_responses(
+                vec![Ok(txn_response(
+                    vec![4, 5, 7, 8, 9],
+                    11,
+                    vec![skip(2, 0, 3), skip(3, 1, 0), skip(6, 1, 0), skip(10, 1, 0)],
+                    (11, 14),
+                ))],
+                (0, 11),
+            ));
+            let prom = Arc::new(PrometheusMetrics::new());
+            let mut ctx = context(
+                &h,
+                fetcher.clone(),
+                range(0, 0, 11),
+                small_segments(3),
+                CancellationToken::new(),
+            );
+            ctx.prometheus_metrics = Some(prom.clone());
+            ctx.backup_partition().await.unwrap();
+            h.persistence.end_cycle().await.unwrap();
+
+            let stored = stored_manifest(&h.storage).await;
+            assert_eq!(
+                segment_counts(&stored),
+                vec![((0, 7), (2, 3)), ((8, 10), (1, 0))]
+            );
+            assert_eq!(stored.total_records(), 5);
+            assert_eq!(stored.total_control_records_skipped(), 3);
+            assert_eq!(stored.total_aborted_records_dropped(), 3);
+            assert_eq!(intervals(&stored), vec![(0, 7), (8, 10)]);
+            assert!(stored.topics[0].partitions[0].gaps.is_empty());
+            // The default is read_committed, for the fetch and the offsets.
+            assert!(fetcher
+                .isolation_seen
+                .lock()
+                .iter()
+                .all(|i| *i == IsolationLevel::ReadCommitted));
+
+            let encoded = prom.encode();
+            assert!(
+                encoded.contains(
+                    "kafka_backup_lso_lag{topic=\"t\",partition=\"0\",backup_id=\"b\"} 3"
+                ),
+                "{encoded}"
+            );
+            assert!(
+                encoded.contains("kafka_backup_control_records_skipped_total{backup_id=\"b\"} 3"),
+                "{encoded}"
+            );
+            assert!(
+                encoded.contains("kafka_backup_aborted_records_dropped_total{backup_id=\"b\"} 3"),
+                "{encoded}"
+            );
+        }
+
+        #[tokio::test]
+        async fn read_uncommitted_option_reaches_the_fetch() {
+            let h = harness(Duration::from_secs(0)).await;
+            let fetcher = Arc::new(ScriptedFetcher::new(vec![Ok((records(0..3), 3))], (0, 3)));
+            let options = BackupOptions {
+                isolation_level: IsolationLevel::ReadUncommitted,
+                ..small_segments(1000)
+            };
+            let mut ctx = context(
+                &h,
+                fetcher.clone(),
+                range(0, 0, 3),
+                options,
+                CancellationToken::new(),
+            );
+            // Not a snapshot: the end comes from partition_offsets.
+            ctx.snapshot = None;
+            ctx.backup_partition().await.unwrap();
+            let seen = fetcher.isolation_seen.lock().clone();
+            assert!(seen.len() >= 2, "offsets and fetch: {seen:?}");
+            assert!(seen.iter().all(|i| *i == IsolationLevel::ReadUncommitted));
+        }
+
+        /// A run whose last offsets are an aborted transaction and its
+        /// marker ends on a coverage-only advance: the counts are kept on the
+        /// partition, and the segment that later absorbs that range takes
+        /// them over — in the same process and after a restart.
+        #[tokio::test]
+        async fn marker_only_tail_counts_are_kept_until_a_segment_takes_them() {
+            let h = harness(Duration::from_secs(0)).await;
+            let fetcher = Arc::new(ScriptedFetcher::with_responses(
+                vec![
+                    Ok(txn_response(vec![0, 1], 2, vec![], (6, 6))),
+                    Ok(txn_response(
+                        vec![],
+                        6,
+                        vec![skip(4, 0, 3), skip(5, 1, 0)],
+                        (6, 6),
+                    )),
+                ],
+                (0, 6),
+            ));
+            context(
+                &h,
+                fetcher,
+                range(0, 0, 6),
+                small_segments(2),
+                CancellationToken::new(),
+            )
+            .backup_partition()
+            .await
+            .unwrap();
+            h.persistence.end_cycle().await.unwrap();
+
+            let first = stored_manifest(&h.storage).await;
+            let part = &first.topics[0].partitions[0];
+            assert_eq!(segment_counts(&first), vec![((0, 1), (0, 0))]);
+            assert_eq!(part.covered_through, Some(5));
+            assert_eq!(
+                (
+                    part.tail_control_records_skipped,
+                    part.tail_aborted_records_dropped
+                ),
+                (1, 3)
+            );
+            assert_eq!(first.total_control_records_skipped(), 1);
+            assert_eq!(first.total_aborted_records_dropped(), 3);
+
+            // After a restart, seeding carries the tail counts.
+            let restarted = harness(Duration::from_secs(0)).await;
+            restarted.persistence.seed(&first);
+            assert_eq!(
+                restarted.persistence.durable_reach(&tpk(0)).unwrap().tail,
+                (1, 3)
+            );
+
+            // The next cycle in the same process: the new segment absorbs
+            // the tail and its counts; the partition's tail is reset.
+            let start = h.persistence.durable_reach(&tpk(0)).unwrap().reach + 1;
+            let fetcher = Arc::new(ScriptedFetcher::with_responses(
+                vec![Ok(txn_response(vec![6, 7], 8, vec![], (8, 8)))],
+                (0, 8),
+            ));
+            context(
+                &h,
+                fetcher,
+                range(0, start, 8),
+                small_segments(1000),
+                CancellationToken::new(),
+            )
+            .backup_partition()
+            .await
+            .unwrap();
+            h.persistence.end_cycle().await.unwrap();
+
+            let second = stored_manifest(&h.storage).await;
+            let part = &second.topics[0].partitions[0];
+            assert_eq!(
+                segment_counts(&second),
+                vec![((0, 1), (0, 0)), ((2, 7), (1, 3))]
+            );
+            assert_eq!(
+                (
+                    part.tail_control_records_skipped,
+                    part.tail_aborted_records_dropped
+                ),
+                (0, 0)
+            );
+            assert_eq!(
+                second.total_control_records_skipped(),
+                1,
+                "not counted twice"
+            );
+            assert_eq!(second.total_aborted_records_dropped(), 3);
+        }
+
+        /// Counts noted just before a retention gap are neither lost nor
+        /// counted twice: the gap carries them as the partition's tail
+        /// counts, and the next segment takes them over.
+        #[tokio::test]
+        async fn transaction_counts_before_a_retention_gap_are_kept() {
+            let h = harness(Duration::from_secs(0)).await;
+            let fetcher = Arc::new(ScriptedFetcher::with_responses(
+                vec![
+                    // 0..=4 then a marker at 5; the segment rotates at 5
+                    // records, leaving the marker in the uncovered tail.
+                    Ok(txn_response(records(0..5), 6, vec![skip(5, 1, 0)], (6, 6))),
+                    Err(Error::Kafka(KafkaError::BrokerError {
+                        code: OFFSET_OUT_OF_RANGE,
+                        message: "out of range".to_string(),
+                    })),
+                    Ok(txn_response(vec![20, 21], 22, vec![], (22, 22))),
+                ],
+                (20, 22),
+            ));
+            context(
+                &h,
+                fetcher,
+                range(0, 0, 22),
+                small_segments(5),
+                CancellationToken::new(),
+            )
+            .backup_partition()
+            .await
+            .unwrap();
+            h.persistence.end_cycle().await.unwrap();
+
+            let stored = stored_manifest(&h.storage).await;
+            let part = &stored.topics[0].partitions[0];
+            // The gap starts at the first offset no segment covers, so it
+            // absorbs the marker-only tail at 5 (an upper bound, as for
+            // compacted offsets); its count moves on to the next segment.
+            assert_eq!(
+                (part.gaps[0].start_offset, part.gaps[0].end_offset),
+                (5, 20)
+            );
+            assert_eq!(
+                segment_counts(&stored),
+                vec![((0, 4), (0, 0)), ((20, 21), (1, 0))]
+            );
+            assert_eq!(part.tail_control_records_skipped, 0);
+            assert_eq!(stored.total_control_records_skipped(), 1);
         }
     }
 }

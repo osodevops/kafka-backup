@@ -340,6 +340,8 @@ mod tests {
                 uploaded_at: 0,
                 covered_start_offset: None,
                 covered_end_offset: None,
+                control_records_skipped: 0,
+                aborted_records_dropped: 0,
             };
 
             let out = read_segment(&storage, &segment)
@@ -541,6 +543,8 @@ mod tests {
             uploaded_at: 0,
             covered_start_offset: None,
             covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
         }
     }
 

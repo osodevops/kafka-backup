@@ -13,6 +13,7 @@ mod scram;
 pub mod tls;
 pub mod transactions;
 
+pub use crate::config::IsolationLevel;
 pub use admin::{
     create_topics, delete_records, describe_configs, incremental_alter_configs, ConfigChange,
     ConfigEntry, ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
@@ -24,7 +25,7 @@ pub use consumer_groups::{
     offsets_for_times, CommittedOffset, ConsumerGroup, ConsumerGroupDescription,
     ConsumerGroupMember, GroupCoordinator, TimestampOffset,
 };
-pub use fetch::FetchResponse;
+pub use fetch::{FetchResponse, SkippedBatch};
 pub use metadata::{fetch_metadata, BrokerMetadata, PartitionMetadata, TopicMetadata};
 pub(crate) use partition_router::PartitionFetcher;
 pub use partition_router::PartitionLeaderRouter;

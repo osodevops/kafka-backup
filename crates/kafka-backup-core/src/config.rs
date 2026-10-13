@@ -506,6 +506,54 @@ impl CircuitBreakerSettings {
     }
 }
 
+/// Transaction isolation for the reads a backup makes (Fetch and
+/// ListOffsets), the same choice as the Java consumer's `isolation.level`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    /// Archive only what a `read_committed` consumer sees (default since
+    /// 0.24): records of committed transactions and non-transactional
+    /// records. Records of aborted transactions and the transaction markers
+    /// (commit/abort control records) are not archived, and a partition is
+    /// read up to its last stable offset (LSO), not its high watermark — the
+    /// records of a transaction still open are archived by a later run, once
+    /// it has committed.
+    #[default]
+    #[serde(alias = "READ_COMMITTED")]
+    ReadCommitted,
+    /// Archive every record up to the high watermark, as versions before
+    /// 0.24 did: records of aborted and open transactions are archived, and
+    /// so are the transaction markers, which a restore writes back as
+    /// ordinary records. Only for topics without transactional producers, or
+    /// to keep an existing backup set uniform.
+    #[serde(alias = "READ_UNCOMMITTED")]
+    ReadUncommitted,
+}
+
+impl IsolationLevel {
+    /// The Kafka protocol value (`isolation_level` in Fetch and ListOffsets).
+    pub fn as_protocol(self) -> i8 {
+        match self {
+            IsolationLevel::ReadUncommitted => 0,
+            IsolationLevel::ReadCommitted => 1,
+        }
+    }
+
+    /// The configuration spelling (`read_committed` / `read_uncommitted`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationLevel::ReadCommitted => "read_committed",
+            IsolationLevel::ReadUncommitted => "read_uncommitted",
+        }
+    }
+}
+
+impl std::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Backup-specific options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupOptions {
@@ -532,6 +580,14 @@ pub struct BackupOptions {
     /// Run continuously or one-shot (default: one-shot)
     #[serde(default)]
     pub continuous: bool,
+
+    /// Transaction isolation for the backup's reads: `read_committed`
+    /// (default) archives what a `read_committed` consumer sees and stops at
+    /// the last stable offset; `read_uncommitted` archives everything up to
+    /// the high watermark, including aborted records and transaction
+    /// markers, as versions before 0.24 did. See [`IsolationLevel`].
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
 
     /// Include internal topics (default: false)
     #[serde(default)]
@@ -576,12 +632,14 @@ pub struct BackupOptions {
     #[serde(default)]
     pub source_cluster_id: Option<String>,
 
-    /// Snapshot mode: capture current high watermarks at backup start and stop
-    /// when all partitions have reached their target offsets.
+    /// Snapshot mode: capture each partition's end offset at backup start and
+    /// stop when all partitions have reached their target offsets. The end is
+    /// the last stable offset under `isolation_level: read_committed` (the
+    /// default) and the high watermark under `read_uncommitted`.
     ///
     /// This provides consistent "point-in-time" snapshots for DR backups.
     /// When enabled:
-    /// 1. At startup, captures high watermarks for ALL partitions
+    /// 1. At startup, captures the end offsets of ALL partitions
     /// 2. Each partition backs up until it reaches its snapshot target
     /// 3. Backup exits cleanly when all partitions are caught up
     ///
@@ -756,6 +814,7 @@ impl Default for BackupOptions {
             compression_level: default_compression_level(),
             start_offset: StartOffset::default(),
             continuous: false,
+            isolation_level: IsolationLevel::default(),
             include_internal_topics: false,
             internal_topics: Vec::new(),
             on_missing_topic: OnMissingTopic::default(),
@@ -2123,6 +2182,60 @@ storage:
         );
         let bad = format!("{base}backup:\n  on_missing_topic: ignore\n");
         assert!(serde_yaml::from_str::<Config>(&bad).is_err());
+    }
+
+    #[test]
+    fn isolation_level_defaults_to_read_committed() {
+        let base = r#"
+mode: backup
+backup_id: iso
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+"#;
+        // No backup section, and a backup section without the key.
+        let config: Config = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            config.backup.unwrap_or_default().isolation_level,
+            IsolationLevel::ReadCommitted
+        );
+        let other = format!("{base}backup:\n  compression: lz4\n");
+        let config: Config = serde_yaml::from_str(&other).unwrap();
+        assert_eq!(
+            config.backup.unwrap().isolation_level,
+            IsolationLevel::ReadCommitted
+        );
+        assert_eq!(IsolationLevel::ReadCommitted.as_protocol(), 1);
+        assert_eq!(IsolationLevel::ReadUncommitted.as_protocol(), 0);
+    }
+
+    #[test]
+    fn isolation_level_read_uncommitted_is_the_opt_out() {
+        let base = r#"
+mode: backup
+backup_id: iso
+source:
+  bootstrap_servers: ["localhost:9092"]
+storage:
+  backend: memory
+"#;
+        for (value, expected) in [
+            ("read_uncommitted", IsolationLevel::ReadUncommitted),
+            ("READ_UNCOMMITTED", IsolationLevel::ReadUncommitted),
+            ("read_committed", IsolationLevel::ReadCommitted),
+            ("READ_COMMITTED", IsolationLevel::ReadCommitted),
+        ] {
+            let yaml = format!("{base}backup:\n  isolation_level: {value}\n");
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(config.backup.unwrap().isolation_level, expected, "{value}");
+        }
+        let bad = format!("{base}backup:\n  isolation_level: committed\n");
+        assert!(serde_yaml::from_str::<Config>(&bad).is_err());
+        assert_eq!(
+            serde_json::to_string(&IsolationLevel::ReadUncommitted).unwrap(),
+            "\"read_uncommitted\""
+        );
     }
 
     #[test]

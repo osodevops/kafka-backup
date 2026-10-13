@@ -207,7 +207,14 @@ async fn groups_resume_on_the_next_unconsumed_record_across_dropped_records() {
         .await
         .expect("produce");
     assert_eq!(
-        client.get_offsets(SOURCE_TOPIC, 0).await.expect("offsets"),
+        client
+            .get_offsets(
+                SOURCE_TOPIC,
+                0,
+                kafka_backup_core::IsolationLevel::ReadUncommitted
+            )
+            .await
+            .expect("offsets"),
         (0, RECORDS)
     );
 
@@ -267,10 +274,23 @@ async fn groups_resume_on_the_next_unconsumed_record_across_dropped_records() {
     sleep(Duration::from_secs(1)).await;
 
     // The restored log, read back: target offset -> original source offset.
-    let (_, target_end) = client.get_offsets(TARGET_TOPIC, 0).await.expect("offsets");
+    let (_, target_end) = client
+        .get_offsets(
+            TARGET_TOPIC,
+            0,
+            kafka_backup_core::IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("offsets");
     assert_eq!(target_end, survivors.len() as i64);
     let restored = client
-        .fetch(TARGET_TOPIC, 0, 0, 1024 * 1024)
+        .fetch(
+            TARGET_TOPIC,
+            0,
+            0,
+            1024 * 1024,
+            kafka_backup_core::IsolationLevel::ReadUncommitted,
+        )
         .await
         .expect("fetch target");
     let target_log: Vec<(i64, i64)> = restored

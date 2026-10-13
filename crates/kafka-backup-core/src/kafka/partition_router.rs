@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::config::KafkaConfig;
+use crate::config::{IsolationLevel, KafkaConfig};
 use crate::error::KafkaError;
 use crate::Result;
 
@@ -386,12 +386,16 @@ impl PartitionLeaderRouter {
     ///    outlast that single retry — a proxy or broker resetting connections
     ///    for a second or two would otherwise fail the partition, and with it
     ///    the whole backup, hours in (issue #146).
+    ///
+    /// `isolation` is passed through to the Fetch request (see
+    /// [`super::fetch::fetch`]).
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> Result<FetchResponse> {
         const MAX_CONNECTION_RETRIES: u32 = 5;
 
@@ -399,7 +403,7 @@ impl PartitionLeaderRouter {
 
         loop {
             match self
-                .fetch_internal(topic, partition, offset, max_bytes)
+                .fetch_internal(topic, partition, offset, max_bytes, isolation)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -412,7 +416,7 @@ impl PartitionLeaderRouter {
                     );
                     self.refresh_partition_leader(topic, partition).await?;
                     return self
-                        .fetch_internal(topic, partition, offset, max_bytes)
+                        .fetch_internal(topic, partition, offset, max_bytes, isolation)
                         .await
                         .map_err(RoutedError::into_error);
                 }
@@ -446,26 +450,20 @@ impl PartitionLeaderRouter {
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> std::result::Result<FetchResponse, RoutedError> {
         let (leader_id, client) = self.route(topic, partition).await?;
         client
-            .fetch(topic, partition, offset, max_bytes)
+            .fetch(topic, partition, offset, max_bytes, isolation)
             .await
             .map_err(|error| RoutedError::at(leader_id, error))
     }
 
-    /// Batch get offsets for all given topic-partitions in minimal network calls.
-    ///
-    /// Groups partitions by their leader broker and sends one batched ListOffsetsRequest
-    /// per broker per timestamp. For N partitions across B brokers, this makes 2*B requests
-    /// (earliest + latest) instead of 2*N individual requests.
-    ///
-    /// Returns a map of (topic, partition) -> (earliest, latest) offset.
-    pub async fn batch_get_all_offsets(
+    /// Group partitions by their leader broker.
+    async fn partitions_by_leader(
         &self,
         partitions: &[(String, i32)],
-    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
-        // Group partitions by leader broker
+    ) -> Result<HashMap<i32, Vec<(String, i32)>>> {
         let mut broker_partitions: HashMap<i32, Vec<(String, i32)>> = HashMap::new();
         for (topic, partition) in partitions {
             let leader_id = self.get_leader(topic, *partition).await?;
@@ -474,11 +472,31 @@ impl PartitionLeaderRouter {
                 .or_default()
                 .push((topic.clone(), *partition));
         }
+        Ok(broker_partitions)
+    }
+
+    /// Batch get offsets for all given topic-partitions in minimal network calls.
+    ///
+    /// Groups partitions by their leader broker and sends one batched ListOffsetsRequest
+    /// per broker per timestamp. For N partitions across B brokers, this makes 2*B requests
+    /// (earliest + latest) instead of 2*N individual requests.
+    ///
+    /// Returns a map of (topic, partition) -> (earliest, latest) offset, where
+    /// "latest" is the last stable offset under
+    /// [`IsolationLevel::ReadCommitted`] and the high watermark under
+    /// [`IsolationLevel::ReadUncommitted`].
+    pub async fn batch_get_all_offsets(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
+        let broker_partitions = self.partitions_by_leader(partitions).await?;
 
         debug!(
-            "batch_get_all_offsets: {} partitions across {} brokers",
+            "batch_get_all_offsets: {} partitions across {} brokers (isolation={})",
             partitions.len(),
-            broker_partitions.len()
+            broker_partitions.len(),
+            isolation
         );
 
         let mut all_results: HashMap<(String, i32), (i64, i64)> = HashMap::new();
@@ -500,9 +518,9 @@ impl PartitionLeaderRouter {
                 .collect();
 
             let earliest_offsets: HashMap<(String, i32), i64> =
-                super::fetch::batch_get_offsets(&client, &earliest_requests).await?;
+                super::fetch::batch_get_offsets(&client, &earliest_requests, isolation).await?;
             let latest_offsets: HashMap<(String, i32), i64> =
-                super::fetch::batch_get_offsets(&client, &latest_requests).await?;
+                super::fetch::batch_get_offsets(&client, &latest_requests, isolation).await?;
 
             // Merge results
             for (topic, partition) in broker_parts {
@@ -522,10 +540,40 @@ impl PartitionLeaderRouter {
         Ok(all_results)
     }
 
-    /// Get the earliest and latest offsets for a partition.
-    pub async fn get_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
+    /// Batch get the latest offset of every given partition: one
+    /// ListOffsets request per leader broker. "Latest" is the last stable
+    /// offset under [`IsolationLevel::ReadCommitted`] and the high watermark
+    /// under [`IsolationLevel::ReadUncommitted`].
+    pub async fn batch_get_latest_offsets(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), i64>> {
+        let broker_partitions = self.partitions_by_leader(partitions).await?;
+        let mut all_results = HashMap::with_capacity(partitions.len());
+        for (broker_id, broker_parts) in &broker_partitions {
+            let client = self.get_broker_connection(*broker_id).await?;
+            let requests: Vec<(String, i32, i64)> = broker_parts
+                .iter()
+                .map(|(t, p)| (t.clone(), *p, -1i64))
+                .collect();
+            all_results
+                .extend(super::fetch::batch_get_offsets(&client, &requests, isolation).await?);
+        }
+        Ok(all_results)
+    }
+
+    /// Get the earliest and latest offsets for a partition. "Latest" is the
+    /// last stable offset under [`IsolationLevel::ReadCommitted`] and the
+    /// high watermark under [`IsolationLevel::ReadUncommitted`].
+    pub async fn get_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
         // First attempt
-        match self.get_offsets_internal(topic, partition).await {
+        match self.get_offsets_internal(topic, partition, isolation).await {
             Ok(offsets) => Ok(offsets),
             Err(e) if is_not_leader_error(&e) => {
                 // Refresh metadata and retry
@@ -536,16 +584,21 @@ impl PartitionLeaderRouter {
                 // Routing problem, not a connection problem: refresh the
                 // leader map and retry; every pool stays intact.
                 self.refresh_partition_leader(topic, partition).await?;
-                self.get_offsets_internal(topic, partition).await
+                self.get_offsets_internal(topic, partition, isolation).await
             }
             Err(e) => Err(e),
         }
     }
 
     /// Internal get_offsets implementation.
-    async fn get_offsets_internal(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
+    async fn get_offsets_internal(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
         let client = self.get_leader_client(topic, partition).await?;
-        client.get_offsets(topic, partition).await
+        client.get_offsets(topic, partition, isolation).await
     }
 
     /// Produce records to a partition, routing to the correct leader.
@@ -1070,18 +1123,26 @@ fn is_not_leader_error(error: &crate::Error) -> bool {
 /// the loop can be driven by a scripted source in tests.
 #[async_trait::async_trait]
 pub(crate) trait PartitionFetcher: Send + Sync {
-    /// Fetch records from `offset`; returns the records and the next offset
-    /// to fetch (past any trailing offsets that held no record).
+    /// Fetch records from `offset`; the response's `next_offset` is past
+    /// any trailing offsets that held no record or were filtered out
+    /// (compacted away, transaction markers, aborted records).
     async fn fetch_partition(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<(Vec<BackupRecord>, i64)>;
+        isolation: IsolationLevel,
+    ) -> Result<FetchResponse>;
 
-    /// `(log start offset, high watermark)`.
-    async fn partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)>;
+    /// `(log start offset, end)`: the end is the last stable offset under
+    /// read_committed and the high watermark under read_uncommitted.
+    async fn partition_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)>;
 }
 
 #[async_trait::async_trait]
@@ -1092,13 +1153,19 @@ impl PartitionFetcher for PartitionLeaderRouter {
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<(Vec<BackupRecord>, i64)> {
-        let response = self.fetch(topic, partition, offset, max_bytes).await?;
-        Ok((response.records, response.next_offset))
+        isolation: IsolationLevel,
+    ) -> Result<FetchResponse> {
+        self.fetch(topic, partition, offset, max_bytes, isolation)
+            .await
     }
 
-    async fn partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        self.get_offsets(topic, partition).await
+    async fn partition_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
+        self.get_offsets(topic, partition, isolation).await
     }
 }
 

@@ -8,6 +8,7 @@ use tracing::debug;
 use super::config::MessageCountConfig;
 use super::context::ValidationContext;
 use super::{CheckOutcome, ValidationCheck, ValidationResult};
+use crate::config::IsolationLevel;
 use crate::Result;
 
 /// Compares message counts between the backup manifest and the restored cluster.
@@ -55,7 +56,13 @@ impl ValidationCheck for MessageCountCheck {
                 // Query the restored cluster for this partition's offset range
                 match ctx
                     .target_client
-                    .get_offsets(&topic_backup.name, partition.partition_id)
+                    // Restored records are not transactional: the high
+                    // watermark is the log end.
+                    .get_offsets(
+                        &topic_backup.name,
+                        partition.partition_id,
+                        IsolationLevel::ReadUncommitted,
+                    )
                     .await
                 {
                     Ok((earliest, latest)) => {

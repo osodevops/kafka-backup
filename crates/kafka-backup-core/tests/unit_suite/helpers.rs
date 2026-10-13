@@ -100,6 +100,8 @@ pub fn create_segment_metadata(
         uploaded_at: 0,
         covered_start_offset: None,
         covered_end_offset: None,
+        control_records_skipped: 0,
+        aborted_records_dropped: 0,
     }
 }
 

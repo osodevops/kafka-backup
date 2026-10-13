@@ -321,7 +321,13 @@ async fn test_router_fetch_survives_repeated_connection_resets() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        router.fetch(TOPIC, 0, 0, 1024 * 1024),
+        router.fetch(
+            TOPIC,
+            0,
+            0,
+            1024 * 1024,
+            kafka_backup_core::IsolationLevel::ReadUncommitted,
+        ),
     )
     .await
     .expect("fetch should not hang");

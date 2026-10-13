@@ -373,7 +373,11 @@ async fn azurite_backup_and_restore_round_trip() {
     let mut restored = 0;
     for partition in 0..3 {
         let (start, end) = client
-            .get_offsets(TARGET, partition)
+            .get_offsets(
+                TARGET,
+                partition,
+                kafka_backup_core::IsolationLevel::ReadUncommitted,
+            )
             .await
             .expect("offsets");
         restored += end - start;

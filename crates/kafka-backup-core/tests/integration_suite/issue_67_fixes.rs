@@ -175,7 +175,7 @@ async fn produce(client: &KafkaClient, topic: &str, n: usize) -> anyhow::Result<
 /// Return (earliest_offset, latest_offset) for partition 0 of `topic`.
 async fn offsets(client: &KafkaClient, topic: &str) -> anyhow::Result<(i64, i64)> {
     client
-        .get_offsets(topic, 0)
+        .get_offsets(topic, 0, kafka_backup_core::IsolationLevel::ReadUncommitted)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }

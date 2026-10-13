@@ -7,7 +7,9 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use crate::config::{Config, ExistingTopicConfigPolicy, Mode, OffsetStrategy, RestoreOptions};
+use crate::config::{
+    Config, ExistingTopicConfigPolicy, IsolationLevel, Mode, OffsetStrategy, RestoreOptions,
+};
 use crate::health::HealthCheck;
 use crate::kafka::{
     ConfigChange, ConfigOp, ConfigResourceType, PartitionLeaderRouter, TopicToCreate,
@@ -1048,7 +1050,11 @@ impl RestoreEngine {
 
             let mut to_purge: Vec<(i32, i64)> = Vec::new();
             for pid in 0..partition_count {
-                match router.get_offsets(&target_name, pid).await {
+                // The log end (high watermark): DeleteRecords purges up to it.
+                match router
+                    .get_offsets(&target_name, pid, IsolationLevel::ReadUncommitted)
+                    .await
+                {
                     Ok((_earliest, latest)) => {
                         if latest > 0 {
                             to_purge.push((pid, latest));

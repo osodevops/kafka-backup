@@ -321,6 +321,8 @@ mod tests {
             uploaded_at,
             covered_start_offset: None,
             covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
         }
     }
 
@@ -334,6 +336,10 @@ mod tests {
             gaps: Vec::new(),
             pruned: Vec::new(),
             covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }];
         m
     }

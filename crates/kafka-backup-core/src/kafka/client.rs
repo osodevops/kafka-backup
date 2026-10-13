@@ -27,7 +27,7 @@ pub const WRITE_TIMEOUT_SECS: u64 = 10;
 /// connection failures while the broker may still be processing the request.
 pub const RESPONSE_TIMEOUT_SECS: u64 = 60;
 
-use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
+use crate::config::{IsolationLevel, KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
 use crate::Result;
 
@@ -769,20 +769,29 @@ impl KafkaClient {
             .ok_or_else(|| KafkaError::TopicNotExists(topic.to_string()).into())
     }
 
-    /// Fetch records from a topic/partition
+    /// Fetch records from a topic/partition at the given transaction
+    /// isolation level (see [`super::fetch::fetch`]).
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: IsolationLevel,
     ) -> Result<FetchResponse> {
-        super::fetch::fetch(self, topic, partition, offset, max_bytes).await
+        super::fetch::fetch(self, topic, partition, offset, max_bytes, isolation).await
     }
 
-    /// Get the earliest and latest offsets for a partition
-    pub async fn get_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        super::fetch::get_offsets(self, topic, partition).await
+    /// Get the earliest and latest offsets for a partition. "Latest" is the
+    /// last stable offset under [`IsolationLevel::ReadCommitted`] and the
+    /// high watermark under [`IsolationLevel::ReadUncommitted`].
+    pub async fn get_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+        isolation: IsolationLevel,
+    ) -> Result<(i64, i64)> {
+        super::fetch::get_offsets(self, topic, partition, isolation).await
     }
 
     /// Produce records to a topic/partition

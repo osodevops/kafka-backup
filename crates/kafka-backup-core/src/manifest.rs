@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::config::IsolationLevel;
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Top-level backup manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
@@ -32,6 +38,13 @@ pub struct BackupManifest {
     /// is `warn` (issue #167). Empty — and omitted from JSON — otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_topics: Vec<String>,
+
+    /// Transaction isolation of the most recent backup run
+    /// (`backup.isolation_level`). `None` for manifests written before 0.24,
+    /// which always read uncommitted: their segments can hold records of
+    /// aborted transactions and transaction markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_level: Option<IsolationLevel>,
 }
 
 impl BackupManifest {
@@ -45,6 +58,7 @@ impl BackupManifest {
             compression: "zstd".to_string(),
             topics: Vec::new(),
             missing_topics: Vec::new(),
+            isolation_level: None,
         }
     }
 
@@ -69,6 +83,26 @@ impl BackupManifest {
             .flat_map(|t| &t.partitions)
             .flat_map(|p| &p.segments)
             .map(|s| s.record_count)
+            .sum()
+    }
+
+    /// Transaction markers a `read_committed` backup passed over, across all
+    /// partitions (segments and trailing ranges).
+    pub fn total_control_records_skipped(&self) -> u64 {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(PartitionBackup::control_records_skipped)
+            .sum()
+    }
+
+    /// Records of aborted transactions a `read_committed` backup dropped,
+    /// across all partitions (segments and trailing ranges).
+    pub fn total_aborted_records_dropped(&self) -> u64 {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(PartitionBackup::aborted_records_dropped)
             .sum()
     }
 
@@ -170,6 +204,10 @@ impl TopicBackup {
                 gaps: Vec::new(),
                 pruned: Vec::new(),
                 covered_through: None,
+                tail_control_records_skipped: 0,
+                tail_aborted_records_dropped: 0,
+                snapshot_end_offset: None,
+                high_watermark_at_capture: None,
             });
         }
         self.partitions
@@ -214,9 +252,58 @@ pub struct PartitionBackup {
     /// segments' own ranges then give the reach — see [`reach`](Self::reach)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_through: Option<i64>,
+
+    /// Transaction markers a `read_committed` backup passed over in the
+    /// trailing range after the last segment (through
+    /// [`covered_through`](Self::covered_through)). The next segment's
+    /// covered range absorbs that range and takes these counts over into its
+    /// own [`SegmentMetadata::control_records_skipped`]. 0 (and omitted)
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tail_control_records_skipped: u64,
+
+    /// Records of aborted transactions dropped in the same trailing range
+    /// (see [`tail_control_records_skipped`](Self::tail_control_records_skipped)).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tail_aborted_records_dropped: u64,
+
+    /// Snapshot runs (`stop_at_current_offsets`) only: the offset the most
+    /// recent snapshot captured as its end (exclusive) — the last stable
+    /// offset under `read_committed`, the high watermark under
+    /// `read_uncommitted`. Not recorded for a partition that was empty at
+    /// capture time. Absent before 0.24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_end_offset: Option<i64>,
+
+    /// Snapshot runs only: the partition's high watermark when that snapshot
+    /// was captured. Above [`snapshot_end_offset`](Self::snapshot_end_offset)
+    /// when transactions were open at capture time: their records, and any
+    /// record after them, are left for a later run. Absent before 0.24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_watermark_at_capture: Option<i64>,
 }
 
 impl PartitionBackup {
+    /// Transaction markers a `read_committed` backup passed over in this
+    /// partition: the segments' counts plus the trailing range's.
+    pub fn control_records_skipped(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.control_records_skipped)
+            .sum::<u64>()
+            + self.tail_control_records_skipped
+    }
+
+    /// Records of aborted transactions a `read_committed` backup dropped in
+    /// this partition: the segments' counts plus the trailing range's.
+    pub fn aborted_records_dropped(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.aborted_records_dropped)
+            .sum::<u64>()
+            + self.tail_aborted_records_dropped
+    }
+
     /// Get the last offset backed up for this partition
     pub fn last_offset(&self) -> Option<i64> {
         self.segments.iter().map(|s| s.end_offset).max()
@@ -451,6 +538,19 @@ pub struct SegmentMetadata {
     /// for the same reasons. `None` before 0.24: `end_offset` applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_end_offset: Option<i64>,
+
+    /// Transaction markers (commit/abort control records) inside the covered
+    /// range that a `read_committed` backup passed over: they hold no data
+    /// and are not archived. 0 (and omitted) for `read_uncommitted` backups,
+    /// which archive markers as records, and for segments written before
+    /// 0.24.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub control_records_skipped: u64,
+
+    /// Records of aborted transactions inside the covered range that a
+    /// `read_committed` backup dropped. 0 (and omitted) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub aborted_records_dropped: u64,
 }
 
 impl SegmentMetadata {
@@ -1942,6 +2042,77 @@ mod tests {
         }
     }
 
+    /// The source partition of a read_committed backup: producer A commits
+    /// one transaction and aborts another, producer B aborts one and commits
+    /// one, with plain records in between. Only the committed and plain
+    /// records are restored.
+    ///
+    /// ```text
+    ///  0 n0   1 a0   2 a1   3 n1   4 b0 (aborted)   5 a2   6 COMMIT(A)
+    ///  7 b1 (aborted)   8 ABORT(B)   9 n2   10 a3 (aborted)   11 ABORT(A)
+    /// 12 b2  13 COMMIT(B)  14 n3   — high watermark 15
+    /// ```
+    fn read_committed_restore() -> (Vec<i64>, OffsetMapping) {
+        let restored = vec![0, 1, 2, 3, 5, 9, 12, 14];
+        let mapping = restore_sim(&restored, 0, 3);
+        (restored, mapping)
+    }
+
+    #[test]
+    fn committed_offset_at_a_transaction_marker_resumes_at_the_next_restored_record() {
+        let (restored, m) = read_committed_restore();
+        // At the COMMIT marker 6: the group consumed through 5 (a2); next
+        // is n2 (source 9) = target 5.
+        assert_eq!(m.lookup_target_offset("t", 0, 6), Some(5));
+        // At the ABORT markers 8 and 11, and the COMMIT marker 13.
+        assert_eq!(m.lookup_target_offset("t", 0, 8), Some(5));
+        assert_eq!(m.lookup_target_offset("t", 0, 11), Some(6)); // b2
+        assert_eq!(m.lookup_target_offset("t", 0, 13), Some(7)); // n3
+        for s in [6, 8, 11, 13] {
+            assert_eq!(
+                m.lookup_target_offset("t", 0, s),
+                Some(expected_target(&restored, 0, s))
+            );
+        }
+    }
+
+    #[test]
+    fn committed_offset_just_after_a_marker_resumes_at_the_next_restored_record() {
+        let (_, m) = read_committed_restore();
+        // marker + 1 = 7 is an aborted record: still n2 (target 5).
+        assert_eq!(m.lookup_target_offset("t", 0, 7), Some(5));
+        // ABORT(B) + 1 = 9 is restored: exact.
+        assert_eq!(m.lookup_target_offset("t", 0, 9), Some(5));
+        // COMMIT(B) + 1 = 14 is restored: exact.
+        assert_eq!(m.lookup_target_offset("t", 0, 14), Some(7));
+    }
+
+    #[test]
+    fn committed_offset_inside_an_aborted_transaction_resumes_at_the_next_restored_record() {
+        let (_, m) = read_committed_restore();
+        // b0 (4) was aborted: next is a2 (5) = target 4.
+        assert_eq!(m.lookup_target_offset("t", 0, 4), Some(4));
+        // a3 (10) was aborted: next is b2 (12) = target 6.
+        assert_eq!(m.lookup_target_offset("t", 0, 10), Some(6));
+    }
+
+    #[test]
+    fn committed_offset_at_the_lso_or_high_watermark_resumes_at_the_target_log_end() {
+        let (_, m) = read_committed_restore();
+        // Caught up: committed at the high watermark (= LSO, no open
+        // transaction) → one past the last restored record.
+        assert_eq!(m.lookup_target_offset("t", 0, 15), Some(8));
+        // A hanging transaction from 15 kept the backup at LSO 15 while the
+        // high watermark reached 20; a group committed at 20 (it read the
+        // plain records after the open transaction with read_uncommitted)
+        // resumes at the target's log end, never past it.
+        assert_eq!(m.lookup_target_offset("t", 0, 20), Some(8));
+        assert_eq!(
+            m.resolve_target_offset("t", 0, 20).unwrap().precision,
+            OffsetLookupPrecision::Exact
+        );
+    }
+
     #[test]
     fn lookup_record_filter_drops_resume_at_next_survivor() {
         // Source 0..=9; a record filter dropped 3, 4 and the tail 8, 9.
@@ -2152,6 +2323,10 @@ mod tests {
             gaps: Vec::new(),
             pruned: Vec::new(),
             covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         };
         let json = serde_json::to_string(&partition).unwrap();
         assert!(!json.contains("pruned"), "{json}");
@@ -2165,6 +2340,10 @@ mod tests {
             gaps: Vec::new(),
             pruned: Vec::new(),
             covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         };
         partition.add_pruned(pruned_range(20, 29));
         partition.add_pruned(pruned_range(0, 19));
@@ -2252,6 +2431,8 @@ mod tests {
             uploaded_at: 0,
             covered_start_offset: None,
             covered_end_offset: None,
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
         }
     }
 
@@ -2259,6 +2440,8 @@ mod tests {
         SegmentMetadata {
             covered_start_offset: Some(covered_start),
             covered_end_offset: Some(covered_end),
+            control_records_skipped: 0,
+            aborted_records_dropped: 0,
             ..segment(start, end)
         }
     }
@@ -2270,6 +2453,10 @@ mod tests {
             gaps: Vec::new(),
             pruned: Vec::new(),
             covered_through: None,
+            tail_control_records_skipped: 0,
+            tail_aborted_records_dropped: 0,
+            snapshot_end_offset: None,
+            high_watermark_at_capture: None,
         }
     }
 
@@ -2482,5 +2669,67 @@ mod tests {
         let legacy = r#"{"backup_id":"old","created_at":1,"topics":[]}"#;
         let old: BackupManifest = serde_json::from_str(legacy).unwrap();
         assert!(old.missing_topics.is_empty());
+    }
+
+    #[test]
+    fn transaction_fields_are_omitted_when_unset_and_absent_in_legacy_manifests() {
+        let json = serde_json::to_string(&BackupManifest::new("m".to_string())).unwrap();
+        assert!(!json.contains("isolation_level"), "{json}");
+        let json = serde_json::to_string(&segment(0, 9)).unwrap();
+        assert!(!json.contains("control_records_skipped"), "{json}");
+        assert!(!json.contains("aborted_records_dropped"), "{json}");
+        let json = serde_json::to_string(&empty_partition()).unwrap();
+        for field in [
+            "tail_control_records_skipped",
+            "tail_aborted_records_dropped",
+            "snapshot_end_offset",
+            "high_watermark_at_capture",
+        ] {
+            assert!(!json.contains(field), "{json}");
+        }
+
+        // A 0.23 manifest reads with no isolation level (it read
+        // uncommitted) and zero counts.
+        let legacy = r#"{"backup_id":"old","created_at":1,"topics":[{"name":"t",
+            "partitions":[{"partition_id":0,"segments":[{"key":"k","start_offset":0,
+            "end_offset":9,"start_timestamp":1,"end_timestamp":2,"record_count":10}]}]}]}"#;
+        let old: BackupManifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.isolation_level, None);
+        let part = &old.topics[0].partitions[0];
+        assert_eq!(part.snapshot_end_offset, None);
+        assert_eq!(part.high_watermark_at_capture, None);
+        assert_eq!(part.control_records_skipped(), 0);
+        assert_eq!(part.aborted_records_dropped(), 0);
+    }
+
+    #[test]
+    fn transaction_fields_round_trip() {
+        let mut manifest = BackupManifest::new("m".to_string());
+        manifest.isolation_level = Some(IsolationLevel::ReadCommitted);
+        let part = manifest.get_or_create_topic("t").get_or_create_partition(0);
+        let mut seg = covered(4, 9, 0, 10);
+        seg.control_records_skipped = 2;
+        seg.aborted_records_dropped = 3;
+        part.add_segment(seg);
+        part.covered_through = Some(12);
+        part.tail_control_records_skipped = 1;
+        part.tail_aborted_records_dropped = 1;
+        part.snapshot_end_offset = Some(13);
+        part.high_watermark_at_capture = Some(20);
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            json.contains("\"isolation_level\":\"read_committed\""),
+            "{json}"
+        );
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.isolation_level, Some(IsolationLevel::ReadCommitted));
+        let part = &back.topics[0].partitions[0];
+        assert_eq!(part.control_records_skipped(), 3);
+        assert_eq!(part.aborted_records_dropped(), 4);
+        assert_eq!(part.snapshot_end_offset, Some(13));
+        assert_eq!(part.high_watermark_at_capture, Some(20));
+        assert_eq!(back.total_control_records_skipped(), 3);
+        assert_eq!(back.total_aborted_records_dropped(), 4);
     }
 }
