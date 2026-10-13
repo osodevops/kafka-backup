@@ -19,7 +19,8 @@ use tempfile::TempDir;
 
 use super::produce_mock_broker::{Fault, MockBroker};
 use super::restore_produce_path::{
-    base_options, log_digest, record, restore_config, source_digest, write_backup, TOPIC,
+    base_options, log_digest, record, restore_config, restore_metric, source_digest, write_backup,
+    TOPIC,
 };
 
 fn read_checkpoint(path: &Path) -> RestoreCheckpoint {
@@ -237,6 +238,67 @@ async fn killed_restore_resumes_with_zero_duplicates_and_nothing_missing() {
     assert_eq!(
         cp.partitions[&RestoreCheckpoint::partition_key(TOPIC, 0)].target_hw_after_ack,
         100
+    );
+}
+
+/// The resumed run counts the unsaved tail it verified (and did not
+/// produce again) once, like the report does: the restore metrics match the
+/// report's records and bytes, and the partition completes once.
+#[tokio::test]
+async fn resumed_restore_counts_the_verified_tail_once_in_the_metrics() {
+    let broker = MockBroker::start(TOPIC, 1).await;
+    let dir = TempDir::new().unwrap();
+    let cp_path = dir.path().join("cp.json");
+    let source = records(100);
+    write_backup(
+        dir.path(),
+        "kill-metrics",
+        &HashMap::from([(0, source.clone())]),
+        40,
+    )
+    .await;
+    let config = || {
+        restore_config(
+            &broker.bootstrap(),
+            dir.path(),
+            "kill-metrics",
+            checkpoint_options(&cp_path),
+        )
+    };
+
+    run_and_kill(&broker, config(), 6).await;
+    assert_eq!(broker.log(0).len(), 50);
+    age_checkpoint(&cp_path);
+
+    let prom = std::sync::Arc::new(kafka_backup_core::PrometheusMetrics::new());
+    let report = RestoreEngine::new_with_metrics(config(), Some(prom.clone()))
+        .unwrap()
+        .run()
+        .await
+        .expect("resume");
+    assert_eq!(log_digest(&broker.log(0)), source_digest(&source));
+
+    // 50 verified + 50 produced by this run.
+    assert_eq!(report.records_restored, 100);
+    let encoded = prom.encode();
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_records_total", "kill-metrics"),
+        Some(100.0),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_bytes_total", "kill-metrics"),
+        Some(report.bytes_restored as f64),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(
+            &encoded,
+            "kafka_restore_partitions_completed_total",
+            "kill-metrics"
+        ),
+        Some(1.0),
+        "{encoded}"
     );
 }
 

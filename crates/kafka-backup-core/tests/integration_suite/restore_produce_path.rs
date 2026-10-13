@@ -502,3 +502,203 @@ async fn lost_producer_state_is_recovered_by_an_epoch_bump() {
     );
     assert_eq!(broker.state.lock().unwrap().init_requests, 2);
 }
+
+// ── Schema ID rewrite and restore metrics on the idempotent path ────────
+
+/// Value of `name{restore_id="<restore_id>"}` in the Prometheus text output.
+pub fn restore_metric(encoded: &str, name: &str, restore_id: &str) -> Option<f64> {
+    let label = format!("restore_id=\"{restore_id}\"");
+    encoded.lines().find_map(|line| {
+        let (series, value) = line.rsplit_once(' ')?;
+        (series.starts_with(&format!("{name}{{")) && series.contains(&label))
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// Source schema ID in the fixture's values, and the mapping. The mapping
+/// is chained (7 -> 42 -> 99): a value rewritten twice would reach the
+/// target with 99.
+const SOURCE_SCHEMA_ID: i32 = 7;
+const TARGET_SCHEMA_ID: i32 = 42;
+
+fn schema_id_mapping() -> HashMap<i32, i32> {
+    HashMap::from([(SOURCE_SCHEMA_ID, TARGET_SCHEMA_ID), (TARGET_SCHEMA_ID, 99)])
+}
+
+/// A record whose value is Confluent-framed with `SOURCE_SCHEMA_ID` (the
+/// key is not framed).
+fn framed_record(offset: i64, key: String) -> BackupRecord {
+    let mut value = vec![0u8];
+    value.extend_from_slice(&SOURCE_SCHEMA_ID.to_be_bytes());
+    value.extend_from_slice(format!("payload-{offset}").as_bytes());
+    BackupRecord {
+        key: Some(key.into_bytes()),
+        value: Some(value),
+        headers: vec![],
+        timestamp: 1_700_000_000_000 + offset,
+        offset,
+    }
+}
+
+/// Every record of `log` carries the target schema ID once, and otherwise
+/// the source payload.
+fn assert_rewritten_once(log: &[StoredRecord]) {
+    for r in log {
+        let value = r.value.as_ref().expect("value");
+        assert_eq!(value[0], 0, "magic byte kept");
+        let id = i32::from_be_bytes([value[1], value[2], value[3], value[4]]);
+        assert_eq!(id, TARGET_SCHEMA_ID, "rewritten exactly once");
+        assert!(value[5..].starts_with(b"payload-"));
+    }
+}
+
+async fn run_with_metrics(
+    config: Config,
+) -> (
+    kafka_backup_core::Result<RestoreReport>,
+    Arc<kafka_backup_core::PrometheusMetrics>,
+) {
+    let prom = Arc::new(kafka_backup_core::PrometheusMetrics::new());
+    let report = RestoreEngine::new_with_metrics(config, Some(prom.clone()))
+        .expect("engine")
+        .run()
+        .await;
+    (report, prom)
+}
+
+/// 1:1 path: schema IDs are rewritten once, before the batch is encoded,
+/// so the resends of a batch whose response was lost (both retry layers)
+/// carry the rewritten bytes, and the records, bytes and schema IDs are
+/// counted once although the batch was sent three times.
+#[tokio::test]
+async fn schema_ids_are_rewritten_before_encoding_and_counted_once_across_retries() {
+    let broker = MockBroker::start(TOPIC, 1).await;
+    let dir = TempDir::new().unwrap();
+    let source: Vec<BackupRecord> = (0..35)
+        .map(|i| framed_record(i, format!("key-{i}")))
+        .collect();
+    write_backup(dir.path(), "rewrite", &HashMap::from([(0, source)]), 20).await;
+
+    broker.schedule(1, Fault::ApplyThenDrop);
+    broker.schedule(2, Fault::ApplyThenDrop);
+    let (report, prom) = run_with_metrics(restore_config(
+        &broker.bootstrap(),
+        dir.path(),
+        "rewrite",
+        RestoreOptions {
+            rewrite_schema_ids: true,
+            schema_id_mapping: schema_id_mapping(),
+            ..base_options()
+        },
+    ))
+    .await;
+    let report = report.expect("restore succeeds");
+
+    assert!(report.idempotent_producer);
+    let attempts = broker.attempts();
+    assert_eq!(attempts.len(), 6, "4 batches, one sent three times");
+    assert!(
+        attempts[1..4].iter().all(|a| a.batch == attempts[1].batch),
+        "every resend of the batch is byte-identical"
+    );
+    let log = broker.log(0);
+    assert_eq!(log.len(), 35, "no duplicates");
+    assert_rewritten_once(&log);
+
+    let topic = &report.topics_restored[0];
+    assert_eq!(topic.schema_ids_rewritten, 35);
+    assert_eq!(topic.schema_ids_unmapped, 0);
+
+    let encoded = prom.encode();
+    assert_eq!(report.records_restored, 35);
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_records_total", "rewrite"),
+        Some(35.0),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_bytes_total", "rewrite"),
+        Some(report.bytes_restored as f64),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(
+            &encoded,
+            "kafka_restore_partitions_completed_total",
+            "rewrite"
+        ),
+        Some(1.0),
+        "{encoded}"
+    );
+}
+
+/// Repartition path: the readers rewrite schema IDs before routing, the
+/// writers produce idempotently, and records and bytes are counted once
+/// per acknowledged record, partitions once per target partition.
+#[tokio::test]
+async fn repartitioned_restore_rewrites_once_and_counts_acknowledged_records_once() {
+    let broker = MockBroker::start(TOPIC, 3).await;
+    let dir = TempDir::new().unwrap();
+    let sources: HashMap<i32, Vec<BackupRecord>> = (0..2)
+        .map(|p| {
+            let records = (0..30)
+                .map(|i| framed_record(i, format!("p{p}-k{i}")))
+                .collect();
+            (p, records)
+        })
+        .collect();
+    write_backup(dir.path(), "repart-rewrite", &sources, 10).await;
+
+    broker.schedule(2, Fault::ApplyThenDrop);
+    broker.schedule(5, Fault::ApplyThenDrop);
+    let (report, prom) = run_with_metrics(restore_config(
+        &broker.bootstrap(),
+        dir.path(),
+        "repart-rewrite",
+        RestoreOptions {
+            rewrite_schema_ids: true,
+            schema_id_mapping: schema_id_mapping(),
+            repartitioning: HashMap::from([(
+                TOPIC.to_string(),
+                kafka_backup_core::config::TopicRepartitioning {
+                    strategy: kafka_backup_core::config::RepartitioningStrategy::Murmur2,
+                    target_partitions: 3,
+                },
+            )]),
+            ..base_options()
+        },
+    ))
+    .await;
+    let report = report.expect("restore succeeds");
+
+    assert!(report.idempotent_producer);
+    let log: Vec<StoredRecord> = (0..3).flat_map(|p| broker.log(p)).collect();
+    assert_eq!(log.len(), 60, "no duplicates, nothing missing");
+    assert_rewritten_once(&log);
+
+    let topic = &report.topics_restored[0];
+    assert_eq!(topic.schema_ids_rewritten, 60);
+    assert_eq!(report.records_restored, 60);
+
+    let encoded = prom.encode();
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_records_total", "repart-rewrite"),
+        Some(60.0),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(&encoded, "kafka_restore_bytes_total", "repart-rewrite"),
+        Some(report.bytes_restored as f64),
+        "{encoded}"
+    );
+    assert_eq!(
+        restore_metric(
+            &encoded,
+            "kafka_restore_partitions_completed_total",
+            "repart-rewrite"
+        ),
+        Some(3.0),
+        "{encoded}"
+    );
+}
