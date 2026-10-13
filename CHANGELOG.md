@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A restore whose options contain a map with two or more entries
+  (`topic_mapping`, `partition_mapping`, `repartitioning`,
+  `schema_id_mapping`, `topic_config_overrides`) can now resume its
+  checkpoint. The checkpoint is keyed by a hash of the serialized options,
+  and `HashMap` entries serialized in a different order on every run, so such
+  a restore always started over. Maps now serialize sorted by key; maps with
+  zero or one entry serialize exactly as before, so existing checkpoints keep
+  their hash.
 - **Transactional topics were restored with their aborted records and their
   transaction markers.** Backups read uncommitted: every record of an
   aborted transaction was archived, and so was every COMMIT/ABORT marker,

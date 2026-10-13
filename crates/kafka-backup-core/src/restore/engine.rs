@@ -2713,6 +2713,45 @@ mod tests {
     /// not change the hash while they keep their defaults, or an upgrade
     /// would restart (and duplicate) every interrupted restore.
     #[test]
+    fn restore_config_hash_is_stable_for_multi_entry_maps() {
+        // HashMap iteration order varies between maps (random seeds), so
+        // build the same options many times with entries inserted in
+        // different orders and require one hash.
+        let build = |reverse: bool| {
+            let mut options = RestoreOptions::default();
+            let mut pairs: Vec<(String, String)> = (0..16)
+                .map(|i| (format!("topic-{i:02}"), format!("restored-{i:02}")))
+                .collect();
+            let mut ids: Vec<(i32, i32)> = (0..16).map(|i| (100 + i, 900 + i)).collect();
+            if reverse {
+                pairs.reverse();
+                ids.reverse();
+            }
+            for (k, v) in pairs {
+                options.topic_mapping.insert(k.clone(), v);
+                options
+                    .topic_config_overrides
+                    .entry(k)
+                    .or_default()
+                    .insert("retention.ms".into(), "1000".into());
+            }
+            for (k, v) in ids {
+                options.schema_id_mapping.insert(k, v);
+                options.partition_mapping.insert(k, v);
+            }
+            options
+        };
+        let expected = restore_config_hash(&build(false));
+        for attempt in 0..32 {
+            assert_eq!(
+                restore_config_hash(&build(attempt % 2 == 1)),
+                expected,
+                "hash changed on attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
     fn restore_config_hash_matches_0_23_for_options_at_their_defaults() {
         assert_eq!(
             restore_config_hash(&RestoreOptions::default()),

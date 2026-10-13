@@ -907,6 +907,26 @@ impl std::fmt::Display for RepartitioningStrategy {
     }
 }
 
+/// Serialize a `HashMap` with its entries sorted by key.
+///
+/// `HashMap` iteration order differs from run to run, and the restore
+/// checkpoint is keyed by a hash of the serialized `RestoreOptions`. Sorting
+/// makes that hash stable, so a restore whose options contain a map with two
+/// or more entries can resume its checkpoint. Maps with zero or one entry
+/// serialize exactly as before, which keeps existing checkpoint hashes.
+fn serialize_sorted_map<K, V, S>(
+    map: &std::collections::HashMap<K, V>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    K: Serialize + Ord,
+    V: Serialize,
+    S: serde::Serializer,
+{
+    let sorted: std::collections::BTreeMap<&K, &V> = map.iter().collect();
+    sorted.serialize(serializer)
+}
+
 /// Per-topic repartitioning configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicRepartitioning {
@@ -1016,11 +1036,11 @@ pub struct RestoreOptions {
     pub source_partitions: Option<Vec<i32>>,
 
     /// Partition mapping (source_partition -> target_partition)
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub partition_mapping: std::collections::HashMap<i32, i32>,
 
     /// Topic mapping (original -> target)
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub topic_mapping: std::collections::HashMap<String, String>,
 
     /// Consumer group offset handling strategy
@@ -1169,7 +1189,7 @@ pub struct RestoreOptions {
     /// When set, records are re-partitioned on the fly using the configured strategy
     /// instead of the default 1:1 partition mapping.
     /// Mutually exclusive with `partition_mapping`.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub repartitioning: std::collections::HashMap<String, TopicRepartitioning>,
 
     /// Purge target topics before restoring by advancing each partition's
@@ -1208,7 +1228,7 @@ pub struct RestoreOptions {
 
     /// Per-target-topic configuration overrides. These take precedence over
     /// values captured from the source manifest.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub topic_config_overrides:
         std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
 
@@ -1244,7 +1264,7 @@ pub struct RestoreOptions {
     /// Source-to-target Schema Registry ID mapping used by
     /// `rewrite_schema_ids`. Map keys are the IDs encoded after the Confluent
     /// magic byte and values are the IDs registered in the target registry.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub schema_id_mapping: std::collections::HashMap<i32, i32>,
 
     /// Source topics whose records `rewrite_schema_ids` applies to (glob,
