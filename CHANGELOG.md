@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record filter dropped. The lookup no longer needs them, and an entry for a
   dropped tail record put the end-of-log answer one past the log end.
 
+- KIP-368 re-authentication tasks no longer pile up across reconnects.
+  Each connection carries a generation. A re-auth task exits when its
+  connection has been replaced, never re-authenticates or drops a newer
+  one, and is aborted when its connection is dropped. There is at most one
+  task per live connection. Before this fix, each reconnect left the
+  previous task running against the new connection.
+- A re-auth the broker rejects is pinned by a test to retire the
+  connection, so the next request reconnects with a full SASL handshake.
+  Example: "Cannot change principals during re-authentication".
+
 ### Changed
 - **One-time re-read after upgrading.** On the first run, a partition whose
   `offsets.db` checkpoint (written by an older version) is ahead of the
@@ -82,6 +92,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `restore::filter::map_dropped_offsets` is deprecated (unused by the engine).
 - **API (semver minor):** `PartitionResetPlan` gains the public field
   `approximate`. Struct literals must set it (`approximate: false`).
+
+- Unknown keys under `source.security` and `target.security` are now an
+  error, not a warning. Example: `security.oauth`, which is rejected with
+  the hint "OAuth settings belong under enterprise.oauth (Kafka Backup
+  Enterprise)". A misspelt or misplaced security setting would otherwise
+  connect with different credentials than intended. Library callers can
+  use `Config::check_security_sections` on raw YAML.
+- **API (semver minor):** `SaslMechanism` is now `#[non_exhaustive]`.
+  Matches on it outside this crate need a wildcard arm.
 
 ### Added
 - Manifest: `SegmentMetadata.covered_start_offset` / `covered_end_offset`
@@ -109,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `"approximate": true` in JSON (omitted when `false`), `~` in the
   `offset-reset plan` text output and an `# APPROXIMATE` comment in the shell
   script, and a warning is logged.
+
+- `sasl_mechanism: OAUTHBEARER` (`SaslMechanism::OAuthBearer`) now parses,
+  including `--sasl-mechanism OAUTHBEARER` on the offset commands. This
+  build ships no OAuth token provider. Without one installed, the command
+  fails with "SASL OAUTHBEARER requires Kafka Backup Enterprise (licence
+  feature `oauth`) or a custom SaslMechanismPlugin", where before the
+  config failed to parse.
 
 ### API
 - New public fields on `SegmentMetadata`, `PartitionBackup` and

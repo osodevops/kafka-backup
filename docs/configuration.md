@@ -69,12 +69,24 @@ Configuration for the Kafka cluster to read from (backup mode).
 | `topics.include` | list[string] | No | `["*"]` | Topics to include (glob patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude (glob patterns) |
 | `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER; see below) |
 | `security.sasl_username` | string | No | - | SASL username |
 | `security.sasl_password` | string | No | - | SASL password |
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |
 | `security.ssl_certificate_location` | string | No | - | Path to client certificate |
 | `security.ssl_key_location` | string | No | - | Path to client key |
+
+`sasl_mechanism: OAUTHBEARER` (for example Confluent Cloud OAuth) parses, but
+this build ships no OAuth token provider. Without Kafka Backup Enterprise
+(licence feature `oauth`) or a custom `SaslMechanismPlugin` installed by code,
+the command fails with "SASL OAUTHBEARER requires Kafka Backup Enterprise
+(licence feature `oauth`) or a custom SaslMechanismPlugin".
+
+Unknown keys under `source.security` and `target.security` are an error, not a
+warning, because a misspelt or misplaced security setting connects with
+different credentials than intended. OAuth settings such as `security.oauth`
+are rejected with the hint "OAuth settings belong under enterprise.oauth (Kafka
+Backup Enterprise)".
 
 ### Topic Patterns
 
@@ -242,7 +254,7 @@ Configuration for the Kafka cluster to write to (restore mode).
 | `topics.include` | list[string] | No | `["*"]` | Topics to restore (glob/regex patterns) |
 | `topics.exclude` | list[string] | No | `[]` | Topics to exclude |
 | `security.security_protocol` | string | No | `PLAINTEXT` | Security protocol |
-| `security.sasl_mechanism` | string | No | - | SASL mechanism |
+| `security.sasl_mechanism` | string | No | - | SASL mechanism (as for the source) |
 | `security.sasl_username` | string | No | - | SASL username |
 | `security.sasl_password` | string | No | - | SASL password |
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |

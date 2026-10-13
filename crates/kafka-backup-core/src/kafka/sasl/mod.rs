@@ -12,6 +12,8 @@
 
 pub mod plugin;
 pub(crate) mod reauth;
+#[cfg(test)]
+mod reauth_tests;
 
 #[cfg(feature = "gssapi")]
 pub mod gssapi;
