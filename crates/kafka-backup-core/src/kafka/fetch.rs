@@ -1,11 +1,13 @@
 //! Kafka Fetch API implementation.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use kafka_protocol::compression::{self as cmpr, Decompressor};
 use kafka_protocol::messages::{
     ApiKey, BrokerId, FetchRequest, FetchResponse as KafkaFetchResponse, ListOffsetsRequest,
     TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
 use tracing::debug;
 
@@ -170,16 +172,47 @@ fn decode_fetch_data(data: &Bytes, fetch_offset: i64) -> Result<(Vec<BackupRecor
         }
 
         let mut batch_buf = data.slice(pos..pos + batch_total);
-        let record_set = RecordBatchDecoder::decode(&mut batch_buf).map_err(|e| {
-            crate::Error::from(KafkaError::Protocol(format!(
-                "Failed to decode records: {:?}",
-                e
-            )))
-        })?;
-
-        for record in &record_set.records {
+        let raw_headers = std::cell::RefCell::new(None);
+        let decode = |input: &mut Bytes, compression: Compression| -> anyhow::Result<Bytes> {
+            let body = match compression {
+                Compression::None => {
+                    cmpr::None::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+                }
+                Compression::Gzip => {
+                    cmpr::Gzip::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+                }
+                Compression::Snappy => {
+                    cmpr::Snappy::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+                }
+                Compression::Lz4 => {
+                    cmpr::Lz4::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+                }
+                Compression::Zstd => {
+                    cmpr::Zstd::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+                }
+            };
+            *raw_headers.borrow_mut() = Some(super::header_codec::decode(&body)?);
+            Ok(body)
+        };
+        let record_set =
+            RecordBatchDecoder::decode_with_custom_compression(&mut batch_buf, Some(&decode))
+                .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {e:?}")))?;
+        let raw_headers = raw_headers.into_inner();
+        if raw_headers
+            .as_ref()
+            .is_some_and(|h| h.len() != record_set.records.len())
+        {
+            return Err(
+                KafkaError::Protocol("Kafka record/header list count mismatch".into()).into(),
+            );
+        }
+        for (i, record) in record_set.records.iter().enumerate() {
             if record.offset >= fetch_offset {
-                records.push(convert_record(record));
+                let mut record = convert_record(record);
+                if let Some(headers) = &raw_headers {
+                    record.headers = headers[i].clone();
+                }
+                records.push(record);
             }
         }
 

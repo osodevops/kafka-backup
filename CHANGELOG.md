@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-10-13
+
+### Added
+- Embedders can attach a fallible `RecordTransform` to restore options. Every
+  replay path calls it after time and record filters and before partition
+  routing; its fingerprint is checked when resuming a checkpoint.
+- The public `restore::read_segment` API lets embedders preflight archived
+  record formats with the same decoder used for replay.
+
+### Fixed
+- Fetch and produce preserve duplicate Kafka headers in order, including null
+  and empty values. The batch codec still validates checksums and handles
+  compression; ordered headers are retained around its map-based record API.
+- Legacy configured schema ID rewriting fails on truncated or unmapped frames
+  and also runs before partition selection during repartitioned restores.
+
 ## [0.23.8] - 2026-10-09
 
 ### Fixed

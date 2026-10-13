@@ -2,6 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use indexmap::IndexMap;
+use kafka_protocol::compression::{self as cmpr, Compressor};
 use kafka_protocol::messages::{
     ApiKey, ProduceRequest, ProduceResponse as KafkaProduceResponse, TopicName,
 };
@@ -151,6 +152,7 @@ pub async fn produce(
 
     for sub_batch in sub_batches {
         let sub_batch_len = sub_batch.len();
+        let headers: Vec<_> = sub_batch.iter().map(|r| r.headers.clone()).collect();
         let kafka_records = build_kafka_records(sub_batch);
 
         let options = RecordEncodeOptions {
@@ -159,8 +161,38 @@ pub async fn produce(
         };
 
         let mut records_buf = BytesMut::new();
-        RecordBatchEncoder::encode(&mut records_buf, kafka_records.iter(), &options)
-            .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
+        {
+            let header_index = std::cell::Cell::new(0);
+            let compressor = |raw: &mut BytesMut,
+                              out: &mut BytesMut,
+                              compression: Compression|
+             -> anyhow::Result<()> {
+                let count = super::header_codec::decode(raw)?.len();
+                let start = header_index.get();
+                let end = start + count;
+                let raw = super::header_codec::replace(
+                    raw,
+                    headers
+                        .get(start..end)
+                        .ok_or_else(|| anyhow::anyhow!("Kafka record/header count mismatch"))?,
+                )?;
+                header_index.set(end);
+                if compression != Compression::Zstd {
+                    anyhow::bail!("Unexpected produce compression");
+                }
+                cmpr::Zstd::compress(out, |body| {
+                    body.extend_from_slice(&raw);
+                    Ok(())
+                })
+            };
+            RecordBatchEncoder::encode_with_custom_compression(
+                &mut records_buf,
+                kafka_records.iter(),
+                &options,
+                Some(&compressor),
+            )
+            .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {e:?}")))?;
+        }
 
         let records_bytes = records_buf.freeze();
 

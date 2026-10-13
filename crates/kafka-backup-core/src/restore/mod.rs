@@ -9,9 +9,11 @@ pub mod offset_rollback;
 pub mod preflight;
 pub mod repartition;
 pub mod three_phase;
+pub mod transform;
 
 pub use engine::{RestoreEngine, RestoreProgress};
 pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};
+pub use helpers::read_segment;
 pub use offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
     GroupResetOutcome, OffsetMapping as BulkOffsetMapping, OffsetResetBatch, OffsetResetMetrics,

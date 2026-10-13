@@ -1066,6 +1066,10 @@ pub struct RestoreOptions {
     #[serde(skip)]
     pub record_filter_fingerprint: Option<String>,
 
+    /// Fallible transform after filtering, before routing/production.
+    #[serde(skip)]
+    pub record_transform: Option<crate::restore::transform::RecordTransformHandle>,
+
     /// Kafka circuit-breaker settings (advisory — never blocks requests; see
     /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
     /// thresholds (failure=5, reset=30s, success=2).
@@ -1142,6 +1146,7 @@ impl Default for RestoreOptions {
             dry_run_check_segments: false,
             record_filter: None,
             record_filter_fingerprint: None,
+            record_transform: None,
             circuit_breaker: CircuitBreakerSettings::default(),
         }
     }
