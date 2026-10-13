@@ -813,6 +813,16 @@ pub struct TopicRestoreReport {
     /// Records tombstoned by the configured record filter for this topic.
     #[serde(default)]
     pub records_tombstoned_by_filter: u64,
+
+    /// Confluent schema IDs rewritten in this topic's keys and values
+    /// (`restore.rewrite_schema_ids`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_ids_rewritten: u64,
+
+    /// Keys and values that start with the Confluent magic byte but carry a
+    /// schema ID absent from `restore.schema_id_mapping`, restored unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_ids_unmapped: u64,
 }
 
 /// Per-partition restore report

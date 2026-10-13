@@ -85,6 +85,15 @@ pub async fn run(config_path: &str) -> Result<()> {
         );
     }
 
+    for topic in &report.topics_restored {
+        if topic.schema_ids_rewritten > 0 || topic.schema_ids_unmapped > 0 {
+            println!(
+                "Schema IDs ({}): {} rewritten, {} not in schema_id_mapping (left unchanged)",
+                topic.source_topic, topic.schema_ids_rewritten, topic.schema_ids_unmapped,
+            );
+        }
+    }
+
     info!("Restore completed successfully");
     Ok(())
 }

@@ -1121,6 +1121,21 @@ pub struct RestoreOptions {
     #[serde(default)]
     pub schema_id_mapping: std::collections::HashMap<i32, i32>,
 
+    /// Source topics whose records `rewrite_schema_ids` applies to (glob,
+    /// or regex with a `~` prefix, as in topic selection). Empty (the
+    /// default): every restored topic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_id_rewrite_topics: Vec<String>,
+
+    /// Fail the restore on a key or value that carries the Confluent magic
+    /// byte and a schema ID absent from `schema_id_mapping`, instead of
+    /// producing it with the source registry's ID. A raw (not Schema
+    /// Registry framed) payload that starts with a zero byte looks the same,
+    /// so enable this only for topics whose keys and values are all framed
+    /// or never start with a zero byte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub schema_id_rewrite_strict: bool,
+
     /// Phase 1 header preflight behaviour.
     ///
     /// - `auto` (default): scan the backup for tracking-header coverage when
@@ -1232,6 +1247,8 @@ impl Default for RestoreOptions {
             topic_config_overrides: Default::default(),
             rewrite_schema_ids: false,
             schema_id_mapping: Default::default(),
+            schema_id_rewrite_topics: Vec::new(),
+            schema_id_rewrite_strict: false,
             header_preflight: HeaderPreflightMode::default(),
             header_preflight_external: false,
             dry_run_check_segments: false,
@@ -1561,6 +1578,16 @@ impl RestoreOptions {
         {
             return Err(crate::Error::Config(
                 "consumer_groups must be specified when reset_consumer_offsets is true".to_string(),
+            ));
+        }
+
+        if !self.rewrite_schema_ids
+            && (self.schema_id_rewrite_strict || !self.schema_id_rewrite_topics.is_empty())
+        {
+            return Err(crate::Error::Config(
+                "schema_id_rewrite_topics and schema_id_rewrite_strict need \
+                 rewrite_schema_ids: true"
+                    .to_string(),
             ));
         }
 
@@ -2021,6 +2048,40 @@ connection:
             checkpoint_interval_secs: default_restore_checkpoint_interval_secs(),
             ..RestoreOptions::default()
         }
+    }
+
+    #[test]
+    fn schema_id_rewrite_options_parse_and_validate() {
+        let yaml = r#"
+rewrite_schema_ids: true
+schema_id_mapping: {7: 42}
+schema_id_rewrite_topics: ["orders-*", "~^payments-v\\d+$"]
+schema_id_rewrite_strict: true
+"#;
+        let opts: RestoreOptions = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(opts.schema_id_rewrite_topics.len(), 2);
+        assert!(opts.schema_id_rewrite_strict);
+        opts.validate().unwrap();
+
+        for tweak in [
+            |o: &mut RestoreOptions| o.schema_id_rewrite_strict = true,
+            |o: &mut RestoreOptions| o.schema_id_rewrite_topics = vec!["orders".into()],
+        ] {
+            let mut opts = RestoreOptions::default();
+            tweak(&mut opts);
+            let err = opts.validate().unwrap_err().to_string();
+            assert!(err.contains("rewrite_schema_ids: true"), "{err}");
+        }
+    }
+
+    #[test]
+    fn schema_id_rewrite_defaults_do_not_change_the_serialized_options() {
+        // The restore checkpoint's config hash is taken over the serialized
+        // options: unset new fields must not change it for existing
+        // checkpoints.
+        let json = serde_json::to_string(&RestoreOptions::default()).unwrap();
+        assert!(!json.contains("schema_id_rewrite_topics"), "{json}");
+        assert!(!json.contains("schema_id_rewrite_strict"), "{json}");
     }
 
     #[test]
