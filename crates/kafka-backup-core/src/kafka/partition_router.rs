@@ -572,21 +572,35 @@ impl PartitionLeaderRouter {
         partition: i32,
         isolation: IsolationLevel,
     ) -> Result<(i64, i64)> {
-        // First attempt
-        match self.get_offsets_internal(topic, partition, isolation).await {
-            Ok(offsets) => Ok(offsets),
-            Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
-                warn!(
-                    "NOT_LEADER_FOR_PARTITION error for {}/{} during get_offsets, refreshing metadata",
-                    topic, partition
-                );
-                // Routing problem, not a connection problem: refresh the
-                // leader map and retry; every pool stays intact.
-                self.refresh_partition_leader(topic, partition).await?;
-                self.get_offsets_internal(topic, partition, isolation).await
+        // A partition of a topic created moments ago (restore creates its
+        // targets, then reads their high watermarks before producing) may
+        // not have an elected leader yet, or the leader may move. Retry like
+        // `produce` does instead of failing the topic on the first answer.
+        const MAX_LEADER_RETRIES: u32 = 20;
+        let mut leader_attempts = 0;
+        loop {
+            match self.get_offsets_internal(topic, partition, isolation).await {
+                Ok(offsets) => return Ok(offsets),
+                Err(e) if is_leader_not_ready(&e) && leader_attempts < MAX_LEADER_RETRIES => {
+                    leader_attempts += 1;
+                    let backoff = Duration::from_millis((250 * leader_attempts as u64).min(2_000));
+                    warn!(
+                        "Leader not ready for {}/{} during get_offsets (attempt {}/{}), refreshing metadata after {:?}: {}",
+                        topic, partition, leader_attempts, MAX_LEADER_RETRIES, backoff, e
+                    );
+                    tokio::time::sleep(backoff).await;
+                    // Routing problem, not a connection problem: refresh the
+                    // leader map and retry; every pool stays intact. A refresh
+                    // that finds no leader yet is retried with the request.
+                    if let Err(refresh) = self.refresh_partition_leader(topic, partition).await {
+                        debug!(
+                            "Leader refresh for {}/{} failed (will retry): {}",
+                            topic, partition, refresh
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -1162,6 +1176,25 @@ fn is_connection_error(error: &crate::Error) -> bool {
     super::connection_error::is_connection_error(error)
 }
 
+/// A partition whose leader is not usable yet: NOT_LEADER_OR_FOLLOWER (6),
+/// LEADER_NOT_AVAILABLE (5), or metadata that still reports no leader
+/// (`-1`, e.g. right after the topic was created).
+fn is_leader_not_ready(error: &crate::Error) -> bool {
+    if is_not_leader_error(error) {
+        return true;
+    }
+    match error {
+        crate::Error::Kafka(KafkaError::BrokerError { code, .. }) => *code == 5,
+        crate::Error::Kafka(KafkaError::PartitionNotAvailable { .. }) => true,
+        _ => {
+            let msg = error.to_string();
+            msg.contains("LEADER_NOT_AVAILABLE")
+                || msg.contains("code 5")
+                || msg.contains("Unknown broker ID: -1")
+        }
+    }
+}
+
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).
 fn is_not_leader_error(error: &crate::Error) -> bool {
     match error {
@@ -1262,5 +1295,41 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped.get(&1), Some(&vec![(0, 10), (2, 30)]));
         assert_eq!(grouped.get(&2), Some(&vec![(1, 20)]));
+    }
+}
+
+#[cfg(test)]
+mod leader_readiness_tests {
+    use super::*;
+
+    fn broker_error(code: i16) -> crate::Error {
+        crate::Error::Kafka(KafkaError::BrokerError {
+            code,
+            message: format!("ListOffsets error for t:0: code {code}"),
+        })
+    }
+
+    #[test]
+    fn leader_not_ready_covers_new_topic_states() {
+        assert!(is_leader_not_ready(&broker_error(6)));
+        assert!(is_leader_not_ready(&broker_error(5)));
+        assert!(is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::PartitionNotAvailable {
+                topic: "t".into(),
+                partition: 0,
+            }
+        )));
+        assert!(is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::Protocol("Unknown broker ID: -1".into())
+        )));
+    }
+
+    #[test]
+    fn other_errors_are_not_retried_as_leader_errors() {
+        assert!(!is_leader_not_ready(&broker_error(3)));
+        assert!(!is_leader_not_ready(&broker_error(29)));
+        assert!(!is_leader_not_ready(&crate::Error::Kafka(
+            KafkaError::Protocol("Unknown broker ID: 7".into())
+        )));
     }
 }

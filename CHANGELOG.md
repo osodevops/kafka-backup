@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reading a partition's offsets (ListOffsets) retries while the leader is
+  not ready (NOT_LEADER_OR_FOLLOWER, LEADER_NOT_AVAILABLE, or no leader yet
+  in metadata), with the same bounded backoff as produce. A restore reads the
+  high watermarks of topics it has just created, and failed the topic when a
+  leader had not been elected yet.
 - A restore whose options contain a map with two or more entries
   (`topic_mapping`, `partition_mapping`, `repartitioning`,
   `schema_id_mapping`, `topic_config_overrides`) can now resume its
