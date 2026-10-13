@@ -5,7 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.25.0] - 2026-10-13
+
+Backups of transactional topics now read committed by default (a behaviour
+change: aborted records and transaction markers are no longer archived or
+restored). Backup checkpoints can no longer run ahead of the data actually
+stored, and three-phase restores resume consumer groups on the next restored
+record across offset gaps instead of overshooting. Restores are idempotent by
+default (retries and lost responses no longer duplicate batches) and keep
+durable, resumable checkpoints. Topic configs restore into Kafka 4.x and
+Confluent Cloud, skipping what the target rejects. SASL gains the
+OAUTHBEARER mechanism core and KIP-368 re-authentication fixes; the OAuth
+token providers ship in Kafka Backup Enterprise. Also: Azure SAS,
+managed-identity and emulator fixes, restore metrics and progress events,
+logs on stderr (`--log-format json`), and Kafka's `SCRAM-SHA-256` /
+`SCRAM-SHA-512` spellings.
+
+### Upgrade notes
+- **`backup.isolation_level` defaults to `read_committed`.** Set
+  `read_uncommitted` to keep the previous behaviour byte for byte. A backup
+  set continued after the upgrade reads committed from then on (a warning
+  says the set mixes both); alert on `kafka_backup_lso_lag` for hanging
+  transactions.
+- **One-time re-read after upgrading.** A partition whose `offsets.db`
+  checkpoint is ahead of the manifest re-reads from the manifest's reach + 1
+  on the first run (with a warning); if retention already deleted those
+  offsets, a `resume_beyond_durable` gap is recorded.
+- **Backups resume from the manifest without `offset_storage`.** Re-running
+  a backup with an existing `backup_id` continues incrementally instead of
+  starting over.
+- **Restore rate limits are restore-wide.** `rate_limit_records_per_sec`
+  was applied per partition; it is now one budget shared by every partition
+  and repartitioning writer, so multiply a tuned value by
+  `max_concurrent_partitions` to keep the same throughput.
+  `rate_limit_bytes_per_sec`, which was ignored, now applies the same way.
+- **`restore.produce_acks` must be `-1` with the idempotent producer**, which
+  is now the default. Set `restore.idempotent_producer: false` to use `0` or
+  `1`.
+- **Logs go to stderr.** stdout carries only command output; use
+  `--log-format json` for structured logs.
+- Unknown keys under `source.security` / `target.security` are now errors.
+- From 0.23.x: `rewrite_schema_ids` now fails on a truncated or unmapped
+  schema ID frame (as 0.24 did); set `schema_id_rewrite_strict: false` or
+  narrow `schema_id_rewrite_topics` for topics with raw keys or values.
+  Interrupted 0.23 and 0.24 restores resume from their checkpoints.
+- **Library API (semver minor):** new public fields on manifest, config and
+  report structs break struct-literal construction, `FetchResponse` and
+  `SaslMechanism` are now `#[non_exhaustive]`, and fetch / offset calls take
+  an `IsolationLevel`. See Changed and API below.
 
 ### Fixed
 - Reading a partition's offsets (ListOffsets) retries while the leader is
