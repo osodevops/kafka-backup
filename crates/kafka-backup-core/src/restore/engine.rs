@@ -947,6 +947,11 @@ impl RestoreEngine {
                         self.save_checkpoint(true).await?;
                         return Err(e);
                     }
+                    if restore_options.record_transform.is_some()
+                        || restore_options.rewrite_schema_ids
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -1627,6 +1632,7 @@ impl RestoreEngine {
     /// (#160). Returns whether the run resumes earlier progress.
     async fn open_checkpoint(&self, options: &RestoreOptions) -> Result<bool> {
         let expected_hash = restore_config_hash(options);
+        let hash_0_23 = restore_config_hash_0_23(options);
         let target_servers = self
             .config
             .target
@@ -1651,7 +1657,14 @@ impl RestoreEngine {
         };
 
         let mut checkpoint = match store.load().await? {
-            Some(cp) if cp.config_hash == expected_hash => {
+            Some(mut cp)
+                if cp.config_hash == expected_hash
+                    || hash_0_23.as_deref() == Some(cp.config_hash.as_str()) =>
+            {
+                if cp.config_hash != expected_hash {
+                    info!("Restore checkpoint was written by kafka-backup 0.23; resuming it");
+                    cp.config_hash = expected_hash.clone();
+                }
                 info!(
                     "Loaded restore checkpoint from {}: {} segments completed, {} records \
                      restored",
@@ -2224,6 +2237,29 @@ impl RestorePartitionContext {
             records_dropped_by_filter += filter_outcome.dropped;
             records_tombstoned_by_filter += filter_outcome.tombstoned;
 
+            // Replay-time changes, in this order on both restore paths:
+            //  1. the embedder's `RecordTransform`, on the record as archived
+            //     (source schema IDs, archived headers); a failure stops the
+            //     partition before anything of this segment is produced;
+            //  2. `rewrite_schema_ids` on keys and values;
+            //  3. the kafka-backup offset headers (strip, then inject), last,
+            //     so neither step above can alter or drop them.
+            // All three run once per segment, before batches are planned and
+            // encoded: a retried batch resends identical bytes, and a resume
+            // checks its unsaved tail against exactly what was produced.
+            let mut filtered_records = super::transform::apply(
+                &self.source_topic,
+                filtered_records,
+                self.options.record_transform.as_ref(),
+            )?;
+            super::helpers::rewrite_schema_ids(
+                &mut filtered_records,
+                &self.source_topic,
+                self.source_partition,
+                &self.options,
+                &self.schema_ids,
+            )?;
+
             if filtered_records.is_empty() {
                 // Mark segment as completed even if no records match
                 self.mark_segment_completed(&segment.key).await;
@@ -2280,13 +2316,6 @@ impl RestorePartitionContext {
                 self.source_partition,
                 &self.options,
             );
-            super::helpers::rewrite_schema_ids(
-                &mut records_to_produce,
-                &self.source_topic,
-                self.source_partition,
-                &self.options,
-                &self.schema_ids,
-            )?;
 
             // Records the interrupted run wrote after its last checkpoint
             // save: verified against the target, mapped and acknowledged
@@ -2339,10 +2368,17 @@ impl RestorePartitionContext {
                 // restore-wide rate limit).
                 match self
                     .produce_path
-                    .produce(&self.target_topic, self.target_partition, batch)
+                    .produce(&self.target_topic, self.target_partition, batch, || {
+                        self.cancel.is_cancelled()
+                    })
                     .await
                 {
-                    Ok(produced) => {
+                    // Stopped while waiting for the rate limit.
+                    Ok(None) => {
+                        cancelled = true;
+                        break;
+                    }
+                    Ok(Some(produced)) => {
                         self.kafka_cb.record_success();
                         self.health.mark_healthy("kafka");
 
@@ -2673,18 +2709,49 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
-/// Hash the restore options (and any record-filter fingerprint) for the
-/// resume checkpoint. The serde representation skips the programmatic filter
-/// handle itself, so the fingerprint is folded in explicitly.
+/// Hash the restore options (and any record-filter and record-transform
+/// fingerprints) for the resume checkpoint. The serde representation skips
+/// the programmatic handles themselves, so their fingerprints are folded in
+/// explicitly.
+///
+/// This is the 0.24 form: every JSON object's keys are sorted, so map
+/// insertion order never changes it. Options added after 0.24 are left out
+/// of the serialization at their defaults, so they hash as in 0.24.
 fn restore_config_hash(options: &RestoreOptions) -> String {
     use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut value = serde_json::to_value(options).unwrap_or_default();
+    value.sort_all_objects();
+    hasher.update(serde_json::to_vec(&value).unwrap_or_default());
+    if let Some(fingerprint) = &options.record_filter_fingerprint {
+        hasher.update(fingerprint.as_bytes());
+    }
+    if let Some(transform) = &options.record_transform {
+        hasher.update(b"record-transform:");
+        hasher.update(transform.fingerprint().as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The hash a 0.23.x checkpoint carries for `options`: the options
+/// serialized in field order (maps sorted by key, which 0.23 wrote the same
+/// way for zero or one entry), plus the record-filter fingerprint. Accepted
+/// on resume besides [`restore_config_hash`], so an upgrade from 0.23 does
+/// not restart (and duplicate) an interrupted restore. `None` with a record
+/// transform, which 0.23 did not have.
+fn restore_config_hash_0_23(options: &RestoreOptions) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if options.record_transform.is_some() {
+        return None;
+    }
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(options).unwrap_or_default());
     if let Some(fingerprint) = &options.record_filter_fingerprint {
         hasher.update(fingerprint.as_bytes());
     }
     let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{:02x}", b)).collect()
+    Some(digest.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
@@ -2706,12 +2773,6 @@ mod tests {
     use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetStrategy};
     use std::collections::HashMap;
 
-    /// A restore checkpoint is only resumed when its config hash matches.
-    /// The values below are what kafka-backup 0.23.8 computes: the options
-    /// added in 0.24 (batch bytes, idempotent producer, checkpoint storage,
-    /// restore id, topic-config compatibility, schema-ID rewrite scope) must
-    /// not change the hash while they keep their defaults, or an upgrade
-    /// would restart (and duplicate) every interrupted restore.
     #[test]
     fn restore_config_hash_is_stable_for_multi_entry_maps() {
         // HashMap iteration order varies between maps (random seeds), so
@@ -2742,37 +2803,103 @@ mod tests {
             options
         };
         let expected = restore_config_hash(&build(false));
+        let expected_0_23 = restore_config_hash_0_23(&build(false));
         for attempt in 0..32 {
             assert_eq!(
                 restore_config_hash(&build(attempt % 2 == 1)),
                 expected,
                 "hash changed on attempt {attempt}"
             );
+            assert_eq!(
+                restore_config_hash_0_23(&build(attempt % 2 == 1)),
+                expected_0_23,
+                "0.23-form hash changed on attempt {attempt}"
+            );
         }
     }
 
+    /// A restore checkpoint is only resumed when its config hash matches the
+    /// current (0.24) form or, without a record transform, the 0.23 form.
+    /// The values below are what kafka-backup 0.24.1 and 0.23.8 compute: the
+    /// options added in 0.25 (batch bytes, idempotent producer, checkpoint
+    /// storage, restore id, topic-config compatibility, schema-ID rewrite
+    /// scope and strictness) must not change either while they keep their
+    /// defaults, or an upgrade would restart (and duplicate) every
+    /// interrupted restore.
     #[test]
-    fn restore_config_hash_matches_0_23_for_options_at_their_defaults() {
-        assert_eq!(
-            restore_config_hash(&RestoreOptions::default()),
-            "d64786ecf4db4764e2eb8751c4d6794e5381c6e0c8e639c136a9d88b3920d6b2"
-        );
+    fn restore_config_hash_matches_0_23_and_0_24_for_options_at_their_defaults() {
+        // 0.24.1's `restore_config_hash` (sorted JSON objects).
+        const DEFAULT_0_24: &str =
+            "29a012b4bde36b21d5ed77608ce5db5ebe377063bbd8380b7c1970f0e296536a";
+        const TWEAKED_0_24: &str =
+            "adf1b1f798a97447bab970664c957fbec1f2c77e7f2c4e9ad4715b424e91c040";
+        // 0.23.8's (field order).
+        const DEFAULT_0_23: &str =
+            "d64786ecf4db4764e2eb8751c4d6794e5381c6e0c8e639c136a9d88b3920d6b2";
+        const TWEAKED_0_23: &str =
+            "cadb9095317612a38c112d8c18cfcb7acfc242df63dc8e77187a45fee21e6217";
+
+        let options = RestoreOptions::default();
+        assert_eq!(restore_config_hash(&options), DEFAULT_0_24);
+        assert_eq!(restore_config_hash_0_23(&options).unwrap(), DEFAULT_0_23);
 
         let mut options = RestoreOptions::default();
         options.topic_mapping.insert("a".into(), "b".into());
         options.checkpoint_state = Some("/tmp/cp.json".into());
         options.produce_batch_size = 500;
-        assert_eq!(
-            restore_config_hash(&options),
-            "cadb9095317612a38c112d8c18cfcb7acfc242df63dc8e77187a45fee21e6217"
-        );
+        assert_eq!(restore_config_hash(&options), TWEAKED_0_24);
+        assert_eq!(restore_config_hash_0_23(&options).unwrap(), TWEAKED_0_23);
 
-        // A 0.24 option away from its default changes the hash.
-        options.idempotent_producer = false;
-        assert_ne!(
-            restore_config_hash(&options),
-            "cadb9095317612a38c112d8c18cfcb7acfc242df63dc8e77187a45fee21e6217"
-        );
+        // An option added in 0.25 away from its default changes both.
+        let mut changed = options.clone();
+        changed.idempotent_producer = false;
+        assert_ne!(restore_config_hash(&changed), TWEAKED_0_24);
+        assert_ne!(restore_config_hash_0_23(&changed).unwrap(), TWEAKED_0_23);
+        let mut lenient = options.clone();
+        lenient.rewrite_schema_ids = true;
+        let strict_hash = restore_config_hash(&lenient);
+        lenient.schema_id_rewrite_strict = false;
+        assert_ne!(restore_config_hash(&lenient), strict_hash);
+
+        // 0.23 had no record transforms: with one, only the current form
+        // applies, and the transform's fingerprint is part of it.
+        struct Noop(&'static str);
+        impl crate::restore::transform::RecordTransform for Noop {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn fingerprint(&self) -> &str {
+                self.0
+            }
+            fn transform(&self, _: &str, _: &mut BackupRecord) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut transformed = options.clone();
+        transformed.record_transform = Some(crate::restore::transform::RecordTransformHandle::new(
+            Arc::new(Noop("v1")),
+        ));
+        assert!(restore_config_hash_0_23(&transformed).is_none());
+        let v1 = restore_config_hash(&transformed);
+        assert_ne!(v1, TWEAKED_0_24);
+        transformed.record_transform = Some(crate::restore::transform::RecordTransformHandle::new(
+            Arc::new(Noop("v2")),
+        ));
+        assert_ne!(restore_config_hash(&transformed), v1);
+    }
+
+    #[test]
+    fn checkpoint_hash_is_independent_of_mapping_insertion_order() {
+        let mut a = RestoreOptions::default();
+        let mut b = RestoreOptions::default();
+        for (source, target) in [("a", "x"), ("b", "y")] {
+            a.topic_mapping.insert(source.into(), target.into());
+        }
+        for (source, target) in [("b", "y"), ("a", "x")] {
+            b.topic_mapping.insert(source.into(), target.into());
+        }
+        assert_eq!(restore_config_hash(&a), restore_config_hash(&b));
+        assert_eq!(restore_config_hash_0_23(&a), restore_config_hash_0_23(&b));
     }
 
     #[test]

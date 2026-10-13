@@ -3,12 +3,14 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use kafka_protocol::compression::{self as cmpr, Decompressor};
 use kafka_protocol::messages::{
     ApiKey, BrokerId, FetchRequest, FetchResponse as KafkaFetchResponse, ListOffsetsRequest,
     TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
 use tracing::debug;
 
@@ -368,13 +370,13 @@ pub(crate) fn decode_fetch_data(
 
         // Decoded lazily: an aborted batch whose records all lie at or after
         // the fetch offset is counted from its header and never decompressed.
-        let mut records: Option<Vec<Record>> = None;
+        let mut records: Option<DecodedBatch> = None;
         let disposition = match (&mut *filter, header) {
             (TransactionFilter::ReadCommitted(aborted), Some(h)) if h.producer_id >= 0 => {
                 aborted.begin_up_to(last_offset);
                 if h.control {
                     let decoded = decode_batch(&batch)?;
-                    if is_abort_marker(&decoded) {
+                    if is_abort_marker(&decoded.records) {
                         aborted.aborted_producers.remove(&h.producer_id);
                     }
                     records = Some(decoded);
@@ -393,27 +395,26 @@ pub(crate) fn decode_fetch_data(
 
         match disposition {
             BatchDisposition::Keep => {
-                let records = match records {
-                    Some(records) => records,
+                let decoded = match records {
+                    Some(decoded) => decoded,
                     None => decode_batch(&batch)?,
                 };
-                out.records.extend(
-                    records
-                        .iter()
-                        .filter(|r| r.offset >= fetch_offset)
-                        .map(convert_record),
-                );
+                decoded.push_from(fetch_offset, &mut out.records);
             }
             BatchDisposition::Control | BatchDisposition::Aborted => {
                 let header_count = header.map_or(0, |h| h.records_count.max(0) as u64);
                 let count = if base_offset >= fetch_offset {
                     header_count
                 } else {
-                    let records = match records {
-                        Some(records) => records,
+                    let decoded = match records {
+                        Some(decoded) => decoded,
                         None => decode_batch(&batch)?,
                     };
-                    records.iter().filter(|r| r.offset >= fetch_offset).count() as u64
+                    decoded
+                        .records
+                        .iter()
+                        .filter(|r| r.offset >= fetch_offset)
+                        .count() as u64
                 };
                 let (control_records, aborted_records) = match disposition {
                     BatchDisposition::Control => (count, 0),
@@ -435,17 +436,74 @@ pub(crate) fn decode_fetch_data(
     Ok(out)
 }
 
-/// Decode the records of one complete batch.
-fn decode_batch(batch: &Bytes) -> Result<Vec<Record>> {
+/// The records of one complete batch.
+struct DecodedBatch {
+    records: Vec<Record>,
+    /// Each record's headers in wire order, duplicates and null values
+    /// included. kafka-protocol's `Record` keeps headers in a map, which
+    /// collapses repeated keys, so they are read from the decompressed
+    /// record bytes instead. `None` when the codec did not hand the record
+    /// bytes over (no v2 records); the map headers are used then.
+    headers: Option<Vec<Vec<crate::manifest::RecordHeader>>>,
+}
+
+impl DecodedBatch {
+    /// Append the records at or after `fetch_offset` to `out`.
+    fn push_from(self, fetch_offset: i64, out: &mut Vec<BackupRecord>) {
+        let mut ordered = self.headers.map(Vec::into_iter);
+        for record in &self.records {
+            let headers = ordered.as_mut().and_then(Iterator::next);
+            if record.offset >= fetch_offset {
+                let mut converted = convert_record(record);
+                if let Some(headers) = headers {
+                    converted.headers = headers;
+                }
+                out.push(converted);
+            }
+        }
+    }
+}
+
+/// Decode the records of one complete batch. Batch framing, CRC checks,
+/// decompression and timestamps stay with the upstream codec; the ordered
+/// header lists are taken from the decompressed records on the way through.
+fn decode_batch(batch: &Bytes) -> Result<DecodedBatch> {
     let mut buf = batch.clone();
-    RecordBatchDecoder::decode(&mut buf)
-        .map(|set| set.records)
-        .map_err(|e| {
-            crate::Error::from(KafkaError::Protocol(format!(
-                "Failed to decode records: {:?}",
-                e
-            )))
-        })
+    let ordered_headers = std::cell::RefCell::new(None);
+    let decompress = |input: &mut Bytes, compression: Compression| -> anyhow::Result<Bytes> {
+        let body = match compression {
+            Compression::None => {
+                cmpr::None::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Gzip => {
+                cmpr::Gzip::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Snappy => {
+                cmpr::Snappy::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Lz4 => {
+                cmpr::Lz4::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+            Compression::Zstd => {
+                cmpr::Zstd::decompress(input, |b| Ok(b.copy_to_bytes(b.remaining())))?
+            }
+        };
+        *ordered_headers.borrow_mut() = Some(super::header_codec::decode(&body)?);
+        Ok(body)
+    };
+    let set = RecordBatchDecoder::decode_with_custom_compression(&mut buf, Some(&decompress))
+        .map_err(|e| KafkaError::Protocol(format!("Failed to decode records: {e:?}")))?;
+    let headers = ordered_headers.into_inner();
+    if headers
+        .as_ref()
+        .is_some_and(|h| h.len() != set.records.len())
+    {
+        return Err(KafkaError::Protocol("Kafka record/header list count mismatch".into()).into());
+    }
+    Ok(DecodedBatch {
+        records: set.records,
+        headers,
+    })
 }
 
 /// Whether a control batch is an ABORT marker: its first record's key is

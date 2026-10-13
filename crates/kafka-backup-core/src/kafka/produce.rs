@@ -2,6 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use indexmap::IndexMap;
+use kafka_protocol::compression::{self as cmpr, Compressor};
 use kafka_protocol::messages::{
     ApiKey, ProduceRequest, ProduceResponse as KafkaProduceResponse, TopicName,
 };
@@ -274,6 +275,14 @@ pub(crate) fn build_kafka_records(records: &[BackupRecord], batch: &ProducerBatc
 }
 
 /// Encode `records` once as a single v2 record batch.
+///
+/// kafka-protocol's `Record` holds headers in a map, which collapses
+/// duplicate keys. The batch framing, timestamps, compression and CRC stay
+/// with the upstream encoder; only each record's header list is rewritten
+/// (in order, duplicates and null values included) in the uncompressed
+/// record bytes before they are compressed. Every produce path — plain,
+/// idempotent and transactional — encodes through here exactly once, so a
+/// retry resends these identical bytes.
 pub(crate) fn encode_batch(
     records: &[BackupRecord],
     batch: &ProducerBatch,
@@ -283,16 +292,46 @@ pub(crate) fn encode_batch(
         return Err(KafkaError::Protocol("cannot encode an empty record batch".to_string()).into());
     }
     let kafka_records = build_kafka_records(records, batch);
+    let headers: Vec<_> = records.iter().map(|r| r.headers.clone()).collect();
+    let header_index = std::cell::Cell::new(0);
+    let compressor =
+        |raw: &mut BytesMut, out: &mut BytesMut, compression: Compression| -> anyhow::Result<()> {
+            let count = super::header_codec::decode(raw)?.len();
+            let start = header_index.get();
+            let end = start + count;
+            let raw = super::header_codec::replace(
+                raw,
+                headers
+                    .get(start..end)
+                    .ok_or_else(|| anyhow::anyhow!("Kafka record/header count mismatch"))?,
+            )?;
+            header_index.set(end);
+            let body = |buf: &mut BytesMut| -> anyhow::Result<()> {
+                buf.extend_from_slice(&raw);
+                Ok(())
+            };
+            match compression {
+                Compression::None => cmpr::None::compress(out, body),
+                Compression::Gzip => cmpr::Gzip::compress(out, body),
+                Compression::Snappy => cmpr::Snappy::compress(out, body),
+                Compression::Lz4 => cmpr::Lz4::compress(out, body),
+                Compression::Zstd => cmpr::Zstd::compress(out, body),
+            }
+        };
     let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
+    RecordBatchEncoder::encode_with_custom_compression(
         &mut buf,
         kafka_records.iter(),
         &RecordEncodeOptions {
             version: 2,
             compression,
         },
+        Some(&compressor),
     )
-    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {:?}", e)))?;
+    .map_err(|e| KafkaError::Protocol(format!("Failed to encode records: {e:?}")))?;
+    if header_index.get() != headers.len() {
+        return Err(KafkaError::Protocol("Kafka record/header count mismatch".to_string()).into());
+    }
     Ok(buf.freeze())
 }
 
@@ -625,6 +664,65 @@ mod tests {
         assert_eq!(increment_sequence(i32::MAX, 1), 0);
         assert_eq!(increment_sequence(i32::MAX - 2, 5), 2);
         assert_eq!(increment_sequence(i32::MAX - 999, 1_000), 0);
+    }
+
+    /// Duplicate, null and empty headers survive the single encode every
+    /// produce path uses (plain, idempotent, transactional), in order, for
+    /// every codec, and fetch decodes them back the same way. The encoding
+    /// is deterministic, so a retry resends identical bytes.
+    #[test]
+    fn encode_batch_keeps_ordered_duplicate_headers_on_every_produce_path() {
+        use super::super::fetch::{decode_fetch_data, TransactionFilter};
+        use super::super::transactions::ProducerIdAndEpoch;
+
+        let header = |key: &str, value: Option<&[u8]>| RecordHeader {
+            key: key.to_string(),
+            value: value.map(<[u8]>::to_vec),
+        };
+        let mut first = make_record(1_700_000_000_000);
+        first.headers = vec![
+            header("x", None),
+            header("x", Some(b"")),
+            header("y", Some(b"2")),
+            header("x", Some(b"3")),
+        ];
+        let mut second = make_record(1_700_000_000_001);
+        second.headers = vec![header("y", Some(b"a")), header("y", Some(b"a"))];
+        let records = vec![first, make_record(1_700_000_000_002), second];
+
+        let idempotent = ProducerBatch {
+            producer: ProducerIdAndEpoch {
+                producer_id: 7,
+                producer_epoch: 1,
+            },
+            base_sequence: 40,
+            transactional: false,
+        };
+        let transactional = ProducerBatch {
+            transactional: true,
+            ..idempotent
+        };
+        for batch in [ProducerBatch::NON_IDEMPOTENT, idempotent, transactional] {
+            for compression in [
+                Compression::None,
+                Compression::Gzip,
+                Compression::Snappy,
+                Compression::Lz4,
+                Compression::Zstd,
+            ] {
+                let bytes = encode_batch(&records, &batch, compression).unwrap();
+                assert_eq!(
+                    bytes,
+                    encode_batch(&records, &batch, compression).unwrap(),
+                    "{compression:?}: encoding must be deterministic"
+                );
+                let decoded =
+                    decode_fetch_data(&bytes, 0, &mut TransactionFilter::ReadUncommitted).unwrap();
+                let headers: Vec<_> = decoded.records.iter().map(|r| r.headers.clone()).collect();
+                let expected: Vec<_> = records.iter().map(|r| r.headers.clone()).collect();
+                assert_eq!(headers, expected, "{compression:?} {batch:?}");
+            }
+        }
     }
 
     /// A batch whose sequences cross `i32::MAX` is still encoded as one

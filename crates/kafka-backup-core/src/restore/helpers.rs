@@ -217,7 +217,7 @@ impl SchemaIdCounts {
             warn!(
                 "{source_topic}: {unmapped} key(s)/value(s) start with the Confluent magic byte \
                  but carry a schema ID absent from restore.schema_id_mapping; they were \
-                 restored unchanged (set restore.schema_id_rewrite_strict to fail instead)"
+                 restored unchanged (restore.schema_id_rewrite_strict: false)"
             );
         }
         (rewritten, unmapped)
@@ -239,10 +239,16 @@ pub(crate) fn schema_id_rewrite_applies(options: &RestoreOptions, source_topic: 
 /// Rewrite the Confluent schema IDs of records about to be produced
 /// (`restore.rewrite_schema_ids`) and count them in `counts`.
 ///
-/// Records of topics outside `schema_id_rewrite_topics` are left alone. A key
-/// or value with the magic byte and an ID absent from `schema_id_mapping` is
-/// left unchanged and counted, or, with `schema_id_rewrite_strict`, fails the
-/// restore before any record of the batch is produced.
+/// Records of topics outside `schema_id_rewrite_topics` are left alone. With
+/// `schema_id_rewrite_strict` (the default, as in 0.24) a key or value that
+/// starts with the magic byte but is shorter than the 5-byte frame, or
+/// carries an ID absent from `schema_id_mapping`, fails the restore before
+/// any record of the batch is produced; with `schema_id_rewrite_strict:
+/// false` it is left unchanged (an unmapped ID is counted). A mapping to an
+/// ID that is not positive always fails.
+///
+/// Both restore paths call this after the record transform and before the
+/// offset headers and partition routing.
 pub(crate) fn rewrite_schema_ids(
     records: &mut [BackupRecord],
     source_topic: &str,
@@ -260,19 +266,41 @@ pub(crate) fn rewrite_schema_ids(
             ("key", record.key.as_mut()),
             ("value", record.value.as_mut()),
         ] {
-            match rewrite_confluent_payload(payload, &options.schema_id_mapping) {
-                PayloadRewrite::NotFramed => {}
-                PayloadRewrite::Rewritten => rewritten += 1,
-                PayloadRewrite::Unmapped(id) if options.schema_id_rewrite_strict => {
-                    counts.add(rewritten, unmapped);
-                    return Err(Error::Validation(format!(
-                        "schema ID {id} in the {part} of {source_topic} partition \
-                         {source_partition} offset {offset} is not in restore.schema_id_mapping; \
-                         restore.schema_id_rewrite_strict refuses to produce it with the source \
-                         registry's ID"
-                    )));
+            let strict = options.schema_id_rewrite_strict;
+            let failure = match rewrite_confluent_payload(payload, &options.schema_id_mapping) {
+                PayloadRewrite::NotFramed => None,
+                PayloadRewrite::Rewritten => {
+                    rewritten += 1;
+                    None
                 }
-                PayloadRewrite::Unmapped(_) => unmapped += 1,
+                PayloadRewrite::InvalidTarget { source, target } => Some(format!(
+                    "restore.schema_id_mapping maps schema ID {source} (in the {part} of \
+                     {source_topic} partition {source_partition} offset {offset}) to {target}; \
+                     schema IDs are positive"
+                )),
+                PayloadRewrite::Truncated if strict => Some(format!(
+                    "the {part} of {source_topic} partition {source_partition} offset {offset} \
+                     starts with the Confluent magic byte but is shorter than a schema ID frame; \
+                     restore.schema_id_rewrite_strict refuses to produce it (narrow \
+                     schema_id_rewrite_topics, or set schema_id_rewrite_strict: false, for topics \
+                     with raw keys or values)"
+                )),
+                PayloadRewrite::Truncated => None,
+                PayloadRewrite::Unmapped(id) if strict => Some(format!(
+                    "schema ID {id} in the {part} of {source_topic} partition \
+                     {source_partition} offset {offset} is not in restore.schema_id_mapping; \
+                     restore.schema_id_rewrite_strict refuses to produce it with the source \
+                     registry's ID (narrow schema_id_rewrite_topics, or set \
+                     schema_id_rewrite_strict: false, for topics with raw keys or values)"
+                )),
+                PayloadRewrite::Unmapped(_) => {
+                    unmapped += 1;
+                    None
+                }
+            };
+            if let Some(message) = failure {
+                counts.add(rewritten, unmapped);
+                return Err(Error::Validation(message));
             }
         }
     }
@@ -282,11 +310,18 @@ pub(crate) fn rewrite_schema_ids(
 
 #[derive(Debug, PartialEq, Eq)]
 enum PayloadRewrite {
-    /// Null, shorter than 5 bytes, or no magic byte 0.
+    /// Null, empty, or no magic byte 0.
     NotFramed,
+    /// Magic byte 0 but shorter than the 5-byte frame header.
+    Truncated,
     Rewritten,
     /// Magic byte 0 followed by this ID, absent from the mapping.
     Unmapped(i32),
+    /// The mapping sends `source` to an ID that is not positive.
+    InvalidTarget {
+        source: i32,
+        target: i32,
+    },
 }
 
 /// Rewrite the 4-byte schema ID following Confluent's magic byte. Avro, JSON
@@ -299,11 +334,18 @@ fn rewrite_confluent_payload(
     let Some(payload) = payload else {
         return PayloadRewrite::NotFramed;
     };
-    if payload.len() < 5 || payload[0] != 0 {
+    if payload.first() != Some(&0) {
         return PayloadRewrite::NotFramed;
+    }
+    if payload.len() < 5 {
+        return PayloadRewrite::Truncated;
     }
     let source_id = i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
     match mapping.get(&source_id) {
+        Some(&target) if target <= 0 => PayloadRewrite::InvalidTarget {
+            source: source_id,
+            target,
+        },
         Some(target_id) => {
             payload[1..5].copy_from_slice(&target_id.to_be_bytes());
             PayloadRewrite::Rewritten
@@ -760,14 +802,16 @@ mod tests {
     }
 
     #[test]
-    fn ignores_null_short_and_non_confluent_payloads_and_counts_unmapped() {
+    fn lenient_mode_ignores_null_short_and_non_confluent_payloads_and_counts_unmapped() {
         let mut records = vec![
             record(None, Some(vec![0, 1, 2])),
             record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8])),
         ];
         let original = records.clone();
         let counts = SchemaIdCounts::default();
-        rewrite_schema_ids(&mut records, "t", 0, &rewrite_options(&[(7, 42)]), &counts).unwrap();
+        let mut options = rewrite_options(&[(7, 42)]);
+        options.schema_id_rewrite_strict = false;
+        rewrite_schema_ids(&mut records, "t", 0, &options, &counts).unwrap();
         assert_eq!(records[0].key, original[0].key);
         assert_eq!(records[0].value, original[0].value);
         assert_eq!(records[1].key, original[1].key);
@@ -802,10 +846,11 @@ mod tests {
         assert_eq!(counts.finish("t"), (1, 0));
     }
 
+    /// Strict is the default (0.24 failed on truncated and unmapped frames).
     #[test]
     fn strict_mode_fails_on_an_unmapped_id_naming_the_record() {
-        let mut options = rewrite_options(&[(7, 42)]);
-        options.schema_id_rewrite_strict = true;
+        let options = rewrite_options(&[(7, 42)]);
+        assert!(options.schema_id_rewrite_strict);
         let counts = SchemaIdCounts::default();
 
         // Mapped and non-framed payloads pass.
@@ -821,5 +866,37 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("restore.schema_id_mapping"), "{err}");
+    }
+
+    #[test]
+    fn strict_mode_fails_on_a_truncated_frame_and_any_mode_on_a_non_positive_target() {
+        let counts = SchemaIdCounts::default();
+        let mut truncated = vec![record(None, Some(vec![0, 1, 2]))];
+        let err = rewrite_schema_ids(
+            &mut truncated,
+            "t",
+            0,
+            &rewrite_options(&[(7, 42)]),
+            &counts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shorter than a schema ID frame"), "{err}");
+
+        // Raw payloads that do not start with 0 pass, with or without a mapping.
+        let mut raw = vec![record(None, Some(vec![1, 2]))];
+        rewrite_schema_ids(&mut raw, "t", 0, &rewrite_options(&[]), &counts).unwrap();
+        assert_eq!(raw[0].value, Some(vec![1, 2]));
+
+        for strict in [true, false] {
+            let mut options = rewrite_options(&[(7, 0)]);
+            options.schema_id_rewrite_strict = strict;
+            let mut zero = vec![record(None, Some(vec![0, 0, 0, 0, 7, 1]))];
+            let err = rewrite_schema_ids(&mut zero, "t", 0, &options, &counts)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("schema IDs are positive"), "{err}");
+            assert_eq!(zero[0].value, Some(vec![0, 0, 0, 0, 7, 1]));
+        }
     }
 }

@@ -244,6 +244,9 @@ pub(crate) async fn restore_topic_repartitioned(
                 &telemetry,
             )
             .await;
+            if result.is_err() {
+                cancel.store(true, Ordering::Relaxed);
+            }
             drop(permit);
             result
         }));
@@ -306,12 +309,14 @@ pub(crate) async fn restore_topic_repartitioned(
 
     for handle in writer_handles {
         match handle.await {
-            Ok(Ok(report)) => {
+            Ok(Ok(Some(report))) => {
                 total_records += report.records;
                 total_bytes += report.bytes;
                 partition_reports.push(report);
                 telemetry.partition_completed();
             }
+            // Stopped early by a failure reported by another task.
+            Ok(Ok(None)) => {}
             Ok(Err(e)) => reader_errors.push(e),
             Err(e) => reader_errors.push(Error::Io(std::io::Error::other(format!(
                 "Writer task join error: {}",
@@ -423,26 +428,29 @@ async fn run_reader(
             None => filtered,
         };
 
+        // Same order as the 1:1 path: the record transform, the schema-ID
+        // rewrite, then the offset headers. Both run before the partitioner
+        // sees the key, so a key whose schema ID is rewritten is routed by
+        // the bytes a native producer on the target would write. A failure
+        // stops the other readers and the writers too (the task wrapper
+        // sets `cancel`).
+        let mut filtered =
+            super::transform::apply(source_topic, filtered, options.record_transform.as_ref())?;
+        helpers::rewrite_schema_ids(
+            &mut filtered,
+            source_topic,
+            source_partition,
+            options,
+            schema_ids,
+        )?;
+
         if filtered.is_empty() {
             helpers::mark_segment_completed(checkpoint, &segment.key).await;
             continue;
         }
 
         let stripped = helpers::strip_offset_headers(filtered, options);
-        let mut records_to_send =
-            helpers::inject_offset_headers(stripped, source_partition, options);
-        // Same rewrite as the 1:1 path. A strict-mode failure stops the
-        // other readers and the writers too.
-        if let Err(e) = helpers::rewrite_schema_ids(
-            &mut records_to_send,
-            source_topic,
-            source_partition,
-            options,
-            schema_ids,
-        ) {
-            cancel.store(true, Ordering::Relaxed);
-            return Err(e);
-        }
+        let records_to_send = helpers::inject_offset_headers(stripped, source_partition, options);
 
         // Route each record through the partitioner. The segment is marked
         // complete by the writers, once all its records are acknowledged.
@@ -473,7 +481,9 @@ async fn run_reader(
 }
 
 /// Writer task: receives records from a channel and produces them in
-/// batches capped by record count and encoded bytes.
+/// batches capped by record count and encoded bytes. `None` when it stopped
+/// early because a reader or another writer failed (that error is the
+/// topic's result).
 #[allow(clippy::too_many_arguments)]
 async fn run_writer(
     mut rx: mpsc::Receiver<Routed>,
@@ -486,7 +496,7 @@ async fn run_writer(
     health: &HealthCheck,
     metrics: &PerformanceMetrics,
     telemetry: &RestoreTelemetry,
-) -> Result<PartitionRestoreReport> {
+) -> Result<Option<PartitionRestoreReport>> {
     let batch_size = produce_path.max_batch_records();
     let max_batch_bytes = produce_path.max_batch_bytes();
     let mut total_records = 0u64;
@@ -497,8 +507,16 @@ async fn run_writer(
     let mut acks: Vec<Arc<SegmentAck>> = Vec::with_capacity(batch_size);
     // A record drained from the channel that did not fit the previous batch.
     let mut carry: Option<Routed> = None;
+    let mut stopped = false;
 
     loop {
+        // A reader or another writer failed: stop before the next batch.
+        // Records still queued are not acknowledged, so their segments stay
+        // incomplete in the checkpoint.
+        if cancel.load(Ordering::Relaxed) {
+            stopped = true;
+            break;
+        }
         // Start the batch with the carried record, else block on the first one
         let mut batch_encoded = RECORD_BATCH_OVERHEAD;
         let first = match carry.take() {
@@ -552,12 +570,19 @@ async fn run_writer(
             })
             .sum();
 
-        // Produce (after the restore-wide rate limit)
+        // Produce (after the restore-wide rate limit, unless the restore
+        // started stopping while the batch waited for it)
         match produce_path
-            .produce(target_topic, target_partition, &batch)
+            .produce(target_topic, target_partition, &batch, || {
+                cancel.load(Ordering::Relaxed)
+            })
             .await
         {
-            Ok(_) => {
+            Ok(None) => {
+                stopped = true;
+                break;
+            }
+            Ok(Some(_)) => {
                 kafka_cb.record_success();
                 health.mark_healthy("kafka");
                 acknowledge_segments(&acks).await;
@@ -580,12 +605,21 @@ async fn run_writer(
         acks.clear();
     }
 
+    // A writer whose readers all stopped because one failed also ends here
+    // with the channel closed: it did not finish the topic either.
+    if stopped || cancel.load(Ordering::Relaxed) {
+        debug!(
+            "Writer for {}:{} stopped after {} records: a reader or writer failed",
+            target_topic, target_partition, total_records
+        );
+        return Ok(None);
+    }
     debug!(
         "Writer for {}:{} finished ({} records)",
         target_topic, target_partition, total_records
     );
 
-    Ok(PartitionRestoreReport {
+    Ok(Some(PartitionRestoreReport {
         source_partition: -1, // N:M mapping, no single source
         target_partition,
         segments_processed: 0, // tracked by readers
@@ -597,7 +631,7 @@ async fn run_writer(
         last_timestamp: 0,
         records_dropped_by_filter: 0, // tracked at topic level by readers
         records_tombstoned_by_filter: 0,
-    })
+    }))
 }
 
 #[cfg(test)]

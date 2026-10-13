@@ -6,7 +6,8 @@
 //! a one-broker mock that decodes every produced record batch, and check the
 //! bytes that were produced: rewritten IDs, the topic allow-list
 //! (`schema_id_rewrite_topics`), the per-topic counts in the report, and
-//! `schema_id_rewrite_strict`.
+//! `schema_id_rewrite_strict` (on by default, as 0.24 always failed on an
+//! unmapped ID).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,8 +31,9 @@ use kafka_backup_core::config::{
     CompressionType, Config, ConnectionConfig, KafkaConfig, Mode, RepartitioningStrategy,
     RestoreOptions, SecurityConfig, TopicRepartitioning, TopicSelection,
 };
-use kafka_backup_core::manifest::{BackupManifest, RestoreReport};
+use kafka_backup_core::manifest::{BackupManifest, BackupRecord, RecordHeader, RestoreReport};
 use kafka_backup_core::metrics::PerformanceMetrics;
+use kafka_backup_core::restore::transform::{RecordTransform, RecordTransformHandle};
 use kafka_backup_core::restore::RestoreEngine;
 use kafka_backup_core::segment::{BinaryRecord, SegmentWriter, SegmentWriterConfig};
 use kafka_backup_core::storage::{create_backend, StorageBackendConfig};
@@ -53,6 +55,8 @@ const FRAMED_PAYLOADS: u64 = (PARTITIONS as u64) * (RECORDS_PER_PARTITION as u64
 struct Produced {
     key: Option<Vec<u8>>,
     value: Option<Vec<u8>>,
+    /// As kafka-protocol decodes them (a map: one value per key).
+    headers: HashMap<String, Option<Vec<u8>>>,
 }
 
 /// One broker leading every partition of `TOPIC`; records every produced
@@ -117,9 +121,16 @@ async fn serve(
                         produced
                             .lock()
                             .await
-                            .extend(set.records.into_iter().map(|r| Produced {
-                                key: r.key.map(|k| k.to_vec()),
-                                value: r.value.map(|v| v.to_vec()),
+                            .extend(set.records.into_iter().map(|r| {
+                                Produced {
+                                    key: r.key.map(|k| k.to_vec()),
+                                    value: r.value.map(|v| v.to_vec()),
+                                    headers: r
+                                        .headers
+                                        .into_iter()
+                                        .map(|(k, v)| (k.to_string(), v.map(|v| v.to_vec())))
+                                        .collect(),
+                                }
                             }));
                         let mut offsets = next_offset.lock().await;
                         let base = offsets.entry(partition.index).or_insert(0);
@@ -396,9 +407,12 @@ async fn topic_allow_list_scopes_the_rewrite_on_both_paths() {
 }
 
 #[tokio::test]
-async fn unmapped_ids_are_left_and_counted_by_default() {
+async fn unmapped_ids_are_left_and_counted_when_not_strict() {
     for path in [Path::OneToOne, Path::Repartition] {
-        let (result, produced) = restore(path, true, |_| {}).await;
+        let (result, produced) = restore(path, true, |r| {
+            r.schema_id_rewrite_strict = false;
+        })
+        .await;
         let report = result.expect("restore");
         assert_eq!(topic_counts(&report), (FRAMED_PAYLOADS, 1), "{path:?}");
         let lost = produced
@@ -410,12 +424,9 @@ async fn unmapped_ids_are_left_and_counted_by_default() {
 }
 
 #[tokio::test]
-async fn strict_mode_fails_on_an_unmapped_id_on_both_paths() {
+async fn an_unmapped_id_fails_the_restore_by_default_on_both_paths() {
     for path in [Path::OneToOne, Path::Repartition] {
-        let (result, produced) = restore(path, true, |r| {
-            r.schema_id_rewrite_strict = true;
-        })
-        .await;
+        let (result, produced) = restore(path, true, |_| {}).await;
         let err = result.expect_err("strict restore fails").to_string();
         for needle in [
             "schema ID 9",
@@ -435,6 +446,98 @@ async fn strict_mode_fails_on_an_unmapped_id_on_both_paths() {
                 .all(|r| r.key.as_deref() != Some(&b"unmapped"[..])),
             "{path:?}: the unmapped record must not be produced"
         );
+    }
+}
+
+/// A record transform, as Kafka Backup Enterprise's registry restore uses.
+/// It must see the record as archived: the source registry's value ID (the
+/// schema-ID rewrite runs after it) and no kafka-backup offset headers (they
+/// are added after it). It tags each record, and fails at `fail_at`.
+struct CheckingTransform {
+    fail_at: Option<i64>,
+}
+
+impl RecordTransform for CheckingTransform {
+    fn name(&self) -> &str {
+        "checking"
+    }
+    fn fingerprint(&self) -> &str {
+        "checking-v1"
+    }
+    fn transform(
+        &self,
+        source_topic: &str,
+        record: &mut BackupRecord,
+    ) -> kafka_backup_core::Result<()> {
+        let fail = |why: String| Err(kafka_backup_core::Error::Config(why));
+        if self.fail_at == Some(record.offset) {
+            return fail(format!("test transform rejects offset {}", record.offset));
+        }
+        let value_id = record.value.as_deref().and_then(schema_id);
+        if value_id != Some(VALUE_ID) {
+            return fail(format!("transform saw value schema ID {value_id:?}"));
+        }
+        if record.headers.iter().any(|h| h.key.starts_with("x-")) {
+            return fail(format!("transform saw headers {:?}", record.headers));
+        }
+        record.headers.push(RecordHeader {
+            key: "transformed-by".to_string(),
+            value: Some(source_topic.as_bytes().to_vec()),
+        });
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn transform_then_schema_id_rewrite_then_offset_headers_on_both_paths() {
+    for path in [Path::OneToOne, Path::Repartition] {
+        let (result, produced) = restore(path, false, |r| {
+            r.include_original_offset_header = true;
+            r.record_transform = Some(RecordTransformHandle::new(Arc::new(CheckingTransform {
+                fail_at: None,
+            })));
+        })
+        .await;
+        let report = result.expect("restore");
+        assert_rewritten(&produced, path);
+        assert_eq!(topic_counts(&report), (FRAMED_PAYLOADS, 0), "{path:?}");
+        for record in &produced {
+            assert_eq!(
+                record.headers.get("transformed-by"),
+                Some(&Some(TOPIC.as_bytes().to_vec())),
+                "{path:?}: {record:?}"
+            );
+            let offset = record
+                .headers
+                .get("x-original-offset")
+                .cloned()
+                .flatten()
+                .map(|v| i64::from_le_bytes(v.try_into().unwrap()));
+            assert!(
+                offset.is_some_and(|o| (0..RECORDS_PER_PARTITION).contains(&o)),
+                "{path:?}: offset header {offset:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failing_transform_stops_the_restore_before_its_segment_is_produced() {
+    for path in [Path::OneToOne, Path::Repartition] {
+        let (result, produced) = restore(path, false, |r| {
+            r.record_transform = Some(RecordTransformHandle::new(Arc::new(CheckingTransform {
+                fail_at: Some(5),
+            })));
+        })
+        .await;
+        let err = result.expect_err("the transform fails").to_string();
+        assert!(
+            err.contains("test transform rejects offset 5"),
+            "{path:?}: {err}"
+        );
+        // Every partition holds offset 5 in its only segment: the transform
+        // fails before any record of it is routed or produced.
+        assert!(produced.is_empty(), "{path:?}: produced {}", produced.len());
     }
 }
 
@@ -604,6 +707,7 @@ async fn schema_ids_are_rewritten_on_both_paths_against_kafka() {
                 restored.extend(resp.records.into_iter().map(|r| Produced {
                     key: r.key,
                     value: r.value,
+                    headers: r.headers.into_iter().map(|h| (h.key, h.value)).collect(),
                 }));
             }
         }

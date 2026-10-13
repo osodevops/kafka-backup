@@ -1273,13 +1273,18 @@ pub struct RestoreOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_id_rewrite_topics: Vec<String>,
 
-    /// Fail the restore on a key or value that carries the Confluent magic
-    /// byte and a schema ID absent from `schema_id_mapping`, instead of
-    /// producing it with the source registry's ID. A raw (not Schema
-    /// Registry framed) payload that starts with a zero byte looks the same,
-    /// so enable this only for topics whose keys and values are all framed
-    /// or never start with a zero byte.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Fail the restore on a key or value that starts with the Confluent
+    /// magic byte but is shorter than the 5-byte frame or carries a schema
+    /// ID absent from `schema_id_mapping`, instead of producing it with the
+    /// source registry's ID. Default `true` (0.24 always failed). A raw (not
+    /// Schema Registry framed) payload that starts with a zero byte looks
+    /// the same, so for topics with raw keys or values either leave them out
+    /// of `schema_id_rewrite_topics` or set this to `false`, which restores
+    /// such payloads unchanged and counts the unmapped ones.
+    #[serde(
+        default = "default_schema_id_rewrite_strict",
+        skip_serializing_if = "is_default_schema_id_rewrite_strict"
+    )]
     pub schema_id_rewrite_strict: bool,
 
     /// Phase 1 header preflight behaviour.
@@ -1321,6 +1326,10 @@ pub struct RestoreOptions {
     /// `record_filter`; not configurable from YAML.
     #[serde(skip)]
     pub record_filter_fingerprint: Option<String>,
+
+    /// Fallible transform after filtering, before routing/production.
+    #[serde(skip)]
+    pub record_transform: Option<crate::restore::transform::RecordTransformHandle>,
 
     /// Kafka circuit-breaker settings (advisory — never blocks requests; see
     /// [`CircuitBreakerSettings`]). Default matches the previous hardcoded
@@ -1401,12 +1410,13 @@ impl Default for RestoreOptions {
             rewrite_schema_ids: false,
             schema_id_mapping: Default::default(),
             schema_id_rewrite_topics: Vec::new(),
-            schema_id_rewrite_strict: false,
+            schema_id_rewrite_strict: default_schema_id_rewrite_strict(),
             header_preflight: HeaderPreflightMode::default(),
             header_preflight_external: false,
             dry_run_check_segments: false,
             record_filter: None,
             record_filter_fingerprint: None,
+            record_transform: None,
             circuit_breaker: CircuitBreakerSettings::default(),
         }
     }
@@ -1433,6 +1443,14 @@ fn default_idempotent_producer() -> bool {
 // checkpoint written by an earlier release must keep its hash.
 fn is_default_produce_max_batch_bytes(value: &usize) -> bool {
     *value == default_produce_max_batch_bytes()
+}
+
+fn default_schema_id_rewrite_strict() -> bool {
+    true
+}
+
+fn is_default_schema_id_rewrite_strict(value: &bool) -> bool {
+    *value == default_schema_id_rewrite_strict()
 }
 
 fn is_default_idempotent_producer(value: &bool) -> bool {
@@ -1802,7 +1820,7 @@ impl RestoreOptions {
         }
 
         if !self.rewrite_schema_ids
-            && (self.schema_id_rewrite_strict || !self.schema_id_rewrite_topics.is_empty())
+            && (!self.schema_id_rewrite_strict || !self.schema_id_rewrite_topics.is_empty())
         {
             return Err(crate::Error::Config(
                 "schema_id_rewrite_topics and schema_id_rewrite_strict need \
@@ -2356,7 +2374,7 @@ schema_id_rewrite_strict: true
         opts.validate().unwrap();
 
         for tweak in [
-            |o: &mut RestoreOptions| o.schema_id_rewrite_strict = true,
+            |o: &mut RestoreOptions| o.schema_id_rewrite_strict = false,
             |o: &mut RestoreOptions| o.schema_id_rewrite_topics = vec!["orders".into()],
         ] {
             let mut opts = RestoreOptions::default();
@@ -2465,7 +2483,7 @@ schema_id_rewrite_strict: true
                 o.schema_id_rewrite_topics = vec!["orders".into()]
             }),
             ("schema_id_rewrite_strict", |o| {
-                o.schema_id_rewrite_strict = true
+                o.schema_id_rewrite_strict = false
             }),
         ];
         for (key, tweak) in tweaks {

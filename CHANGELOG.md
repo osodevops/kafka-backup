@@ -13,14 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in metadata), with the same bounded backoff as produce. A restore reads the
   high watermarks of topics it has just created, and failed the topic when a
   leader had not been elected yet.
-- A restore whose options contain a map with two or more entries
-  (`topic_mapping`, `partition_mapping`, `repartitioning`,
-  `schema_id_mapping`, `topic_config_overrides`) can now resume its
-  checkpoint. The checkpoint is keyed by a hash of the serialized options,
-  and `HashMap` entries serialized in a different order on every run, so such
-  a restore always started over. Maps now serialize sorted by key; maps with
-  zero or one entry serialize exactly as before, so existing checkpoints keep
-  their hash.
+- **Restore checkpoints written by 0.23.x resume again.** The checkpoint is
+  keyed by a hash of the restore options. 0.24.0 changed how it is computed
+  (sorted JSON objects, so a map with two or more entries such as
+  `topic_mapping`, `partition_mapping`, `repartitioning`,
+  `schema_id_mapping` or `topic_config_overrides` no longer changes the hash
+  from run to run), which made an interrupted 0.23 restore start over after
+  an upgrade. A checkpoint now resumes when it carries the 0.24 hash or,
+  without a record transform, the 0.23 one; it is saved with the 0.24 hash
+  from then on. Every option added in this release is left out of both at
+  its default. Maps in serialized restore options are sorted by key.
 - **Transactional topics were restored with their aborted records and their
   transaction markers.** Backups read uncommitted: every record of an
   aborted transaction was archived, and so was every COMMIT/ABORT marker,
@@ -130,11 +132,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by log lines and did not parse. All logs now go to stderr; stdout carries
   only command output. Text logs are coloured only when stderr is a
   terminal.
-- **`restore.rewrite_schema_ids` did nothing for repartitioned topics.** The
-  1:1 path rewrote Confluent schema IDs, but the repartition (fan-out) path
-  produced the source registry's IDs unchanged, so consumers of a
-  repartitioned topic resolved the wrong schemas on the target. Both paths
-  now apply the same rewrite.
+- **`restore.rewrite_schema_ids` did nothing for repartitioned topics** in
+  0.23. The 1:1 path rewrote Confluent schema IDs, but the repartition
+  (fan-out) path produced the source registry's IDs unchanged, so consumers
+  of a repartitioned topic resolved the wrong schemas on the target. 0.24.0
+  added a second, always-strict rewrite in front of partition selection;
+  there is now one rewrite on both paths, with a topic scope, per-topic
+  counts and `schema_id_rewrite_strict` (on by default, so 0.24's
+  fail-on-unmapped behaviour is kept). A mapping to a schema ID that is not
+  positive always fails.
 - **One unsupported topic config failed the whole restore, after the topics
   were created.** Restoring a backup from Kafka 3.x or Confluent into Kafka
   4.x or Confluent Cloud sent every captured override in one
@@ -171,7 +177,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     checkpoint after the error). A failing partition now stops its
     siblings after their in-flight batch and all are awaited, so the
     checkpoint holds exactly the acknowledged work; partition tasks are
-    also aborted if the run itself is cancelled.
+    also aborted if the run itself is cancelled. On the repartition path a
+    failing reader or writer stops the other writers the same way, also
+    when a batch was waiting for the rate limit. (0.24.1 aborted the
+    sibling tasks wherever they were, and checkpointed a repartitioned
+    topic's segments only once the whole topic succeeded; segments are now
+    completed one by one as their records are acknowledged.)
   - Resuming inside a partially restored segment re-produced the whole
     segment. Each source partition now records the source offset of its
     last acknowledged record and the target's high watermark after it; a
@@ -260,6 +271,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every repartitioning writer, as is `rate_limit_bytes_per_sec`.
   Configurations tuned around the old behaviour should multiply the value
   by `max_concurrent_partitions` to keep the same throughput.
+- A `RecordTransform` that changes a record's offset fails the restore:
+  resume, the offset mapping and the checkpoint identify records by source
+  offset. On both restore paths the order is: time and record filters, the
+  transform, `rewrite_schema_ids`, then the kafka-backup offset headers
+  (strip, inject), and on the repartition path partition routing. All of it
+  runs once per segment before batches are encoded, so a retried batch
+  resends identical bytes and a resume verifies its unsaved tail against
+  what was produced.
 - **`restore.produce_acks` other than `-1` now needs
   `restore.idempotent_producer: false`.** An idempotent producer requires
   acks=all; a configuration with `produce_acks: 0` or `1` and the new
@@ -389,9 +408,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kafka_restore_errors_total{error_type}` (#173).
 
 - `restore.schema_id_rewrite_topics` (source topics the schema ID rewrite
-  applies to; all by default) and `restore.schema_id_rewrite_strict` (fail on
-  a framed key or value whose ID is not in `schema_id_mapping`, instead of
-  restoring it with the source ID). The restore report counts
+  applies to; all by default) and `restore.schema_id_rewrite_strict`
+  (default `true`: fail on a key or value that starts with the magic byte
+  but is truncated or carries an ID not in `schema_id_mapping`; `false`
+  restores such payloads with the source ID and counts them, for topics
+  whose raw keys or values can start with `0x00`). The restore report counts
   `schema_ids_rewritten` / `schema_ids_unmapped` per topic; `restore` prints
   them.
 
@@ -407,6 +428,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restore applies them only where the target lists them.
 
 ### API
+- `RecordTransformHandle::name()`.
 - `RestoreEngine::new_with_metrics(config, Option<Arc<PrometheusMetrics>>)`
   and `RestoreEngine::prometheus_metrics()`, as on `BackupEngine`;
   `ThreePhaseRestore::with_prometheus_metrics`.
@@ -442,6 +464,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RestoreCheckpoint::partition_key` and `record_ack`. `RestoreOptions`
   gains `checkpoint_storage` (`RestoreCheckpointStorage`) and `restore_id`;
   `checkpoint_interval_secs: 0` is now rejected.
+
+## [0.24.1] - 2026-10-13
+
+### Fixed
+- A failing record transform stops subsequent topic replay and cancels sibling
+  partition workers before returning the error. Repartitioned writers stop
+  when a reader fails, including after rate limiting.
+- Repartitioned segments are checkpointed only after all producers succeed;
+  enqueueing records no longer marks unacknowledged data as restored.
+
+## [0.24.0] - 2026-10-13
+
+### Added
+- Embedders can attach a fallible `RecordTransform` to restore options. Every
+  replay path calls it after time and record filters and before partition
+  routing; its fingerprint is checked when resuming a checkpoint.
+- The public `restore::read_segment` API lets embedders preflight archived
+  record formats with the same decoder used for replay.
+
+### Fixed
+- Fetch and produce preserve duplicate Kafka headers in order, including null
+  and empty values. The batch codec still validates checksums and handles
+  compression; ordered headers are retained around its map-based record API.
+- Legacy configured schema ID rewriting fails on truncated or unmapped frames
+  and also runs before partition selection during repartitioned restores.
 
 ## [0.23.8] - 2026-10-09
 

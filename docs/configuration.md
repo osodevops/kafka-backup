@@ -1227,24 +1227,38 @@ otherwise.
 | `rewrite_schema_ids` | bool | No | `false` | Rewrite the schema ID of every framed key and value, on the 1:1 and the repartition path |
 | `schema_id_mapping` | map[int]int | No | `{}` | Source schema ID → target schema ID |
 | `schema_id_rewrite_topics` | list[string] | No | `[]` (all) | Source topics to rewrite (glob, or regex with a `~` prefix); others are restored unchanged |
-| `schema_id_rewrite_strict` | bool | No | `false` | Fail on a framed key or value whose ID is not in `schema_id_mapping`, naming the topic, partition and offset, instead of restoring it with the source ID |
+| `schema_id_rewrite_strict` | bool | No | `true` | Fail on a key or value that starts with the magic byte but is shorter than 5 bytes or carries an ID not in `schema_id_mapping`, naming the topic, partition and offset. `false` restores such payloads unchanged (with the source ID) and counts the unmapped ones |
 
 Only the 4 ID bytes change; the payload after them is produced byte for
 byte. The restore report counts, per topic, `schema_ids_rewritten` and
 `schema_ids_unmapped` (framed keys and values left unchanged because their
-ID is not in the mapping), and the CLI prints them. A raw payload that
-starts with a zero byte looks framed, so it can be counted as unmapped:
-enable `schema_id_rewrite_strict` only for topics whose keys and values are
-all Schema Registry framed (or never start with `0x00`), and use
-`schema_id_rewrite_topics` to leave other topics alone.
+ID is not in the mapping, with `schema_id_rewrite_strict: false`), and the
+CLI prints them. A mapping to an ID that is not positive always fails.
+
+A raw payload that starts with a zero byte (a big-endian integer key, for
+example) looks framed. Strict mode, the default and the 0.24 behaviour,
+fails on it unless its ID happens to be mapped: use
+`schema_id_rewrite_topics` to leave topics with raw keys or values alone,
+or set `schema_id_rewrite_strict: false` for them.
 
 ```yaml
 restore:
   rewrite_schema_ids: true
   schema_id_mapping: {100001: 1, 100002: 2}
   schema_id_rewrite_topics: ["orders-*", "payments"]
-  schema_id_rewrite_strict: true
 ```
+
+The rewrite runs on every replay path in the same place, once per segment
+before records are batched and encoded (so a retried batch resends the
+same bytes):
+
+1. time window and record filter;
+2. a library embedder's `RecordTransform` (Kafka Backup Enterprise uses it
+   for Schema Registry restores), on the record as archived;
+3. the schema ID rewrite, on keys and values;
+4. the kafka-backup offset headers (`strip_offset_headers`, then
+   `include_original_offset_header` / header-based strategy);
+5. on the repartition path, partition routing by the rewritten key.
 
 ### Complete Restore Example
 

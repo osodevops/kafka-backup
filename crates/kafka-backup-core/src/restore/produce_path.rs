@@ -102,18 +102,29 @@ impl ProducePath {
     /// `topic`/`partition` with the restore producer (idempotent unless it
     /// fell back). The result lists `(base offset, record count)` per
     /// produced sub-batch, in order.
+    ///
+    /// `cancelled` is checked once the rate limit lets the batch through: a
+    /// restore that started stopping while the batch waited (another
+    /// partition or reader failed) returns `Ok(None)` without sending it.
     pub(crate) async fn produce(
         &self,
         topic: &str,
         partition: i32,
         batch: &[BackupRecord],
-    ) -> Result<ProducedBatch> {
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<ProducedBatch>> {
         if let Some(limiter) = &self.rate_limiter {
             limiter
                 .acquire(batch.len() as u64, records_encoded_size(batch) as u64)
                 .await;
         }
-        self.producer.produce(topic, partition, batch).await
+        if cancelled() {
+            return Ok(None);
+        }
+        self.producer
+            .produce(topic, partition, batch)
+            .await
+            .map(Some)
     }
 }
 

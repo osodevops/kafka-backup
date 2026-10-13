@@ -15,9 +15,11 @@ pub mod repartition;
 mod telemetry;
 pub mod three_phase;
 mod topic_configs;
+pub mod transform;
 
 pub use engine::{RestoreEngine, RestoreProgress};
 pub use filter::{FilterAction, RecordFilter, RecordFilterHandle};
+pub use helpers::read_segment;
 pub use offset_automation::{
     BulkOffsetReset, BulkOffsetResetConfig, BulkOffsetResetReport, BulkResetStatus,
     GroupResetOutcome, OffsetMapping as BulkOffsetMapping, OffsetResetBatch, OffsetResetMetrics,
