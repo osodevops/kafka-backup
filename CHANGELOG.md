@@ -95,6 +95,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where directories cannot be fsynced). A crash or concurrent writer can no
   longer leave a truncated manifest, offset database or segment. Leftover
   temp files are never listed as keys.
+- **One unsupported topic config failed the whole restore, after the topics
+  were created.** Restoring a backup from Kafka 3.x or Confluent into Kafka
+  4.x or Confluent Cloud sent every captured override in one
+  IncrementalAlterConfigs request, and a key the target rejects
+  (`message.format.version` on Kafka 4.x, `flush.ms` on Confluent Cloud)
+  failed the request and stopped the restore. Now keys the target does not
+  list (or lists read-only) are skipped, the rest is applied, and for a
+  topic the broker rejects each key is checked on its own (`validate_only`)
+  and the accepted ones applied. Skipped keys and the broker's messages are
+  logged and listed in the restore report (`topic_configs_skipped`).
+  `restore.unsupported_config_policy: fail` stops the restore instead,
+  before any configuration is changed.
 
 ### Changed
 - **New default: `backup.isolation_level: read_committed`.** Fetch and
@@ -232,7 +244,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gain the `use_emulator` and `allow_http` fields. Code that builds them
   field by field must set both (`false` keeps the previous behaviour).
 
+- `restore.unsupported_config_policy` (`skip` default, `fail`),
+  `restore.target_profile: confluent_cloud` (replication factor 3 for created
+  topics; clamps `min.insync.replicas`, `segment.bytes`, `segment.ms`,
+  `max.message.bytes`, `max.compaction.lag.ms` and `delete.retention.ms` to
+  Confluent Cloud's documented ranges) and `restore.target_cluster_type`.
+  The restore report lists `topic_configs_skipped` and
+  `topic_configs_adjusted`; `restore` prints them.
+- Backups capture `confluent.*` topic settings (schema validation, subject
+  name strategies, tiering; not `confluent.placement.constraints`). A
+  restore applies them only where the target lists them.
+
 ### API
+- `kafka::incremental_alter_configs_per_resource` (and the router method of
+  the same name) returns a `ConfigChangeResult` per resource, optionally
+  `validate_only`; `incremental_alter_configs` keeps its behaviour.
+- New `RestoreReport` fields `topic_configs_skipped` /
+  `topic_configs_adjusted` (`SkippedTopicConfig`, `TopicConfigSkipReason`,
+  `AdjustedTopicConfig`) and `RestoreOptions` fields
+  `unsupported_config_policy`, `target_profile`, `target_cluster_type`
+  (`UnsupportedConfigPolicy`, `TargetProfile`, `TargetClusterType`).
 - New public fields on `SegmentMetadata`, `PartitionBackup` and
   `BackupOptions` break struct-literal construction (minor version bump).
 
