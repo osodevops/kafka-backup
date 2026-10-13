@@ -71,12 +71,24 @@ mod schema_id_rewrite_tests {
     }
 
     #[test]
+    fn checkpoint_hash_is_independent_of_mapping_insertion_order() {
+        let mut a = RestoreOptions::default();
+        let mut b = RestoreOptions::default();
+        for (source, target) in [("a", "x"), ("b", "y")] {
+            a.topic_mapping.insert(source.into(), target.into());
+        }
+        for (source, target) in [("b", "y"), ("a", "x")] {
+            b.topic_mapping.insert(source.into(), target.into());
+        }
+        assert_eq!(restore_config_hash(&a), restore_config_hash(&b));
+    }
+    #[test]
     fn rewrites_confluent_key_and_value_without_touching_payload() {
         let mut records = vec![record(
             Some(vec![0, 0, 0, 0, 7, 10]),
             Some(vec![0, 0, 0, 0, 7, 20, 21]),
         )];
-        rewrite_confluent_schema_ids(&mut records, &[(7, 42)].into_iter().collect());
+        rewrite_confluent_schema_ids(&mut records, &[(7, 42)].into_iter().collect()).unwrap();
         assert_eq!(records[0].key.as_deref(), Some(&[0, 0, 0, 0, 42, 10][..]));
         assert_eq!(
             records[0].value.as_deref(),
@@ -85,17 +97,18 @@ mod schema_id_rewrite_tests {
     }
 
     #[test]
-    fn ignores_null_short_non_confluent_and_unmapped_payloads() {
-        let mut records = vec![
-            record(None, Some(vec![0, 1, 2])),
-            record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8])),
-        ];
-        let original = records.clone();
-        rewrite_confluent_schema_ids(&mut records, &[(7, 42)].into_iter().collect());
-        assert_eq!(records[0].key, original[0].key);
-        assert_eq!(records[0].value, original[0].value);
-        assert_eq!(records[1].key, original[1].key);
-        assert_eq!(records[1].value, original[1].value);
+    fn rejects_malformed_and_unmapped_configured_frames() {
+        let mut malformed = vec![record(None, Some(vec![0, 1, 2]))];
+        assert!(
+            rewrite_confluent_schema_ids(&mut malformed, &[(7, 42)].into_iter().collect()).is_err()
+        );
+        let mut unknown = vec![record(Some(vec![1, 0, 0, 0, 7]), Some(vec![0, 0, 0, 0, 8]))];
+        assert!(
+            rewrite_confluent_schema_ids(&mut unknown, &[(7, 42)].into_iter().collect()).is_err()
+        );
+        let mut raw = vec![record(None, Some(vec![1, 2]))];
+        rewrite_confluent_schema_ids(&mut raw, &Default::default()).unwrap();
+        assert_eq!(raw[0].value, Some(vec![1, 2]));
     }
 }
 
@@ -1765,6 +1778,18 @@ impl RestorePartitionContext {
             records_dropped_by_filter += filter_outcome.dropped;
             records_tombstoned_by_filter += filter_outcome.tombstoned;
 
+            let mut filtered_records = super::transform::apply(
+                &self.source_topic,
+                filtered_records,
+                self.options.record_transform.as_ref(),
+            )?;
+            if self.options.rewrite_schema_ids {
+                rewrite_confluent_schema_ids(
+                    &mut filtered_records,
+                    &self.options.schema_id_mapping,
+                )?;
+            }
+
             if filtered_records.is_empty() {
                 // Mark segment as completed even if no records match
                 self.mark_segment_completed(&segment.key).await;
@@ -1816,17 +1841,11 @@ impl RestorePartitionContext {
             // fresh original-offset headers if configured (header-based strategy)
             let stripped_records =
                 super::helpers::strip_offset_headers(filtered_records, &self.options);
-            let mut records_to_produce = super::helpers::inject_offset_headers(
+            let records_to_produce = super::helpers::inject_offset_headers(
                 stripped_records,
                 self.source_partition,
                 &self.options,
             );
-            if self.options.rewrite_schema_ids {
-                rewrite_confluent_schema_ids(
-                    &mut records_to_produce,
-                    &self.options.schema_id_mapping,
-                );
-            }
 
             // Track bytes
             let batch_bytes: u64 = records_to_produce
@@ -2051,22 +2070,39 @@ fn decode_i64_header(value: Option<&[u8]>) -> Option<i64> {
 /// Rewrite the 4-byte schema ID following Confluent's magic byte in both keys
 /// and values. Avro, JSON Schema and Protobuf all share this five-byte prefix;
 /// any format-specific bytes after it are preserved verbatim.
-fn rewrite_confluent_schema_ids(records: &mut [BackupRecord], mapping: &HashMap<i32, i32>) {
+pub(crate) fn rewrite_confluent_schema_ids(
+    records: &mut [BackupRecord],
+    mapping: &HashMap<i32, i32>,
+) -> Result<()> {
     for record in records {
-        rewrite_confluent_payload(record.key.as_mut(), mapping);
-        rewrite_confluent_payload(record.value.as_mut(), mapping);
+        rewrite_confluent_payload(record.key.as_mut(), mapping)?;
+        rewrite_confluent_payload(record.value.as_mut(), mapping)?;
     }
+    Ok(())
 }
 
-fn rewrite_confluent_payload(payload: Option<&mut Vec<u8>>, mapping: &HashMap<i32, i32>) {
-    let Some(payload) = payload else { return };
-    if payload.len() < 5 || payload[0] != 0 {
-        return;
+fn rewrite_confluent_payload(
+    payload: Option<&mut Vec<u8>>,
+    mapping: &HashMap<i32, i32>,
+) -> Result<()> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    if payload.first() != Some(&0) {
+        return Ok(());
+    }
+    if payload.len() < 5 {
+        return Err(Error::Config("Malformed Confluent schema ID frame".into()));
     }
     let source_id = i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
-    if let Some(target_id) = mapping.get(&source_id) {
-        payload[1..5].copy_from_slice(&target_id.to_be_bytes());
+    let target_id = mapping
+        .get(&source_id)
+        .ok_or_else(|| Error::Config(format!("Unmapped schema ID {source_id}")))?;
+    if *target_id <= 0 {
+        return Err(Error::Config("Invalid destination schema ID".into()));
     }
+    payload[1..5].copy_from_slice(&target_id.to_be_bytes());
+    Ok(())
 }
 
 /// Pattern matching for topic names.
@@ -2134,9 +2170,15 @@ fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
 fn restore_config_hash(options: &RestoreOptions) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(options).unwrap_or_default());
+    let mut value = serde_json::to_value(options).unwrap_or_default();
+    value.sort_all_objects();
+    hasher.update(serde_json::to_vec(&value).unwrap_or_default());
     if let Some(fingerprint) = &options.record_filter_fingerprint {
         hasher.update(fingerprint.as_bytes());
+    }
+    if let Some(transform) = &options.record_transform {
+        hasher.update(b"record-transform:");
+        hasher.update(transform.fingerprint().as_bytes());
     }
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{:02x}", b)).collect()

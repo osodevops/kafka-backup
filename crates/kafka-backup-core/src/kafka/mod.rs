@@ -5,6 +5,7 @@ mod client;
 pub mod connection_error;
 pub mod consumer_groups;
 mod fetch;
+mod header_codec;
 mod metadata;
 mod partition_router;
 mod produce;

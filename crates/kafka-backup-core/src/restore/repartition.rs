@@ -348,6 +348,12 @@ async fn run_reader(
             None => filtered,
         };
 
+        let mut filtered =
+            super::transform::apply(source_topic, filtered, options.record_transform.as_ref())?;
+        if options.rewrite_schema_ids {
+            super::engine::rewrite_confluent_schema_ids(&mut filtered, &options.schema_id_mapping)?;
+        }
+
         if filtered.is_empty() {
             helpers::mark_segment_completed(checkpoint, &segment.key).await;
             continue;
