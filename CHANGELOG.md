@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-10-13
+
+### Fixed
+- A failing record transform stops subsequent topic replay and cancels sibling
+  partition workers before returning the error. Repartitioned writers stop
+  when a reader fails, including after rate limiting.
+- Repartitioned segments are checkpointed only after all producers succeed;
+  enqueueing records no longer marks unacknowledged data as restored.
+
 ## [0.24.0] - 2026-10-13
 
 ### Added
