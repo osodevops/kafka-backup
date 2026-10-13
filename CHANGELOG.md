@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Transactional topics were restored with their aborted records and their
+  transaction markers.** Backups read uncommitted: every record of an
+  aborted transaction was archived, and so was every COMMIT/ABORT marker,
+  which a restore then produced as an ordinary record (key `00 00 00 00` or
+  `00 00 00 01`, value `00 00 00 00 00 00`). A topic with 216 committed
+  records, 72 aborted records and 72 markers came back as 360 records, and
+  consumer groups committed at or after a marker resumed on an aborted
+  record. Backups now read committed by default (see Changed): the restored
+  topic is what a `read_committed` consumer of the source sees, and groups
+  resume on the next committed record.
 - **Backup checkpoints could run ahead of the data actually backed up.**
   The partition loop checkpointed each fetch as soon as its records reached
   the in-memory segment buffer, before the segment was uploaded or listed in
@@ -87,6 +97,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   temp files are never listed as keys.
 
 ### Changed
+- **New default: `backup.isolation_level: read_committed`.** Fetch and
+  ListOffsets use isolation level 1, and fetched batches are filtered the
+  way the Java consumer filters them, from the batch headers: records of
+  aborted transactions are dropped and transaction markers are skipped.
+  Each partition is read up to its last stable offset (LSO) instead of its
+  high watermark, in snapshot mode too (the captured end is the LSO), so the
+  records of a transaction still open — and anything written after them —
+  are archived by a later run once it completes. Dropped offsets are inside
+  the segments' covered ranges: they are not offset gaps and `validate` does
+  not report them as holes.
+  - **Opt-out:** `backup.isolation_level: read_uncommitted` keeps the
+    previous behaviour byte for byte (aborted records and markers archived
+    and restored, reads up to the high watermark).
+  - **Existing backups are unaffected:** nothing stored is rewritten and
+    restoring an older backup behaves as before. A backup set written before
+    0.24 and continued by 0.24 reads committed from then on; the run logs a
+    warning that the set mixes both. Set `read_uncommitted` to keep it
+    uniform, or start a new `backup_id`.
+  - **Hanging transactions:** an open transaction that never completes holds
+    a partition's backup at its LSO. Alert on `kafka_backup_lso_lag` staying
+    above 0 (example rule in docs/configuration.md, "Hanging transactions").
+- **API (semver minor):** the isolation level is passed explicitly:
+  `KafkaClient::fetch` / `get_offsets`, `PartitionLeaderRouter::fetch` /
+  `get_offsets` / `batch_get_all_offsets` and
+  `kafka::consumer_groups::offsets_for_times` take an `IsolationLevel`
+  (timestamp lookups and restore-side reads of the target use
+  `ReadUncommitted`). `FetchResponse` is `#[non_exhaustive]` and gains
+  `last_stable_offset`, `control_records_skipped`,
+  `aborted_records_dropped` and `skipped`. `BackupOptions` gains
+  `isolation_level`; `BackupManifest` gains `isolation_level`;
+  `SegmentMetadata` gains `control_records_skipped` /
+  `aborted_records_dropped`; `PartitionBackup` gains
+  `tail_control_records_skipped` / `tail_aborted_records_dropped` /
+  `snapshot_end_offset` / `high_watermark_at_capture`. Struct literals must
+  set them (`0` / `None`).
 - **One-time re-read after upgrading.** On the first run, a partition whose
   `offsets.db` checkpoint (written by an older version) is ahead of the
   manifest logs a warning and re-reads from the manifest's reach + 1. If
@@ -120,6 +165,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Matches on it outside this crate need a wildcard arm.
 
 ### Added
+- `backup.isolation_level` (`read_committed` default, `read_uncommitted`)
+  and `IsolationLevel` (`kafka_backup_core::IsolationLevel`).
+- Manifest (all optional; older manifests read as before and older binaries
+  ignore them): `isolation_level` of the most recent run; per segment
+  `control_records_skipped` / `aborted_records_dropped` (omitted when 0);
+  per partition the counts for a trailing range after the last segment
+  (`tail_*`), and for snapshot runs `snapshot_end_offset` (the LSO used as
+  the end) and `high_watermark_at_capture`. `describe` shows the isolation
+  level, the counts and partitions a snapshot ended below the high watermark.
+  `BackupManifest::total_control_records_skipped` /
+  `total_aborted_records_dropped`.
+- Metrics: `kafka_backup_aborted_records_dropped_total`,
+  `kafka_backup_control_records_skipped_total` and
+  `kafka_backup_lso_lag{topic,partition}` (high watermark minus LSO, from
+  each fetch and, for partitions with nothing to fetch, from a batched
+  ListOffsets per cycle; subject to `metrics.max_partition_labels`).
+- `kafka::transactions`: transaction coordinator lookup, `InitProducerId`
+  (v3, with the current producer id and epoch for an epoch bump),
+  `AddPartitionsToTxn`, `EndTxn`, and record batches stamped with a producer
+  id, epoch and base sequence (`encode_producer_batch`, sent unchanged by
+  `produce_encoded_batch`). Used by the integration tests' transactional
+  producer; the plumbing for an idempotent restore producer.
+  `PartitionLeaderRouter::batch_get_latest_offsets`.
 - Manifest: `SegmentMetadata.covered_start_offset` / `covered_end_offset`
   and `PartitionBackup.covered_through` record the offsets a segment (or a
   trailing range with no record — compacted away, transaction markers)

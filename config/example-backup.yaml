@@ -51,6 +51,12 @@ backup:
   # Continuous mode (keep running and backing up new data)
   continuous: false  # true for continuous, false for one-shot
 
+  # Transactional topics (default: read_committed). Archives what a
+  # read_committed consumer sees: no aborted records, no transaction markers,
+  # each partition read up to its last stable offset. read_uncommitted archives
+  # everything up to the high watermark (markers included) as before 0.24.
+  isolation_level: read_committed
+
   # Offset-tracking headers (default: true). Adds x-original-offset and
   # x-original-timestamp to every archived record for header-based consumer
   # offset recovery. Set false for an archive whose records carry only their

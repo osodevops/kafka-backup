@@ -430,7 +430,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `compression_level` | int | No | `3` | Compression level (1–22; only meaningful for `zstd`) |
 | `start_offset` | string / map | No | `earliest` | Where a partition starts when there is no checkpoint: `earliest`, `latest`, or `specific: {topic: {partition: offset}}` |
 | `continuous` | bool | No | `false` | Run continuously (streaming replication) |
-| `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture HWMs at start, exit when caught up |
+| `isolation_level` | string | No | **`read_committed`** | `read_committed` archives what a `read_committed` consumer sees: no records of aborted transactions, no transaction markers, and each partition is read up to its last stable offset. `read_uncommitted` archives everything up to the high watermark, markers included, as before 0.24 — see [Transactional topics](#transactional-topics-isolation-level) |
+| `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture each partition's end offset at start (the last stable offset under `read_committed`), exit when caught up |
 | `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
 | `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
 | `segment_max_bytes` | int | No | `134217728` | Rotate a segment once it holds this many uncompressed bytes (128MB) |
@@ -511,6 +512,84 @@ restore:
 they are produced. Offset mapping is unaffected: the source offset is stored
 natively in the segment, not only in the header.
 
+### Transactional topics (isolation level)
+
+`backup.isolation_level` decides what a backup archives from topics written
+by transactional producers (Kafka Streams exactly-once, Flink, Connect
+exactly-once source connectors, any `transactional.id` producer). It is the
+Java consumer's `isolation.level`, applied to the backup's Fetch and
+ListOffsets requests.
+
+**`read_committed` (default since 0.24)**
+
+- Records of committed transactions and non-transactional records are
+  archived, in offset order.
+- Records of aborted transactions are dropped, and transaction markers (the
+  COMMIT/ABORT control records the broker writes at the end of every
+  transaction) are skipped. Neither is a gap: the offsets they occupy are
+  inside the segments' covered ranges, so `validate` does not report holes,
+  and each segment records how many it passed over
+  (`control_records_skipped`, `aborted_records_dropped`).
+- Each partition is read up to its **last stable offset** (LSO), not its high
+  watermark. The LSO is the first offset of the oldest transaction still
+  open on the partition. Records at or after it — the open transaction's
+  records and anything written after them, transactional or not — are
+  archived by a later run, once the transaction completes. In snapshot mode
+  the captured end of each partition is its LSO; the manifest records it as
+  `snapshot_end_offset`, next to `high_watermark_at_capture`.
+- A restore therefore writes back exactly what a `read_committed` consumer
+  of the source sees, and consumer groups committed at a marker, just after
+  one, or inside an aborted transaction resume on the next committed record
+  (three-phase restore and `offset-reset` use the per-record offset mapping).
+
+**`read_uncommitted` (opt-out)** archives every record up to the high
+watermark, byte for byte as versions before 0.24 did. That includes records
+of aborted and still-open transactions **and the transaction markers, which a
+restore writes back as ordinary records** (key `00 00 00 00` or
+`00 00 00 01`, value `00 00 00 00 00 00`). Use it only for topics without
+transactional producers, or to keep an existing backup set uniform:
+
+```yaml
+backup:
+  isolation_level: read_uncommitted
+```
+
+**Existing backups are unaffected.** Nothing already stored is rewritten,
+and restoring a backup written before 0.24 behaves as before (its segments
+may hold markers and aborted records). A backup set created before 0.24 and
+continued by 0.24 reads committed from then on; the run logs a warning that
+the set now mixes both, and the manifest's `isolation_level` records the
+level of the most recent run (absent in manifests written before 0.24, which
+read uncommitted). Set `isolation_level: read_uncommitted` to keep such a set
+uniform, or start a new `backup_id`.
+
+#### Hanging transactions
+
+A transaction that is never completed — one the transaction coordinator
+lost track of (the "hanging transaction" of KIP-664), or one a producer
+keeps open under a very long `transaction.timeout.ms` — holds the LSO back,
+and with it a `read_committed` backup of that partition: the backup keeps
+succeeding but stops archiving new records there. Snapshot runs log
+`N partition(s) have open transactions: this snapshot ends at their last
+stable offset ...` at INFO (per-partition detail is at DEBUG), and every run
+exposes the distance as `kafka_backup_lso_lag` (high watermark minus LSO,
+per partition). The gauge is normally 0, or briefly above it while
+transactions are in flight; alert when it stays up:
+
+```yaml
+- alert: KafkaBackupHangingTransaction
+  expr: min_over_time(kafka_backup_lso_lag[30m]) > 0
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "{{ $labels.topic }}[{{ $labels.partition }}]: an open transaction has held the backup at the last stable offset for 45m"
+    description: "Find it with kafka-transactions.sh --bootstrap-server ... find-hanging --broker-id N and abort it (kafka-transactions.sh abort), or wait for transaction.timeout.ms."
+```
+
+Pick the window longer than your producers' `transaction.timeout.ms`. The
+gauge is subject to `metrics.max_partition_labels`.
+
 ### Performance Tuning
 
 **`max_concurrent_partitions`**: Controls how many partitions are backed up simultaneously. Higher values increase throughput but may cause resource contention (CPU, memory, network, storage I/O). Default is 8.
@@ -523,10 +602,10 @@ natively in the segment, not only in the header.
 |------|---------------|----------|
 | **One-shot** (default) | `continuous: false` | Backup current data and exit |
 | **Continuous** | `continuous: true` | Run forever, backing up new data as it arrives |
-| **Snapshot** | `stop_at_current_offsets: true` | Capture high watermarks at start, backup until caught up, then exit cleanly |
+| **Snapshot** | `stop_at_current_offsets: true` | Capture end offsets at start, backup until caught up, then exit cleanly |
 
 **Snapshot mode** (`stop_at_current_offsets: true`) is ideal for scheduled DR backups:
-1. At startup, captures high watermarks for ALL partitions (atomic snapshot point)
+1. At startup, captures the end offset of ALL partitions (atomic snapshot point): the last stable offset under `read_committed` (the default), the high watermark under `read_uncommitted`
 2. Backs up all data up to those fixed offsets
 3. Exits cleanly with exit code 0 when complete
 
@@ -547,8 +626,9 @@ not from a separate checkpoint:
 - Since 0.24 each segment records `covered_start_offset` /
   `covered_end_offset`: the source offsets it accounts for, including
   offsets before its first record or after its last that held no record
-  (compacted away, transaction markers). `covered_through` on the partition
-  records such a trailing range when no segment follows it yet. Older
+  (compacted away, transaction markers, records of aborted transactions).
+  `covered_through` on the partition records such a trailing range when no
+  segment follows it yet. Older
   manifests without these fields still resume from their segments' first and
   last offsets.
 - `offsets.db` (the offset store) only records checkpoints that a saved
@@ -815,6 +895,9 @@ metrics:
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
 | `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
 | `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
+| `kafka_backup_lso_lag` | Gauge | Per partition: high watermark minus last stable offset — offsets held back by open transactions. Stays above 0 under a [hanging transaction](#hanging-transactions) |
+| `kafka_backup_aborted_records_dropped_total` | Counter | Records of aborted transactions not archived (`isolation_level: read_committed`) |
+| `kafka_backup_control_records_skipped_total` | Counter | Transaction markers not archived (`isolation_level: read_committed`) |
 | `kafka_backup_missing_topics` | Gauge | Literal include topics absent from the cluster at the last discovery pass (`backup.on_missing_topic: warn`); returns to 0 once they exist |
 | `kafka_backup_segments_pruned_total` | Counter | Segments deliberately deleted by retention (`prune` / `backup.retention`) |
 | `kafka_backup_bytes_pruned_total` | Counter | Compressed bytes deleted by retention |
