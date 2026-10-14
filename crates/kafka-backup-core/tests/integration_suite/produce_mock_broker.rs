@@ -106,6 +106,9 @@ pub struct MockState {
     pub init_producer_id_max_version: i16,
     pub next_producer_id: i64,
     pub init_requests: usize,
+    pub metadata_requests: usize,
+    pub list_offset_requests: usize,
+    pub list_offset_errors: VecDeque<i16>,
     pub logs: HashMap<i32, Vec<StoredRecord>>,
     producers: HashMap<(i32, i64), ProducerEntry>,
     pub attempts: Vec<ProduceAttempt>,
@@ -141,6 +144,9 @@ impl MockBroker {
             init_producer_id_max_version: 4,
             next_producer_id: 4000,
             init_requests: 0,
+            metadata_requests: 0,
+            list_offset_requests: 0,
+            list_offset_errors: VecDeque::new(),
             logs: HashMap::new(),
             producers: HashMap::new(),
             attempts: Vec::new(),
@@ -299,6 +305,7 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
         let mut out = BytesMut::new();
         match api_key {
             ApiKey::Metadata => {
+                state.lock().unwrap().metadata_requests += 1;
                 let state = state.lock().unwrap();
                 let partitions = (0..state.partitions)
                     .map(|p| {
@@ -384,7 +391,9 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
             }
             ApiKey::ListOffsets => {
                 let request = ListOffsetsRequest::decode(&mut body, version).unwrap();
-                let state = state.lock().unwrap();
+                let mut state = state.lock().unwrap();
+                state.list_offset_requests += 1;
+                let response_error = state.list_offset_errors.pop_front().unwrap_or(0);
                 let topics = request
                     .topics
                     .iter()
@@ -401,6 +410,7 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
                                             state.high_watermark(p.partition_index)
                                         };
                                         ListOffsetsPartitionResponse::default()
+                                            .with_error_code(response_error)
                                             .with_partition_index(p.partition_index)
                                             .with_timestamp(-1)
                                             .with_offset(offset)

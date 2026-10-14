@@ -73,3 +73,5 @@ pub mod tls_tests;
 pub mod topic_config_compat;
 pub mod transactional_producer;
 pub mod validation;
+
+pub mod batched_offset_leader_retries;
