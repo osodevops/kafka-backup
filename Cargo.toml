@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.25.1"
+version = "0.25.2"
 edition = "2021"
 license = "MIT"
 authors = ["OSO"]
@@ -60,7 +60,7 @@ base64 = "0.22"
 
 # TLS
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "1.0"
 ring = "0.17"
