@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-10-14
+
+### Fixed
+- Batched earliest/latest and latest-only offset queries now refresh metadata
+  and retry with bounded backoff when a partition leader is not available or
+  has moved. This prevents a restore checkpoint baseline from failing directly
+  after target topic creation. Authorisation and other permanent errors still
+  fail immediately; successful partial responses are never checkpointed.
+
 ## [0.25.0] - 2026-10-13
 
 Backups of transactional topics now read committed by default (a behaviour

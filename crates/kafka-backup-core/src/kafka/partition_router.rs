@@ -490,6 +490,17 @@ impl PartitionLeaderRouter {
         partitions: &[(String, i32)],
         isolation: IsolationLevel,
     ) -> Result<HashMap<(String, i32), (i64, i64)>> {
+        self.retry_offset_leaders("batch_get_all_offsets", || {
+            self.batch_get_all_offsets_internal(partitions, isolation)
+        })
+        .await
+    }
+
+    async fn batch_get_all_offsets_internal(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), (i64, i64)>> {
         let broker_partitions = self.partitions_by_leader(partitions).await?;
 
         debug!(
@@ -549,6 +560,17 @@ impl PartitionLeaderRouter {
         partitions: &[(String, i32)],
         isolation: IsolationLevel,
     ) -> Result<HashMap<(String, i32), i64>> {
+        self.retry_offset_leaders("batch_get_latest_offsets", || {
+            self.batch_get_latest_offsets_internal(partitions, isolation)
+        })
+        .await
+    }
+
+    async fn batch_get_latest_offsets_internal(
+        &self,
+        partitions: &[(String, i32)],
+        isolation: IsolationLevel,
+    ) -> Result<HashMap<(String, i32), i64>> {
         let broker_partitions = self.partitions_by_leader(partitions).await?;
         let mut all_results = HashMap::with_capacity(partitions.len());
         for (broker_id, broker_parts) in &broker_partitions {
@@ -561,6 +583,34 @@ impl PartitionLeaderRouter {
                 .extend(super::fetch::batch_get_offsets(&client, &requests, isolation).await?);
         }
         Ok(all_results)
+    }
+
+    /// Retry complete, read-only batches when their routing snapshot is stale.
+    /// Refreshing metadata leaves healthy pooled connections intact; partial
+    /// results are discarded so callers never checkpoint an incomplete batch.
+    async fn retry_offset_leaders<T, F, Fut>(&self, operation: &str, mut request: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        const MAX_LEADER_RETRIES: u32 = 20;
+        let mut attempts = 0;
+        loop {
+            match request().await {
+                Ok(result) => return Ok(result),
+                Err(error) if is_leader_not_ready(&error) && attempts < MAX_LEADER_RETRIES => {
+                    attempts += 1;
+                    let backoff = Duration::from_millis((250 * u64::from(attempts)).min(2_000));
+                    warn!(operation, attempts, max_attempts = MAX_LEADER_RETRIES,
+                        ?backoff, %error, "Leader not ready for batched offset read; refreshing metadata");
+                    tokio::time::sleep(backoff).await;
+                    if let Err(refresh) = self.refresh_metadata().await {
+                        debug!(%refresh, "Batch leader refresh failed; retrying the offset read");
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Get the earliest and latest offsets for a partition. "Latest" is the
