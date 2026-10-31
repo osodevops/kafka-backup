@@ -114,6 +114,7 @@ gssapi = ["dep:libgssapi"]
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
+rcgen = "0.13"
 crc32c = "0.6"
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
