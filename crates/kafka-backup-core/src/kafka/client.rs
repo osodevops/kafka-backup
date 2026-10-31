@@ -728,7 +728,7 @@ impl KafkaClient {
         match api_key {
             ApiKey::Metadata => 9,
             ApiKey::Fetch => 11,
-            ApiKey::Produce => 8,
+            ApiKey::Produce => self.config.connection.produce_api_version.unwrap_or(8),
             ApiKey::SaslHandshake => 1,
             ApiKey::SaslAuthenticate => 2,
             ApiKey::ApiVersions => 3,
@@ -988,6 +988,41 @@ mod tests {
     use super::*;
     use crate::config::ConnectionConfig;
     use std::net::TcpListener;
+
+    fn client_with_produce_version(produce_api_version: Option<i16>) -> KafkaClient {
+        KafkaClient::new(KafkaConfig {
+            bootstrap_servers: vec!["localhost:9092".to_string()],
+            security: Default::default(),
+            topics: Default::default(),
+            connection: ConnectionConfig {
+                produce_api_version,
+                ..Default::default()
+            },
+        })
+    }
+
+    #[test]
+    fn produce_version_is_8_unless_overridden() {
+        let default = client_with_produce_version(None);
+        assert_eq!(default.get_api_version(ApiKey::Produce), 8);
+
+        let overridden = client_with_produce_version(Some(7));
+        assert_eq!(overridden.get_api_version(ApiKey::Produce), 7);
+        // Only Produce follows the setting.
+        assert_eq!(overridden.get_api_version(ApiKey::Fetch), 11);
+    }
+
+    #[test]
+    fn produce_request_header_and_encoding_follow_the_override() {
+        use kafka_protocol::messages::ProduceRequest;
+
+        // A broker reads the version from bytes 2-3 of the request.
+        let client = client_with_produce_version(Some(7));
+        let frame = client
+            .encode_request(ApiKey::Produce, &ProduceRequest::default())
+            .unwrap();
+        assert_eq!(i16::from_be_bytes([frame[6], frame[7]]), 7);
+    }
 
     #[test]
     fn parse_broker_endpoint_host_port() {

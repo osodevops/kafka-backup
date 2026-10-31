@@ -303,10 +303,42 @@ pub struct ConnectionConfig {
     /// broker, dramatically improving throughput on high-latency connections.
     #[serde(default = "default_connections_per_broker")]
     pub connections_per_broker: usize,
+
+    /// Produce API version to send, overriding the built-in default of 8
+    /// (default: unset). Allowed: 3 to 8.
+    ///
+    /// The client does not negotiate this version. Set it for a broker with
+    /// a lower maximum: Redpanda accepts up to version 7 and drops the
+    /// connection on version 8, which surfaces as `early eof` on every
+    /// produce. Versions 7 and 8 send the same request; version 8 only adds
+    /// per-record error detail to the response. Below version 7, brokers
+    /// reject zstd-compressed batches.
+    pub produce_api_version: Option<i16>,
 }
 
 fn default_connections_per_broker() -> usize {
     4
+}
+
+/// Produce API versions accepted for `connection.produce_api_version`.
+/// Version 3 is the first to carry v2 record batches; versions above 8 are
+/// not used by this client.
+pub const PRODUCE_API_VERSIONS: std::ops::RangeInclusive<i16> = 3..=8;
+
+impl ConnectionConfig {
+    /// Validate the connection settings
+    pub fn validate(&self) -> crate::Result<()> {
+        if let Some(version) = self.produce_api_version {
+            if !PRODUCE_API_VERSIONS.contains(&version) {
+                return Err(crate::Error::Config(format!(
+                    "connection.produce_api_version must be between {} and {}, got {version}",
+                    PRODUCE_API_VERSIONS.start(),
+                    PRODUCE_API_VERSIONS.end(),
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -317,6 +349,7 @@ impl Default for ConnectionConfig {
             keepalive_interval_secs: 20,
             tcp_nodelay: true,
             connections_per_broker: default_connections_per_broker(),
+            produce_api_version: None,
         }
     }
 }
@@ -1649,6 +1682,13 @@ impl Config {
             }
         }
 
+        if let Some(source) = &self.source {
+            source.connection.validate()?;
+        }
+        if let Some(target) = &self.target {
+            target.connection.validate()?;
+        }
+
         // Storage config validation is handled by StorageBackendConfig's typed enum
         // Required fields are non-Optional in each variant, so invalid configs
         // fail at deserialization time rather than runtime validation
@@ -1853,6 +1893,33 @@ impl RestoreOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn produce_api_version_defaults_to_unset_and_parses() {
+        assert_eq!(ConnectionConfig::default().produce_api_version, None);
+        let unset: ConnectionConfig = serde_yaml::from_str("tcp_nodelay: true").unwrap();
+        assert_eq!(unset.produce_api_version, None);
+        let set: ConnectionConfig = serde_yaml::from_str("produce_api_version: 7").unwrap();
+        assert_eq!(set.produce_api_version, Some(7));
+    }
+
+    #[test]
+    fn produce_api_version_outside_range_is_rejected() {
+        for version in [None, Some(3), Some(7), Some(8)] {
+            let config = ConnectionConfig {
+                produce_api_version: version,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "{version:?} should be accepted");
+        }
+        for version in [-1, 0, 2, 9] {
+            let config = ConnectionConfig {
+                produce_api_version: Some(version),
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{version} should be rejected");
+        }
+    }
 
     #[test]
     fn backup_options_parse_fetch_max_bytes_and_segment_max_records() {

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `connection.produce_api_version` sets the Produce API version the client sends (3 to 8, default 8). Redpanda accepts up to version 7 and drops the connection on version 8, so restoring to Redpanda needs `produce_api_version: 7`; without it every topic fails with `early eof`.
+
 ## [0.25.2] - 2026-10-14
 
 ### Security
