@@ -97,10 +97,20 @@ impl ConnectionStream {
         }
     }
 
+    /// Write a whole request and flush it. TLS needs the flush: with the socket
+    /// momentarily full, `write_all` can return while the last records are still
+    /// in the rustls buffer, and nothing else sends them while we wait for the
+    /// response.
     pub(super) async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         match self {
-            ConnectionStream::Plain(s) => s.write_all(buf).await,
-            ConnectionStream::Tls(s) => s.write_all(buf).await,
+            ConnectionStream::Plain(s) => {
+                s.write_all(buf).await?;
+                s.flush().await
+            }
+            ConnectionStream::Tls(s) => {
+                s.write_all(buf).await?;
+                s.flush().await
+            }
         }
     }
 }
@@ -985,6 +995,80 @@ pub(super) fn parse_broker_endpoint(entry: &str) -> (String, u16) {
 
 #[cfg(test)]
 mod tests {
+    /// A TLS write can return with its last records still in the rustls
+    /// buffer when the socket is momentarily full. Nothing sends them until
+    /// the next flush, so without one the broker waits for the rest of the
+    /// request while the client waits for the response.
+    #[tokio::test]
+    async fn write_all_delivers_every_byte_over_tls() {
+        use rustls::pki_types::{PrivateKeyDer, ServerName};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        // Completes the handshake and then reads nothing, so the socket fills up.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _tls = acceptor.accept(tcp).await.unwrap();
+            let _ = released.await;
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        let mut stream = ConnectionStream::Tls(Box::new(tls));
+
+        // Write until the socket is full. A write that reports success must
+        // have left nothing behind; the one that cannot blocks instead.
+        let chunk = vec![7u8; 1024];
+        let mut blocked = false;
+        for _ in 0..1_000_000 {
+            if timeout(Duration::from_millis(200), stream.write_all(&chunk))
+                .await
+                .is_err()
+            {
+                blocked = true;
+                break;
+            }
+            let ConnectionStream::Tls(tls) = &stream else {
+                unreachable!()
+            };
+            assert!(
+                !tls.get_ref().1.wants_write(),
+                "write_all returned with request bytes still in the TLS buffer"
+            );
+        }
+        assert!(blocked, "the socket never filled up");
+
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
     use super::*;
     use crate::config::ConnectionConfig;
     use std::net::TcpListener;

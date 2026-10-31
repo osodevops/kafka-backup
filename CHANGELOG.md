@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Requests are now flushed after they are written. Over TLS, a write could report
+  success with the last bytes of a request still in the TLS buffer when the socket
+  was momentarily full. The broker then waited for the rest of the request and the
+  client for the response, so large restore batches hung until the 60-second
+  response timeout and retries could hang the same way.
+
 ## [0.25.2] - 2026-10-14
 
 ### Security
