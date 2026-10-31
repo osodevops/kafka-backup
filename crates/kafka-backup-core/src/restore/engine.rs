@@ -1739,9 +1739,11 @@ impl RestoreEngine {
 
     /// Write offset mapping report
     async fn write_offset_report(&self, path: &std::path::Path) -> Result<()> {
-        let mapping = self.offset_mapping.lock().await;
-        let json = serde_json::to_string_pretty(&*mapping)?;
-        tokio::fs::write(path, json).await?;
+        let mapping = Arc::clone(&self.offset_mapping).lock_owned().await;
+        let report_path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || write_offset_mapping(&report_path, &mapping))
+            .await
+            .map_err(std::io::Error::other)??;
         info!("Offset mapping report written to {:?}", path);
         Ok(())
     }
@@ -2767,11 +2769,45 @@ fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
     Ok(report)
 }
 
+/// Write the offset mapping as JSON, streaming it to the file. The mapping holds one entry per
+/// restored record, so building the document in memory first takes several times the memory of
+/// the mapping itself: over 7 GB for 60 million records.
+fn write_offset_mapping(path: &std::path::Path, mapping: &OffsetMapping) -> Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer(&mut writer, mapping)?;
+    std::io::Write::flush(&mut writer)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetStrategy};
     use std::collections::HashMap;
+
+    #[test]
+    fn offset_mapping_report_round_trips() {
+        let mut mapping = OffsetMapping::new();
+        let pairs: Vec<crate::manifest::OffsetPair> = (0..1000)
+            .map(|i| crate::manifest::OffsetPair {
+                source_offset: 10_000 + i,
+                target_offset: i,
+                timestamp: 1_700_000_000_000 + i,
+            })
+            .collect();
+        mapping.add_detailed_batch("orders", 0, pairs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("offset-mapping.json");
+        write_offset_mapping(&path, &mapping).unwrap();
+
+        let read: OffsetMapping = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read.detailed_mapping_count(), 1000);
+        assert_eq!(
+            read.resolve_target_offset("orders", 0, 10_500),
+            mapping.resolve_target_offset("orders", 0, 10_500)
+        );
+    }
 
     #[test]
     fn restore_config_hash_is_stable_for_multi_entry_maps() {

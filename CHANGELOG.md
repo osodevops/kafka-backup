@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was momentarily full. The broker then waited for the rest of the request and the
   client for the response, so large restore batches hung until the 60-second
   response timeout and retries could hang the same way.
+- The restore offset report is streamed to its file instead of being built in memory first. It holds one entry per restored record, so a restore of 60 million records needed over 7 GB on top of the mapping itself, and an operator with less was killed right after the data had loaded, before consumer group offsets were applied. The report is now compact JSON rather than pretty-printed.
 
 ## [0.26.0] - 2026-11-03
 
