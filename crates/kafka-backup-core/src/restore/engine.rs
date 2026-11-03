@@ -2772,11 +2772,15 @@ fn finalize_restore_report(report: RestoreReport) -> Result<RestoreReport> {
 /// Write the offset mapping as JSON, streaming it to the file. The mapping holds one entry per
 /// restored record, so building the document in memory first takes several times the memory of
 /// the mapping itself: over 7 GB for 60 million records.
+///
+/// The file is replaced atomically (see [`super::checkpoint::write_file_atomic_streaming`]): streaming
+/// a report of that size takes minutes, and a reader such as the operator's `KafkaOffsetReset`
+/// must never see it half-written.
 fn write_offset_mapping(path: &std::path::Path, mapping: &OffsetMapping) -> Result<()> {
-    let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-    serde_json::to_writer(&mut writer, mapping)?;
-    std::io::Write::flush(&mut writer)?;
-    Ok(())
+    super::checkpoint::write_file_atomic_streaming(path, |writer| {
+        serde_json::to_writer(writer, mapping)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -2807,6 +2811,19 @@ mod tests {
             read.resolve_target_offset("orders", 0, 10_500),
             mapping.resolve_target_offset("orders", 0, 10_500)
         );
+    }
+
+    /// `restore.offset_report` may name a directory that does not exist yet (a
+    /// CLI user pointing it at a fresh path); the report creates it.
+    #[test]
+    fn offset_mapping_report_creates_its_directory() {
+        let mut mapping = OffsetMapping::new();
+        mapping.add_detailed("orders", 0, 7, 0, 1_700_000_000_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-1").join("offset-mapping.json");
+        write_offset_mapping(&path, &mapping).unwrap();
+        let read: OffsetMapping = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read.detailed_mapping_count(), 1);
     }
 
     #[test]

@@ -37,13 +37,9 @@ use crate::Result;
 /// Distinguishes concurrent temp files within this process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Write `data` to `path` atomically: a temp file in the same directory,
-/// fsynced, renamed over `path`, then the directory fsynced (Unix). A
-/// reader, or a process restarted after a crash, sees the old content or
-/// the new content, never a partial file.
-pub(crate) async fn write_file_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
+/// The directory of `path` and a temp file name in it that no other writer
+/// in this process uses.
+fn temp_path_for(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -51,13 +47,64 @@ pub(crate) async fn write_file_atomic(path: &Path, data: &[u8]) -> std::io::Resu
     let file_name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other(format!("not a file path: {}", path.display())))?;
-    tokio::fs::create_dir_all(&parent).await?;
     let tmp = parent.join(format!(
         ".{}.tmp-{}-{}",
         file_name.to_string_lossy(),
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+    Ok((parent, tmp))
+}
+
+/// Blocking, streaming counterpart of [`write_file_atomic`] for files too
+/// large to build in memory: `write` streams into a buffered temp file in the
+/// same directory, which is flushed, fsynced and renamed over `path`, then the
+/// directory is fsynced (Unix). On any error the temp file is removed and
+/// `path` keeps its previous content. Call it from a blocking thread.
+pub(crate) fn write_file_atomic_streaming(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<()>,
+) -> Result<()> {
+    let (parent, tmp) = temp_path_for(path)?;
+    std::fs::create_dir_all(&parent)?;
+    let result = (|| -> Result<()> {
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        write(&mut writer)?;
+        // `into_inner` flushes and reports a failed flush; dropping the
+        // BufWriter would swallow it.
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(&parent) {
+        if let Err(e) = dir.sync_all() {
+            debug!(
+                "fsync of {} after writing {} failed: {}",
+                parent.display(),
+                path.display(),
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Write `data` to `path` atomically: a temp file in the same directory,
+/// fsynced, renamed over `path`, then the directory fsynced (Unix). A
+/// reader, or a process restarted after a crash, sees the old content or
+/// the new content, never a partial file.
+pub(crate) async fn write_file_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (parent, tmp) = temp_path_for(path)?;
+    tokio::fs::create_dir_all(&parent).await?;
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await?;
         file.write_all(data).await?;
@@ -455,6 +502,58 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    fn temp_leftovers(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-")
+            })
+            .count()
+    }
+
+    #[test]
+    fn streaming_atomic_write_creates_the_directory_and_replaces_the_file() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("offset-mapping.json");
+        write_file_atomic_streaming(&path, |w| Ok(w.write_all(b"first")?)).unwrap();
+        write_file_atomic_streaming(&path, |w| {
+            for chunk in [&b"second, "[..], b"streamed in ", b"pieces"] {
+                w.write_all(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"second, streamed in pieces".to_vec()
+        );
+        assert_eq!(temp_leftovers(path.parent().unwrap()), 0);
+    }
+
+    /// A report streamed over minutes must never be visible half-written:
+    /// a reader of `path` (the operator's KafkaOffsetReset) would fail to
+    /// parse it, or worse, act on a prefix.
+    #[test]
+    fn streaming_atomic_write_keeps_the_old_file_when_the_writer_fails() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("offset-mapping.json");
+        write_file_atomic_streaming(&path, |w| Ok(w.write_all(b"good")?)).unwrap();
+
+        let result = write_file_atomic_streaming(&path, |w| {
+            w.write_all(b"{\"entries\":{\"partial")?;
+            Err(crate::Error::Io(std::io::Error::other("disk full")))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"good".to_vec());
+        assert_eq!(temp_leftovers(dir.path()), 0);
     }
 
     #[tokio::test]
