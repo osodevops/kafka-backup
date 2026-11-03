@@ -5,10 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.26.0] - 2026-11-03
 
 ### Added
-- `connection.produce_api_version` sets the Produce API version the client sends (3 to 8, default 8). Redpanda accepts up to version 7 and drops the connection on version 8, so restoring to Redpanda needs `produce_api_version: 7`; without it every topic fails with `early eof`.
+- `connection.produce_api_version` sets the Produce API version the client sends (`7` or `8`, unset keeps 8). Redpanda advertises Produce `0..7` and drops the connection on version 8, so restoring to Redpanda needs `produce_api_version: 7`; without it every topic fails with `early eof` ([#240](https://github.com/osodevops/kafka-backup/issues/240)). Versions below 7 are rejected at validation: every batch this client produces is zstd-compressed, which brokers accept from version 7 (`UNSUPPORTED_COMPRESSION_TYPE` otherwise). The client does not negotiate API versions yet; this is the override until it does.
+- A Produce request whose connection the broker drops while the client sends version 8 now reports that in the error and names `connection.produce_api_version: 7`, instead of a bare `early eof`. The error variant and kind are unchanged, so connection-loss retries behave as before.
+
+### Changed
+- **Breaking** (`kafka-backup-core`): `ConnectionConfig` gains the public field `produce_api_version: Option<i16>`. Code that builds it as a struct literal must add the field (`None` keeps the previous behaviour); `..Default::default()` users are unaffected.
 
 ## [0.25.2] - 2026-10-14
 
