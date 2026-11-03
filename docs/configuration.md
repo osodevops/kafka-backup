@@ -136,7 +136,7 @@ All are optional and live under `source.connection` / `target.connection`.
 | `connection.keepalive_interval_secs` | integer | `20` | Interval between keepalive probes |
 | `connection.tcp_nodelay` | bool | `true` | Disable Nagle's algorithm (lower request latency) |
 | `connection.connections_per_broker` | integer | `4` | TCP connections kept per broker; concurrent partitions share them, so raise this on high-latency links |
-| `connection.produce_api_version` | integer | unset (8) | Produce API version to send, 3 to 8. The client does not negotiate it, so set it for a target broker with a lower maximum. **Redpanda needs `7`**: it drops the connection on version 8, and every topic of a restore then fails with `early eof` |
+| `connection.produce_api_version` | integer | unset (8) | Produce API version to send, `7` or `8`. The client does not negotiate API versions yet, so set it for a target broker whose maximum is lower. **Redpanda needs `7`**: it advertises Produce `0..7` and drops the connection on version 8, so every topic of a restore fails with `early eof` (the error now says so). Versions below 7 are rejected: every batch this client produces is zstd-compressed, which brokers accept from version 7. Only Produce requests follow it; a backup never produces |
 
 ```yaml
 source:

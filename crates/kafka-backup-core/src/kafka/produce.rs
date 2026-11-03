@@ -335,6 +335,44 @@ pub(crate) fn encode_batch(
     Ok(buf.freeze())
 }
 
+/// A broker that does not support Produce version 8 (Redpanda advertises
+/// `0..7`) closes the connection instead of answering, which reaches the
+/// caller as a bare `early eof` / connection reset. When the client was
+/// sending version 8, say so and name the setting that fixes it. The error
+/// variant and `kind` are kept, so retry and reconcile logic that relies on
+/// [`crate::kafka::is_connection_error`] is unaffected.
+pub(crate) fn with_produce_version_hint(error: crate::Error, produce_version: i16) -> crate::Error {
+    use std::io::ErrorKind;
+    match error {
+        crate::Error::Kafka(crate::error::KafkaError::ConnectionIo {
+            operation,
+            kind,
+            raw_os_error,
+            message,
+        }) if produce_version == 8
+            && matches!(
+                kind,
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+            ) =>
+        {
+            crate::Error::Kafka(crate::error::KafkaError::ConnectionIo {
+                operation,
+                kind,
+                raw_os_error,
+                message: format!(
+                    "{message}; the broker closed the connection on a Produce version 8 request. \
+                     If it accepts at most version 7 (Redpanda does), set \
+                     connection.produce_api_version: 7"
+                ),
+            })
+        }
+        other => other,
+    }
+}
+
 /// Send one already-encoded record batch to `topic`/`partition` on
 /// `client` and return the base offset the broker assigned. `client`
 /// retries a lost connection once with the identical request bytes.
@@ -359,7 +397,10 @@ pub(crate) async fn produce_encoded(
         .with_timeout_ms(timeout_ms)
         .with_topic_data(vec![topic_data]);
 
-    let response: KafkaProduceResponse = client.send_request(ApiKey::Produce, request).await?;
+    let response: KafkaProduceResponse = client
+        .send_request(ApiKey::Produce, request)
+        .await
+        .map_err(|error| with_produce_version_hint(error, client.produce_api_version()))?;
     Ok(parse_produce_response(&response, topic, partition)?.base_offset)
 }
 
@@ -965,5 +1006,69 @@ mod tests {
         let ts: Vec<i64> = batches[0].records.iter().map(|r| r.timestamp).collect();
         assert_eq!(ts, vec![0, now]);
         assert!(now > i32::MAX as i64);
+    }
+}
+
+#[cfg(test)]
+mod produce_version_hint_tests {
+    use super::with_produce_version_hint;
+    use crate::error::KafkaError;
+    use crate::Error;
+    use std::io::ErrorKind;
+
+    fn connection_error(kind: ErrorKind) -> Error {
+        Error::Kafka(KafkaError::ConnectionIo {
+            operation: "read response length".to_string(),
+            kind,
+            raw_os_error: None,
+            message: "early eof".to_string(),
+        })
+    }
+
+    #[test]
+    fn connection_drop_on_produce_v8_gets_a_version_hint() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let error = with_produce_version_hint(connection_error(kind), 8);
+            // The variant and kind are kept so retry / reconcile logic that
+            // relies on `is_connection_error` is unaffected.
+            match &error {
+                Error::Kafka(KafkaError::ConnectionIo {
+                    kind: got, message, ..
+                }) => {
+                    assert_eq!(*got, kind);
+                    assert!(message.starts_with("early eof"), "{message}");
+                    assert!(message.contains("produce_api_version: 7"), "{message}");
+                }
+                other => panic!("variant changed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hint_is_not_added_for_other_versions_or_errors() {
+        let text = |e: &Error| e.to_string();
+        // Already pinned below 8: the hint would be wrong.
+        assert!(!text(&with_produce_version_hint(
+            connection_error(ErrorKind::UnexpectedEof),
+            7
+        ))
+        .contains("produce_api_version"));
+        // A timeout is not a connection drop.
+        assert!(!text(&with_produce_version_hint(
+            connection_error(ErrorKind::TimedOut),
+            8
+        ))
+        .contains("produce_api_version"));
+        // A broker-side error is reported as such.
+        let broker = Error::Kafka(KafkaError::BrokerError {
+            code: 76,
+            message: "UNSUPPORTED_COMPRESSION_TYPE".to_string(),
+        });
+        assert!(!text(&with_produce_version_hint(broker, 8)).contains("produce_api_version"));
     }
 }

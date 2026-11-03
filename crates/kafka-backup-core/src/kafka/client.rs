@@ -723,6 +723,12 @@ impl KafkaClient {
     }
 
     /// Get the API version to use for a given API key
+    /// The Produce API version this client sends: `connection.produce_api_version`
+    /// when set, otherwise the built-in default.
+    pub(crate) fn produce_api_version(&self) -> i16 {
+        self.get_api_version(ApiKey::Produce)
+    }
+
     fn get_api_version(&self, api_key: ApiKey) -> i16 {
         // Use reasonable default versions that are widely supported
         match api_key {

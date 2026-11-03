@@ -305,14 +305,17 @@ pub struct ConnectionConfig {
     pub connections_per_broker: usize,
 
     /// Produce API version to send, overriding the built-in default of 8
-    /// (default: unset). Allowed: 3 to 8.
+    /// (default: unset). Allowed: 7 or 8.
     ///
-    /// The client does not negotiate this version. Set it for a broker with
-    /// a lower maximum: Redpanda accepts up to version 7 and drops the
-    /// connection on version 8, which surfaces as `early eof` on every
-    /// produce. Versions 7 and 8 send the same request; version 8 only adds
-    /// per-record error detail to the response. Below version 7, brokers
-    /// reject zstd-compressed batches.
+    /// The client does not negotiate API versions yet, so set this for a
+    /// target broker whose maximum is lower: Redpanda advertises Produce
+    /// `0..7` and drops the connection on a version 8 request, which surfaces
+    /// as `early eof` on every produce. Versions 7 and 8 send the same
+    /// request; version 8 only adds per-record error detail to the response.
+    /// Versions below 7 are rejected because every batch this client
+    /// produces is zstd-compressed, which brokers accept from Produce
+    /// version 7 (`UNSUPPORTED_COMPRESSION_TYPE` otherwise). Only Produce
+    /// requests follow the setting; a backup never produces.
     pub produce_api_version: Option<i16>,
 }
 
@@ -321,9 +324,9 @@ fn default_connections_per_broker() -> usize {
 }
 
 /// Produce API versions accepted for `connection.produce_api_version`.
-/// Version 3 is the first to carry v2 record batches; versions above 8 are
-/// not used by this client.
-pub const PRODUCE_API_VERSIONS: std::ops::RangeInclusive<i16> = 3..=8;
+/// Every batch this client produces is zstd-compressed, which brokers accept
+/// from version 7 (KIP-110); 8 is the highest version the client encodes.
+pub const PRODUCE_API_VERSIONS: std::ops::RangeInclusive<i16> = 7..=8;
 
 impl ConnectionConfig {
     /// Validate the connection settings
@@ -331,9 +334,12 @@ impl ConnectionConfig {
         if let Some(version) = self.produce_api_version {
             if !PRODUCE_API_VERSIONS.contains(&version) {
                 return Err(crate::Error::Config(format!(
-                    "connection.produce_api_version must be between {} and {}, got {version}",
+                    "connection.produce_api_version must be {} or {} (every batch this client \
+                     produces is zstd-compressed, which brokers accept from Produce version {}), \
+                     got {version}",
                     PRODUCE_API_VERSIONS.start(),
                     PRODUCE_API_VERSIONS.end(),
+                    PRODUCE_API_VERSIONS.start(),
                 )));
             }
         }
@@ -1905,20 +1911,55 @@ mod tests {
 
     #[test]
     fn produce_api_version_outside_range_is_rejected() {
-        for version in [None, Some(3), Some(7), Some(8)] {
+        for version in [None, Some(7), Some(8)] {
             let config = ConnectionConfig {
                 produce_api_version: version,
                 ..Default::default()
             };
             assert!(config.validate().is_ok(), "{version:?} should be accepted");
         }
-        for version in [-1, 0, 2, 9] {
+        // Every batch this client produces is zstd-compressed, which brokers
+        // accept from Produce version 7, so 3..6 would only fail per partition
+        // at runtime (UNSUPPORTED_COMPRESSION_TYPE).
+        for version in [-1, 0, 2, 3, 6, 9] {
             let config = ConnectionConfig {
                 produce_api_version: Some(version),
                 ..Default::default()
             };
-            assert!(config.validate().is_err(), "{version} should be rejected");
+            let err = config
+                .validate()
+                .expect_err(&format!("{version} should be rejected"))
+                .to_string();
+            assert!(err.contains("7") && err.contains("zstd"), "{err}");
         }
+    }
+
+    #[test]
+    fn produce_api_version_is_validated_for_source_and_target() {
+        let yaml = r#"
+mode: restore
+backup_id: produce-version
+target:
+  bootstrap_servers: [localhost:9092]
+  connection:
+    produce_api_version: 6
+storage:
+  backend: filesystem
+  path: /tmp/produce-version
+restore:
+  consumer_group_strategy: skip
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("produce_api_version"), "{err}");
+
+        config
+            .target
+            .as_mut()
+            .unwrap()
+            .connection
+            .produce_api_version = Some(7);
+        config.validate().expect("7 is accepted on the target");
     }
 
     #[test]

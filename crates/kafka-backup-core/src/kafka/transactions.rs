@@ -332,7 +332,12 @@ pub async fn produce_encoded_batch(
         .with_acks(acks)
         .with_timeout_ms(timeout_ms)
         .with_topic_data(vec![topic_data]);
-    let response: KafkaProduceResponse = leader.send_request(ApiKey::Produce, request).await?;
+    let response: KafkaProduceResponse = leader
+        .send_request(ApiKey::Produce, request)
+        .await
+        .map_err(|error| {
+            super::produce::with_produce_version_hint(error, leader.produce_api_version())
+        })?;
     for topic_response in &response.responses {
         if topic_response.name.as_str() != topic {
             continue;
