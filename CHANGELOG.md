@@ -5,15 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.26.1] - 2026-11-03
 
 ### Fixed
 - Requests are now flushed after they are written. Over TLS, a write could report
   success with the last bytes of a request still in the TLS buffer when the socket
   was momentarily full. The broker then waited for the rest of the request and the
   client for the response, so large restore batches hung until the 60-second
-  response timeout and retries could hang the same way.
-- The restore offset report is streamed to its file instead of being built in memory first. It holds one entry per restored record, so a restore of 60 million records needed over 7 GB on top of the mapping itself, and an operator with less was killed right after the data had loaded, before consumer group offsets were applied. The report is now compact JSON rather than pretty-printed.
+  response timeout and retries could hang the same way
+  ([#242](https://github.com/osodevops/kafka-backup/issues/242)).
+- The restore offset report is streamed to its file instead of being built in memory first. It holds one entry per restored record, so a restore of 60 million records needed over 7 GB on top of the mapping itself, and an operator with less was killed right after the data had loaded, before consumer group offsets were applied. The report is now compact JSON rather than pretty-printed ([#244](https://github.com/osodevops/kafka-backup/issues/244)).
+- The restore offset report is replaced atomically: it is streamed into a temporary file in the same directory, which is synced and then renamed over the report path, and the directory is created if it is missing. A failed or interrupted write no longer leaves a truncated report for a later offset reset to read, and the previous report stays in place.
 
 ## [0.26.0] - 2026-11-03
 
