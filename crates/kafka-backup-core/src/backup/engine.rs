@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
+
+use crate::rate_limit::RateLimiter;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -690,6 +692,20 @@ impl BackupEngine {
         // Create semaphore to limit concurrent partition backups
         let semaphore = Arc::new(Semaphore::new(backup_opts.max_concurrent_partitions));
 
+        // One limiter for the whole backup, shared by every partition (and,
+        // in continuous mode, every pass), so the limits are total rates.
+        let rate_limiter = RateLimiter::from_limits(
+            backup_opts.rate_limit_records_per_sec,
+            backup_opts.rate_limit_bytes_per_sec,
+        )
+        .map(Arc::new);
+        if rate_limiter.is_some() {
+            info!(
+                "Backup rate limit: {:?} records/s, {:?} bytes/s",
+                backup_opts.rate_limit_records_per_sec, backup_opts.rate_limit_bytes_per_sec
+            );
+        }
+
         info!(
             "Backup engine starting with max_concurrent_partitions={}, poll_interval_ms={}",
             backup_opts.max_concurrent_partitions, backup_opts.poll_interval_ms
@@ -825,6 +841,7 @@ impl BackupEngine {
                         storage_cb: Arc::clone(&self.storage_circuit_breaker),
                         snapshot,
                         cancel: cancel.clone(),
+                        rate_limiter: rate_limiter.clone(),
                         resume_beyond_durable: self
                             .manifest_persistence
                             .take_healed(&(topic.clone(), partition)),
@@ -1813,6 +1830,9 @@ struct BackupPartitionContext {
     snapshot: Option<SnapshotRange>,
     /// Graceful shutdown: stop fetching, flush the buffer, stage, return.
     cancel: CancellationToken,
+    /// Backup-wide rate limit (`rate_limit_records_per_sec` /
+    /// `rate_limit_bytes_per_sec`), shared by every partition of the run.
+    rate_limiter: Option<Arc<RateLimiter>>,
     /// The legacy checkpoint was ahead of the manifest; when the source has
     /// already deleted the offsets this run goes back for, record them as a
     /// `ResumeBeyondDurable` gap.
@@ -2098,6 +2118,16 @@ impl BackupPartitionContext {
                 .sum::<usize>() as u64;
 
             self.health.record_records(record_count);
+
+            // Pace the next fetch. A shutdown interrupts the wait: the loop
+            // then stops at the top and flushes what it has.
+            if let Some(limiter) = &self.rate_limiter {
+                let encoded = crate::kafka::produce::records_encoded_size(records) as u64;
+                tokio::select! {
+                    _ = limiter.acquire(record_count, encoded) => {}
+                    _ = self.cancel.cancelled() => {}
+                }
+            }
 
             // Update Prometheus metrics
             if let Some(ref prom) = self.prometheus_metrics {
@@ -4670,6 +4700,11 @@ mod tests {
             options: BackupOptions,
             cancel: CancellationToken,
         ) -> BackupPartitionContext {
+            let rate_limiter = RateLimiter::from_limits(
+                options.rate_limit_records_per_sec,
+                options.rate_limit_bytes_per_sec,
+            )
+            .map(Arc::new);
             BackupPartitionContext {
                 topic: "t".to_string(),
                 partition: 0,
@@ -4686,6 +4721,7 @@ mod tests {
                 storage_cb: Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
                 snapshot: Some(snapshot),
                 cancel,
+                rate_limiter,
                 resume_beyond_durable: false,
             }
         }
@@ -4718,6 +4754,96 @@ mod tests {
                 .collect();
             v.sort();
             v
+        }
+
+        // -- backup rate limits ---------------------------------------------
+        /// 30 records over three fetches.
+        fn thirty_records() -> Arc<ScriptedFetcher> {
+            Arc::new(ScriptedFetcher::new(
+                vec![
+                    Ok((records(0..10), 10)),
+                    Ok((records(10..20), 20)),
+                    Ok((records(20..30), 30)),
+                ],
+                (0, 30),
+            ))
+        }
+
+        #[tokio::test]
+        async fn records_rate_limit_paces_the_partition() {
+            let h = harness(Duration::from_secs(0)).await;
+            let options = BackupOptions {
+                rate_limit_records_per_sec: Some(60),
+                ..small_segments(100)
+            };
+            let started = Instant::now();
+            context(
+                &h,
+                thirty_records(),
+                range(0, 0, 30),
+                options,
+                CancellationToken::new(),
+            )
+            .backup_partition()
+            .await
+            .unwrap();
+            // 30 records at 60/s from an empty bucket: at least 0.5 s.
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+            h.persistence.end_cycle().await.unwrap();
+            assert_eq!(stored_manifest(&h.storage).await.total_records(), 30);
+        }
+
+        #[tokio::test]
+        async fn bytes_rate_limit_paces_the_partition() {
+            let h = harness(Duration::from_secs(0)).await;
+            let all: Vec<BackupRecord> = (0..30).map(record_at).collect();
+            let bytes = crate::kafka::produce::records_encoded_size(&all) as u64;
+            let options = BackupOptions {
+                // Half the total per second: at least 2 s for the 30 records.
+                rate_limit_bytes_per_sec: Some(bytes / 2),
+                ..small_segments(100)
+            };
+            let started = Instant::now();
+            context(
+                &h,
+                thirty_records(),
+                range(0, 0, 30),
+                options,
+                CancellationToken::new(),
+            )
+            .backup_partition()
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(1_900), "{elapsed:?}");
+        }
+
+        /// A rate-limit wait must not hold up a graceful shutdown.
+        #[tokio::test]
+        async fn shutdown_interrupts_a_rate_limit_wait() {
+            let h = harness(Duration::from_secs(0)).await;
+            let options = BackupOptions {
+                // 10 records at 1/s: a 10 s wait after the first fetch.
+                rate_limit_records_per_sec: Some(1),
+                ..small_segments(100)
+            };
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                trigger.cancel();
+            });
+            let started = Instant::now();
+            context(&h, thirty_records(), range(0, 0, 30), options, cancel)
+                .backup_partition()
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+            assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+            h.persistence.end_cycle().await.unwrap();
+            // The fetched batch is flushed, the rest is left for the next run.
+            assert_eq!(stored_manifest(&h.storage).await.total_records(), 10);
         }
 
         #[tokio::test]

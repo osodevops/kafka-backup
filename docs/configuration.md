@@ -435,6 +435,8 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `stop_at_current_offsets` | bool | No | `false` | Snapshot mode: capture each partition's end offset at start (the last stable offset under `read_committed`), exit when caught up |
 | `poll_interval_ms` | int | No | `100` | Delay between backup passes in continuous mode (milliseconds) |
 | `max_concurrent_partitions` | int | No | `8` | Maximum concurrent partition backups (limits parallelism) |
+| `rate_limit_records_per_sec` | int | No | unset | Rate limit for the **whole backup** (records/sec), shared by every partition. Unset: unlimited. Since 0.27.0 |
+| `rate_limit_bytes_per_sec` | int | No | unset | Rate limit for the **whole backup** (bytes/sec, each record's encoded size), shared by every partition. Unset: unlimited. Since 0.27.0 |
 | `segment_max_bytes` | int | No | `134217728` | Rotate a segment once it holds this many uncompressed bytes (128MB) |
 | `segment_max_interval_ms` | int | No | `60000` | Rotate a segment after this many milliseconds even if it is not full |
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
@@ -596,6 +598,8 @@ gauge is subject to `metrics.max_partition_labels`.
 **`max_concurrent_partitions`**: Controls how many partitions are backed up simultaneously. Higher values increase throughput but may cause resource contention (CPU, memory, network, storage I/O). Default is 8.
 
 **`poll_interval_ms`**: In continuous mode, this controls the delay between backup passes. Lower values reduce lag but increase CPU usage. Default is 100ms. Set to 0 for maximum throughput (no delay).
+
+**`rate_limit_records_per_sec` / `rate_limit_bytes_per_sec`**: Cap the load a backup puts on the source cluster. Each limit is one token bucket shared by every partition, so it is the backup's total rate, and it is an average: the next fetch waits until the records and bytes of the previous one fit the rate, so a single fetch can exceed it (bounded by `fetch_max_bytes`). A graceful shutdown does not wait for a rate-limit pause. Before 0.27.0 these keys were ignored with an "unknown config key" warning.
 
 ### Backup Modes
 

@@ -25,3 +25,5 @@ backup:
   segment_max_bytes: 134217728
   checkpoint_interval_secs: 5
   max_concurrent_partitions: 4
+  # rate_limit_records_per_sec: 10000   # total across all partitions
+  # rate_limit_bytes_per_sec: 52428800  # 50 MB/s, total
