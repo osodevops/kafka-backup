@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.27.0] - 2026-11-04
 
 ### Added
 - Backup rate limits: `backup.rate_limit_records_per_sec` and `backup.rate_limit_bytes_per_sec`. Like the restore limits they are one token bucket each, shared by every partition, so they cap the backup's total rate; bytes are counted as each record's encoded size, as for restores. The limit is an average: the next fetch waits until the previous one fits the rate. A graceful shutdown interrupts the wait. These keys used to be ignored with an "unknown config key" warning, and the operator's `KafkaBackup.spec.rateLimiting` had nothing to map to ([kafka-backup-operator#81](https://github.com/osodevops/kafka-backup-operator/issues/81)).
