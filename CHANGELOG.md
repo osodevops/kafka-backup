@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- Validation evidence reports no longer contain storage credentials. The CLI recorded the
+  report's `backup.storage_backend` as `format!("{:?}", config.storage)`, which printed the
+  storage config with its secrets: the S3 access and secret keys, the Azure account key,
+  SAS token or client secret. They ended up in plaintext in the stored JSON and PDF of every
+  `kafka-backup validation run`, inside the signed payload. The field now holds a
+  credential-free location such as `azure://account/container/prefix` or
+  `s3://bucket/prefix (endpoint https://...)`. Reports written by earlier versions still
+  contain the credentials that were in the validation config: treat any such credential
+  whose reports were stored or shared as exposed and rotate it. Re-writing an old report
+  is not possible without breaking its signature.
+- `StorageBackendConfig`'s `Debug` output redacts credentials (`<redacted>`), including a
+  userinfo or query string in `endpoint`, so `{:?}` of a storage config is safe in logs and
+  reports in every consumer of the crate.
+
+### Added
+- `StorageBackendConfig::describe()`: a credential-free description of the storage location.
+
 ## [0.26.1] - 2026-11-03
 
 ### Fixed
