@@ -103,7 +103,9 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
         backup_id: &config.backup_id,
         manifest: &manifest,
         manifest_sha256,
-        storage_backend: format!("{:?}", config.storage),
+        // Never `{:?}`: the report is handed to auditors and must not carry
+        // storage credentials.
+        storage_backend: config.storage.describe(),
         pitr_timestamp: config.pitr_timestamp,
         target_bootstrap_servers: config.target.bootstrap_servers.clone(),
         summary: summary.clone(),
