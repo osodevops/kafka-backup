@@ -704,6 +704,20 @@ pub struct BackupOptions {
     #[serde(default = "default_backup_max_concurrent_partitions")]
     pub max_concurrent_partitions: usize,
 
+    /// Backup-wide fetch rate limit, in records per second.
+    ///
+    /// One token bucket shared by every partition of the backup, so this is
+    /// the backup's total rate, not a per-partition rate. Unset: unlimited.
+    /// Must be > 0 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_records_per_sec: Option<u64>,
+
+    /// Backup-wide fetch rate limit, in bytes per second, counted like the
+    /// restore's `rate_limit_bytes_per_sec`: each record's encoded size (key,
+    /// value, headers and framing). Unset: unlimited. Must be > 0 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bytes_per_sec: Option<u64>,
+
     /// Poll interval in milliseconds for continuous backup mode.
     ///
     /// In continuous mode, after each complete pass through all partitions,
@@ -870,6 +884,8 @@ impl Default for BackupOptions {
             source_cluster_id: None,
             stop_at_current_offsets: false,
             max_concurrent_partitions: default_backup_max_concurrent_partitions(),
+            rate_limit_records_per_sec: None,
+            rate_limit_bytes_per_sec: None,
             poll_interval_ms: default_poll_interval_ms(),
             consumer_group_snapshot: false,
             fetch_max_bytes: None,
@@ -1731,6 +1747,18 @@ impl BackupOptions {
             ));
         }
 
+        // Validate rate limits
+        if self.rate_limit_records_per_sec == Some(0) {
+            return Err(crate::Error::Config(
+                "backup.rate_limit_records_per_sec must be > 0".to_string(),
+            ));
+        }
+        if self.rate_limit_bytes_per_sec == Some(0) {
+            return Err(crate::Error::Config(
+                "backup.rate_limit_bytes_per_sec must be > 0".to_string(),
+            ));
+        }
+
         if let Some(retention) = &self.retention {
             retention.validate()?;
         }
@@ -2002,6 +2030,60 @@ backup:
         assert_eq!(opts.segment_max_records, None);
         assert_eq!(opts.segment_max_bytes, 134217728);
         assert!(opts.stop_at_current_offsets);
+    }
+
+    /// Issue: `backup.rate_limit_*` was an unknown key (a warning) and the
+    /// backup engine had no rate limit at all.
+    #[test]
+    fn backup_rate_limits_are_known_backup_options() {
+        let yaml = r#"
+mode: backup
+backup_id: rate-limited
+source:
+  bootstrap_servers:
+    - localhost:9092
+storage:
+  backend: filesystem
+  path: /tmp/rate-limited
+backup:
+  rate_limit_records_per_sec: 500
+  rate_limit_bytes_per_sec: 1048576
+"#;
+        let (config, warnings) = Config::from_yaml_with_warnings(yaml).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.validate().is_ok());
+        let backup = config.backup.unwrap();
+        assert_eq!(backup.rate_limit_records_per_sec, Some(500));
+        assert_eq!(backup.rate_limit_bytes_per_sec, Some(1_048_576));
+    }
+
+    #[test]
+    fn backup_rate_limits_must_be_positive() {
+        for (records, bytes, field) in [
+            (Some(0), None, "rate_limit_records_per_sec"),
+            (None, Some(0), "rate_limit_bytes_per_sec"),
+        ] {
+            let opts = BackupOptions {
+                rate_limit_records_per_sec: records,
+                rate_limit_bytes_per_sec: bytes,
+                ..BackupOptions::default()
+            };
+            let err = opts.validate().expect_err(field).to_string();
+            assert!(err.contains(field) && err.contains("> 0"), "{err}");
+        }
+        assert!(BackupOptions {
+            rate_limit_records_per_sec: Some(1),
+            rate_limit_bytes_per_sec: Some(1),
+            ..BackupOptions::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn unset_backup_rate_limits_are_not_serialized() {
+        let yaml = serde_yaml::to_string(&BackupOptions::default()).unwrap();
+        assert!(!yaml.contains("rate_limit"), "{yaml}");
     }
 
     #[test]

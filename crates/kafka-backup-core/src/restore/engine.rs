@@ -327,7 +327,7 @@ impl RestoreEngine {
         let rate_limiter = config
             .restore
             .as_ref()
-            .and_then(super::rate_limit::RestoreRateLimiter::from_options)
+            .and_then(super::rate_limit::limiter_for)
             .map(Arc::new);
 
         Ok(Self {
