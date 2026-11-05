@@ -186,6 +186,13 @@ impl KafkaClient {
         self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Fetch `max_wait_ms`, kept below the response timeout so a held Fetch
+    /// is never mistaken for a dead connection.
+    pub(super) fn fetch_max_wait_ms(&self) -> i32 {
+        let cap = (RESPONSE_TIMEOUT_SECS * 1000 / 2) as i32;
+        self.config.connection.fetch_max_wait_ms.clamp(0, cap)
+    }
+
     pub(super) fn config_clone(&self) -> KafkaConfig {
         self.config.clone()
     }
