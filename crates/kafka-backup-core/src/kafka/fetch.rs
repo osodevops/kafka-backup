@@ -90,7 +90,7 @@ pub async fn fetch(
 
     let request = FetchRequest::default()
         .with_replica_id(BrokerId(-1)) // Client mode
-        .with_max_wait_ms(500)
+        .with_max_wait_ms(client.fetch_max_wait_ms())
         .with_min_bytes(1)
         .with_max_bytes(max_bytes)
         .with_isolation_level(isolation.as_protocol())

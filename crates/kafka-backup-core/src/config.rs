@@ -317,6 +317,17 @@ pub struct ConnectionConfig {
     /// version 7 (`UNSUPPORTED_COMPRESSION_TYPE` otherwise). Only Produce
     /// requests follow the setting; a backup never produces.
     pub produce_api_version: Option<i16>,
+
+    /// Fetch `max_wait_ms`: how long a broker may hold a Fetch before it
+    /// answers (default: 500).
+    ///
+    /// With tiered storage a broker serves offsets that left local disk from
+    /// the remote tier asynchronously; if that read takes longer than this
+    /// wait, the broker answers with no records. Raise it for clusters with
+    /// tiered storage so remote reads can complete within one Fetch. Capped
+    /// below the client's response timeout.
+    #[serde(default = "default_fetch_max_wait_ms")]
+    pub fetch_max_wait_ms: i32,
 }
 
 fn default_connections_per_broker() -> usize {
@@ -347,6 +358,10 @@ impl ConnectionConfig {
     }
 }
 
+fn default_fetch_max_wait_ms() -> i32 {
+    500
+}
+
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
@@ -356,6 +371,7 @@ impl Default for ConnectionConfig {
             tcp_nodelay: true,
             connections_per_broker: default_connections_per_broker(),
             produce_api_version: None,
+            fetch_max_wait_ms: default_fetch_max_wait_ms(),
         }
     }
 }
@@ -746,6 +762,17 @@ pub struct BackupOptions {
     #[serde(default)]
     pub fetch_max_bytes: Option<u64>,
 
+    /// Seconds a partition keeps retrying a Fetch that returns no records and
+    /// no progress while its offset is still below the end offset captured
+    /// for this run (default: 0, end the partition as before).
+    ///
+    /// Such a fetch does not mean the data is gone: with tiered storage the
+    /// broker answers empty while it reads the offset from the remote tier.
+    /// When the budget runs out the partition fails instead of completing
+    /// with a silent hole.
+    #[serde(default)]
+    pub empty_fetch_retry_secs: u64,
+
     /// Maximum records per segment before rotation.
     ///
     /// When unset, segments rotate on `segment_max_bytes` /
@@ -889,6 +916,7 @@ impl Default for BackupOptions {
             poll_interval_ms: default_poll_interval_ms(),
             consumer_group_snapshot: false,
             fetch_max_bytes: None,
+            empty_fetch_retry_secs: 0,
             segment_max_records: None,
             capture_topic_configs: default_capture_topic_configs(),
             require_topic_configs: false,
