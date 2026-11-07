@@ -26,3 +26,7 @@ tap = "osodevops/homebrew-tap"
 formula = "kafka-backup"
 # Publish jobs to run (updates homebrew tap automatically)
 publish-jobs = ["homebrew"]
+
+# macos-14 was retired on 2026-11-02. The release matrix is computed at run time.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
