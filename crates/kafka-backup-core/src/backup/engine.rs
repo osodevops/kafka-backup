@@ -2953,7 +2953,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener); // refused connection; no Kafka service required
         let config: Config = serde_yaml::from_str(&format!(
-            "mode: backup\nbackup_id: startup\nsource:\n  bootstrap_servers: ['{address}']\nstorage:\n  type: filesystem\n  path: {}\n",
+            "mode: backup\nbackup_id: startup\nsource:\n  bootstrap_servers: ['{address}']\nstorage:\n  backend: filesystem\n  path: {}\n",
             dir.path().display(),
         )).unwrap();
         let metrics = Arc::new(PrometheusMetrics::new());
