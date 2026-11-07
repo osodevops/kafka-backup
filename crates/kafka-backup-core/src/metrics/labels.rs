@@ -285,6 +285,21 @@ pub enum ErrorType {
 }
 
 impl ErrorType {
+    /// Bounded categories used to initialize error counters before any error occurs.
+    pub const ALL: [Self; 11] = [
+        Self::BrokerConnection,
+        Self::ConsumerTimeout,
+        Self::Deserialization,
+        Self::StorageIo,
+        Self::Codec,
+        Self::OffsetInvalid,
+        Self::Auth,
+        Self::Timeout,
+        Self::NotFound,
+        Self::Quota,
+        Self::Unknown,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorType::BrokerConnection => "broker_connection",

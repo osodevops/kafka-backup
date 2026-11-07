@@ -20,6 +20,9 @@ pub async fn run(config_path: &str) -> Result<()> {
         metrics_config.max_partition_labels,
     ));
 
+    // Initialize before exposing HTTP, so even the first scrape has error samples.
+    prometheus_metrics.initialize_backup_errors(&config.backup_id);
+
     let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
         &metrics_config,
         prometheus_metrics.clone(),
