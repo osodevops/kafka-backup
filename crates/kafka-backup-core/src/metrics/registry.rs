@@ -879,6 +879,19 @@ impl PrometheusMetrics {
     // Error & Health Methods
     // ========================================
 
+    /// Expose zero-valued error counters for a configured backup before its first error.
+    ///
+    /// Only the actual backup ID and the bounded error categories are initialized.
+    /// Repeated calls preserve existing counts, including when a registry is shared.
+    pub fn initialize_backup_errors(&self, backup_id: &str) {
+        for error_type in ErrorType::ALL {
+            drop(
+                self.errors_total
+                    .get_or_create(&ErrorLabels::new(backup_id, error_type)),
+            );
+        }
+    }
+
     /// Record an error.
     pub fn record_error(&self, backup_id: &str, error_type: ErrorType) {
         let labels = ErrorLabels::new(backup_id, error_type);
@@ -1107,6 +1120,52 @@ mod tests {
 
         let encoded = metrics.encode();
         assert!(encoded.contains("kafka_backup_storage_write_latency_seconds"));
+    }
+
+    #[test]
+    fn backup_errors_are_zero_before_the_first_error() {
+        let metrics = PrometheusMetrics::new();
+        metrics.initialize_backup_errors("healthy");
+        let encoded = metrics.encode();
+        let samples: Vec<_> = encoded
+            .lines()
+            .filter(|line| line.starts_with("kafka_backup_errors_total{"))
+            .collect();
+        assert_eq!(
+            samples.len(),
+            11,
+            "one series per bounded error category: {encoded}"
+        );
+        for sample in samples {
+            assert!(sample.contains("backup_id=\"healthy\""), "{sample}");
+            assert!(sample.ends_with(" 0"), "{sample}");
+        }
+        assert!(!encoded.contains("_total_total"));
+    }
+
+    #[test]
+    fn initializing_backup_errors_is_idempotent_and_does_not_reset_counts() {
+        let metrics = PrometheusMetrics::with_max_labels(1);
+        metrics.initialize_backup_errors("first");
+        metrics.record_error("first", ErrorType::BrokerConnection);
+        metrics.record_error("first", ErrorType::BrokerConnection);
+        metrics.initialize_backup_errors("first");
+        metrics.initialize_backup_errors("second");
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains(
+                "kafka_backup_errors_total{backup_id=\"first\",error_type=\"broker_connection\"} 2"
+            ),
+            "{encoded}"
+        );
+        assert!(encoded.contains("kafka_backup_errors_total{backup_id=\"second\",error_type=\"broker_connection\"} 0"), "{encoded}");
+        assert_eq!(
+            encoded
+                .lines()
+                .filter(|l| l.starts_with("kafka_backup_errors_total{"))
+                .count(),
+            22
+        );
     }
 
     #[test]

@@ -1114,7 +1114,7 @@ After restore:
 
 ### Restore performance summary
 
-From 0.27.1, restore logs show restored records, exact payload bytes,
+From 0.27.2, restore logs show restored records, exact payload bytes,
 bytes/s and MiB/s, segments read, and errors. Payload bytes are key plus value
 lengths after filtering and transformations; they exclude headers, protocol
 overhead and compression. They match `kafka_restore_bytes_total`, rather than

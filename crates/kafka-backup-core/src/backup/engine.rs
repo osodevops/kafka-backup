@@ -482,6 +482,11 @@ impl BackupEngine {
             .as_ref()
             .ok_or_else(|| Error::Config("Source configuration required".to_string()))?;
 
+        // Library users also get zero-valued error counters, before connecting.
+        if let Some(prom) = &prometheus_metrics {
+            prom.initialize_backup_errors(&config.backup_id);
+        }
+
         // Create partition leader router for multi-broker support
         let router = Arc::new(PartitionLeaderRouter::new(source.clone()).await?);
         let storage = create_backend(&config.storage)?;
@@ -2940,6 +2945,28 @@ fn to_binary_record(record: &BackupRecord, options: &BackupOptions) -> BinaryRec
 mod tests {
     use super::*;
     use crate::manifest::{PartitionBackup, RecordHeader, TopicBackup};
+
+    #[tokio::test]
+    async fn error_counters_exist_before_the_initial_broker_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener); // refused connection; no Kafka service required
+        let config: Config = serde_yaml::from_str(&format!(
+            "mode: backup\nbackup_id: startup\nsource:\n  bootstrap_servers: ['{address}']\nstorage:\n  backend: filesystem\n  path: {}\n",
+            dir.path().display(),
+        )).unwrap();
+        let metrics = Arc::new(PrometheusMetrics::new());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            BackupEngine::new_with_metrics(config, Some(metrics.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err(), "the test broker must be unreachable");
+        let encoded = metrics.encode();
+        assert!(encoded.contains("kafka_backup_errors_total{backup_id=\"startup\",error_type=\"broker_connection\"} 0"), "{encoded}");
+    }
 
     // ------------------------------------------------------------------
     // Snapshot planning (strimzi-backup-operator#57)

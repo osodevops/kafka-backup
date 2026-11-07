@@ -358,6 +358,39 @@ mod tests {
         let _server = MetricsServer::new(config, metrics);
     }
 
+    #[tokio::test]
+    async fn healthy_backup_http_scrape_contains_zero_error_samples() {
+        let metrics = Arc::new(PrometheusMetrics::new());
+        metrics.initialize_backup_errors("healthy-http");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let server = MetricsServer::new(MetricsServerConfig::with_address(address), metrics);
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await });
+        let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match reqwest::get(format!("http://{address}/metrics")).await {
+                    Ok(response) => {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        break response.text().await.unwrap();
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("kafka_backup_errors_total{"))
+            .collect();
+        assert_eq!(samples.len(), 11, "{text}");
+        assert!(samples.iter().all(|line| line.ends_with(" 0")), "{text}");
+    }
+
     #[test]
     fn test_server_state() {
         // Verify ServerState can be created with the correct fields
