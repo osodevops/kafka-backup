@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.1] - 2026-11-07
+
+### Fixed
+- Backup Prometheus error counters are initialized to zero for the configured
+  `backup_id` and every known `error_type` before the first HTTP scrape and
+  before the engine connects to Kafka. Healthy backups now publish
+  `kafka_backup_errors_total` without waiting for an error. Reinitializing a
+  shared registry preserves existing counts and labels remain unchanged
+  ([strimzi-backup-operator#79](https://github.com/osodevops/strimzi-backup-operator/issues/79)).
+
 ## [0.27.0] - 2026-11-04
 
 ### Added
