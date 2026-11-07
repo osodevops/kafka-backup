@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.1] - 2026-11-07
+
+### Fixed
+- Restore performance metrics now count key plus value bytes after acknowledgement on the standard and repartitioned paths, including checkpoint-tail reconciliation ([#251](https://github.com/osodevops/kafka-backup/issues/251)). Filters and transforms are accounted for using the restored payload; failed batches do not add bytes.
+- Restore's final log summary uses its restore counters, with exact payload bytes, bytes/s, MiB/s, segments read and errors. It no longer shows unmeasured backup-only compression and write latencies. Small restores show their byte count even below 1 MiB. Dry runs do not print a performance summary for work they only planned. Backup summaries and Prometheus metric names and semantics are unchanged.
+
 ## [0.27.0] - 2026-11-04
 
 ### Added

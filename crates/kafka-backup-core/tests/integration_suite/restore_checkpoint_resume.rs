@@ -271,15 +271,16 @@ async fn resumed_restore_counts_the_verified_tail_once_in_the_metrics() {
     age_checkpoint(&cp_path);
 
     let prom = std::sync::Arc::new(kafka_backup_core::PrometheusMetrics::new());
-    let report = RestoreEngine::new_with_metrics(config(), Some(prom.clone()))
-        .unwrap()
-        .run()
-        .await
-        .expect("resume");
+    let engine = RestoreEngine::new_with_metrics(config(), Some(prom.clone())).unwrap();
+    let report = engine.run().await.expect("resume");
     assert_eq!(log_digest(&broker.log(0)), source_digest(&source));
 
     // 50 verified + 50 produced by this run.
     assert_eq!(report.records_restored, 100);
+    assert_eq!(
+        engine.metrics().report().bytes_written,
+        report.bytes_restored
+    );
     let encoded = prom.encode();
     assert_eq!(
         restore_metric(&encoded, "kafka_restore_records_total", "kill-metrics"),

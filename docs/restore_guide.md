@@ -1112,6 +1112,24 @@ After restore:
 
 ## Troubleshooting
 
+### Restore performance summary
+
+From 0.27.1, restore logs show restored records, exact payload bytes,
+bytes/s and MiB/s, segments read, and errors. Payload bytes are key plus value
+lengths after filtering and transformations; they exclude headers, protocol
+overhead and compression. They match `kafka_restore_bytes_total`, rather than
+the size of the compressed objects read from storage. Tombstones contribute
+only their key length. A failed batch adds no records or bytes; acknowledged
+work before a later failure remains visible.
+
+On resume, completed checkpoint segments are skipped. Records in an unsaved
+tail that are verified as already present on the target count once as restored,
+as in the restore report and Prometheus counters; they are not produced again.
+Dry runs report planned work and do not print a restore performance summary.
+
+Backup compression ratios, segments written, checkpoint latencies and segment
+write latencies do not apply to this summary and are no longer shown.
+
 ### "Backup not found"
 
 ```
