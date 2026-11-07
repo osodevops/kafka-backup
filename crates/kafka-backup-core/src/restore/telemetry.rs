@@ -245,6 +245,33 @@ impl RestoreTelemetry {
         self.update(Some(status), true);
     }
 
+    /// Human-readable restore summary. These are the same restored key/value
+    /// bytes as progress and Prometheus, rather than compressed archive bytes
+    /// or Kafka protocol bytes. Show raw bytes as well as MiB so small restores
+    /// do not look empty after rounding. Segments are read, never written.
+    pub fn report(&self) -> String {
+        let progress = self.snapshot(None);
+        format!(
+            "=== Restore Performance Metrics ===\n\
+             Duration: {:.2}s\n\
+             Records restored: {}\n\
+             Records/sec: {:.0}\n\
+             Bytes restored: {} bytes ({:.2} MiB; key + value)\n\
+             Throughput: {:.2} bytes/s ({:.2} MiB/s)\n\
+             Segments read: {}\n\
+             Errors: {}",
+            self.started.lock().elapsed().as_secs_f64(),
+            progress.records_restored,
+            progress.throughput_records_per_sec,
+            progress.bytes_restored,
+            progress.bytes_restored as f64 / 1_048_576.0,
+            progress.throughput_bytes_per_sec,
+            progress.throughput_bytes_per_sec / 1_048_576.0,
+            progress.segments_completed,
+            self.errors.load(Ordering::Relaxed),
+        )
+    }
+
     /// Publish the gauges and a progress event: always when `force`,
     /// otherwise at most once per interval.
     fn update(&self, finished: Option<OperationStatus>, force: bool) {
@@ -515,5 +542,49 @@ mod tests {
         telemetry.start();
         telemetry.record_produced("t", 0, &[record(b"k", None)]);
         telemetry.finish(RestoreOutcome::Success, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn restore_summary_shows_payload_bytes_and_only_restore_metrics() {
+        let telemetry = RestoreTelemetry::disabled();
+        telemetry.start();
+        telemetry.segment_processed();
+        telemetry.record_produced("t", 0, &[record(b"k", Some(b"vv")), record(b"k", None)]);
+        telemetry.finish(
+            RestoreOutcome::Failure(&Error::Connection("failed next batch".into())),
+            Duration::from_secs(1),
+        );
+
+        let summary = telemetry.report();
+        for expected in [
+            "=== Restore Performance Metrics ===",
+            "Records restored: 2",
+            "Bytes restored: 4 bytes",
+            "Throughput:",
+            "bytes/s",
+            "Segments read: 1",
+            "Errors: 1",
+        ] {
+            assert!(summary.contains(expected), "missing {expected}: {summary}");
+        }
+        for backup_only in [
+            "Compression ratio",
+            "Segments written",
+            "Checkpoint latency",
+            "Segment write latency",
+        ] {
+            assert!(!summary.contains(backup_only), "{summary}");
+        }
+    }
+
+    #[test]
+    fn empty_restore_summary_has_finite_zero_throughput() {
+        let telemetry = RestoreTelemetry::disabled();
+        let summary = telemetry.report();
+        assert!(summary.contains("Records restored: 0"), "{summary}");
+        assert!(summary.contains("Bytes restored: 0 bytes"), "{summary}");
+        assert!(summary.contains("Throughput: 0.00 bytes/s"), "{summary}");
+        assert!(!summary.contains("NaN"), "{summary}");
+        assert!(!summary.contains("inf"), "{summary}");
     }
 }

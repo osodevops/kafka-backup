@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use super::telemetry::{RestoreOutcome, RestorePlan, RestoreTelemetry};
+use super::telemetry::{
+    payload_bytes as record_bytes, RestoreOutcome, RestorePlan, RestoreTelemetry,
+};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{
@@ -413,9 +415,12 @@ impl RestoreEngine {
             start_time.elapsed(),
         );
 
-        // Log final metrics
-        let report = self.metrics.report();
-        info!("{}", report);
+        // Restore has no backup compression or segment-write measurements.
+        // Use the same counters as restore progress and Prometheus, including
+        // acknowledged work when a later batch fails. A dry run only plans work.
+        if !matches!(&result, Ok(report) if report.dry_run) {
+            info!("{}", self.telemetry.report());
+        }
 
         match result {
             Ok(mut restore_result) => {
@@ -2437,6 +2442,8 @@ impl RestorePartitionContext {
 
                 total_records += batch.len() as u64;
                 self.metrics.record_records(batch.len() as u64);
+                let bytes = record_bytes(batch);
+                self.metrics.record_bytes(bytes, bytes);
                 self.health.record_records(batch.len() as u64);
                 self.telemetry
                     .record_produced(&self.target_topic, self.target_partition, batch);
@@ -2562,6 +2569,8 @@ impl RestorePartitionContext {
         );
         self.record_ack(progress, records, sub_batches).await;
         self.metrics.record_records(records.len() as u64);
+        let bytes = record_bytes(records);
+        self.metrics.record_bytes(bytes, bytes);
         // Counted like produced records, as the restore report counts them
         // (they are never produced again, so never counted twice).
         self.telemetry
@@ -2605,17 +2614,6 @@ impl RestorePartitionContext {
             .find_map(|h| decode_i64_header(h.value.as_deref()))
             .unwrap_or(record.timestamp)
     }
-}
-
-/// Key plus value bytes of `records`, as the restore report counts them.
-fn record_bytes(records: &[BackupRecord]) -> u64 {
-    records
-        .iter()
-        .map(|r| {
-            r.key.as_ref().map(|k| k.len()).unwrap_or(0) as u64
-                + r.value.as_ref().map(|v| v.len()).unwrap_or(0) as u64
-        })
-        .sum()
 }
 
 /// Aborts tasks still running when dropped.

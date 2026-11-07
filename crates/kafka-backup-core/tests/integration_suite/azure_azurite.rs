@@ -359,14 +359,18 @@ async fn azurite_backup_and_restore_round_trip() {
         offset_storage: None,
         metrics: None,
     };
-    let report = tokio::time::timeout(
-        Duration::from_secs(90),
-        RestoreEngine::new(restore).expect("restore engine").run(),
-    )
-    .await
-    .expect("restore timed out")
-    .expect("restore");
+    let engine = RestoreEngine::new(restore).expect("restore engine");
+    let report = tokio::time::timeout(Duration::from_secs(90), engine.run())
+        .await
+        .expect("restore timed out")
+        .expect("restore");
     assert_eq!(report.records_restored, RECORDS as u64);
+    // #251 was reported with Azure storage: the performance collector must
+    // count restored payload bytes, independently of compressed blob sizes.
+    let metrics = engine.metrics().report();
+    assert_eq!(metrics.bytes_written, report.bytes_restored);
+    assert!(metrics.bytes_written > 0);
+    assert!(metrics.throughput_mbps > 0.0);
 
     let client = cluster.create_client();
     client.connect().await.expect("connect");

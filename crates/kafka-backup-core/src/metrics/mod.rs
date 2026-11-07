@@ -61,9 +61,9 @@ pub use self::PerformanceMetrics as LegacyPerformanceMetrics;
 pub struct PerformanceMetrics {
     /// Total records processed
     pub records_processed: AtomicU64,
-    /// Total bytes written (compressed)
+    /// Total bytes written (compressed for backups, key + value payload for restores)
     pub bytes_written: AtomicU64,
-    /// Total bytes before compression
+    /// Total bytes before compression (key + value payload for restores)
     pub bytes_uncompressed: AtomicU64,
     /// Checkpoint operation latencies in nanoseconds
     checkpoint_latencies_ns: RwLock<Vec<u64>>,

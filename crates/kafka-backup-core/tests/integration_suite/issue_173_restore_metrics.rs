@@ -157,6 +157,7 @@ async fn restore_records_prometheus_metrics_and_progress() {
 
     let report = engine.run().await.expect("restore succeeds");
     assert_eq!(report.records_restored, RECORDS as u64);
+    assert_performance_metrics(&engine, &report);
 
     assert_completed_restore_metrics(&prom.encode(), backup_id, report.bytes_restored);
 
@@ -200,6 +201,7 @@ async fn repartitioned_restore_records_prometheus_metrics() {
     let mut progress = engine.progress_receiver();
     let report = engine.run().await.expect("repartitioned restore succeeds");
     assert_eq!(report.records_restored, RECORDS as u64);
+    assert_performance_metrics(&engine, &report);
 
     assert_completed_restore_metrics(&prom.encode(), backup_id, report.bytes_restored);
 
@@ -273,9 +275,23 @@ async fn failed_restore_counts_errors_and_a_failure_duration() {
     );
     let last = drain(&mut progress).pop().expect("final progress event");
     assert!(last.percentage < 100.0, "{last:?}");
+    let performance = engine.metrics().report();
+    assert_eq!(performance.records_processed, last.records_restored);
+    assert_eq!(performance.bytes_written, last.bytes_restored);
+    assert!(performance.bytes_written > 0);
 
     b1.shutdown().await;
     b2.shutdown().await;
+}
+
+// #251: the final CLI summary's collector must agree with restore telemetry,
+// including on the fan-out path and after a partition fails.
+fn assert_performance_metrics(engine: &RestoreEngine, report: &kafka_backup_core::RestoreReport) {
+    let performance = engine.metrics().report();
+    assert_eq!(performance.records_processed, report.records_restored);
+    assert_eq!(performance.bytes_written, report.bytes_restored);
+    assert_eq!(performance.bytes_uncompressed, report.bytes_restored);
+    assert!(performance.throughput_mbps > 0.0);
 }
 
 #[tokio::test]

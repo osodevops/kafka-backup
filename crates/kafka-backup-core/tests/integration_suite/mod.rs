@@ -47,6 +47,7 @@ pub mod issue_173_restore_metrics;
 pub mod issue_197_broker_pause;
 pub mod issue_197_circuit_breaker;
 pub mod issue_224_group_coordinator;
+pub mod issue_251_restore_metrics;
 pub mod issue_56_missing_topic;
 pub mod issue_57_incremental_snapshot_target;
 pub mod issue_67_fixes;

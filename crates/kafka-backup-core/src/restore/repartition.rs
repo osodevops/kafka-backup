@@ -26,7 +26,7 @@ use crate::{Error, Result};
 
 use super::helpers;
 use super::produce_path::{ProducePath, RecordOrigin};
-use super::telemetry::RestoreTelemetry;
+use super::telemetry::{payload_bytes, RestoreTelemetry};
 
 /// Kafka's default seed for murmur2 hashing (0x9747b28c).
 const KAFKA_MURMUR2_SEED: u32 = murmur2::KAFKA_SEED;
@@ -562,13 +562,7 @@ async fn run_writer(
             return Err(e);
         }
 
-        let batch_bytes: u64 = batch
-            .iter()
-            .map(|r| {
-                r.key.as_ref().map(|k| k.len()).unwrap_or(0) as u64
-                    + r.value.as_ref().map(|v| v.len()).unwrap_or(0) as u64
-            })
-            .sum();
+        let batch_bytes = payload_bytes(&batch);
 
         // Produce (after the restore-wide rate limit, unless the restore
         // started stopping while the batch waited for it)
@@ -590,6 +584,7 @@ async fn run_writer(
                 total_records += batch.len() as u64;
                 total_bytes += batch_bytes;
                 metrics.record_records(batch.len() as u64);
+                metrics.record_bytes(batch_bytes, batch_bytes);
                 health.record_records(batch.len() as u64);
                 telemetry.record_produced(target_topic, target_partition, &batch);
             }
