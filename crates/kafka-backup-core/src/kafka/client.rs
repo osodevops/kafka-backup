@@ -186,6 +186,13 @@ impl KafkaClient {
         self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Fetch `max_wait_ms`, capped below the response timeout. Remote-read
+    /// waits may also depend on the broker's configuration (KIP-1018).
+    pub(super) fn fetch_max_wait_ms(&self) -> i32 {
+        let cap = (RESPONSE_TIMEOUT_SECS * 1000 / 2) as i32;
+        self.config.connection.fetch_max_wait_ms.clamp(0, cap)
+    }
+
     pub(super) fn config_clone(&self) -> KafkaConfig {
         self.config.clone()
     }
@@ -721,15 +728,23 @@ impl KafkaClient {
         Resp: Decodable + Default,
     {
         let api_version = self.get_api_version(api_key);
-        let mut conn = self.connection.lock().await;
-        let conn = conn.as_mut().ok_or_else(|| KafkaError::ConnectionIo {
+        // Keep requests serialized, but own the socket while doing I/O. If
+        // this future is dropped during write_all/read_exact, dropping the
+        // connection closes the partially consumed stream and aborts re-auth.
+        // A cancelled waiter has not taken the connection and cannot affect it.
+        let mut slot = self.connection.lock().await;
+        let mut conn = slot.take().ok_or_else(|| KafkaError::ConnectionIo {
             operation: "send request".to_string(),
             kind: std::io::ErrorKind::NotConnected,
             raw_os_error: None,
             message: "Not connected".to_string(),
         })?;
 
-        send_rpc_on_stream(&mut conn.stream, api_key, api_version, buf).await
+        let result = send_rpc_on_stream(&mut conn.stream, api_key, api_version, buf).await;
+        if result.is_ok() {
+            *slot = Some(conn);
+        }
+        result
     }
 
     /// Get the API version to use for a given API key
@@ -1089,6 +1104,119 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    // A deadline may interrupt read_exact in the middle of a Kafka frame.
+    // The stream must be closed, while a caller cancelled waiting for the
+    // connection mutex must leave the request that owns it alone.
+    async fn connected_pair() -> (KafkaClient, tokio::net::TcpStream, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = KafkaClient::new(
+            serde_json::from_value(serde_json::json!({
+                "bootstrap_servers": [addr.to_string()]
+            }))
+            .unwrap(),
+        );
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        *client.connection.lock().await =
+            Some(BrokerConnection::new(ConnectionStream::Plain(tcp), 1));
+        (client, server, listener)
+    }
+
+    fn versions_response() -> Vec<u8> {
+        use bytes::{BufMut, BytesMut};
+        use kafka_protocol::messages::ApiVersionsResponse;
+        let mut body = BytesMut::new();
+        ResponseHeader::default().encode(&mut body, 0).unwrap();
+        ApiVersionsResponse::default().encode(&mut body, 3).unwrap();
+        let mut frame = BytesMut::new();
+        frame.put_i32(body.len() as i32);
+        frame.extend_from_slice(&body);
+        frame.to_vec()
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_response_discards_connection() {
+        use kafka_protocol::messages::{ApiVersionsRequest, ApiVersionsResponse};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut server, listener) = connected_pair().await;
+        // Send a complete response length but only half its body.
+        let frame = versions_response();
+        server.write_all(&frame[..6]).await.unwrap();
+        let request = client
+            .encode_request(ApiKey::ApiVersions, &ApiVersionsRequest::default())
+            .unwrap();
+        assert!(timeout(
+            Duration::from_millis(50),
+            client.send_raw_request::<ApiVersionsResponse>(ApiKey::ApiVersions, &request)
+        )
+        .await
+        .is_err());
+        assert!(
+            client.connection.lock().await.is_none(),
+            "partial frame must never be reused"
+        );
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(1), server.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received, request,
+            "cancelled RPC closed the socket after its request"
+        );
+
+        // The public request path reconnects, then decodes a fresh response.
+        let broker = tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            server.write_all(&frame).await.unwrap();
+        });
+        client
+            .send_request::<ApiVersionsRequest, ApiVersionsResponse>(
+                ApiKey::ApiVersions,
+                ApiVersionsRequest::default(),
+            )
+            .await
+            .unwrap();
+        broker.await.unwrap();
+        assert!(client.connection.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_mutex_waiter_preserves_active_connection() {
+        use kafka_protocol::messages::{ApiVersionsRequest, ApiVersionsResponse};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut server, _listener) = connected_pair().await;
+        let client = std::sync::Arc::new(client);
+        let request = client
+            .encode_request(ApiKey::ApiVersions, &ApiVersionsRequest::default())
+            .unwrap();
+        let active = {
+            let client = client.clone();
+            let request = request.clone();
+            tokio::spawn(async move {
+                client
+                    .send_raw_request::<ApiVersionsResponse>(ApiKey::ApiVersions, &request)
+                    .await
+            })
+        };
+        let mut received = vec![0; request.len()];
+        server.read_exact(&mut received).await.unwrap();
+        assert!(timeout(
+            Duration::from_millis(50),
+            client.send_raw_request::<ApiVersionsResponse>(ApiKey::ApiVersions, &request)
+        )
+        .await
+        .is_err());
+        server.write_all(&versions_response()).await.unwrap();
+        timeout(Duration::from_secs(1), active)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(client.connection.lock().await.is_some());
     }
 
     #[test]

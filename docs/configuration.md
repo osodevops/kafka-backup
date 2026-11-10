@@ -135,6 +135,7 @@ All are optional and live under `source.connection` / `target.connection`.
 | `connection.keepalive_time_secs` | integer | `60` | Idle time before the first keepalive probe |
 | `connection.keepalive_interval_secs` | integer | `20` | Interval between keepalive probes |
 | `connection.tcp_nodelay` | bool | `true` | Disable Nagle's algorithm (lower request latency) |
+| `connection.fetch_max_wait_ms` | integer | `500` | Broker Fetch wait in ms, 0–30000; older remote reads may use this too. With KIP-1018, remote reads use broker `remote.fetch.max.wait.ms` instead. Does not extend client timeouts or the no-progress budget |
 | `connection.connections_per_broker` | integer | `4` | TCP connections kept per broker; concurrent partitions share them, so raise this on high-latency links |
 | `connection.produce_api_version` | integer | unset (8) | Produce API version to send, `7` or `8`. The client does not negotiate API versions yet, so set it for a target broker whose maximum is lower. **Redpanda needs `7`**: it advertises Produce `0..7` and drops the connection on version 8, so every topic of a restore fails with `early eof` (the error now says so). Versions below 7 are rejected: every batch this client produces is zstd-compressed, which brokers accept from version 7. Only Produce requests follow it; a backup never produces |
 
@@ -440,6 +441,7 @@ the values in `kafka-backup-core`'s `BackupOptions::default()`.
 | `segment_max_bytes` | int | No | `134217728` | Rotate a segment once it holds this many uncompressed bytes (128MB) |
 | `segment_max_interval_ms` | int | No | `60000` | Rotate a segment after this many milliseconds even if it is not full |
 | `segment_max_records` | int | No | unset | Rotate a segment after this many records (no record limit when unset) |
+| `empty_fetch_retry_secs` | int | No | `30` | Per-partition no-progress budget in seconds, 0–3600. Zero fails immediately on a stalled Fetch below the captured end. Includes backoff and subsequent requests; resets on offset progress. Expiry fails the run and preserves its durable prefix |
 | `fetch_max_bytes` | int | No | unset | Max bytes per Kafka Fetch request; when unset, `min(segment_max_bytes, 16MB)` |
 | `checkpoint_interval_secs` | int | No | `5` | **Deprecated (0.22.0) — no effect.** Offsets are checkpointed at the end of every backup cycle; a warning is logged if set |
 | `sync_interval_secs` | int | No | `30` | How often the manifest is saved during a run. Offset checkpoints only move after the manifest save that lists the data, so they lag by at most this interval (the end of every cycle, an error and shutdown always save). `offset_storage.sync_interval_secs` overrides how often `offsets.db` is uploaded |

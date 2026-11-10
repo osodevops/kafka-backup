@@ -1928,6 +1928,10 @@ impl BackupPartitionContext {
         let mut current_offset = start_offset;
         // LSO and high watermark from the latest fetch response.
         let mut last_stable = None;
+        // Start of the current run of empty, no-progress fetches below
+        // `end_offset`, and how many of them were retried.
+        let mut empty_since: Option<tokio::time::Instant> = None;
+        let mut empty_retries: u32 = 0;
 
         // Fetch and store records in segments. Under read_committed the
         // end is a last stable offset, which the fetch never reads past, and
@@ -1943,7 +1947,14 @@ impl BackupPartitionContext {
                 break;
             }
 
-            let fetch_result = self.fetch_records(current_offset, end_offset).await;
+            let fetch_result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                result = self.with_empty_fetch_deadline(
+                    empty_since, current_offset, end_offset, empty_retries,
+                    self.fetch_records(current_offset, end_offset),
+                ) => result,
+            };
 
             let fetched = match fetch_result {
                 Ok(data) => data,
@@ -1961,11 +1972,15 @@ impl BackupPartitionContext {
                              refetching earliest and resuming",
                             self.topic, self.partition, current_offset
                         );
-                        match self
-                            .router
-                            .partition_offsets(&self.topic, self.partition, self.isolation())
-                            .await
-                        {
+                        let offsets = tokio::select! {
+                            biased;
+                            _ = self.cancel.cancelled() => break,
+                            result = self.with_empty_fetch_deadline(
+                                empty_since, current_offset, end_offset, empty_retries,
+                                self.router.partition_offsets(&self.topic, self.partition, self.isolation()),
+                            ) => result,
+                        };
+                        match offsets {
                             Ok((new_earliest, _)) if new_earliest > current_offset => {
                                 // The gap accounts for everything up to its end,
                                 // so it may only become durable after the records
@@ -1989,6 +2004,8 @@ impl BackupPartitionContext {
                                 .await;
                                 pw.writer.skip_coverage_to(new_earliest);
                                 current_offset = new_earliest;
+                                empty_since = None;
+                                empty_retries = 0;
                                 continue;
                             }
                             Ok((new_earliest, new_latest)) => {
@@ -2010,7 +2027,7 @@ impl BackupPartitionContext {
                                     "{}:{}: failed to refetch earliest offset after out-of-range error: {}",
                                     self.topic, self.partition, offset_err
                                 );
-                                e
+                                offset_err
                             }
                         }
                     } else {
@@ -2065,9 +2082,69 @@ impl BackupPartitionContext {
             // on compacted topics the log cleaner may have removed every
             // record in the fetched batches, and under read_committed every
             // batch may have been a marker or aborted. Only "no records and
-            // no progress" means we have reached the end of available data.
+            // no progress" below the captured end needs bounded retries.
             if records.is_empty() && next_offset <= current_offset {
-                break;
+                // `end_offset` was read from the broker before the loop, so
+                // an empty fetch below it is not the end of the data: with
+                // tiered storage the broker answers empty while it reads the
+                // offset from the remote tier. Retry within the budget, and
+                // fail rather than complete with a silent hole.
+                let budget = Duration::from_secs(self.options.empty_fetch_retry_secs);
+                let since = *empty_since.get_or_insert_with(tokio::time::Instant::now);
+                let elapsed = since.elapsed();
+                if elapsed >= budget {
+                    let e = empty_fetch_error(
+                        &self.topic,
+                        self.partition,
+                        current_offset,
+                        end_offset,
+                        empty_retries,
+                        elapsed,
+                    );
+                    self.health
+                        .mark_degraded("kafka", &format!("Fetch error: {}", e));
+                    self.kafka_cb.record_failure();
+                    if let Some(ref prom) = self.prometheus_metrics {
+                        prom.record_error(&self.backup_id, ErrorType::from_error(&e));
+                    }
+                    if let Err(flush_err) = self.drain(&mut pw).await {
+                        warn!(
+                            "{}:{}: could not flush buffered records after empty fetches: {}",
+                            self.topic, self.partition, flush_err
+                        );
+                    }
+                    self.persist_progress_best_effort("empty fetches").await;
+                    return Err(e);
+                }
+                empty_retries += 1;
+                let delay = empty_fetch_backoff(empty_retries).min(budget - elapsed);
+                warn!(
+                    "{}:{}: fetch at offset {} returned no records below end offset {} \
+                     retry {} in {:?}, empty for {:?}",
+                    self.topic,
+                    self.partition,
+                    current_offset,
+                    end_offset,
+                    empty_retries,
+                    delay,
+                    elapsed
+                );
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+            if let Some(since) = empty_since.take() {
+                info!(
+                    "{}:{}: fetch at offset {} advanced after {} empty retries in {:?}",
+                    self.topic,
+                    self.partition,
+                    current_offset,
+                    empty_retries,
+                    since.elapsed()
+                );
+                empty_retries = 0;
             }
 
             // Convert to binary records and add to writer. Batches the
@@ -2418,11 +2495,50 @@ impl BackupPartitionContext {
         self.options.isolation_level
     }
 
-    async fn fetch_records(&self, start_offset: i64, _end_offset: i64) -> Result<FetchResponse> {
+    /// The no-progress budget includes backoff, connection setup and every
+    /// subsequent RPC. Check before polling the operation so an expired budget
+    /// cannot dispatch another request; timeout_at alone polls its future first.
+    async fn with_empty_fetch_deadline<T>(
+        &self,
+        since: Option<tokio::time::Instant>,
+        offset: i64,
+        end_offset: i64,
+        retries: u32,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let Some(since) = since else {
+            return operation.await;
+        };
+        let deadline = since + Duration::from_secs(self.options.empty_fetch_retry_secs);
+        let error = || {
+            empty_fetch_error(
+                &self.topic,
+                self.partition,
+                offset,
+                end_offset,
+                retries,
+                since.elapsed(),
+            )
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(error());
+        }
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| error())?;
+        // Tokio polls the operation before its timer. Reject a response that
+        // became ready after expiry, including a long synchronous decode.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(error());
+        }
+        result
+    }
+
+    async fn fetch_records(&self, start_offset: i64, end_offset: i64) -> Result<FetchResponse> {
         let max_bytes = effective_fetch_max_bytes(&self.options);
 
         // Fetch records using router (automatically routes to partition leader)
-        let fetched = self
+        let mut fetched = self
             .router
             .fetch_partition(
                 &self.topic,
@@ -2433,12 +2549,46 @@ impl BackupPartitionContext {
             )
             .await?;
         failpoint!("backup::fetch::after");
+        // Fetch has no exclusive-end parameter. The broker may append data
+        // (or advance its LSO) while we retry, but this run must retain its
+        // captured boundary for records, coverage and transaction counters.
+        fetched.records.retain(|record| record.offset < end_offset);
+        fetched
+            .skipped
+            .retain(|batch| batch.last_offset < end_offset);
+        fetched.control_records_skipped = fetched.skipped.iter().map(|b| b.control_records).sum();
+        fetched.aborted_records_dropped = fetched.skipped.iter().map(|b| b.aborted_records).sum();
+        fetched.next_offset = fetched.next_offset.min(end_offset);
         Ok(fetched)
     }
 }
 
 /// Kafka protocol error code for OFFSET_OUT_OF_RANGE.
 const OFFSET_OUT_OF_RANGE: i16 = 1;
+
+/// Delay before the `retry`-th retry of an empty fetch below the end offset:
+/// 1s, 2s, 4s, 8s, then 10s.
+fn empty_fetch_backoff(retry: u32) -> Duration {
+    Duration::from_secs(1u64 << retry.saturating_sub(1).min(4)).min(Duration::from_secs(10))
+}
+
+/// Build the error for a partition whose fetches kept returning no records
+/// and no progress below the end offset for the whole retry budget.
+fn empty_fetch_error(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    end_offset: i64,
+    retries: u32,
+    elapsed: Duration,
+) -> Error {
+    Error::Kafka(KafkaError::Protocol(format!(
+        "Fetch at offset {} for {}:{} returned no records below end offset {} for {:?} \
+         ({} retries): incomplete backup; the broker did not serve the remaining range \
+         within backup.empty_fetch_retry_secs",
+        offset, topic, partition, end_offset, elapsed, retries
+    )))
+}
 
 /// True if `e` is the broker rejecting a Fetch with OFFSET_OUT_OF_RANGE.
 fn is_offset_out_of_range(e: &Error) -> bool {
@@ -4625,6 +4775,11 @@ mod tests {
             assert_eq!(finished, vec![1]);
             assert!(tasks.is_empty());
         }
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/regressions/empty_fetch_partition.rs"
+        ));
 
         // -- the partition loop, against a scripted fetcher -----------------
 
