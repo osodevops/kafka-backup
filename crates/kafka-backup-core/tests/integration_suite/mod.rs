@@ -35,6 +35,7 @@
 
 pub mod azure_azurite;
 pub mod common;
+pub mod empty_fetch_retry;
 pub mod group_coordinator_mock;
 pub mod issue_144_offset_out_of_range;
 pub mod issue_146_connection_errors;

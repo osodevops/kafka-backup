@@ -317,6 +317,14 @@ pub struct ConnectionConfig {
     /// version 7 (`UNSUPPORTED_COMPRESSION_TYPE` otherwise). Only Produce
     /// requests follow the setting; a backup never produces.
     pub produce_api_version: Option<i16>,
+
+    /// Broker Fetch wait in milliseconds (default: 500, range: 0..=30000).
+    /// Older Kafka remote reads may use this wait too. Kafka with KIP-1018
+    /// uses the separate broker `remote.fetch.max.wait.ms` for remote reads.
+    /// This setting does not extend the client's response timeout or the
+    /// backup's no-progress retry budget.
+    #[serde(default = "default_fetch_max_wait_ms")]
+    pub fetch_max_wait_ms: i32,
 }
 
 fn default_connections_per_broker() -> usize {
@@ -331,6 +339,11 @@ pub const PRODUCE_API_VERSIONS: std::ops::RangeInclusive<i16> = 7..=8;
 impl ConnectionConfig {
     /// Validate the connection settings
     pub fn validate(&self) -> crate::Result<()> {
+        if !(0..=30_000).contains(&self.fetch_max_wait_ms) {
+            return Err(crate::Error::Config(
+                "connection.fetch_max_wait_ms must be between 0 and 30000".into(),
+            ));
+        }
         if let Some(version) = self.produce_api_version {
             if !PRODUCE_API_VERSIONS.contains(&version) {
                 return Err(crate::Error::Config(format!(
@@ -347,6 +360,10 @@ impl ConnectionConfig {
     }
 }
 
+fn default_fetch_max_wait_ms() -> i32 {
+    500
+}
+
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
@@ -356,6 +373,7 @@ impl Default for ConnectionConfig {
             tcp_nodelay: true,
             connections_per_broker: default_connections_per_broker(),
             produce_api_version: None,
+            fetch_max_wait_ms: default_fetch_max_wait_ms(),
         }
     }
 }
@@ -746,6 +764,14 @@ pub struct BackupOptions {
     #[serde(default)]
     pub fetch_max_bytes: Option<u64>,
 
+    /// No-progress retry budget per partition in seconds (default: 30,
+    /// range: 0..=3600). Zero fails immediately on the first stalled Fetch.
+    /// Starts at the first empty response below the captured end; includes
+    /// backoff and subsequent requests, and resets whenever offsets advance.
+    /// Expiry fails the backup while preserving its durable prefix.
+    #[serde(default = "default_empty_fetch_retry_secs")]
+    pub empty_fetch_retry_secs: u64,
+
     /// Maximum records per segment before rotation.
     ///
     /// When unset, segments rotate on `segment_max_bytes` /
@@ -849,6 +875,10 @@ impl RetentionOptions {
     }
 }
 
+fn default_empty_fetch_retry_secs() -> u64 {
+    30
+}
+
 fn default_capture_topic_configs() -> bool {
     true
 }
@@ -889,6 +919,7 @@ impl Default for BackupOptions {
             poll_interval_ms: default_poll_interval_ms(),
             consumer_group_snapshot: false,
             fetch_max_bytes: None,
+            empty_fetch_retry_secs: default_empty_fetch_retry_secs(),
             segment_max_records: None,
             capture_topic_configs: default_capture_topic_configs(),
             require_topic_configs: false,
@@ -1722,6 +1753,12 @@ impl Config {
 impl BackupOptions {
     /// Validate backup options
     pub fn validate(&self) -> crate::Result<()> {
+        if self.empty_fetch_retry_secs > 3600 {
+            return Err(crate::Error::Config(
+                "backup.empty_fetch_retry_secs must be between 0 and 3600".into(),
+            ));
+        }
+
         // stop_at_current_offsets is incompatible with continuous mode
         if self.stop_at_current_offsets && self.continuous {
             return Err(crate::Error::Config(
@@ -1926,6 +1963,45 @@ impl RestoreOptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_fetch_defaults_and_bounds() {
+        let parsed: super::BackupOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.empty_fetch_retry_secs, 30);
+        assert_eq!(super::BackupOptions::default().empty_fetch_retry_secs, 30);
+        for retry in [0, 30, 3600] {
+            assert!(super::BackupOptions {
+                empty_fetch_retry_secs: retry,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        for retry in [3601, u64::MAX] {
+            assert!(super::BackupOptions {
+                empty_fetch_retry_secs: retry,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for wait in [0, 500, 30000] {
+            assert!(super::ConnectionConfig {
+                fetch_max_wait_ms: wait,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        for wait in [-1, 30001, i32::MAX] {
+            assert!(super::ConnectionConfig {
+                fetch_max_wait_ms: wait,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
     use super::*;
 
     #[test]

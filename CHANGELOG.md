@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-11-10
+
+### Fixed
+- Retry empty Fetch responses below the captured backup end instead of silently completing with unread records ([#256](https://github.com/osodevops/kafka-backup/issues/256), based on [#250](https://github.com/osodevops/kafka-backup/pull/250)). The default 30-second no-progress budget includes backoff and subsequent RPCs, resets on offset progress including retention recovery, and preserves buffered records and durable checkpoints on expiry. Zero now fails immediately on the first stalled response.
+- Keep records, checkpoint coverage and transaction skip counters inside the captured exclusive end even when new data arrives during a retry.
+- Close connections when an RPC is cancelled or fails, preventing reuse of partially consumed Kafka frames. Cancellation while waiting for the connection mutex leaves the active request intact.
+
+### Added
+- `backup.empty_fetch_retry_secs` (0–3600) and `source.connection.fetch_max_wait_ms` (0–30000, default 500). These public Rust struct fields require downstream literal updates, hence the minor version bump. Kafka with KIP-1018 uses broker `remote.fetch.max.wait.ms` for remote reads independently of the client Fetch wait.
+
 ## [0.27.3] - 2026-11-07
 
 ### Fixed

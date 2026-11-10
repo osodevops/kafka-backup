@@ -118,6 +118,11 @@ pub struct MockState {
     /// Faults for the Produce attempt with this index (0-based, counting
     /// every attempt received), checked first.
     pub scheduled: HashMap<usize, Fault>,
+    /// Fetch requests still to answer with no records (as a broker does
+    /// while it reads an offset from the remote tier).
+    pub empty_fetches: usize,
+    /// `max_wait_ms` of every Fetch request received.
+    pub fetch_max_waits: Vec<i32>,
 }
 
 impl MockState {
@@ -153,6 +158,8 @@ impl MockBroker {
             faults: VecDeque::new(),
             partition_faults: HashMap::new(),
             scheduled: HashMap::new(),
+            empty_fetches: 0,
+            fetch_max_waits: Vec::new(),
         }));
         let st = state.clone();
         let handle = tokio::spawn(async move {
@@ -426,7 +433,12 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
             }
             ApiKey::Fetch => {
                 let request = FetchRequest::decode(&mut body, version).unwrap();
-                let state = state.lock().unwrap();
+                let mut state = state.lock().unwrap();
+                state.fetch_max_waits.push(request.max_wait_ms);
+                let empty = state.empty_fetches > 0;
+                if empty {
+                    state.empty_fetches -= 1;
+                }
                 let topics = request
                     .topics
                     .iter()
@@ -438,7 +450,11 @@ async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<MockSta
                                 let log = state.logs.get(&p.partition).cloned().unwrap_or_default();
                                 let hw = log.len() as i64;
                                 let start = p.fetch_offset.max(0) as usize;
-                                let records = encode_log(&log, start, 100);
+                                let records = if empty {
+                                    Bytes::new()
+                                } else {
+                                    encode_log(&log, start, 100)
+                                };
                                 PartitionData::default()
                                     .with_partition_index(p.partition)
                                     .with_high_watermark(hw)
