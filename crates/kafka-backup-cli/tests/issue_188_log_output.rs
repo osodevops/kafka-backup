@@ -222,3 +222,36 @@ fn unknown_log_format_is_rejected() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--log-format"), "{stderr}");
 }
+
+/// operator#114: the shipped OSS binary uses the same overlap/PITR count as
+/// core, without connecting to or changing the target cluster.
+#[tokio::test]
+async fn validate_restore_counts_overlapping_segments_after_topic_and_time_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    write_backup(dir.path()).await;
+    let manifest_path = dir.path().join(BACKUP_ID).join("manifest.json");
+    let mut manifest: BackupManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let repeated = manifest.topics[0].partitions[0].segments[0].clone();
+    manifest.topics[0].partitions[0].segments.push(repeated);
+    let mut excluded = manifest.topics[0].clone();
+    excluded.name = "excluded".to_string();
+    manifest.topics.push(excluded);
+    std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let config = restore_config(dir.path());
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    value["target"]["topics"] = serde_yaml::from_str("include: [orders]").unwrap();
+    value["restore"] = serde_yaml::from_str("time_window_start: 1700000000003\ntime_window_end: 1700000000006\nconsumer_group_strategy: skip").unwrap();
+    std::fs::write(&config, serde_yaml::to_string(&value).unwrap()).unwrap();
+    let out = kafka_backup(&[
+        "validate-restore",
+        "--config",
+        config.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let report = assert_json_stdout(&out, "filtered incremental dry-run");
+    assert_eq!(report["records_to_restore"], 4);
+    assert_eq!(report["topics_to_restore"].as_array().unwrap().len(), 1);
+}

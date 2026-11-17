@@ -1180,3 +1180,21 @@ WARN No topics matched for restore
 ```bash
 RUST_LOG=kafka_backup_core=debug kafka-backup restore --config restore.yaml
 ```
+
+### Validation message counts
+
+`validation run` checks the configured Kafka target; its “restored” count is
+a bounded scan of visible `read_committed` application records, not a dry-run
+restore and not the difference between Kafka offsets. Offsets include
+compacted holes, transaction markers and aborted records. An exact count
+requires reading the selected partitions, so allow time and network capacity
+for large topics. The scan captures each partition's end before reading and
+excludes later appends; use a quiet target for a stable comparison. Retention
+advancing or a stalled fetch fails the check rather than claiming an exact count.
+
+`validate-restore` and `restore --dry-run` inspect archive metadata without
+producing records. Overlapping legacy segments, partial PITR windows and
+programmatic record filters require reading the selected segments to count
+records using replay's rules. Full disjoint segments use manifest counts;
+byte and timestamp summaries still describe selected segment metadata. Neither
+path adds `offsets.db` checkpoint values to manifest record counts.

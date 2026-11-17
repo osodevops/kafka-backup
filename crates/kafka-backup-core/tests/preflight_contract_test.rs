@@ -1105,3 +1105,91 @@ async fn dry_run_embeds_preflight_and_blocks_invalid_recovery() {
     assert!(report.valid);
     assert!(report.header_preflight.is_none());
 }
+
+// operator#114: incremental archives can contain overlapping legacy segments.
+// Dry-run must count what replay produces, including record-level PITR filtering.
+#[tokio::test]
+async fn dry_run_counts_unique_offsets_and_applies_record_time_window() {
+    let dir = TempDir::new().unwrap();
+    let first = write_binary_segment(dir.path(), 0, 0, 10, false).await;
+    let second = write_binary_segment(dir.path(), 0, 5, 10, false).await;
+    // Unsorted plus a repeated inherited segment: raw count is 30, replay is 15.
+    write_manifest(
+        dir.path(),
+        vec![serde_json::from_value(serde_json::json!({
+            "partition_id": 0, "segments": [second, first.clone(), first],
+        }))
+        .unwrap()],
+    );
+    let options = RestoreOptions {
+        consumer_group_strategy: kafka_backup_core::config::OffsetStrategy::Skip,
+        ..Default::default()
+    };
+    let report = RestoreEngine::new(restore_config(dir.path(), options.clone()))
+        .unwrap()
+        .dry_run()
+        .await
+        .unwrap();
+    assert!(report.valid, "{:?}", report.errors);
+    assert_eq!(report.records_to_restore, 15);
+    let options = RestoreOptions {
+        time_window_start: Some(1_700_000_000_007),
+        time_window_end: Some(1_700_000_000_011),
+        ..options
+    };
+    let report = RestoreEngine::new(restore_config(dir.path(), options))
+        .unwrap()
+        .dry_run()
+        .await
+        .unwrap();
+    assert!(report.valid, "{:?}", report.errors);
+    assert_eq!(report.records_to_restore, 5);
+}
+
+#[tokio::test]
+async fn dry_run_partial_segment_counts_records_and_respects_partition_selection() {
+    let dir = TempDir::new().unwrap();
+    let selected = write_binary_segment(dir.path(), 0, 0, 10, false).await;
+    let excluded = write_binary_segment(dir.path(), 1, 0, 10, false).await;
+    write_manifest(
+        dir.path(),
+        vec![
+            serde_json::from_value(serde_json::json!({"partition_id": 0, "segments": [selected]}))
+                .unwrap(),
+            serde_json::from_value(serde_json::json!({"partition_id": 1, "segments": [excluded]}))
+                .unwrap(),
+        ],
+    );
+    let options = RestoreOptions {
+        source_partitions: Some(vec![0]),
+        time_window_start: Some(1_700_000_000_003),
+        time_window_end: Some(1_700_000_000_006),
+        ..Default::default()
+    };
+    let config = restore_config(dir.path(), options);
+    let report = RestoreEngine::new(config.clone())
+        .unwrap()
+        .dry_run()
+        .await
+        .unwrap();
+    assert!(report.valid);
+    assert_eq!(report.records_to_restore, 4);
+    assert_eq!(report.topics_to_restore[0].partitions.len(), 1);
+    // A count that requires scanning cannot pass with unreadable segment data.
+    let manifest: BackupManifest = serde_json::from_slice(
+        &std::fs::read(dir.path().join(format!("{BACKUP_ID}/manifest.json"))).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path()
+            .join(&manifest.topics[0].partitions[0].segments[0].key),
+        b"corrupt",
+    )
+    .unwrap();
+    let report = RestoreEngine::new(config).unwrap().dry_run().await.unwrap();
+    assert!(!report.valid);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.contains("cannot count selected records")));
+}
