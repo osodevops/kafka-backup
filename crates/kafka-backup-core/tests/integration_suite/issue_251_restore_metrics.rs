@@ -177,3 +177,53 @@ async fn fully_filtered_restore_counts_no_bytes_on_either_path() {
         assert!(broker.log(1).is_empty());
     }
 }
+
+/// A legacy incremental manifest repeats an inherited segment. Prove the
+/// dry-run count equals produced output in both replay paths after PITR/filtering.
+#[tokio::test]
+async fn incremental_dry_run_count_matches_standard_and_repartitioned_replay() {
+    for repartitioned in [false, true] {
+        let broker = MockBroker::start(TOPIC, 2).await;
+        let dir = TempDir::new().unwrap();
+        write_backup(
+            dir.path(),
+            "count-parity",
+            &HashMap::from([(0, (0..15).map(|o| record(o, 32, false)).collect())]),
+            10,
+        )
+        .await;
+        let path = dir.path().join("count-parity/manifest.json");
+        let mut manifest: kafka_backup_core::manifest::BackupManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let segments = &mut manifest.topics[0].partitions[0].segments;
+        segments.push(segments[0].clone());
+        segments.reverse();
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut options = base_options();
+        options.time_window_start = Some(1_700_000_000_003);
+        options.time_window_end = Some(1_700_000_000_012);
+        options.record_filter = Some(RecordFilterHandle::new(Arc::new(DropEvenTombstoneSome)));
+        if repartitioned {
+            options.repartitioning.insert(
+                TOPIC.to_string(),
+                TopicRepartitioning {
+                    target_partitions: 2,
+                    strategy: RepartitioningStrategy::Murmur2,
+                },
+            );
+        }
+        let engine = RestoreEngine::new(restore_config(
+            &broker.addr.to_string(),
+            dir.path(),
+            "count-parity",
+            options,
+        ))
+        .unwrap();
+        let dry = engine.dry_run().await.unwrap();
+        let replay = engine.run().await.unwrap();
+        assert!(dry.valid, "{:?}", dry.errors);
+        assert_eq!(dry.records_to_restore, 5);
+        assert_eq!(dry.records_to_restore, replay.records_restored);
+        assert_eq!((0..2).map(|p| broker.log(p).len()).sum::<usize>(), 5);
+    }
+}

@@ -624,7 +624,24 @@ impl RestoreEngine {
                     ));
                 }
 
-                let mut partition_records = 0i64;
+                let partition_records = match super::helpers::count_archive_records(
+                    self.storage.as_ref(),
+                    &topic_backup.name,
+                    &segments,
+                    &restore_options,
+                )
+                .await
+                {
+                    Ok(count) => count,
+                    Err(error) => {
+                        report.valid = false;
+                        report.errors.push(format!(
+                            "{}:{}: cannot count selected records: {}",
+                            topic_backup.name, partition_backup.partition_id, error
+                        ));
+                        continue;
+                    }
+                };
                 let mut partition_min_offset = i64::MAX;
                 let mut partition_max_offset = i64::MIN;
                 let mut partition_min_ts = i64::MAX;
@@ -632,7 +649,6 @@ impl RestoreEngine {
 
                 for segment in &segments {
                     report.segments_to_process += 1;
-                    partition_records += segment.record_count;
                     report.bytes_to_restore += segment.uncompressed_size;
 
                     partition_min_offset = partition_min_offset.min(segment.start_offset);

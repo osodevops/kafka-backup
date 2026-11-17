@@ -730,3 +730,68 @@ async fn read_uncommitted_opt_out_reproduces_the_previous_behaviour() {
         3
     );
 }
+
+/// operator#114: the source log spans 15 offsets, but contains only eight
+/// committed application records. The shared CLI/operator check must pass.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn validation_counts_visible_records_instead_of_transactional_offset_span() {
+    use kafka_backup_core::validation::config::MessageCountConfig;
+    use kafka_backup_core::validation::context::ValidationContext;
+    use kafka_backup_core::validation::message_count::MessageCountCheck;
+    use kafka_backup_core::validation::{CheckOutcome, ValidationCheck};
+
+    let cluster = KafkaTestCluster::start_with_transactions().await.unwrap();
+    cluster
+        .wait_for_ready(Duration::from_secs(60))
+        .await
+        .unwrap();
+    let bs = &cluster.bootstrap_servers;
+    let client = cluster.create_client();
+    client.connect().await.unwrap();
+    let topic = "validation-record-count";
+    create_topic(&client, topic).await;
+    let expected = write_interleaved_scenario(bs, &client, topic).await;
+    assert_eq!(expected.len(), 8);
+    let dir = tempfile::TempDir::new().unwrap();
+    run_backup(
+        backup_config(
+            bs,
+            dir.path().to_path_buf(),
+            "count",
+            topic,
+            default_backup_options(),
+        ),
+        None,
+    )
+    .await;
+    let mut manifest = stored_manifest(dir.path(), "count").await;
+    assert_eq!(manifest.total_records(), 8);
+    // Ensure the topic filter excludes a topic that cannot be queried.
+    let mut excluded = manifest.topics[0].clone();
+    excluded.name = "excluded-missing-topic".to_string();
+    manifest.topics.push(excluded);
+    let ctx = ValidationContext {
+        backup_id: "count".to_string(),
+        backup_manifest: manifest,
+        target_client: Arc::new(PartitionLeaderRouter::new(kafka(bs, topic)).await.unwrap()),
+        storage: kafka_backup_core::storage::create_backend(&StorageBackendConfig::Filesystem {
+            path: dir.path().to_path_buf(),
+        })
+        .unwrap(),
+        pitr_timestamp: None,
+        http_client: reqwest::Client::new(),
+        target_bootstrap_servers: vec![bs.clone()],
+    };
+    let result = MessageCountCheck::new(MessageCountConfig {
+        topics: vec![topic.to_string()],
+        ..Default::default()
+    })
+    .run(&ctx)
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, CheckOutcome::Passed, "{}", result.detail);
+    assert_eq!(result.data["total_messages_expected"], 8);
+    assert_eq!(result.data["total_messages_restored"], 8);
+    assert_eq!(result.data["topics_verified"], 1);
+}

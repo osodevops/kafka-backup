@@ -166,6 +166,47 @@ pub(crate) fn segments_in_offset_order<'a>(
     ordered
 }
 
+/// Count the records replay would select. Disjoint, fully selected segments
+/// have authoritative counts in their metadata. Overlaps, partial PITR windows
+/// and record filters require reading records: offset arithmetic cannot account
+/// for compacted/transactional gaps. Keep the same ordering and filtering as replay.
+pub(crate) async fn count_archive_records(
+    storage: &dyn StorageBackend,
+    topic: &str,
+    segments: &[&SegmentMetadata],
+    options: &RestoreOptions,
+) -> Result<i64> {
+    let ordered = segments_in_offset_order(segments.iter().copied());
+    let mut end = None;
+    let mut scan = options.record_filter.is_some();
+    for segment in &ordered {
+        scan |= end.is_some_and(|last| segment.start_offset <= last)
+            || options
+                .time_window_start
+                .is_some_and(|start| start > segment.start_timestamp)
+            || options
+                .time_window_end
+                .is_some_and(|end| end < segment.end_timestamp);
+        end = Some(end.map_or(segment.end_offset, |last: i64| last.max(segment.end_offset)));
+    }
+    if !scan {
+        return Ok(ordered.iter().map(|s| s.record_count).sum());
+    }
+    let mut count = 0;
+    let mut overlap = OverlapGuard::default();
+    for segment in ordered {
+        let mut records = read_segment(storage, segment).await?;
+        overlap.skip_restored(&mut records);
+        let records = filter_records_by_time(records, options);
+        let records = match &options.record_filter {
+            Some(filter) => super::filter::apply_record_filter(topic, records, filter).0,
+            None => records,
+        };
+        count += records.len() as i64;
+    }
+    Ok(count)
+}
+
 /// Remembers the highest source offset already restored for one source
 /// partition, so a record is never produced twice when a manifest written
 /// before 0.25 lists overlapping segments (a segment key rewritten on

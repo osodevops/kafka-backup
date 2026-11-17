@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-11-17
+
+### Fixed
+- Count visible records in `MessageCountCheck` with a bounded read-committed scan rather than subtracting offsets, which include compaction holes and transaction markers (kafka-backup-operator#114). Fail incomplete scans instead of reporting an exact count.
+- Count overlapping legacy segments once and apply record-level PITR and record filters in dry-run and validation expectations, using the same selection rules as replay. Disjoint full segments retain the metadata fast path.
+
 ## [0.28.0] - 2026-11-10
 
 ### Fixed
