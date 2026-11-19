@@ -24,6 +24,12 @@
 
 **kafka-backup** is a production-grade tool written in Rust for backing up and restoring Apache Kafka topics to cloud storage or local filesystem. It supports **point-in-time recovery (PITR)** with millisecond precision and solves the **consumer group offset discontinuity problem** when restoring to different clusters.
 
+## Sponsorship
+
+kafka-backup is free and open source. If your company relies on it, please consider [sponsoring it through GitHub Sponsors](https://github.com/sponsors/osodevops). Sponsorship pays for testing against new Kafka versions and distributions, release engineering, security fixes and documentation.
+
+Need support, an SLA or Enterprise features? See [Kafka Backup Enterprise](https://enterprise.kafkabackup.com).
+
 ## Features
 
 - **Multi-cloud storage** — S3, Azure Blob, GCS, or local filesystem
