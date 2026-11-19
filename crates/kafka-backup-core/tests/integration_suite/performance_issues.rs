@@ -58,6 +58,9 @@ fn create_continuous_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -93,6 +96,9 @@ fn create_high_partition_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

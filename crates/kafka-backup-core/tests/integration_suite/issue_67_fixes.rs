@@ -63,6 +63,9 @@ fn backup_cfg(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -83,6 +86,9 @@ fn restore_cfg(bs: &str, storage_path: PathBuf, backup_id: &str, opts: RestoreOp
         restore: Some(opts),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

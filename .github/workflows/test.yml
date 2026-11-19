@@ -107,6 +107,13 @@ jobs:
         # and checks that no token or secret reaches any log line.
         run: cargo test -p kafka-backup-core --test oauth_redaction_test --all-features
 
+      - name: Run Schema Registry tests (mocked registries)
+        # Its own test binary: backup, restore and the failure contracts
+        # (conflicts, capacity, cancellation, mode guard, retries) against
+        # mocked and fake registries. No Docker. The real-registry matrix is
+        # the Schema Registry E2E workflow.
+        run: cargo test -p kafka-backup-core --test schema_registry_tests --all-features
+
       - name: Run CLI tests
         # kafka-backup-cli is binary-only, so `cargo test --lib` skips it. This
         # runs its unit tests and tests/*.rs, which spawn the built binary

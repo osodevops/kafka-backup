@@ -159,6 +159,9 @@ fn config(
             ..Default::default()
         }),
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

@@ -4,6 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::warn;
 
+// Registry configuration lives with its code; it is re-exported here so
+// every configuration type is reachable from `kafka_backup_core::config`.
+pub use crate::apicurio_registry::config::{
+    ApicurioApiVersion, ApicurioBackupOptions, ApicurioConnectionConfig, ApicurioRegistryAuth,
+    ApicurioRegistryConfig, ApicurioRegistryTls,
+};
+pub use crate::schema_registry::config::{
+    SchemaBackupOptions, SchemaConnectionConfig, SchemaRegistryAuth, SchemaRegistryConfig,
+    SchemaRegistryOAuth, SchemaRegistryTls, SchemaRestoreOptions, SchemaRestoreStrategy,
+    VersionSelection,
+};
+
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -45,6 +57,21 @@ pub struct Config {
     /// `security.oauth.provider`; [`crate::oauth::install`] wires them up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OauthConfig>,
+
+    /// Confluent Schema Registry to snapshot with a backup, or to restore
+    /// before the records of a restore. See [`crate::schema_registry`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_registry: Option<crate::schema_registry::SchemaRegistryConfig>,
+
+    /// Apicurio Registry to snapshot with a backup, or to restore before
+    /// the records of a restore. See [`crate::apicurio_registry`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apicurio_registry: Option<crate::apicurio_registry::ApicurioRegistryConfig>,
+
+    /// How a restore treats an Apicurio target, or a target of the other
+    /// registry kind. See [`crate::registry_restore`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_restore: Option<crate::registry_restore::RestoreConfig>,
 }
 
 /// Metrics server configuration
@@ -1758,6 +1785,12 @@ impl Config {
         }
         if let Some(target) = &self.target {
             target.connection.validate()?;
+        }
+        if let Some(schema_registry) = &self.schema_registry {
+            schema_registry.validate()?;
+        }
+        if let Some(apicurio_registry) = &self.apicurio_registry {
+            apicurio_registry.validate()?;
         }
 
         // Storage config validation is handled by StorageBackendConfig's typed enum

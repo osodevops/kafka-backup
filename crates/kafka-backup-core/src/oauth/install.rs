@@ -21,6 +21,7 @@ use crate::oauth::providers::oidc::{OidcClientCredentialsProvider, OidcSettings}
 use crate::oauth::providers::static_token::StaticTokenProvider;
 use crate::oauth::token::OauthTokenProvider;
 use crate::oauth::{OauthBearerPlugin, OauthError, OauthPluginFactory};
+use crate::schema_registry::config::{SchemaRegistryAuth, SchemaRegistryOAuth};
 
 /// Which Kafka cluster of a configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +58,10 @@ impl OauthInstall {
 
 /// Wire the `oauth` section into `config`: an OAUTHBEARER plugin factory on
 /// each of the `source` / `target` clusters that has a `security.oauth`
-/// binding. Call after parsing and before building any client.
+/// binding, and the token cache on `schema_registry.auth` when its type is
+/// `oauth`. Call after parsing and before building any client.
 ///
-/// Clusters that share a provider share one token cache.
+/// Everything that names the same provider shares one token cache.
 pub fn install(config: &mut Config) -> Result<OauthInstall, OauthError> {
     let oauth = config.oauth.clone();
     let oauth = oauth.as_ref();
@@ -77,6 +79,18 @@ pub fn install(config: &mut Config) -> Result<OauthInstall, OauthError> {
     if let (Some(binding), Some(kafka)) = (&target, config.target.as_mut()) {
         install_binding(&mut providers, KafkaRole::Target, binding, kafka)?;
         uses.push(describe(KafkaRole::Target, binding));
+    }
+    // The Schema Registry client takes its tokens from the same cache as
+    // the Kafka clusters bound to the provider.
+    if let Some(slot) = registry_slot(config) {
+        let user = "schema_registry.auth";
+        if slot.provider.trim().is_empty() {
+            return Err(OauthError::Config(format!(
+                "{user}: auth type oauth needs `provider`, naming one of oauth.providers"
+            )));
+        }
+        slot.token_source = Some(providers.cache(&slot.provider, user)?);
+        uses.push(format!("Schema Registry (provider '{}')", slot.provider));
     }
 
     let installed = OauthInstall {
@@ -108,6 +122,19 @@ pub fn install_cluster(
     };
     info!(uses = %installed.uses.join(", "), "OAuth enabled");
     Ok(installed)
+}
+
+/// The `schema_registry.auth: { type: oauth }` block of an enabled section.
+fn registry_slot(config: &mut Config) -> Option<&mut SchemaRegistryOAuth> {
+    match config
+        .schema_registry
+        .as_mut()
+        .filter(|sr| sr.enabled)
+        .and_then(|sr| sr.auth.as_mut())
+    {
+        Some(SchemaRegistryAuth::OAuth(slot)) => Some(slot),
+        _ => None,
+    }
 }
 
 fn describe(role: KafkaRole, binding: &ClusterBinding) -> String {

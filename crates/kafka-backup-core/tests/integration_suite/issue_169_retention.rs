@@ -64,6 +64,9 @@ fn config(bootstrap: &str, storage: &TempDir, offset_db: &Path, retention: bool)
             ..Default::default()
         }),
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

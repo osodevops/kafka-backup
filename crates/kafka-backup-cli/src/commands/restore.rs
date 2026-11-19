@@ -1,11 +1,12 @@
 use anyhow::Result;
 use kafka_backup_core::restore::{OffsetResetPhaseOutcome, ThreePhaseRestore};
+use kafka_backup_core::schema_registry::run::RestoreScope;
 use kafka_backup_core::{restore::RestoreEngine, Config, PrometheusMetrics};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-pub async fn run(config_path: &str) -> Result<()> {
+pub async fn run(config_path: &str, schema_only: bool) -> Result<()> {
     info!("Loading configuration from: {}", config_path);
 
     let config_content = tokio::fs::read_to_string(config_path).await?;
@@ -13,6 +14,18 @@ pub async fn run(config_path: &str) -> Result<()> {
     let mut config: Config = super::config::parse_config(&config_content)?;
     let oauth = super::oauth::apply(&mut config)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.target)?;
+
+    // The Schema Registry comes first: a failure here stops the restore
+    // before a record is produced. `--schema-only` stops after it.
+    let scope = if schema_only {
+        RestoreScope::SchemaOnly
+    } else {
+        RestoreScope::BeforeRecords
+    };
+    super::schema_registry::restore_first(&mut config, scope).await?;
+    if schema_only {
+        return Ok(());
+    }
 
     info!("Starting restore from backup: {}", config.backup_id);
 

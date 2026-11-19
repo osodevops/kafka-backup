@@ -60,24 +60,36 @@ enum LogFormat {
 enum Commands {
     /// Back up Kafka topics to cloud storage or local filesystem
     #[command(
-        after_help = "Examples:\n  kafka-backup backup --config backup.yaml\n  kafka-backup backup -v --config backup.yaml   # with debug logging"
+        after_help = "Examples:\n  kafka-backup backup --config backup.yaml\n  kafka-backup backup -v --config backup.yaml   # with debug logging\n  kafka-backup backup --schema-only --config backup.yaml   # Schema Registry only"
     )]
     Backup {
         /// Path to the YAML configuration file
         #[arg(short, long)]
         config: String,
+
+        /// Back up the Schema Registry only (the `schema_registry` section);
+        /// do not connect to Kafka
+        #[arg(long)]
+        schema_only: bool,
     },
 
     /// Restore Kafka topics from a backup with optional PITR filtering and,
     /// when `reset_consumer_offsets` / `auto_consumer_groups` is set, consumer
-    /// group offset reset on the target after the data restore
+    /// group offset reset on the target after the data restore. With a
+    /// `schema_registry` section, the Schema Registry is restored first
+    /// (original schema IDs), then the records
     #[command(
-        after_help = "Examples:\n  kafka-backup restore --config restore.yaml\n  kafka-backup validate-restore --config restore.yaml   # dry-run first"
+        after_help = "Examples:\n  kafka-backup restore --config restore.yaml\n  kafka-backup restore --schema-only --config restore.yaml   # Schema Registry only\n  kafka-backup validate-restore --config restore.yaml   # dry-run first"
     )]
     Restore {
         /// Path to the YAML configuration file
         #[arg(short, long)]
         config: String,
+
+        /// Restore the Schema Registry only (the `schema_registry` section,
+        /// its url being the target registry); skip the Kafka records
+        #[arg(long)]
+        schema_only: bool,
     },
 
     /// List available backups in a storage location
@@ -225,6 +237,11 @@ enum Commands {
         /// Output format (text, json, yaml)
         #[arg(short, long, default_value = "text")]
         format: String,
+
+        /// Validate the Schema Registry restore only: show what would be
+        /// registered, skipped, rewritten or in conflict, without Kafka
+        #[arg(long)]
+        schema_only: bool,
     },
 
     /// Show source-to-target offset mapping from a completed restore
@@ -634,11 +651,17 @@ async fn main() -> Result<()> {
     init_logging(filter, cli.log_format);
 
     match cli.command {
-        Commands::Backup { config } => {
-            commands::backup::run(&config).await?;
+        Commands::Backup {
+            config,
+            schema_only,
+        } => {
+            commands::backup::run(&config, schema_only).await?;
         }
-        Commands::Restore { config } => {
-            commands::restore::run(&config).await?;
+        Commands::Restore {
+            config,
+            schema_only,
+        } => {
+            commands::restore::run(&config, schema_only).await?;
         }
         Commands::List { path, backup_id } => {
             commands::list::run(&path, backup_id.as_deref()).await?;
@@ -717,8 +740,12 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::ValidateRestore { config, format } => {
-            commands::validate_restore::run(&config, &format).await?;
+        Commands::ValidateRestore {
+            config,
+            format,
+            schema_only,
+        } => {
+            commands::validate_restore::run(&config, &format, schema_only).await?;
         }
         Commands::ShowOffsetMapping {
             path,

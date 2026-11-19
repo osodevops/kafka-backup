@@ -14,7 +14,7 @@ Available from v0.29.0.
 | Commands | `backup`, `restore`, `three-phase-restore`, `validate-restore`, `snapshot-groups`, `validation run`, and the offset commands with `--config <yaml> --cluster source\|target` |
 | Kafka | `sasl_mechanism: OAUTHBEARER` plus a `security.oauth` binding on the cluster |
 | Providers | `oidc_client_credentials`, `azure_managed_identity`, `azure_workload_identity`, `file` |
-| Schema Registry | Not yet: bearer authentication for the registry arrives with Schema Registry backup ([#262](https://github.com/osodevops/kafka-backup/issues/262)) and will use the same providers and token cache |
+| Schema Registry | `schema_registry.auth: { type: oauth, provider, target_sr_cluster, identity_pool_id }` (v0.30.0+), with the same providers and the same token cache as the Kafka clusters; see [Schema Registry backup and restore](schema-registry.md#6-authentication) |
 
 - [1. Quick start](#1-quick-start)
 - [2. Configuration reference](#2-configuration-reference)
@@ -523,4 +523,6 @@ parsed `Config` into plugin factories on its clusters; call it before building
 an engine. `OauthTokenProvider` is the trait to implement for a token source
 of your own, and `RegistryOauth` adds a bearer token and Confluent Cloud's
 `target-sr-cluster` / `Confluent-Identity-Pool-Id` headers to a `reqwest`
-request from the same cache.
+request from the same cache. `install` also attaches that cache to
+`schema_registry.auth` when its type is `oauth`, which is what
+`kafka_backup_core::schema_registry::SchemaRegistryClient` uses.

@@ -1,0 +1,127 @@
+# Schema Registry backup/restore test stack (issue #262), compose project `kbsr`.
+#
+#   SR_VERSION=8.3.1 docker compose -f tests/schema-registry-test-infra/docker-compose.yml up -d --wait
+#   cargo test -p kafka-backup-core --test schema_registry_real -- --ignored --test-threads=1
+#   tests/schema-registry-test-infra/e2e/run.sh
+#   docker compose -f tests/schema-registry-test-infra/docker-compose.yml down -v
+#
+# `tests/schema-registry-test-infra/matrix.sh` runs all of it for every
+# supported Schema Registry version.
+#
+# Host ports (chosen to stay clear of the other test stacks in this repo):
+#   29092  source Kafka      28081  source Schema Registry
+#   29192  target Kafka      28082  target Schema Registry (starts empty)
+#                            28083  shared Schema Registry (populated, for
+#                                   into_existing; never holds a backup first)
+#
+# SR_VERSION            cp-schema-registry tag for both registries (default 8.3.1)
+# SR_RESOURCE_EXTENSION resource extension class; the rule-set extension makes
+#                       a registry store `ruleSet` (8.x). Empty: none.
+name: kbsr
+
+x-kafka: &kafka
+  image: apache/kafka:${KAFKA_VERSION:-3.7.1}
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9094 >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 10s
+    retries: 30
+
+x-kafka-env: &kafka-env
+  KAFKA_NODE_ID: 1
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  KAFKA_MIN_INSYNC_REPLICAS: 1
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_LOG_DIRS: /tmp/kraft-logs
+
+x-registry: &registry
+  image: confluentinc/cp-schema-registry:${SR_VERSION:-8.3.1}
+  healthcheck:
+    # cp-schema-registry 8.x ships no curl; probe the port with bash.
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081 && printf \"GET /subjects HTTP/1.0\\r\\n\\r\\n\" >&3 && grep -q \" 200 \" <&3'"]
+    interval: 5s
+    timeout: 5s
+    retries: 40
+
+services:
+  kafka-source:
+    <<: *kafka
+    hostname: kafka-source
+    ports:
+      - "29092:29092"
+    environment:
+      <<: *kafka-env
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-source:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-source:9094,EXTERNAL://localhost:29092
+
+  kafka-target:
+    <<: *kafka
+    hostname: kafka-target
+    ports:
+      - "29192:29192"
+    environment:
+      <<: *kafka-env
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-target:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:29192,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-target:9094,EXTERNAL://localhost:29192
+
+  sr-source:
+    <<: *registry
+    hostname: sr-source
+    depends_on:
+      kafka-source:
+        condition: service_healthy
+    ports:
+      - "28081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: sr-source
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-source:9094
+      SCHEMA_REGISTRY_MODE_MUTABILITY: "true"
+      SCHEMA_REGISTRY_RESOURCE_EXTENSION_CLASS: ${SR_RESOURCE_EXTENSION:-}
+
+  sr-target:
+    <<: *registry
+    hostname: sr-target
+    depends_on:
+      kafka-target:
+        condition: service_healthy
+    ports:
+      - "28082:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: sr-target
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-target:9094
+      # IMPORT mode needs mutable modes.
+      SCHEMA_REGISTRY_MODE_MUTABILITY: "true"
+      SCHEMA_REGISTRY_RESOURCE_EXTENSION_CLASS: ${SR_RESOURCE_EXTENSION:-}
+
+  # A registry that other teams already use: the into_existing target. It is
+  # separate from sr-target because a registry remembers the ID of a schema
+  # it once held even after a hard delete, which would make a second restore
+  # of the same schemas behave differently from a first one.
+  sr-shared:
+    <<: *registry
+    hostname: sr-shared
+    depends_on:
+      kafka-target:
+        condition: service_healthy
+    ports:
+      - "28083:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: sr-shared
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-target:9094
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas_shared
+      SCHEMA_REGISTRY_KAFKASTORE_GROUP_ID: kbsr-shared
+      SCHEMA_REGISTRY_SCHEMA_REGISTRY_GROUP_ID: kbsr-shared
+      SCHEMA_REGISTRY_MODE_MUTABILITY: "true"
+      SCHEMA_REGISTRY_RESOURCE_EXTENSION_CLASS: ${SR_RESOURCE_EXTENSION:-}

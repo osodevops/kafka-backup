@@ -160,6 +160,9 @@ pub fn topic_restore_config(
         restore: Some(options),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

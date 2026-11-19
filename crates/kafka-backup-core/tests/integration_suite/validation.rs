@@ -72,6 +72,9 @@ fn create_snapshot_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -105,6 +108,9 @@ fn create_restore_config(
         restore: Some(restore_opts),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

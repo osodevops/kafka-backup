@@ -1,8 +1,9 @@
 use anyhow::Result;
+use kafka_backup_core::schema_registry::run::RestoreScope;
 use kafka_backup_core::{Config, RestoreEngine};
 use tracing::info;
 
-pub async fn run(config_path: &str, format: &str) -> Result<()> {
+pub async fn run(config_path: &str, format: &str, schema_only: bool) -> Result<()> {
     // Load configuration
     let config_content = std::fs::read_to_string(config_path)?;
     let config_content = super::config::expand_env_vars(&config_content);
@@ -11,31 +12,87 @@ pub async fn run(config_path: &str, format: &str) -> Result<()> {
     // provider or binding fails validation instead of passing.
     super::oauth::apply(&mut config)?;
 
-    // Force dry-run mode
-    if let Some(ref mut restore) = config.restore {
-        restore.dry_run = true;
-    } else {
-        config.restore = Some(kafka_backup_core::config::RestoreOptions {
-            dry_run: true,
-            ..Default::default()
-        });
-    }
+    // Force dry-run mode, for the records and for the registries.
+    super::registry_restore::normalize_dry_run(&mut config, true);
 
     info!("Validating restore configuration from: {}", config_path);
 
+    // The registry plans: what would be registered, skipped, rewritten or in
+    // conflict. Nothing is changed and no report is written.
+    let scope = if schema_only {
+        RestoreScope::SchemaOnly
+    } else {
+        RestoreScope::BeforeRecords
+    };
+    let registry = super::schema_registry::preview(&config, scope).await?;
+    let registry_errors = registry.errors();
+    let add_plans = |value: &mut serde_json::Value| -> Result<()> {
+        if let Some(outcome) = &registry.confluent {
+            value["schema_registry"] = serde_json::to_value(&outcome.report)?;
+        }
+        if !registry.engine.is_empty() {
+            value["registry_restore"] = serde_json::to_value(&registry.engine)?;
+        }
+        Ok(())
+    };
+    let print_plans = || {
+        if let Some(outcome) = &registry.confluent {
+            super::schema_registry::print_report(&outcome.report, "");
+        }
+        super::schema_registry::print_engine_plans(&registry.engine);
+    };
+
+    if schema_only {
+        let mut value = serde_json::json!({
+            "valid": registry_errors.is_empty(),
+            "backup_id": config.backup_id,
+        });
+        add_plans(&mut value)?;
+        match format.to_lowercase().as_str() {
+            "json" => println!("{}", serde_json::to_string_pretty(&value)?),
+            "yaml" => println!("{}", serde_yaml::to_string(&value)?),
+            _ => {
+                print_plans();
+                println!(
+                    "Validation: {}",
+                    if registry_errors.is_empty() {
+                        "PASSED"
+                    } else {
+                        "FAILED"
+                    }
+                );
+            }
+        }
+        if !registry_errors.is_empty() {
+            anyhow::bail!("{}", registry_errors.join("; "));
+        }
+        return Ok(());
+    }
+
     // Create engine and run dry-run
     let engine = RestoreEngine::new(config)?;
-    let report = engine.dry_run().await?;
+    let mut report = engine.dry_run().await?;
+    if !registry_errors.is_empty() {
+        report.errors.extend(registry_errors.iter().cloned());
+        report.valid = false;
+    }
 
     // Output based on format
     match format.to_lowercase().as_str() {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        "yaml" => {
-            println!("{}", serde_yaml::to_string(&report)?);
+        fmt @ ("json" | "yaml") => {
+            // The dry-run report gains `schema_registry` / `registry_restore`
+            // keys only when a registry is configured; otherwise the output
+            // is unchanged.
+            let mut value = serde_json::to_value(&report)?;
+            add_plans(&mut value)?;
+            if fmt == "json" {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", serde_yaml::to_string(&value)?);
+            }
         }
         _ => {
+            print_plans();
             print_validation_report(&report);
         }
     }
