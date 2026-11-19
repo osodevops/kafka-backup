@@ -97,6 +97,8 @@ run_case apicurio_preserve_real apicurio-preserve
 unset REGISTRY_EXPECT_ARCHIVE_REJECTION
 # Build separate pinned SDK classpaths for each API generation. A single
 # Maven classpath cannot load both v2 and v3 clients at once.
+# The dependency plugin is named with its full coordinates and version: the
+# short `dependency:` prefix needs a metadata lookup that can fail on its own.
 build_oracle() {
   local registry_side="$1" registry_ap_version="$2" registry_cf_version="$3" registry_provider="$4"
   local registry_oracle_dir="$REGISTRY_EVIDENCE_DIR/oracle-$registry_side"
@@ -105,8 +107,8 @@ build_oracle() {
   cp tests/registry-serdes-oracle/pom.xml "$registry_oracle_dir/"
   local registry_maven_args=(-P"oracle-$registry_provider")
   if [[ "$registry_ap_version" == 2.* ]]; then registry_maven_args+=(-Dapicurio.v2=true); fi
-  registry_maven "$REGISTRY_EVIDENCE_DIR/sdk-$registry_side.log" -q -f "$registry_oracle_dir/pom.xml" "${registry_maven_args[@]}" -Dapicurio.version="$registry_ap_version" -Dconfluent.version="$registry_cf_version" package dependency:build-classpath -Dmdep.outputFile=classpath.txt -Dmdep.regenerateFile=true || return 1
-  registry_maven "$REGISTRY_EVIDENCE_DIR/sdk-tree-$registry_side.log" -q -f "$registry_oracle_dir/pom.xml" "${registry_maven_args[@]}" -Dapicurio.version="$registry_ap_version" -Dconfluent.version="$registry_cf_version" dependency:tree -DoutputFile="$REGISTRY_EVIDENCE_DIR/dependencies-$registry_side.txt" || return 1
+  registry_maven "$REGISTRY_EVIDENCE_DIR/sdk-$registry_side.log" -q -f "$registry_oracle_dir/pom.xml" "${registry_maven_args[@]}" -Dapicurio.version="$registry_ap_version" -Dconfluent.version="$registry_cf_version" package org.apache.maven.plugins:maven-dependency-plugin:3.8.1:build-classpath -Dmdep.outputFile=classpath.txt -Dmdep.regenerateFile=true || return 1
+  registry_maven "$REGISTRY_EVIDENCE_DIR/sdk-tree-$registry_side.log" -q -f "$registry_oracle_dir/pom.xml" "${registry_maven_args[@]}" -Dapicurio.version="$registry_ap_version" -Dconfluent.version="$registry_cf_version" org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree -DoutputFile="$REGISTRY_EVIDENCE_DIR/dependencies-$registry_side.txt" || return 1
   printf '%s:%s' "$registry_oracle_dir/target/classes" "$(cat "$registry_oracle_dir/classpath.txt")"
 }
 REGISTRY_ORACLE_CF_SOURCE_CLASSPATH="$(build_oracle source-confluent "$REGISTRY_APICURIO_SOURCE_VERSION" "$REGISTRY_CONFLUENT_SOURCE_VERSION" confluent)"
