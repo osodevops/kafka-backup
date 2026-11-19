@@ -409,6 +409,37 @@ restore strategies, the mode guard, the report and Confluent Cloud.
 Unknown keys anywhere under `schema_registry` are errors. Passwords and
 tokens are never logged or serialised.
 
+### Apicurio Registry
+
+`apicurio_registry` is the Apicurio counterpart (Apicurio Registry 2.x and
+3.x), and `registry_restore` sets how a restore treats an Apicurio target or
+a target of the other registry kind. The
+[Apicurio Registry guide](apicurio-registry.md) has every option, the
+serializer profiles and the tested versions.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `apicurio_registry.url` | string | required | Registry base URL |
+| `apicurio_registry.api_version` | string | `v3` | `v3`, or `v2` for Apicurio Registry 2.x |
+| `apicurio_registry.auth.type` | string | `none` | `none`, `basic`, `mtls` or `oidc` |
+| `apicurio_registry.backup.groups` / `artifacts` | list[string] | `["*"]` | What to capture (glob); `exclude_groups` / `exclude_artifacts` leave out |
+| `apicurio_registry.backup.include_export` | bool | `true` | Store the registry's export archive; an ID-preserving restore imports it |
+| `apicurio_registry.backup.fail_on_partial` | bool | `false` | Fail the backup when the snapshot is incomplete |
+| `registry_restore.source` / `destination` | string | the enabled section | `apicurio` or `confluent`: which snapshot is restored into which registry |
+| `registry_restore.id_policy` | string | `preserve` | `preserve` (original IDs; empty target) or `rewrite` (the target allocates IDs and the records are rewritten) |
+| `registry_restore.serializers` | map | `{}` | How each topic's keys and values are framed; required when IDs are rewritten |
+| `registry_restore.coordinates` | list | `[]` | Move subjects or artifacts to another group or name |
+| `registry_restore.restore_global_settings` | bool | `false` | Apply the snapshot's global rules; needs an empty target |
+| `registry_restore.dry_run` | bool | `false` | Plan only |
+
+```yaml
+apicurio_registry:
+  url: https://apicurio.example.com
+  api_version: v3
+registry_restore:
+  id_policy: preserve
+```
+
 ```yaml
 schema_registry:
   url: https://psrc-xxxxx.westeurope.azure.confluent.cloud

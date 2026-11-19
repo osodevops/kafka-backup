@@ -56,6 +56,8 @@ fn create_snapshot_backup_config(
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -105,6 +107,8 @@ fn test_config_validation_mutual_exclusivity() {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let result = config.validate();
@@ -143,6 +147,8 @@ fn test_config_validation_snapshot_mode_valid() {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let result = config.validate();
@@ -174,6 +180,8 @@ fn test_config_validation_compression_level() {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let result = config.validate();
@@ -531,6 +539,8 @@ async fn test_incremental_oneshot_backup_resumes_from_offset() {
         }),
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let engine1 = BackupEngine::new(config1)
@@ -615,6 +625,8 @@ async fn test_incremental_oneshot_backup_resumes_from_offset() {
         }),
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let engine2 = BackupEngine::new(config2)

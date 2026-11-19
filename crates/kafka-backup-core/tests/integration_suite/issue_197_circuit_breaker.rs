@@ -524,6 +524,8 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
 
     let engine = RestoreEngine::new(config).expect("engine");

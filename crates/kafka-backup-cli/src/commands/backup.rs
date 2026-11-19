@@ -1,5 +1,5 @@
 //! `backup`: the Kafka data backup and, with a `schema_registry` section,
-//! the Schema Registry snapshot.
+//! the registry snapshot (Confluent Schema Registry and/or Apicurio Registry).
 //!
 //! The snapshot does not depend on the data backup:
 //!
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
-use super::schema_registry::{combine, print_snapshot, Snapshots};
+use super::schema_registry::{combine, print_pass, Snapshots};
 
 pub async fn run(config_path: &str, schema_only: bool) -> Result<()> {
     info!("Loading configuration from: {}", config_path);
@@ -101,9 +101,7 @@ pub async fn run(config_path: &str, schema_only: bool) -> Result<()> {
                     "post-backup"
                 })
                 .await;
-            if let Ok(manifest) = &pass {
-                print_snapshot(&backup_id, manifest);
-            }
+            print_pass(&backup_id, &pass);
             Some(pass)
         }
         None => None,
@@ -118,11 +116,7 @@ pub async fn run(config_path: &str, schema_only: bool) -> Result<()> {
         signal_task.abort(); // Clean up signal watcher if operation finished normally
     }
 
-    combine(
-        kafka_result,
-        pass.as_ref(),
-        snapshots.as_ref().is_some_and(|s| s.fail_on_partial()),
-    )?;
+    combine(kafka_result, pass.as_ref())?;
     info!("Backup completed successfully");
     Ok(())
 }

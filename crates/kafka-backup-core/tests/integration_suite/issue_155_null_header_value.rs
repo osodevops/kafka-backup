@@ -100,6 +100,8 @@ fn backup_config(bs: &str, storage: PathBuf, include_offset_headers: bool) -> Co
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -127,6 +129,8 @@ fn restore_config(bs: &str, storage: PathBuf) -> Config {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

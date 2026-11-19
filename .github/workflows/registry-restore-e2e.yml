@@ -1,0 +1,165 @@
+name: Registry restore E2E
+
+# Apicurio Registry backup and restore, and restores between Apicurio and
+# Confluent Schema Registry, against real registries (issue #262):
+#
+# - cli: `backup --schema-only`, `validate-restore` and `restore --schema-only`
+#   through the CLI for every supported Apicurio version, comparing the source
+#   and the restored registry version by version; plus the backup suite.
+# - contract: the provider-neutral restore engine with records produced and
+#   consumed by the released Confluent and Apicurio Java serializers, for the
+#   registry pairs listed by tests/registry-restore-test-infra/matrix.py.
+#
+# Runs on pull requests that touch this code. Run it by hand with
+# full_matrix for every ordered pair of the nine registry versions (81 jobs).
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/registry-restore-e2e.yml'
+      - 'crates/kafka-backup-core/src/apicurio_registry/**'
+      - 'crates/kafka-backup-core/src/registry_restore/**'
+      - 'crates/kafka-backup-core/src/schema_registry/**'
+      - 'crates/kafka-backup-core/src/restore/**'
+      - 'crates/kafka-backup-core/tests/apicurio_registry_real.rs'
+      - 'crates/kafka-backup-core/tests/registry_restore_real.rs'
+      - 'crates/kafka-backup-cli/src/commands/registry_restore.rs'
+      - 'crates/kafka-backup-cli/src/commands/schema_registry.rs'
+      - 'tests/registry-restore-test-infra/**'
+      - 'tests/registry-serdes-oracle/**'
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        type: boolean
+        default: false
+        description: Run all 81 registry/version pairs
+
+concurrency:
+  group: registry-restore-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli:
+    name: Apicurio ${{ matrix.version }} (CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['2.6.13.Final', '3.0.15', '3.1.7', '3.3.3']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-registry-restore-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-restore-cli-
+
+      - name: Build the CLI
+        run: cargo build -p kafka-backup-cli
+
+      - name: Back up and restore Apicurio ${{ matrix.version }} through the CLI
+        run: tests/registry-restore-test-infra/cli-e2e.sh "${{ matrix.version }}"
+
+      - name: Backup suite against a seeded registry
+        # The fixture is registered through the v3 API.
+        if: ${{ !startsWith(matrix.version, '2.') }}
+        env:
+          APICURIO_IMAGE: quay.io/apicurio/apicurio-registry:${{ matrix.version }}
+        run: |
+          C=tests/registry-restore-test-infra/docker-compose.apicurio-backup.yml
+          docker compose -f "$C" up -d
+          tests/registry-restore-test-infra/seed-apicurio.sh http://localhost:29485
+          cargo test -p kafka-backup-core --test apicurio_registry_real -- --ignored --nocapture --test-threads=1
+          docker compose -f "$C" down -v
+
+  matrix:
+    name: Registry pairs
+    runs-on: ubuntu-latest
+    outputs:
+      cases: ${{ steps.cases.outputs.cases }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - id: cases
+        env:
+          FULL_MATRIX: ${{ inputs.full_matrix }}
+        run: |
+          if [[ "$FULL_MATRIX" == true ]]; then
+            echo "cases=$(python3 tests/registry-restore-test-infra/matrix.py --full)" >> "$GITHUB_OUTPUT"
+          else
+            echo "cases=$(python3 tests/registry-restore-test-infra/matrix.py)" >> "$GITHUB_OUTPUT"
+          fi
+
+  contract:
+    name: ${{ matrix.name }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJSON(needs.matrix.outputs.cases) }}
+    env:
+      REGISTRY_CONFLUENT_SOURCE_VERSION: ${{ matrix.cf_source }}
+      REGISTRY_CONFLUENT_TARGET_VERSION: ${{ matrix.cf_target }}
+      REGISTRY_APICURIO_SOURCE_VERSION: ${{ matrix.ap_source }}
+      REGISTRY_APICURIO_TARGET_VERSION: ${{ matrix.ap_target }}
+      REGISTRY_MATRIX_SOURCE_PROVIDER: ${{ matrix.source_provider }}
+      REGISTRY_MATRIX_TARGET_PROVIDER: ${{ matrix.target_provider }}
+      REGISTRY_EVIDENCE_DIR: ${{ github.workspace }}/target/registry-compatibility
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+
+      - name: Install Java for the serializer oracle
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-registry-restore-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-restore-
+
+      - name: Build the test binary
+        run: cargo test -p kafka-backup-core --test registry_restore_real --no-run
+
+      - name: Restore between real registries with the released serializers
+        run: tests/registry-restore-test-infra/run.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: registry-restore-${{ matrix.name }}
+          path: target/registry-compatibility
+          if-no-files-found: ignore

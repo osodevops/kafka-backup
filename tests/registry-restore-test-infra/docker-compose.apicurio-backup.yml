@@ -1,0 +1,20 @@
+# Two Apicurio Registry instances (API v3) for the backup tests in
+# crates/kafka-backup-core/tests/apicurio_registry_real.rs:
+#
+#   C=tests/registry-restore-test-infra/docker-compose.apicurio-backup.yml
+#   docker compose -f $C up -d
+#   tests/registry-restore-test-infra/seed-apicurio.sh http://localhost:29485
+#   cargo test -p kafka-backup-core --test apicurio_registry_real -- --ignored --test-threads=1
+#   docker compose -f $C down -v
+#
+# 29485 is the source (seeded), 29486 the target (empty; an export archive is
+# imported into it). APICURIO_IMAGE picks the image (default 3.3.3); cli-e2e.sh
+# sets it per version, including the API v2 image.
+name: kb-apicurio-backup
+services:
+  apicurio-source:
+    image: ${APICURIO_IMAGE:-quay.io/apicurio/apicurio-registry:3.3.3}
+    ports: ["29485:8080"]
+  apicurio-target:
+    image: ${APICURIO_IMAGE:-quay.io/apicurio/apicurio-registry:3.3.3}
+    ports: ["29486:8080"]

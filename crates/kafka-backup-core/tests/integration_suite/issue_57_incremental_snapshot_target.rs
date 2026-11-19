@@ -61,6 +61,8 @@ fn snapshot_config(bootstrap: &str, storage: &TempDir, offset_db: &Path) -> Conf
         }),
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

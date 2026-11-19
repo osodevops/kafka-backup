@@ -315,6 +315,8 @@ fn restore_config(
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 
@@ -627,6 +629,8 @@ async fn schema_ids_are_rewritten_on_both_paths_against_kafka() {
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     };
     tokio::time::timeout(
         Duration::from_secs(60),
@@ -679,6 +683,8 @@ async fn schema_ids_are_rewritten_on_both_paths_against_kafka() {
             offset_storage: None,
             metrics: None,
             schema_registry: None,
+            apicurio_registry: None,
+            registry_restore: None,
         };
         let report = tokio::time::timeout(
             Duration::from_secs(60),

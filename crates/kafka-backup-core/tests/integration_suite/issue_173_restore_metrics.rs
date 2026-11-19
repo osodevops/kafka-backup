@@ -69,6 +69,8 @@ fn restore_config(bootstrap: &str, storage: &std::path::Path, backup_id: &str) -
         offset_storage: None,
         metrics: None,
         schema_registry: None,
+        apicurio_registry: None,
+        registry_restore: None,
     }
 }
 

@@ -303,7 +303,10 @@ async fn schema_only_needs_an_enabled_schema_registry_section() {
     let out = run(&["backup", "--schema-only", "--config", fx.config()]);
     let all = text(&out);
     assert!(!out.status.success(), "{all}");
-    assert!(all.contains("no enabled schema_registry section"), "{all}");
+    assert!(
+        all.contains("no enabled schema_registry or apicurio_registry section"),
+        "{all}"
+    );
 
     let fx = restore_fixture("", "", "").await;
     for command in ["restore", "validate-restore"] {
@@ -311,7 +314,7 @@ async fn schema_only_needs_an_enabled_schema_registry_section() {
         let all = text(&out);
         assert!(!out.status.success(), "{command}: {all}");
         assert!(
-            all.contains("no schema_registry section"),
+            all.contains("no enabled schema_registry or apicurio_registry section"),
             "{command}: {all}"
         );
     }
@@ -841,5 +844,109 @@ async fn a_wrong_registry_oauth_provider_fails_every_command_before_connecting()
             "{command:?}"
         );
         assert_eq!(fx.kafka.connections(), 0, "{command:?}: {all}");
+    }
+}
+
+// ===========================================================================
+// Apicurio Registry and registry_restore
+// ===========================================================================
+
+#[test]
+fn unknown_keys_in_the_apicurio_and_registry_restore_sections_are_errors() {
+    for (yaml, key) in [
+        (
+            "apicurio_registry:\n  url: http://ap\n  backup:\n    groupz: [a]\n",
+            "groupz",
+        ),
+        (
+            "apicurio_registry:\n  url: http://ap\n  restore:\n    use_import_api: true\n",
+            "restore",
+        ),
+        (
+            "apicurio_registry:\n  url: http://ap\n  api_version: v4\n",
+            "v4",
+        ),
+        (
+            "apicurio_registry:\n  url: http://ap\nregistry_restore:\n  id_polic: rewrite\n",
+            "id_polic",
+        ),
+    ] {
+        let fx = backup_fixture(yaml, "");
+        let out = run(&["backup", "--schema-only", "--config", fx.config()]);
+        let all = text(&out);
+        assert!(!out.status.success(), "{key}: {all}");
+        assert!(all.contains(key), "{key}: {all}");
+        assert_eq!(fx.kafka.connections(), 0, "{key}");
+    }
+}
+
+/// One registry failing does not stop the other from being snapshotted, and
+/// `--schema-only` reports the failure.
+#[tokio::test]
+async fn backup_schema_only_snapshots_each_registry_independently() {
+    let (src, _source) = source().await;
+    let fx = backup_fixture(
+        &format!(
+            "{}apicurio_registry:\n  url: http://127.0.0.1:1\n  connection:\n    max_retries: 0\n",
+            registry_yaml(&src.uri(), "")
+        ),
+        "",
+    );
+    let out = run(&["backup", "--schema-only", "--config", fx.config()]);
+    let all = text(&out);
+    assert!(!out.status.success(), "{all}");
+    assert!(
+        all.contains("Schema Registry backup: 3 subject(s)"),
+        "{all}"
+    );
+    assert!(all.contains("Apicurio Registry backup failed"), "{all}");
+    assert_eq!(fx.json(STATUS)["complete"], true);
+    assert_eq!(
+        fx.json("sr-cli/apicurio-registry/_status.json")["complete"],
+        false
+    );
+    assert_eq!(fx.kafka.connections(), 0, "{all}");
+}
+
+/// `registry_restore` is not a second way to do a Confluent-to-Confluent
+/// restore: it is refused before anything connects.
+#[tokio::test]
+async fn registry_restore_without_apicurio_points_to_schema_registry_restore() {
+    for command in ["restore", "three-phase-restore", "validate-restore"] {
+        let (tgt, target) = FakeSchemaRegistry::start().await;
+        let fx = restore_fixture(&tgt.uri(), "", "registry_restore:\n  id_policy: rewrite\n").await;
+        let out = run(&[command, "--config", fx.config()]);
+        let all = text(&out);
+        assert!(!out.status.success(), "{command}: {all}");
+        assert!(
+            all.contains("use schema_registry.restore"),
+            "{command}: {all}"
+        );
+        assert!(target.log().is_empty(), "{command}: {:?}", target.log());
+        assert_eq!(fx.kafka.connections(), 0, "{command}: {all}");
+    }
+}
+
+/// An Apicurio restore that cannot reach its registry stops the command
+/// before any Kafka connection, and before the Confluent registry changes.
+#[tokio::test]
+async fn an_apicurio_failure_stops_the_restore_before_kafka_and_before_the_other_registry() {
+    for command in ["restore", "three-phase-restore"] {
+        let (tgt, target) = FakeSchemaRegistry::start().await;
+        let fx = restore_fixture(
+            &tgt.uri(),
+            "",
+            "apicurio_registry:\n  url: http://127.0.0.1:1\n  connection:\n    max_retries: 0\n",
+        )
+        .await;
+        let out = run(&[command, "--config", fx.config()]);
+        let all = text(&out);
+        assert!(!out.status.success(), "{command}: {all}");
+        assert!(
+            target.mutations().is_empty(),
+            "{command}: {:?}",
+            target.mutations()
+        );
+        assert_eq!(fx.kafka.connections(), 0, "{command}: {all}");
     }
 }

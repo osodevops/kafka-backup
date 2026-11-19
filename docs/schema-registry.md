@@ -5,7 +5,8 @@ and restores it before the records, so that every restored record still
 resolves to its schema under its **original schema ID**.
 
 Available from v0.30.0. It works with self-managed Confluent Schema Registry
-and with Confluent Cloud.
+and with Confluent Cloud. For Apicurio Registry, see
+[Apicurio Registry backup and restore](apicurio-registry.md).
 
 | | |
 |---|---|
@@ -458,8 +459,9 @@ works. 6.2 has no schema contexts.
 
 Other limits:
 
-- **Apicurio Registry** and conversion between registry formats are not
-  supported.
+- **Apicurio Registry**, and restoring between Apicurio and Confluent Schema
+  Registry, are covered by a separate engine and guide:
+  [Apicurio Registry backup and restore](apicurio-registry.md).
 - **Data contract rules are not executed** on restored records (for example
   CSFLE encryption), and the DEK Registry is not backed up. Rule sets are
   backed up verbatim.
@@ -498,7 +500,7 @@ layout and are read by this release.
 | `schema_registry.restore.enabled` | Removed. A restore configuration with a `schema_registry` section restores the registry; use `schema_registry.enabled: false` to skip it |
 | `restore.strategy: preserve` or `skip` | `into_existing` |
 | `connection.concurrent_requests` | Removed (it was not used) |
-| `enterprise.registry_restore`, serializer profiles | Not included; use `schema_registry.restore` |
+| `enterprise.registry_restore`, serializer profiles | Top-level `registry_restore`, for Apicurio and for restores between Apicurio and Confluent ([guide](apicurio-registry.md)). A Confluent-to-Confluent restore uses `schema_registry.restore` |
 | `mtls` without `client_cert` or `client_key` | Both are required |
 | Licence checks, exit status 2 | None |
 
@@ -511,8 +513,8 @@ Two behaviours changed:
 - A restore configuration that has a `schema_registry` section but no
   `restore` subsection now restores the registry, with the defaults.
 
-Not included from Enterprise: Apicurio Registry, the DEK Registry and CSFLE,
-Confluent RBAC and authorization recovery, erasure, and the MSK migration.
+Not included from Enterprise: the DEK Registry and CSFLE, Confluent RBAC and
+authorization recovery, erasure, and the MSK migration.
 
 ## 11. Testing locally
 

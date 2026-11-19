@@ -40,11 +40,11 @@ pub fn hash(data: &[u8]) -> String {
 }
 
 /// A referenced (subject, version) that the snapshot does not contain.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Coordinate {
-    /// Context-qualified subject.
+    /// Confluent context-qualified subject, or Apicurio artifact ID.
     pub name: String,
-    /// Always empty for Confluent Schema Registry.
+    /// Empty for Confluent Schema Registry; the group for Apicurio.
     #[serde(default)]
     pub group: String,
     pub version: String,
@@ -57,6 +57,16 @@ impl Coordinate {
             group: String::new(),
             version: version.to_string(),
         }
+    }
+
+    /// `group/name/version`, for messages.
+    pub fn path(&self) -> String {
+        format!("{}/{}/{}", self.group, self.name, self.version)
+    }
+
+    /// `(group, name)`: the subject or artifact without its version.
+    pub fn artifact(&self) -> (String, String) {
+        (self.group.clone(), self.name.clone())
     }
 }
 
@@ -77,6 +87,10 @@ pub struct SnapshotInfo {
     /// Every subject and version, soft-deleted included, was in scope.
     #[serde(default)]
     pub full_registry: bool,
+    /// Apicurio: what the stored export archive covers. It is independent
+    /// of the structured snapshot's filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_scope: Option<String>,
     /// Storage key -> `sha256:<hex>` for every object of the snapshot except
     /// the manifest itself.
     #[serde(default)]

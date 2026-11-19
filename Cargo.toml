@@ -113,6 +113,14 @@ rand = "0.8"
 glob = "0.3"
 urlencoding = "2.1"
 
+# Apicurio Registry backup and restore: the export archive, Protobuf
+# descriptors for message-index framing, and the restore journal lock
+zip = { version = "2", default-features = false, features = ["deflate"] }
+protox = "0.9"
+protox-parse = "0.9"
+prost-types = "0.14"
+fs2 = "0.4"
+
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature in core/cli
 libgssapi = "0.9"
 

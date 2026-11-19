@@ -36,6 +36,8 @@ kafka-backup/
 │   │       ├── health.rs
 │   │       ├── oauth/            # SASL/OAUTHBEARER: token providers, cache, plugin
 │   │       ├── schema_registry/  # Confluent Schema Registry backup + restore (original schema IDs)
+│   │       ├── apicurio_registry/ # Apicurio Registry (API v2/v3) client + backup
+│   │       ├── registry_restore/ # Provider-neutral restore: Apicurio targets, Confluent<->Apicurio, record ID/framing rewrite
 │   │       └── metrics/          # Prometheus metrics
 │   └── kafka-backup-cli/         # Binary CLI wrapper
 │       └── src/
@@ -288,6 +290,7 @@ s3://kafka-backups/
         ├── offsets.db                       # SQLite offset store; only with continuous: true or offset_storage:
         ├── consumer-groups-snapshot.json    # only with backup.consumer_group_snapshot: true
         ├── schema-registry/                 # only with a schema_registry section: _status.json, _manifest.json (checksums), subjects/
+        ├── apicurio-registry/               # only with an apicurio_registry section: _manifest.json, _export.zip, groups/
         ├── restore/schema-registry-report.json   # written by every registry restore (…report.dry-run.json for a dry run)
         └── topics/
             └── {topic}/
@@ -330,6 +333,12 @@ schema_registry:  # Confluent Schema Registry: snapshot on backup, restore befor
   auth: { type: none | basic | mtls | oauth }   # oauth: { provider: <name>, target_sr_cluster, identity_pool_id }
   backup: { subjects: ["*"], exclude: [], fail_on_partial: false, snapshot_interval: 15m }
   restore: { strategy: preserve_ids | into_existing, rewrite_ids: false, dry_run: false }
+
+apicurio_registry:  # Apicurio Registry 2.x / 3.x (0.30.0; docs/apicurio-registry.md)
+  url: https://apicurio:8080
+  api_version: v3 | v2
+registry_restore:   # Apicurio targets and Confluent<->Apicurio; NOT Confluent->Confluent (that is schema_registry.restore)
+  id_policy: preserve | rewrite   # rewrite needs `serializers` (per-topic framing profiles)
 
 storage:
   backend: s3 | azure | gcs | filesystem | memory
@@ -399,6 +408,7 @@ For exact consumer offset recovery:
 | `docs/storage_guide.md` | Storage backend setup |
 | `docs/oauth.md` | OAuth (SASL/OAUTHBEARER) providers, token cache, Confluent Cloud + Entra ID |
 | `docs/schema-registry.md` | Schema Registry backup/restore: strategies, mode guard, report, tested versions |
+| `docs/apicurio-registry.md` | Apicurio backup/restore, `registry_restore`, serializer profiles, tested versions |
 | `docs/restore_guide.md` | Restore examples |
 | `docs/Three_Phase_Restore_Guide.md` | Offset recovery system |
 | `docs/Offset_Remapping_Deep_Dive.md` | Offset mapping technical details |
@@ -436,6 +446,15 @@ first: it attaches the shared token cache to `schema_registry.auth`.
 Only reads are retried; a write is sent once. Never weaken the mode guard:
 every mode the restore changes is put back on success, failure and
 cancellation, and a mode someone else changed is left alone.
+
+Two restore engines, routed by `commands::registry_restore::route`:
+`schema_registry::restore` for Confluent-to-Confluent, and
+`registry_restore::engine` for an Apicurio target and for restores between
+the two registries (it installs a `RecordTransform` on `restore` and keeps a
+local journal beside `restore.checkpoint_state`). Both plan before either
+changes a registry. Real-registry tests for the second engine:
+`tests/registry-restore-test-infra/run.sh` (Java serializer oracle, needs
+Maven) and `cli-e2e.sh`, run by `.github/workflows/registry-restore-e2e.yml`.
 
 Tests: `--test schema_registry_tests` (mocked, in CI's unit job),
 `tests/schema_registry_cli.rs`, and the `#[ignore]` real-registry suite

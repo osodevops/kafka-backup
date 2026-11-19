@@ -478,6 +478,90 @@ impl SchemaRegistryClient {
     }
 
     // ========================================================================
+    // Used by the provider-neutral restore (`crate::registry_restore`)
+    // ========================================================================
+
+    /// Get a specific schema version.
+    pub async fn get_schema_version(
+        &self,
+        subject: &str,
+        version: i32,
+    ) -> Result<SchemaVersion, SchemaRegistryError> {
+        let path = format!(
+            "/subjects/{}/versions/{}",
+            urlencoding::encode(subject),
+            version
+        );
+        self.get_json(&path).await
+    }
+
+    pub async fn get_schema_by_id_for_subject(
+        &self,
+        id: i32,
+        subject: &str,
+    ) -> Result<serde_json::Value, SchemaRegistryError> {
+        self.get_json(&format!(
+            "/schemas/ids/{id}?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await
+    }
+    pub async fn cluster_identity(&self) -> Result<Option<serde_json::Value>, SchemaRegistryError> {
+        match self.get_json("/v1/metadata/id").await {
+            Ok(v) => Ok(Some(v)),
+            Err(SchemaRegistryError::SubjectNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Deleted versions are visible only when explicitly requested.
+    pub async fn get_schema_version_including_deleted(
+        &self,
+        subject: &str,
+        version: i32,
+    ) -> Result<SchemaVersion, SchemaRegistryError> {
+        self.get_json(&format!(
+            "/subjects/{}/versions/{}?deleted=true",
+            urlencoding::encode(subject),
+            version
+        ))
+        .await
+    }
+
+    /// Mutations are sent once. The caller journals and reconciles uncertain writes.
+    pub async fn mutate(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, SchemaRegistryError> {
+        self.rate_limiter.acquire().await;
+        let req = self
+            .client
+            .request(method, format!("{}{}", self.base_url, path));
+        let mut req = self.apply_auth(req).await?;
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+        let response = req.send().await?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            if let Some(oauth) = &self.oauth {
+                oauth.invalidate();
+            }
+        }
+        let value: serde_json::Value = response.json().await?;
+        if !status.is_success() {
+            return Err(SchemaRegistryError::Api {
+                status: status.as_u16(),
+                error_code: value["error_code"].as_i64().unwrap_or(0) as i32,
+                message: value.to_string(),
+            });
+        }
+        Ok(value)
+    }
+
+    // ========================================================================
     // Internal Request Methods
     // ========================================================================
 

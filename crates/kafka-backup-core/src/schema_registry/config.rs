@@ -470,7 +470,7 @@ impl Default for SchemaConnectionConfig {
 }
 
 /// `Option<Duration>` as a humantime string (`15m`, `1h 30m`).
-mod humantime_opt {
+pub(crate) mod humantime_opt {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 

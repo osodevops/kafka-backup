@@ -35,7 +35,7 @@ Need support, an SLA or Enterprise features? See [Kafka Backup Enterprise](https
 - **Multi-cloud storage** — S3, Azure Blob, GCS, or local filesystem
 - **Point-in-time recovery** — Restore to any millisecond within your backup window
 - **Consumer offset recovery** — Automatically reset consumer group offsets after restore
-- **Schema Registry backup and restore** — Confluent Schema Registry (self-managed or Confluent Cloud) is snapshotted with the topics and restored first, so records keep their original schema IDs
+- **Schema Registry backup and restore** — Confluent Schema Registry (self-managed or Confluent Cloud) and Apicurio Registry (2.x and 3.x) are snapshotted with the topics and restored first, so records keep their original schema IDs
 - **Compliance evidence** — Signed JSON/PDF reports for SOX, CMMC, and GDPR auditors
 - **High performance** — 100+ MB/s throughput with zstd/lz4 compression
 - **Incremental backups** — Resume from where you left off
@@ -481,6 +481,12 @@ kafka-backup restore --config restore.yaml                         # the registr
 See the [Schema Registry guide](docs/schema-registry.md) for the restore
 strategies, conflict handling (`rewrite_ids`), Confluent Cloud and the
 tested registry versions.
+
+Apicurio Registry works the same way with an `apicurio_registry` section
+(`url`, and `api_version: v2` for Apicurio 2.x). A `registry_restore` section
+restores into a registry that already has artifacts, or between Apicurio and
+Confluent Schema Registry, rewriting the identifiers inside the records. See
+the [Apicurio Registry guide](docs/apicurio-registry.md).
 
 ### Optional: SASL/GSSAPI (Kerberos) support
 
