@@ -3029,15 +3029,12 @@ fn equivalent(expected: &Schema, actual: &Schema, preserve: bool) -> bool {
             return false;
         }
     }
-    if preserve
+    // With preservation, a GUID recorded in the snapshot must match.
+    !(preserve
         && expected
             .envelope
             .get("guid")
-            .is_some_and(|g| actual.envelope.get("guid") != Some(g))
-    {
-        return false;
-    }
-    true
+            .is_some_and(|g| actual.envelope.get("guid") != Some(g)))
 }
 fn guid(value: &str) -> Result<String> {
     let value = value.replace('-', "").to_lowercase();
