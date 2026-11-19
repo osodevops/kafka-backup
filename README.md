@@ -15,6 +15,9 @@
   <a href="https://github.com/osodevops/kafka-backup/releases">
     <img src="https://img.shields.io/github/v/release/osodevops/kafka-backup" alt="Release">
   </a>
+  <a href="https://github.com/sponsors/osodevops">
+    <img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub">
+  </a>
 </p>
 
 ---
