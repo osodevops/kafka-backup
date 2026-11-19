@@ -11,12 +11,13 @@ Complete reference for all configuration options in Kafka Backup.
 3. [Source Configuration](#source-configuration)
 4. [Target Configuration](#target-configuration)
 5. [OAuth Configuration](#oauth-configuration)
-6. [Storage Configuration](#storage-configuration)
-7. [Backup Configuration](#backup-configuration)
-8. [Offset Storage Configuration](#offset-storage-configuration)
-9. [Restore Configuration](#restore-configuration)
-10. [Environment Variables](#environment-variables)
-11. [CLI Arguments](#cli-arguments)
+6. [Schema Registry Configuration](#schema-registry-configuration)
+7. [Storage Configuration](#storage-configuration)
+8. [Backup Configuration](#backup-configuration)
+9. [Offset Storage Configuration](#offset-storage-configuration)
+10. [Restore Configuration](#restore-configuration)
+11. [Environment Variables](#environment-variables)
+12. [CLI Arguments](#cli-arguments)
 
 ---
 
@@ -366,6 +367,60 @@ oauth:
     refresh_before_expiry: 5m
     clock_skew: 30s
     min_refresh_interval: 30s
+```
+
+---
+
+## Schema Registry Configuration
+
+A Confluent Schema Registry to snapshot with a backup, or to restore before
+the records of a restore, so restored records resolve to their schemas under
+their original schema IDs (v0.30.0+). In a backup configuration `url` is the
+registry to snapshot; in a restore configuration it is the registry to
+restore into. The [Schema Registry guide](schema-registry.md) explains the
+restore strategies, the mode guard, the report and Confluent Cloud.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `schema_registry.enabled` | bool | `true` | `false` skips the registry without removing the section |
+| `schema_registry.url` | string | required | Registry URL (`http://` or `https://`) |
+| `schema_registry.auth.type` | string | `none` | `none`; `basic` (`username`, `password`; a Confluent Cloud API key and secret); `mtls` (`client_cert`, `client_key`, optional `ca_cert`); `oauth` (`provider`, optional `target_sr_cluster` and `identity_pool_id`) |
+| `schema_registry.tls.ca_cert` | string | system roots | PEM CA certificate for the registry's certificate |
+| `schema_registry.connection.timeout_ms` | int | `30000` | Request timeout |
+| `schema_registry.connection.max_retries` | int | `3` | Retries of a read after a 429, a 5xx or a connection error. Writes are sent once |
+| `schema_registry.connection.retry_backoff_ms` | int | `1000` | First backoff; doubles per attempt |
+| `schema_registry.connection.rate_limit_rps` | int | `25` | Maximum requests per second |
+| `schema_registry.backup.subjects` | list[string] | `["*"]` | Subjects to capture (glob) |
+| `schema_registry.backup.exclude` | list[string] | `[]` | Subjects to leave out (glob) |
+| `schema_registry.backup.include_versions` | string | `all` | `all` or `latest` |
+| `schema_registry.backup.include_soft_deleted` | bool | `true` | Capture soft-deleted subjects and versions |
+| `schema_registry.backup.include_references` | bool | `true` | Capture referenced versions outside the subject filter |
+| `schema_registry.backup.fail_on_partial` | bool | `false` | Fail the backup when the snapshot is incomplete (it is always marked incomplete and refused by a restore) |
+| `schema_registry.backup.snapshot_interval` | duration | `15m` | How often a continuous backup takes a new snapshot |
+| `schema_registry.restore.strategy` | string | `preserve_ids` | `preserve_ids` (empty target, original IDs) or `into_existing` (populated target: skip identical, import free IDs, conflict otherwise) |
+| `schema_registry.restore.rewrite_ids` | bool | `false` | `into_existing` only: register conflicting schemas under new IDs and rewrite the IDs in the restored records |
+| `schema_registry.restore.restore_soft_deleted` | bool | `true` | Restore soft-deleted versions with their IDs, then soft-delete them again |
+| `schema_registry.restore.restore_global_config` | bool | by strategy | Apply the backup's global and context compatibility and mode (default: `preserve_ids` only) |
+| `schema_registry.restore.verify` | bool | `true` | Check every restored version and the subject settings afterwards |
+| `schema_registry.restore.max_schema_versions` | int | none | The target's schema version limit; exceeding it fails the restore before any change |
+| `schema_registry.restore.subject_mapping` | map | `{}` | Rename subjects (applies to references too) |
+| `schema_registry.restore.dry_run` | bool | `false` | Plan only. `restore.dry_run` implies it, and it implies `restore.dry_run` |
+
+Unknown keys anywhere under `schema_registry` are errors. Passwords and
+tokens are never logged or serialised.
+
+```yaml
+schema_registry:
+  url: https://psrc-xxxxx.westeurope.azure.confluent.cloud
+  auth:
+    type: basic
+    username: ${SR_API_KEY}
+    password: ${SR_API_SECRET}
+  backup:
+    subjects: ["*"]
+    exclude: ["*-test"]
+  restore:
+    strategy: preserve_ids
 ```
 
 ---
@@ -1302,9 +1357,9 @@ restore:
 
 For records in the Confluent wire format (magic byte `0`, then a 4-byte
 schema ID) restored into a different Schema Registry, the restore can swap
-each source schema ID for the target registry's ID. Kafka Backup Enterprise
-fills `schema_id_mapping` from its Schema Registry restore; set it by hand
-otherwise.
+each source schema ID for the target registry's ID. A
+[Schema Registry restore](schema-registry.md) with `rewrite_ids` turns this
+on and fills `schema_id_mapping` itself; set it by hand otherwise.
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -1464,6 +1519,7 @@ kafka-backup backup --config backup.yaml [OPTIONS]
 | Argument | Description |
 |----------|-------------|
 | `--config` | Path to backup configuration file |
+| `--schema-only` | Back up the Schema Registry only (the `schema_registry` section); do not connect to Kafka |
 
 ### Restore Command
 
@@ -1474,6 +1530,10 @@ kafka-backup restore --config restore.yaml [OPTIONS]
 | Argument | Description |
 |----------|-------------|
 | `--config` | Path to restore configuration file |
+| `--schema-only` | Restore the Schema Registry only (the `schema_registry` section); skip the Kafka records |
+
+With a `schema_registry` section, `restore` and `three-phase-restore` restore
+the registry first and stop before any record is produced if that fails.
 
 ### List Command
 
@@ -1552,6 +1612,12 @@ kafka-backup validate-restore --config restore.yaml [OPTIONS]
 | Argument | Description |
 |----------|-------------|
 | `--config` | Path to restore configuration file |
+| `--format` | `text` (default), `json` or `yaml` |
+| `--schema-only` | Validate the Schema Registry restore only: what would be registered, skipped, rewritten or in conflict, without Kafka |
+
+With a `schema_registry` section the output includes the registry plan
+(`schema_registry` in JSON and YAML), and a registry conflict fails the
+validation.
 
 ### Show-Offset-Mapping Command
 

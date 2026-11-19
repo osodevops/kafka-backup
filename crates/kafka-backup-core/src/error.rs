@@ -67,6 +67,10 @@ pub enum Error {
     /// Notification delivery error
     #[error("Notification error: {0}")]
     Notification(String),
+
+    /// Schema Registry backup or restore error
+    #[error("Schema Registry error: {0}")]
+    SchemaRegistry(String),
 }
 
 /// Kafka-specific errors

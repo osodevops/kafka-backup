@@ -159,6 +159,7 @@ fn config(
             ..Default::default()
         }),
         metrics: None,
+        schema_registry: None,
     }
 }
 

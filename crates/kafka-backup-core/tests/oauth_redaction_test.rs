@@ -1,8 +1,9 @@
 //! No token and no secret ever reaches the logs, even at TRACE with every
 //! dependency's logging on: token fetches from every provider (success,
 //! retry and failure), SASL payloads, broker rejections, registry requests,
-//! and `Debug` / serialization of the configuration and the installed
-//! factories.
+//! a Schema Registry backup and restore with basic and bearer
+//! authentication (success and failure), and `Debug` / serialization of the
+//! configuration and the installed factories.
 //!
 //! One test per binary: it installs a global subscriber.
 
@@ -19,6 +20,10 @@ use kafka_backup_core::oauth::providers::azure_workload::AzureWorkloadIdentityPr
 use kafka_backup_core::oauth::providers::file::FileTokenProvider;
 use kafka_backup_core::oauth::providers::oidc::{OidcClientCredentialsProvider, OidcSettings};
 use kafka_backup_core::oauth::{OauthBearerPlugin, OauthTokenProvider, RegistryOauth};
+use kafka_backup_core::schema_registry::{
+    SchemaRegistryBackup, SchemaRegistryClient, SchemaRegistryConfig, SchemaRegistryRestore,
+};
+use kafka_backup_core::storage::MemoryBackend;
 use kafka_backup_core::Config;
 use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
@@ -32,6 +37,44 @@ const FEDERATED_TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzYSJ9.FEDERATED-S
 const FILE_TOKEN: &str = "FILE-TOKEN-c2a917";
 const CLIENT_SECRET: &str = "CLIENT-SECRET-9d2c41";
 const STATIC_TOKEN: &str = "STATIC-TOKEN-55e1b0";
+const SR_API_KEY: &str = "sr-api-key";
+const SR_API_SECRET: &str = "SR-API-SECRET-e84f17";
+
+#[path = "schema_registry_suite/fake_schema_registry.rs"]
+mod fake_schema_registry;
+use fake_schema_registry::{FakeSchemaRegistry, Schema};
+
+/// Back up `source` and restore it into `target` with this configuration's
+/// registry authentication, logging every outcome the way the CLI does.
+async fn registry_round_trip(config: &SchemaRegistryConfig, source: &str, target: &str) {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut cfg = config.clone();
+    cfg.url = source.to_string();
+    tracing::trace!(config = ?cfg, "schema registry config");
+    tracing::trace!(yaml = %serde_yaml::to_string(&cfg).unwrap(), "re-serialised");
+    let client = SchemaRegistryClient::new(&cfg).unwrap();
+    match SchemaRegistryBackup::new(client, storage.clone(), "b".into(), cfg.clone())
+        .run()
+        .await
+    {
+        Ok(manifest) => {
+            tracing::info!(
+                subjects = manifest.subjects_count,
+                "Schema Registry backup complete"
+            )
+        }
+        Err(e) => tracing::error!(error = %e, debug = ?e, "Schema Registry backup failed"),
+    }
+    cfg.url = target.to_string();
+    let client = SchemaRegistryClient::new(&cfg).unwrap();
+    let (report, error) = SchemaRegistryRestore::new(client, storage, "b".into(), cfg)
+        .run_detailed()
+        .await;
+    tracing::info!(report = %serde_json::to_string(&report).unwrap(), "Schema Registry restore report");
+    if let Some(e) = error {
+        tracing::error!(error = %e, debug = ?e, "Schema Registry restore failed");
+    }
+}
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -316,6 +359,42 @@ oauth:
     assert_eq!(response.status(), 200);
     tracing::trace!(registry = ?registry, "registry auth");
 
+    // ── Schema Registry backup and restore: basic auth, then bearer ──
+    let basic_auth: SchemaRegistryConfig = serde_yaml::from_str(&format!(
+        "url: http://unused\nauth: {{ type: basic, username: {SR_API_KEY}, password: {SR_API_SECRET} }}\n\
+         connection: {{ max_retries: 1, retry_backoff_ms: 1, rate_limit_rps: 10000 }}\n"
+    ))
+    .unwrap();
+    let mut with_registry = config.clone();
+    with_registry.schema_registry = Some(
+        serde_yaml::from_str(
+            "url: http://unused\nauth: { type: oauth, provider: idp, target_sr_cluster: lsrc-1 }\n\
+             connection: { max_retries: 1, retry_backoff_ms: 1, rate_limit_rps: 10000 }\n",
+        )
+        .unwrap(),
+    );
+    kafka_backup_core::oauth::install(&mut with_registry).unwrap();
+    tracing::trace!(config = ?with_registry, "config with registry");
+    let bearer_auth = with_registry.schema_registry.clone().unwrap();
+
+    for auth in [&basic_auth, &bearer_auth] {
+        let (source_server, source) = FakeSchemaRegistry::start().await;
+        source.seed("orders-value", 1, 1, Schema::avro("\"string\""));
+        // A working round trip.
+        let (target_server, _target) = FakeSchemaRegistry::start().await;
+        registry_round_trip(auth, &source_server.uri(), &target_server.uri()).await;
+        // A registry that rejects the credentials (backup and restore), a
+        // restore whose registration fails, and an unreachable registry.
+        let (denied_server, denied) = FakeSchemaRegistry::start().await;
+        denied.fail_once("GET", "/subjects", 401, 40101);
+        denied.fail_once("GET", "/subjects", 401, 40101);
+        registry_round_trip(auth, &denied_server.uri(), &denied_server.uri()).await;
+        let (failing_server, failing) = FakeSchemaRegistry::start().await;
+        failing.fail_once("POST", "/subjects/orders-value/versions", 500, 50001);
+        registry_round_trip(auth, &source_server.uri(), &failing_server.uri()).await;
+        registry_round_trip(auth, "http://127.0.0.1:1", "http://127.0.0.1:1").await;
+    }
+
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(
         logs.contains("OAuth token fetched"),
@@ -341,9 +420,19 @@ oauth:
             "the failure path of `{provider}` ran:\n{logs}"
         );
     }
+    assert!(
+        logs.contains("Schema Registry backup complete")
+            && logs.contains("Schema Registry backup failed")
+            && logs.contains("Schema Registry restore failed"),
+        "the registry paths ran:\n{logs}"
+    );
     let basic =
         base64::engine::general_purpose::STANDARD.encode(format!("kafka-backup:{CLIENT_SECRET}"));
+    let registry_basic =
+        base64::engine::general_purpose::STANDARD.encode(format!("{SR_API_KEY}:{SR_API_SECRET}"));
     for forbidden in [
+        SR_API_SECRET,
+        registry_basic.as_str(),
         ACCESS_TOKEN,
         "TOKEN-SIGNATURE-7f3a",
         IMDS_TOKEN,

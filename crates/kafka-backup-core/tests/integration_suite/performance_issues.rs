@@ -58,6 +58,7 @@ fn create_continuous_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
@@ -93,6 +94,7 @@ fn create_high_partition_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 

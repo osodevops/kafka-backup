@@ -99,6 +99,7 @@ fn backup_config(bs: &str, storage: PathBuf, include_offset_headers: bool) -> Co
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
@@ -125,6 +126,7 @@ fn restore_config(bs: &str, storage: PathBuf) -> Config {
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 

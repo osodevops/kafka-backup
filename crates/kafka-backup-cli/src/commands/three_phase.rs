@@ -1,6 +1,7 @@
 //! CLI command for three-phase restore operations.
 //!
-//! This command runs the complete three-phase restore:
+//! This command runs the complete three-phase restore, after restoring the
+//! Schema Registry when the configuration has a `schema_registry` section:
 //! - Phase 2: Restore data and collect offset mapping
 //! - Phase 3: Generate and apply consumer group offset resets
 
@@ -20,6 +21,14 @@ pub async fn run(config_path: &str) -> Result<()> {
     let oauth = super::oauth::apply(&mut config)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.source)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.target)?;
+
+    // The Schema Registry comes first: a failure here stops the restore
+    // before a record is produced.
+    super::schema_registry::restore_first(
+        &mut config,
+        kafka_backup_core::schema_registry::run::RestoreScope::BeforeRecords,
+    )
+    .await?;
 
     info!(
         "Starting three-phase restore from backup: {}",

@@ -46,6 +46,7 @@ fn config(broker: &MockBroker, storage: &TempDir, retry_secs: u64, max_wait_ms: 
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 

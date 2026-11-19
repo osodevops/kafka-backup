@@ -64,6 +64,7 @@ fn backup_config(bs: &str, storage: PathBuf) -> Config {
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn restore_config(bs: &str, storage: PathBuf, auto_consumer_groups: bool) -> Con
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 

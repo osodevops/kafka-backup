@@ -330,6 +330,7 @@ async fn sasl_gssapi_backup_restore_roundtrip() {
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
 
     let backup_engine = BackupEngine::new(backup_config)
@@ -379,6 +380,7 @@ async fn sasl_gssapi_backup_restore_roundtrip() {
         restore: Some(restore_opts),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
 
     let restore_engine = RestoreEngine::new(restore_config).expect("RestoreEngine::new");

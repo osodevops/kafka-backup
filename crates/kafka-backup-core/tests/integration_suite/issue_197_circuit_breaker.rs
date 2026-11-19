@@ -523,6 +523,7 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
 
     let engine = RestoreEngine::new(config).expect("engine");

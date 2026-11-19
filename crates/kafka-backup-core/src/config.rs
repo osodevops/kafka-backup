@@ -45,6 +45,11 @@ pub struct Config {
     /// `security.oauth.provider`; [`crate::oauth::install`] wires them up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OauthConfig>,
+
+    /// Confluent Schema Registry to snapshot with a backup, or to restore
+    /// before the records of a restore. See [`crate::schema_registry`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_registry: Option<crate::schema_registry::SchemaRegistryConfig>,
 }
 
 /// Metrics server configuration
@@ -1758,6 +1763,9 @@ impl Config {
         }
         if let Some(target) = &self.target {
             target.connection.validate()?;
+        }
+        if let Some(schema_registry) = &self.schema_registry {
+            schema_registry.validate()?;
         }
 
         // Storage config validation is handled by StorageBackendConfig's typed enum

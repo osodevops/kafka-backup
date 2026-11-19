@@ -1,0 +1,104 @@
+name: Schema Registry E2E
+
+# Schema Registry backup and restore against real Confluent Schema Registry
+# (issue #262), for every supported version:
+#
+# - the real-registry suite (preserve_ids, into_existing, conflicts,
+#   rewrite_ids, interruption and resume; the expected refusal on 6.2);
+# - the end-to-end test with independent clients: records produced with the
+#   official Confluent serializers (Avro, JSON Schema, Protobuf), backed up
+#   and restored with the CLI into a second cluster and an empty registry,
+#   and read back with the official deserializers.
+#
+# Runs on pull requests that touch the Schema Registry code, and by hand.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/schema-registry-e2e.yml'
+      - 'crates/kafka-backup-core/src/schema_registry/**'
+      - 'crates/kafka-backup-core/src/oauth/registry_auth.rs'
+      - 'crates/kafka-backup-core/src/restore/**'
+      - 'crates/kafka-backup-core/tests/schema_registry_real.rs'
+      - 'crates/kafka-backup-cli/src/commands/schema_registry.rs'
+      - 'crates/kafka-backup-cli/src/commands/backup.rs'
+      - 'crates/kafka-backup-cli/src/commands/restore.rs'
+      - 'crates/kafka-backup-cli/src/commands/three_phase.rs'
+      - 'crates/kafka-backup-cli/src/commands/validate_restore.rs'
+      - 'tests/schema-registry-test-infra/**'
+  workflow_dispatch:
+
+concurrency:
+  group: schema-registry-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-registry:
+    name: Schema Registry ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 6.2 cannot delete mode overrides: into_existing is refused there.
+          - version: 6.2.0
+            extension: ''
+          - version: 7.6.0
+            extension: ''
+          - version: 7.9.2
+            extension: ''
+          # A stored ruleSet needs the rule-set extension, which 8.x ships.
+          - version: 8.1.1
+            extension: io.confluent.kafka.schemaregistry.rulehandler.RuleSetResourceExtension
+          - version: 8.3.1
+            extension: io.confluent.kafka.schemaregistry.rulehandler.RuleSetResourceExtension
+    env:
+      SR_VERSION: ${{ matrix.version }}
+      SR_RESOURCE_EXTENSION: ${{ matrix.extension }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-schema-registry-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-schema-registry-e2e-
+
+      - name: Build the CLI and the test binary
+        run: |
+          cargo build -p kafka-backup-cli
+          cargo test -p kafka-backup-core --test schema_registry_real --no-run
+
+      - name: Start two Kafka clusters and the registries
+        run: docker compose -f tests/schema-registry-test-infra/docker-compose.yml up -d --wait
+
+      - name: Run the real-registry suite
+        run: cargo test -p kafka-backup-core --test schema_registry_real -- --ignored --nocapture --test-threads=1
+
+      - name: Run the end-to-end test with the official Confluent clients
+        run: tests/schema-registry-test-infra/e2e/run.sh
+
+      - name: Registry and broker logs
+        if: failure()
+        run: docker compose -f tests/schema-registry-test-infra/docker-compose.yml logs --tail 200
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f tests/schema-registry-test-infra/docker-compose.yml down -v

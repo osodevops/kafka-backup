@@ -334,6 +334,7 @@ impl ErrorType {
             crate::Error::Preflight(_) => ErrorType::Unknown,
             crate::Error::Evidence(_) => ErrorType::Unknown,
             crate::Error::Notification(_) => ErrorType::Unknown,
+            crate::Error::SchemaRegistry(_) => ErrorType::Unknown,
         }
     }
 

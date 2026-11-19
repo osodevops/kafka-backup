@@ -35,6 +35,7 @@ Need support, an SLA or Enterprise features? See [Kafka Backup Enterprise](https
 - **Multi-cloud storage** — S3, Azure Blob, GCS, or local filesystem
 - **Point-in-time recovery** — Restore to any millisecond within your backup window
 - **Consumer offset recovery** — Automatically reset consumer group offsets after restore
+- **Schema Registry backup and restore** — Confluent Schema Registry (self-managed or Confluent Cloud) is snapshotted with the topics and restored first, so records keep their original schema IDs
 - **Compliance evidence** — Signed JSON/PDF reports for SOX, CMMC, and GDPR auditors
 - **High performance** — 100+ MB/s throughput with zstd/lz4 compression
 - **Incremental backups** — Resume from where you left off
@@ -454,6 +455,33 @@ Providers: `oidc_client_credentials`, `azure_managed_identity` (Azure VMs),
 [OAuth guide](docs/oauth.md) for every option and a Confluent Cloud and Entra
 ID walkthrough.
 
+### Schema Registry
+
+Records written with the Confluent serializers carry a schema ID. Add a
+`schema_registry` section and the registry is snapshotted with the topics
+and restored before the records, with the original schema IDs:
+
+```yaml
+schema_registry:
+  url: https://schema-registry.example.com
+  auth:
+    type: basic            # none | basic | mtls | oauth
+    username: ${SR_USERNAME}
+    password: ${SR_PASSWORD}
+  restore:
+    strategy: preserve_ids # into_existing for a registry that already has schemas
+```
+
+```bash
+kafka-backup backup --schema-only --config backup.yaml             # the registry only
+kafka-backup validate-restore --schema-only --config restore.yaml  # the plan, nothing changed
+kafka-backup restore --config restore.yaml                         # the registry, then the records
+```
+
+See the [Schema Registry guide](docs/schema-registry.md) for the restore
+strategies, conflict handling (`rewrite_ids`), Confluent Cloud and the
+tested registry versions.
+
 ### Optional: SASL/GSSAPI (Kerberos) support
 
 GSSAPI authentication is gated behind the `gssapi` Cargo feature so the default
@@ -527,8 +555,7 @@ kafka-backup/
 | | GDPR Compliance Tools (right-to-be-forgotten, PII masking) |
 | | Audit Logging (comprehensive trail of all backup/restore ops) |
 | | Role-Based Access Control (granular permissions) |
-| **Advanced Integrations** | Schema Registry Integration (backup & restore schemas with ID remapping) |
-| | Secrets Management (Vault / AWS Secrets Manager integration) |
+| **Advanced Integrations** | Secrets Management (Vault / AWS Secrets Manager integration) |
 | **Scale & Operations** | Multi-Region Replication (active-active disaster recovery) |
 | | Log Shipping (Datadog, Splunk, Grafana Loki) |
 | | Advanced Metrics & Dashboard (throughput, latency, drill-down UI) |

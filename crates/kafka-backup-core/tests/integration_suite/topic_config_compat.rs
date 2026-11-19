@@ -148,6 +148,7 @@ async fn restore(
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
     tokio::time::timeout(
         Duration::from_secs(90),

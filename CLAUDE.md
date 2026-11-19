@@ -35,6 +35,7 @@ kafka-backup/
 │   │       ├── circuit_breaker.rs
 │   │       ├── health.rs
 │   │       ├── oauth/            # SASL/OAUTHBEARER: token providers, cache, plugin
+│   │       ├── schema_registry/  # Confluent Schema Registry backup + restore (original schema IDs)
 │   │       └── metrics/          # Prometheus metrics
 │   └── kafka-backup-cli/         # Binary CLI wrapper
 │       └── src/
@@ -270,6 +271,11 @@ kafka-backup offset-reset execute --path s3://bucket --backup-id backup-001 --gr
 
 # Three-phase restore (backup + restore + offset reset)
 kafka-backup three-phase-restore --config restore.yaml
+
+# Schema Registry only (the `schema_registry` section; no Kafka connection)
+kafka-backup backup --schema-only --config backup.yaml
+kafka-backup restore --schema-only --config restore.yaml
+kafka-backup validate-restore --schema-only --config restore.yaml   # the plan, nothing changed
 ```
 
 ## Storage Data Layout
@@ -281,6 +287,8 @@ s3://kafka-backups/
         ├── manifest.json                    # merged on every save
         ├── offsets.db                       # SQLite offset store; only with continuous: true or offset_storage:
         ├── consumer-groups-snapshot.json    # only with backup.consumer_group_snapshot: true
+        ├── schema-registry/                 # only with a schema_registry section: _status.json, _manifest.json (checksums), subjects/
+        ├── restore/schema-registry-report.json   # written by every registry restore (…report.dry-run.json for a dry run)
         └── topics/
             └── {topic}/
                 └── partition={id}/
@@ -316,6 +324,12 @@ oauth:  # token providers for OAUTHBEARER clusters (docs/oauth.md)
   providers:
     <name>:
       type: oidc_client_credentials | azure_managed_identity | azure_workload_identity | file
+
+schema_registry:  # Confluent Schema Registry: snapshot on backup, restore before the records (0.30.0; docs/schema-registry.md)
+  url: https://schema-registry:8081   # backup config: the source registry; restore config: the target
+  auth: { type: none | basic | mtls | oauth }   # oauth: { provider: <name>, target_sr_cluster, identity_pool_id }
+  backup: { subjects: ["*"], exclude: [], fail_on_partial: false, snapshot_interval: 15m }
+  restore: { strategy: preserve_ids | into_existing, rewrite_ids: false, dry_run: false }
 
 storage:
   backend: s3 | azure | gcs | filesystem | memory
@@ -384,6 +398,7 @@ For exact consumer offset recovery:
 | `docs/configuration.md` | Complete config reference |
 | `docs/storage_guide.md` | Storage backend setup |
 | `docs/oauth.md` | OAuth (SASL/OAUTHBEARER) providers, token cache, Confluent Cloud + Entra ID |
+| `docs/schema-registry.md` | Schema Registry backup/restore: strategies, mode guard, report, tested versions |
 | `docs/restore_guide.md` | Restore examples |
 | `docs/Three_Phase_Restore_Guide.md` | Offset recovery system |
 | `docs/Offset_Remapping_Deep_Dive.md` | Offset mapping technical details |
@@ -410,6 +425,25 @@ before any engine or client is built. A new connecting command must do the
 same; `tests/oauth_cli_test.rs` lists the commands (`CONNECTING_COMMANDS`).
 Never log or `Debug`-print a token or `Secret` value
 (`tests/oauth_redaction_test.rs` checks every log line at TRACE).
+
+### Schema Registry wiring
+`backup`, `restore`, `three-phase-restore` and `validate-restore` go through
+`commands::schema_registry` (CLI) and `kafka_backup_core::schema_registry::run`
+(core). The registry is restored **before** any Kafka client is built for the
+records; a registry failure must stop the command before a record is produced
+(`tests/schema_registry_cli.rs` counts Kafka connections). `oauth::apply` runs
+first: it attaches the shared token cache to `schema_registry.auth`.
+Only reads are retried; a write is sent once. Never weaken the mode guard:
+every mode the restore changes is put back on success, failure and
+cancellation, and a mode someone else changed is left alone.
+
+Tests: `--test schema_registry_tests` (mocked, in CI's unit job),
+`tests/schema_registry_cli.rs`, and the `#[ignore]` real-registry suite
+`--test schema_registry_real` plus `tests/schema-registry-test-infra/e2e/run.sh`
+(official Confluent clients), both run per registry version by
+`.github/workflows/schema-registry-e2e.yml` and locally by
+`tests/schema-registry-test-infra/matrix.sh`. Do not name a test in the core
+integration suite with `tls` or `sasl_` in its path: CI skips those.
 
 ### Adding Compression Algorithm
 1. Add to `CompressionAlgorithm` enum in `compression.rs`

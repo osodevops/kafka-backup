@@ -101,6 +101,10 @@ zeroize.workspace = true
 humantime.workspace = true
 rand.workspace = true
 
+# Schema Registry backup and restore
+glob.workspace = true
+urlencoding.workspace = true
+
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature.
 # Requires krb5 dev headers at build time (libkrb5-dev / krb5-devel /
 # `brew install krb5` on macOS).

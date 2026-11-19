@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-11-19
+
+### Added
+- **Schema Registry backup and restore with original schema IDs** ([#262](https://github.com/osodevops/kafka-backup/issues/262)). A Confluent Schema Registry, self-managed or Confluent Cloud, is snapshotted next to the topic data and restored before the records, so every restored record still resolves to its schema under its original schema ID. This is the implementation from Kafka Backup Enterprise, now part of the open-source tool with no licence check. See [docs/schema-registry.md](docs/schema-registry.md).
+  - A new top-level `schema_registry` section: `url`; `auth` (`none`, `basic` including a Confluent Cloud API key and secret, `mtls`, or `oauth` with a provider from `oauth.providers`); `tls.ca_cert`; `connection` (timeout, retries, backoff, rate limit); `backup`; `restore`.
+  - **Backup.** Subjects are selected with include and exclude globs, all versions or only the latest. For each version: the schema and its type (Avro, JSON Schema, Protobuf), its original ID and version number, its references with exact versions, and `metadata` and `ruleSet` verbatim. Soft-deleted subjects and versions, and referenced schemas outside the filter, are captured by default. Schema contexts are supported. Global, per-context and per-subject compatibility and mode are captured. The snapshot is stored under `{backup_id}/schema-registry/` with a manifest that holds a SHA-256 for every object, and a completeness marker.
+  - The registry is snapshotted with every one-shot backup (also when the topic data backup failed), and at start, every `schema_registry.backup.snapshot_interval` (default 15m) and at shutdown of a continuous backup. `backup --schema-only` snapshots it without connecting to Kafka.
+  - **Restore.** `restore` and `three-phase-restore` restore the registry before the records; any registry failure stops the command before a record is produced. `restore --schema-only` restores the registry on its own.
+    - `strategy: preserve_ids` (default) needs an empty target: the registry and each context are put in IMPORT mode, every version is registered with its original ID and version number, compatibility and modes are restored. A rerun against a target that already holds the backup changes nothing.
+    - `strategy: into_existing` is for a populated target: the same ID with an identical schema is skipped, a free ID and version is imported under subject-level IMPORT, and an ID or version held by a different schema is a conflict. Conflicts fail the restore before anything is changed. With `rewrite_ids: true` a conflicting schema is registered under a new ID and the IDs in the restored records are rewritten through `restore.rewrite_schema_ids`, limited to the restored topics, on the 1:1 and the repartitioning path.
+    - An existing version is never overwritten. Versions are registered in reference order at version level, ties broken by original ID. Soft-deleted versions are restored with their IDs and soft-deleted again (`restore_soft_deleted`). `subject_mapping` renames subjects, in references too. `max_schema_versions` fails a restore that would exceed the target's version limit before any change.
+    - **Mode guard.** The target's previous global, context and subject modes are put back after success, after a failure and after cancellation (Ctrl-C or SIGTERM). A mode that someone else changed while the restore ran is left as they set it and listed in the report.
+    - After the restore, every restored (subject, version) is checked for its ID, schema, references and deleted state, and subject compatibility and mode are checked against the backup (`verify`). A target that dropped or changed `metadata` or `ruleSet` is reported as a warning.
+    - A JSON report is written to `{backup_id}/restore/schema-registry-report.json` (`schema-registry-report.dry-run.json` for a dry run), on failure too.
+  - **Dry run.** `validate-restore` shows what would be registered, skipped, rewritten or in conflict, includes it in its JSON and YAML output under `schema_registry`, and fails on a conflict. `validate-restore --schema-only` shows the plan without Kafka. Neither changes the registry or writes a report. `restore.dry_run` or `schema_registry.restore.dry_run` makes the whole `restore` a dry run.
+  - **OAuth for the registry.** `auth: { type: oauth, provider, target_sr_cluster, identity_pool_id }` sends a bearer token and Confluent Cloud's `target-sr-cluster` and `Confluent-Identity-Pool-Id` headers. The registry client uses the same token cache as every Kafka cluster bound to the provider, so one token request serves both; a 401 fetches a new token once. This completes the Schema Registry part of [#261](https://github.com/osodevops/kafka-backup/issues/261).
+- `kafka_backup_core::schema_registry`: `SchemaRegistryConfig`, `SchemaRegistryClient`, `SchemaRegistryBackup`, `SchemaRegistryRestore` (with `run_with_cancel`), the `snapshot` integrity checks, and `run::snapshot`, `run::restore` and `run::preview`, which are what the commands call.
+- `tests/schema-registry-test-infra`: a compose stack (two Kafka clusters, three registries), an end-to-end test that produces with the official Confluent serializers (Avro including a top-level `bytes` schema, JSON Schema, Protobuf with nested messages; tombstones, null keys, headers; lz4, zstd and gzip topics) and reads the restored records back with the official deserializers pointed only at the target registry, and `matrix.sh`, which runs it and the real-registry suite for Confluent Schema Registry 6.2.0, 7.6.0, 7.9.2, 8.1.1 and 8.3.1. The `Schema Registry E2E` workflow runs the same matrix on pull requests that touch this code.
+
+### Changed
+- `oauth::install` also attaches the provider's token cache to `schema_registry.auth` when its type is `oauth`, and fails before anything connects when that provider is not defined.
+- `restore`, `three-phase-restore` and `validate-restore` read a `schema_registry` section. Configurations without one behave as before.
+- **Breaking for Rust code**, hence the minor version: `Config` gains the public field `schema_registry` (default `None`), which breaks struct literals, and `Error` gains the variant `SchemaRegistry`, which breaks exhaustive matches.
+
+### Security
+- Registry passwords, API secrets and bearer tokens never appear in logs, `Debug` output or serialised configuration. The log-redaction test now runs a registry backup and restore with basic and bearer authentication, including the failure paths, at TRACE.
+- Only reads are retried (after a 429, a 5xx or a connection error). A write is sent once, because a failed write may still have been applied.
+- A restore verifies the snapshot's completeness marker and every checksum before it touches the target, and refuses an incomplete or altered snapshot.
+
+### Known limits
+- Not verified against Confluent Cloud yet; tested against self-managed Confluent Schema Registry only. Reports are welcome on [#262](https://github.com/osodevops/kafka-backup/issues/262).
+- Confluent Platform 6.2 cannot delete mode overrides, so a restore that needs a temporary IMPORT mode on a subject with an inherited mode is refused before any change. That covers `into_existing`. A `preserve_ids` restore into an empty 6.2 registry works.
+- A restore process that is killed outright (SIGKILL) cannot put the modes back; the guide says how to recover.
+- Apicurio Registry, the DEK Registry, and running data contract rules (for example CSFLE) on restored records are not supported. Subject ACLs and role bindings are not part of the snapshot.
+
+### Migrating from Kafka Backup Enterprise
+- Move `enterprise.schema_registry` to the top-level `schema_registry` section, and `enterprise.snapshot_interval` to `schema_registry.backup.snapshot_interval`. Backups written by Enterprise restore with this release.
+- Unknown keys in the section are now errors. Removed keys: `connection.concurrent_requests` (it was not used), `restore.enabled` (use `schema_registry.enabled: false`), the restore strategy values `preserve` and `skip` (use `into_existing`), and the inline OAuth form in `auth` (`token_url`, `client_id`, `client_secret`, `scope`): define the client under `oauth.providers`, with `client_auth: post` to keep sending the credentials in the form body, and name it with `provider`. `mtls` needs both `client_cert` and `client_key`.
+- A restore configuration with a `schema_registry` section and no `restore` subsection now restores the registry with the defaults. In Enterprise it did not.
+- With `fail_on_partial: false` (the default) a failed registry snapshot no longer fails the `backup` command by itself: it is logged as an error and the snapshot is marked incomplete. Set `fail_on_partial: true` to fail the backup. `backup --schema-only` always fails.
+- No licence is needed, and nothing exits with status 2.
+- Not included: `enterprise.registry_restore` and its serializer profiles, Apicurio Registry, the DEK Registry and CSFLE, Confluent RBAC and authorization recovery, erasure, and the MSK migration.
+
 ## [0.29.0] - 2026-11-19
 
 ### Added

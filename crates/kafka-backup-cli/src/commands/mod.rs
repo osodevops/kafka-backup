@@ -12,6 +12,7 @@ pub mod offset_rollback;
 pub mod prune;
 pub mod restore;
 pub mod sasl_plugin;
+pub mod schema_registry;
 pub mod security_args;
 pub mod snapshot_groups;
 pub mod status;

@@ -84,6 +84,7 @@ fn backup_config(bs: &str, storage: PathBuf) -> Config {
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
@@ -110,6 +111,7 @@ fn restore_config(bs: &str, storage: PathBuf, target: &str, restore: RestoreOpti
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 

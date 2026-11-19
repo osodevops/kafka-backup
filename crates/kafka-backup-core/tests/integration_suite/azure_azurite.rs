@@ -322,6 +322,7 @@ async fn azurite_backup_and_restore_round_trip() {
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
     tokio::time::timeout(
         Duration::from_secs(90),
@@ -360,6 +361,7 @@ async fn azurite_backup_and_restore_round_trip() {
         }),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     };
     let engine = RestoreEngine::new(restore).expect("restore engine");
     let report = tokio::time::timeout(Duration::from_secs(90), engine.run())

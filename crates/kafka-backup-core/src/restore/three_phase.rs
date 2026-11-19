@@ -490,6 +490,7 @@ mod tests {
             restore: None,
             offset_storage: None,
             metrics: None,
+            schema_registry: None,
         }
     }
 

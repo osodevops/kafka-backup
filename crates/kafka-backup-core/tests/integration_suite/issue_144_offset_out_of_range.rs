@@ -73,6 +73,7 @@ fn snapshot_backup_config(
             ..Default::default()
         }),
         metrics: None,
+        schema_registry: None,
     }
 }
 

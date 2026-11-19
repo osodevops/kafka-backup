@@ -180,6 +180,7 @@ pub fn create_backup_config(
         restore: None,
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
@@ -209,6 +210,7 @@ pub fn create_restore_config(
         restore: Some(RestoreOptions::default()),
         offset_storage: None,
         metrics: None,
+        schema_registry: None,
     }
 }
 
