@@ -37,6 +37,7 @@ const SOURCE_COMMITS: [(i32, i64); 3] = [(0, 5), (1, 12), (2, 20)];
 
 fn backup_config(bs: &str, storage: PathBuf) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(KafkaConfig {
@@ -70,6 +71,7 @@ fn restore_config(bs: &str, storage: PathBuf, auto_consumer_groups: bool) -> Con
     let mut topic_mapping = HashMap::new();
     topic_mapping.insert(SOURCE_TOPIC.to_string(), TARGET_TOPIC.to_string());
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

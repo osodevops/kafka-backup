@@ -45,6 +45,7 @@ fn backup_cfg(
     opts: BackupOptions,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -67,6 +68,7 @@ fn backup_cfg(
 
 fn restore_cfg(bs: &str, storage_path: PathBuf, backup_id: &str, opts: RestoreOptions) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

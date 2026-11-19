@@ -396,8 +396,9 @@ impl KafkaClient {
                 ))
             }
             Some(SaslMechanism::OAuthBearer) => {
-                // OAUTHBEARER needs a token provider, which this crate does
-                // not ship: it only works through a plugin factory.
+                // OAUTHBEARER works through a plugin factory, installed
+                // from the `security.oauth` binding by `oauth::install`.
+                // Reaching here means nothing installed one.
                 Err(crate::Error::Authentication(
                     crate::config::OAUTHBEARER_REQUIRES_PLUGIN.to_string(),
                 ))

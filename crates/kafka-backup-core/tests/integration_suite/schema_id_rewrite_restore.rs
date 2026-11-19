@@ -291,6 +291,7 @@ fn restore_config(
     }
     tweak(&mut restore);
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,
@@ -599,6 +600,7 @@ async fn schema_ids_are_rewritten_on_both_paths_against_kafka() {
     let storage = create_temp_storage();
     let backup_id = "schema-ids-docker";
     let backup = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -657,6 +659,7 @@ async fn schema_ids_are_rewritten_on_both_paths_against_kafka() {
             )]);
         }
         let config = Config {
+            oauth: None,
             mode: Mode::Restore,
             backup_id: backup_id.to_string(),
             source: None,

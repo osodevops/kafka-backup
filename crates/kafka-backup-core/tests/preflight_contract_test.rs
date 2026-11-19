@@ -226,6 +226,7 @@ async fn scan(
 
 fn restore_config(dir: &Path, options: RestoreOptions) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

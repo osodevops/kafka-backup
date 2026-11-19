@@ -130,6 +130,7 @@ async fn restore(
     policy: UnsupportedConfigPolicy,
 ) -> kafka_backup_core::Result<RestoreReport> {
     let config = Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

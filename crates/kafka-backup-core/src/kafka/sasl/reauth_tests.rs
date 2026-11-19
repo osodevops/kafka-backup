@@ -398,7 +398,7 @@ async fn rejected_reauth_reconnects_with_full_handshake() {
 /// `sasl_mechanism: OAUTHBEARER` without a plugin factory fails with an
 /// error that says what is missing.
 #[tokio::test]
-async fn oauthbearer_without_plugin_names_enterprise_or_a_plugin() {
+async fn oauthbearer_without_plugin_says_how_to_configure_a_provider() {
     let mock = MockBroker::start(&[]).await;
     let config = KafkaConfig {
         bootstrap_servers: vec![mock.addr.to_string()],
@@ -416,10 +416,10 @@ async fn oauthbearer_without_plugin_names_enterprise_or_a_plugin() {
         .expect_err("no plugin installed")
         .to_string();
     assert!(
-        err.contains(
-            "SASL OAUTHBEARER requires Kafka Backup Enterprise (licence feature `oauth`) \
-             or a custom SaslMechanismPlugin"
-        ),
+        err.contains("SASL OAUTHBEARER needs a token provider")
+            && err.contains("oauth.providers")
+            && err.contains("security.oauth.provider")
+            && err.contains("custom SaslMechanismPlugin"),
         "{err}"
     );
     assert_eq!(mock.state.handshakes.load(Ordering::SeqCst), 0);

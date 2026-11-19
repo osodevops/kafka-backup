@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.28.1"
+version = "0.29.0"
 edition = "2021"
 license = "MIT"
 authors = ["OSO"]
@@ -102,6 +102,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # UUID (validation run IDs)
 uuid = { version = "1", features = ["v4"] }
 
+# OAuth (SASL/OAUTHBEARER token providers)
+oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
+http = "1"
+zeroize = "1.6"
+humantime = "2"
+rand = "0.8"
+
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature in core/cli
 libgssapi = "0.9"
 
@@ -113,6 +120,7 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["kafka"] }
 tempfile = "3"
 tokio-test = "0.4"
+wiremock = "0.6"
 
 # Internal crates
 kafka-backup-core = { path = "crates/kafka-backup-core" }

@@ -20,6 +20,9 @@
 //! - Issue #173: restore Prometheus metrics and progress events (no Docker)
 //! - Issue #197: circuit-breaker config + scoped connection eviction
 //! - Offset mapping across gaps: groups resume on the next unconsumed record
+//! - OAuth (no Docker): token providers against a mock identity provider,
+//!   OAUTHBEARER from configuration to the wire against the mock broker,
+//!   bearer authentication for a Schema Registry client
 //! - Restore produce path (mock broker, no Docker): idempotent produce with
 //!   byte-identical retries, the fallback, byte-capped batches, the
 //!   max.message.bytes pre-check
@@ -53,6 +56,9 @@ pub mod issue_56_missing_topic;
 pub mod issue_57_incremental_snapshot_target;
 pub mod issue_67_fixes;
 pub mod kafka_fault_proxy;
+pub mod oauth_kafka_mock;
+pub mod oauth_providers;
+pub mod oauth_registry;
 pub mod offset_mapping_gaps;
 pub mod offset_semantics;
 pub mod performance_issues;

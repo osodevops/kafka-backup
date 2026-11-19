@@ -111,9 +111,10 @@ pub type SaslMechanismPluginHandle = Arc<dyn SaslMechanismPlugin>;
 
 /// The pluggable SASL mechanism trait.
 ///
-/// Implementors live in downstream crates (notably
-/// `kafka-backup-enterprise-core` for `OAUTHBEARER` / MSK IAM). See the
-/// module-level docs for the handshake loop the client uses.
+/// Implemented in this crate for `OAUTHBEARER`
+/// ([`crate::oauth::OauthBearerPlugin`]) and, with the `gssapi` feature,
+/// for Kerberos; downstream crates can add their own (MSK IAM, say). See
+/// the module-level docs for the handshake loop the client uses.
 #[async_trait]
 pub trait SaslMechanismPlugin: Send + Sync + std::fmt::Debug {
     /// The SASL mechanism name as advertised in the `SaslHandshake`

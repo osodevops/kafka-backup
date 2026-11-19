@@ -34,6 +34,7 @@ kafka-backup/
 │   │       ├── error.rs          # Error types
 │   │       ├── circuit_breaker.rs
 │   │       ├── health.rs
+│   │       ├── oauth/            # SASL/OAUTHBEARER: token providers, cache, plugin
 │   │       └── metrics/          # Prometheus metrics
 │   └── kafka-backup-cli/         # Binary CLI wrapper
 │       └── src/
@@ -264,6 +265,8 @@ kafka-backup validate --config backup.yaml --deep
 # Offset management
 kafka-backup offset-reset plan --path s3://bucket --backup-id backup-001 --groups my-group
 kafka-backup offset-reset execute --path s3://bucket --backup-id backup-001 --groups my-group
+kafka-backup offset-reset execute --path s3://bucket --backup-id backup-001 --groups my-group \
+  --config restore.yaml --cluster target   # cluster + security (incl. OAuth) from a config file
 
 # Three-phase restore (backup + restore + offset reset)
 kafka-backup three-phase-restore --config restore.yaml
@@ -302,10 +305,17 @@ source:  # For backup
   sasl_mechanism: SCRAM-SHA-512
   sasl_username: user
   sasl_password: ${KAFKA_PASSWORD}
+  # OAuth instead (0.29.0): sasl_mechanism: OAUTHBEARER plus
+  #   security: { oauth: { provider: <name>, extensions: { logicalCluster: lkc-... } } }
 
 target:  # For restore
   bootstrap_servers: ["kafka-dr:9092"]
   # Same auth options as source
+
+oauth:  # token providers for OAUTHBEARER clusters (docs/oauth.md)
+  providers:
+    <name>:
+      type: oidc_client_credentials | azure_managed_identity | azure_workload_identity | file
 
 storage:
   backend: s3 | azure | gcs | filesystem | memory
@@ -373,6 +383,7 @@ For exact consumer offset recovery:
 | `docs/restore_prd_v1.md` | Restore feature spec |
 | `docs/configuration.md` | Complete config reference |
 | `docs/storage_guide.md` | Storage backend setup |
+| `docs/oauth.md` | OAuth (SASL/OAUTHBEARER) providers, token cache, Confluent Cloud + Entra ID |
 | `docs/restore_guide.md` | Restore examples |
 | `docs/Three_Phase_Restore_Guide.md` | Offset recovery system |
 | `docs/Offset_Remapping_Deep_Dive.md` | Offset mapping technical details |
@@ -391,6 +402,14 @@ For exact consumer offset recovery:
 2. Add variant to `StorageBackendConfig` enum
 3. Update `create_backend()` factory function
 4. Add configuration parsing in `config.rs`
+
+### OAuth wiring
+Every command that connects to Kafka calls `commands::oauth::apply(&mut config)`
+(or `apply_cluster`) right after parsing, before `populate_sasl_plugin` and
+before any engine or client is built. A new connecting command must do the
+same; `tests/oauth_cli_test.rs` lists the commands (`CONNECTING_COMMANDS`).
+Never log or `Debug`-print a token or `Secret` value
+(`tests/oauth_redaction_test.rs` checks every log line at TRACE).
 
 ### Adding Compression Algorithm
 1. Add to `CompressionAlgorithm` enum in `compression.rs`

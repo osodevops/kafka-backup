@@ -422,6 +422,38 @@ cargo test
 RUST_LOG=debug cargo run -p kafka-backup-cli -- --help
 ```
 
+### OAuth (SASL/OAUTHBEARER)
+
+Clusters that authenticate clients with OAuth 2.0 / OIDC tokens, such as
+Confluent Cloud with identity pools or self-managed Kafka backed by Microsoft
+Entra ID, Okta or Keycloak, need no API key or stored password. Name a token
+provider in the `oauth` section and bind the cluster to it:
+
+```yaml
+source:
+  bootstrap_servers: ["pkc-xxxxx.westeurope.azure.confluent.cloud:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+    oauth:
+      provider: entra-backup
+      extensions: { logicalCluster: lkc-abc123 }
+
+oauth:
+  providers:
+    entra-backup:
+      type: oidc_client_credentials
+      token_endpoint_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+      client_id: <app id>
+      client_secret: ${ENTRA_BACKUP_CLIENT_SECRET}
+      scope: api://<api app id>/.default
+```
+
+Providers: `oidc_client_credentials`, `azure_managed_identity` (Azure VMs),
+`azure_workload_identity` (AKS) and `file`. See the
+[OAuth guide](docs/oauth.md) for every option and a Confluent Cloud and Entra
+ID walkthrough.
+
 ### Optional: SASL/GSSAPI (Kerberos) support
 
 GSSAPI authentication is gated behind the `gssapi` Cargo feature so the default
@@ -497,7 +529,6 @@ kafka-backup/
 | | Role-Based Access Control (granular permissions) |
 | **Advanced Integrations** | Schema Registry Integration (backup & restore schemas with ID remapping) |
 | | Secrets Management (Vault / AWS Secrets Manager integration) |
-| | SSO / OIDC (Okta, Azure AD, Google Auth) |
 | **Scale & Operations** | Multi-Region Replication (active-active disaster recovery) |
 | | Log Shipping (Datadog, Splunk, Grafana Loki) |
 | | Advanced Metrics & Dashboard (throughput, latency, drill-down UI) |

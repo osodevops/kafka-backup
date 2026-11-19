@@ -157,6 +157,7 @@ pub fn create_backup_config(
     topics: Vec<String>,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -190,6 +191,7 @@ pub fn create_restore_config(
     topics: Vec<String>,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

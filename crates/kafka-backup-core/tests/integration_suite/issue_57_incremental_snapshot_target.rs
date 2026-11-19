@@ -30,6 +30,7 @@ const PARTITIONS: usize = 3; // KafkaTestCluster::create_topic creates 3 partiti
 
 fn snapshot_config(bootstrap: &str, storage: &TempDir, offset_db: &Path) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(KafkaConfig {

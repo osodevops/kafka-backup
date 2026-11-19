@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-11-19
+
+### Added
+- **OAuth 2.0 / OIDC authentication for Kafka (SASL/OAUTHBEARER)** ([#261](https://github.com/osodevops/kafka-backup/issues/261)). Kafka Backup can connect to clusters that validate OAuth tokens, such as Confluent Cloud with identity pools or self-managed Kafka backed by Microsoft Entra ID, Okta or Keycloak, with no API key or long-lived password. This is the implementation from Kafka Backup Enterprise, now part of the open-source tool with no licence check. See [docs/oauth.md](docs/oauth.md).
+  - Token providers are named under a new top-level `oauth.providers` section: `oidc_client_credentials` (`token_endpoint_url` or an OIDC `issuer` to discover it from, `client_secret_basic` or `client_secret_post`, `scope`, `audience`, extra form parameters, a private CA), `azure_managed_identity` (IMDS; system- or user-assigned), `azure_workload_identity` (AKS; the projected token file is re-read on every refresh) and `file` (a token kept fresh by another process; expiry from a second file or the JWT `exp` claim).
+  - A cluster binds to a provider with `security.oauth: { provider, extensions }`. `source` and `target` bind independently, so backup and restore can run as different identities. `extensions` carries Confluent Cloud's `logicalCluster` and `identityPoolId` (a comma-separated list is allowed; leave it out for automatic pool mapping), checked against RFC 7628 before they are sent.
+  - One token cache per provider, shared by every broker connection: a single request in flight, refresh at 80 % of the lifetime or 5 minutes before expiry (`oauth.cache`), the current token kept in use while the identity provider is unavailable, with exponential backoff and a last attempt before expiry. Every SASL handshake gets a token with at least 60 s left, so KIP-368 re-authentication happens in place without a reconnect. A broker `invalid_token` rejection drops the cached token.
+  - Every command that connects to Kafka applies it: `backup`, `restore`, `three-phase-restore`, `validate-restore`, `snapshot-groups` and `validation run` (which takes `oauth` in its own configuration file).
+  - Metric `kafka_backup_oauth_token_requests_total{provider,kind,outcome}` on the metrics endpoint of `backup`, `restore` and `three-phase-restore`.
+  - A token the cluster refuses is reported with the provider's name and the likely causes: wrong issuer (for example an Entra v1 token), wrong audience, or no matching identity pool.
+- `--config <yaml>` and `--cluster source|target` on `offset-reset execute`, `offset-reset-bulk` and `offset-rollback snapshot | rollback | verify`. The cluster's bootstrap servers and its whole `security:` block (TLS files, SASL credentials, GSSAPI, OAuth) come from a backup or restore configuration file; an explicit `--bootstrap-servers` still overrides the file's list. This is how these commands reach an OAUTHBEARER cluster.
+- `kafka_backup_core::oauth`: `install` / `install_cluster`, the `OauthTokenProvider` trait, `TokenCache`, `OauthBearerPlugin`, `ProviderRegistry`, and `RegistryOauth`, which adds a bearer token and Confluent Cloud's `target-sr-cluster` / `Confluent-Identity-Pool-Id` headers to a Schema Registry request from the same cache. No command uses `RegistryOauth` yet: Schema Registry backup is [#262](https://github.com/osodevops/kafka-backup/issues/262).
+- `tests/sasl-oauth-test-infra/docker-compose-oauth-idp.yml`: an identity provider that signs real JWTs and a Kafka 4.x broker that validates them against its JWKS, issuer and audience and forces re-authentication every 60 s, for the `#[ignore]` suite `oauth_real_broker`.
+
+### Changed
+- `security.oauth` is now the provider binding. It was rejected as an unknown key, with a hint naming Kafka Backup Enterprise. Unknown keys inside `security.oauth` and anywhere under `oauth` are errors.
+- `sasl_mechanism: OAUTHBEARER` without a binding fails before anything connects with "`<cluster>.security.sasl_mechanism is OAUTHBEARER but <cluster>.security.oauth is not set`". It used to fail with "SASL OAUTHBEARER requires Kafka Backup Enterprise". `--sasl-mechanism OAUTHBEARER` on the offset commands, without `--config`, says to use `--config`.
+- `validation run` expands `${ENV_VAR}` references in its configuration file, as every other command does, and installs the GSSAPI plugin for a target that uses Kerberos. An unset variable becomes an empty string, with a warning.
+- **Breaking for Rust code that builds these with a struct literal**, hence the minor version: `Config` and `ValidationConfig` gain the public field `oauth` (default `None`), and `SecurityConfig` gains `oauth` (default `None`; use `..Default::default()`). The text of the constants `OAUTHBEARER_REQUIRES_PLUGIN` and `OAUTH_SETTINGS_HINT` changed.
+
+### Security
+- Client secrets and tokens never appear in logs, `Debug` output or serialised configuration (they are shown as `***`), and error text from the identity provider is scrubbed of secrets and JWT-shaped strings. A test runs every provider at TRACE, including the failure paths, and checks every captured line.
+- Identity-provider calls use `https://` only, unless the host is localhost or `allow_insecure_http` is set. Redirects are not followed. Requests time out after 15 s (5 s to connect) and are retried three times on 429, 5xx and connection errors, honouring `Retry-After`.
+- OAUTHBEARER over `SASL_PLAINTEXT` logs a warning, because bearer tokens then cross the network unencrypted.
+
+### Migrating from Kafka Backup Enterprise
+- Move `enterprise.oauth.providers` and `enterprise.oauth.cache` to the top-level `oauth` section, and each `enterprise.oauth.kafka.<cluster>` entry to `<cluster>.security.oauth`. Provider settings are unchanged.
+- The metric `kafka_backup_enterprise_oauth_token_requests_total` is now `kafka_backup_oauth_token_requests_total`.
+- No licence is needed, and OAuth no longer exits with status 2.
+- Not included: MSK IAM (also OAUTHBEARER, but with SigV4-signed tokens) and Schema Registry authentication (#262).
+
 ## [0.28.1] - 2026-11-17
 
 ### Fixed

@@ -58,6 +58,7 @@ fn backup_config(
     opts: BackupOptions,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(kafka(bs, topic)),
@@ -93,6 +94,7 @@ fn restore_config(
     let mut target_cfg = kafka(bs, topic);
     target_cfg.topics = TopicSelection::default();
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

@@ -478,6 +478,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            oauth: None,
             mode: Mode::Restore,
             backup_id: "test-backup".to_string(),
             source: None,

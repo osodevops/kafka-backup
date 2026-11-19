@@ -11,6 +11,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     let config_content = tokio::fs::read_to_string(config_path).await?;
     let config_content = super::config::expand_env_vars(&config_content);
     let mut config: Config = super::config::parse_config(&config_content)?;
+    let oauth = super::oauth::apply(&mut config)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.target)?;
 
     info!("Starting restore from backup: {}", config.backup_id);
@@ -20,6 +21,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     let prometheus_metrics = Arc::new(PrometheusMetrics::with_max_labels(
         metrics_config.max_partition_labels,
     ));
+    prometheus_metrics.track_oauth(&oauth.caches);
 
     let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
         &metrics_config,

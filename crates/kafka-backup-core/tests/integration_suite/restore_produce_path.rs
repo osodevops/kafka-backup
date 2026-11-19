@@ -137,6 +137,7 @@ pub fn topic_restore_config(
     options: RestoreOptions,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

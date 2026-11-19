@@ -43,6 +43,7 @@ fn snapshot_backup_config(
     topic: &str,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {

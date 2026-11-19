@@ -94,6 +94,13 @@ reqwest.workspace = true
 # UUID (validation run IDs)
 uuid.workspace = true
 
+# OAuth (SASL/OAUTHBEARER token providers)
+oauth2.workspace = true
+http.workspace = true
+zeroize.workspace = true
+humantime.workspace = true
+rand.workspace = true
+
 # SASL/GSSAPI (Kerberos) — optional, enabled by `gssapi` feature.
 # Requires krb5 dev headers at build time (libkrb5-dev / krb5-devel /
 # `brew install krb5` on macOS).
@@ -121,3 +128,4 @@ testcontainers-modules.workspace = true
 tempfile.workspace = true
 tokio-test.workspace = true
 tracing-subscriber.workspace = true
+wiremock.workspace = true

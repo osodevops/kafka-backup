@@ -307,6 +307,7 @@ async fn azurite_backup_and_restore_round_trip() {
     };
 
     let backup = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(kafka(vec![SOURCE.to_string()])),
@@ -345,6 +346,7 @@ async fn azurite_backup_and_restore_round_trip() {
     let mut topic_mapping = HashMap::new();
     topic_mapping.insert(SOURCE.to_string(), TARGET.to_string());
     let restore = Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

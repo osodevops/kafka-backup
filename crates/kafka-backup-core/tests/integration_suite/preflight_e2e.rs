@@ -30,6 +30,7 @@ fn backup_config(
     include_offset_headers: bool,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -76,6 +77,7 @@ fn three_phase_config(
         .insert(source_topic.to_string(), target_topic.to_string());
 
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

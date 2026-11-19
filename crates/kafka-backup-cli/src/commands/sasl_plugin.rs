@@ -6,9 +6,11 @@
 //! that require a plugin (currently just `GSSAPI`), constructs a
 //! factory and sets `security.sasl_mechanism_plugin_factory`.
 //!
-//! `OAUTHBEARER` needs a token provider this binary does not ship: unless
-//! a factory was already installed programmatically, it fails here with
-//! an error naming Kafka Backup Enterprise (licence feature `oauth`).
+//! `OAUTHBEARER` gets its factory from the configuration's `oauth`
+//! section and the cluster's `security.oauth` binding ([`super::oauth`]),
+//! which runs first; reaching here without one (for example
+//! `--sasl-mechanism OAUTHBEARER` without `--config`) is an error that says
+//! how to configure it.
 //!
 //! Binaries built without `--features gssapi` surface a clear runtime
 //! error when the config requests `GSSAPI` — the default build stays
@@ -19,9 +21,7 @@
 //! (`kafka/brokerN.fqdn@REALM`) even on multi-broker clusters.
 
 use anyhow::{anyhow, Result};
-use kafka_backup_core::config::{
-    KafkaConfig, SaslMechanism, SecurityConfig, OAUTHBEARER_REQUIRES_PLUGIN,
-};
+use kafka_backup_core::config::{KafkaConfig, SaslMechanism, SecurityConfig};
 
 /// Inspect the config's SASL mechanism and, if it needs a plugin,
 /// construct a factory and wire it into
@@ -29,12 +29,21 @@ use kafka_backup_core::config::{
 pub fn populate_sasl_plugin(security: &mut SecurityConfig) -> Result<()> {
     match security.sasl_mechanism {
         Some(SaslMechanism::Gssapi) => install_gssapi_plugin(security),
+        // `super::oauth` installs the OAUTHBEARER factory before this runs;
+        // without one there is no token source.
         Some(SaslMechanism::OAuthBearer) if security.sasl_mechanism_plugin_factory.is_none() => {
-            Err(anyhow!(OAUTHBEARER_REQUIRES_PLUGIN))
+            Err(anyhow!(OAUTHBEARER_NEEDS_PROVIDER))
         }
         _ => Ok(()),
     }
 }
+
+/// OAUTHBEARER reached a connection without a token provider (e.g.
+/// `--sasl-mechanism OAUTHBEARER` without `--config`).
+pub const OAUTHBEARER_NEEDS_PROVIDER: &str = "SASL OAUTHBEARER needs a token provider, which \
+     flags cannot describe: pass --config <yaml> --cluster source|target, where the YAML defines \
+     the provider under oauth.providers and binds the cluster with \
+     <cluster>.security.oauth.provider";
 
 /// Convenience wrapper for `Option<KafkaConfig>` config slots.
 pub fn populate_sasl_plugin_opt(kafka: &mut Option<KafkaConfig>) -> Result<()> {
@@ -96,17 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn oauthbearer_without_plugin_names_enterprise() {
+    fn oauthbearer_without_plugin_explains_how_to_configure_a_provider() {
         let mut security = SecurityConfig {
             sasl_mechanism: Some(SaslMechanism::OAuthBearer),
             ..Default::default()
         };
         let msg = format!("{}", populate_sasl_plugin(&mut security).unwrap_err());
-        assert_eq!(
-            msg,
-            "SASL OAUTHBEARER requires Kafka Backup Enterprise (licence feature `oauth`) \
-             or a custom SaslMechanismPlugin"
-        );
+        assert!(msg.contains("oauth.providers"), "{msg}");
+        assert!(msg.contains("security.oauth.provider"), "{msg}");
+        assert!(msg.contains("--config"), "{msg}");
     }
 
     #[test]
@@ -115,7 +122,7 @@ mod tests {
             SaslMechanismPluginFactory, SaslMechanismPluginHandle, SaslPluginError,
         };
 
-        // What Kafka Backup Enterprise installs before this runs.
+        // What `commands::oauth` installs before this runs.
         #[derive(Debug)]
         struct StubFactory;
         impl SaslMechanismPluginFactory for StubFactory {

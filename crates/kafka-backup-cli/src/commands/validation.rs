@@ -16,6 +16,7 @@ use kafka_backup_core::manifest::BackupManifest;
 use kafka_backup_core::notification::pagerduty::PagerDutyNotifier;
 use kafka_backup_core::notification::slack::SlackNotifier;
 use kafka_backup_core::notification::NotificationSender;
+use kafka_backup_core::oauth::KafkaRole;
 use kafka_backup_core::storage::create_backend;
 use kafka_backup_core::validation::config::ValidationConfig;
 use kafka_backup_core::validation::context::ValidationContext;
@@ -27,8 +28,16 @@ use super::storage_path::backend_from_path;
 pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str>) -> Result<()> {
     let config_data = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
+    // `${ENV}` references (OAuth client secrets, SASL passwords), as in
+    // every other command's configuration.
+    let config_data = super::config::expand_env_vars(&config_data);
     let mut config: ValidationConfig =
         serde_yaml::from_str(&config_data).with_context(|| "Failed to parse validation config")?;
+
+    // OAuth and GSSAPI for the target cluster, before anything connects.
+    let oauth = config.oauth.clone();
+    super::oauth::apply_cluster(oauth.as_ref(), KafkaRole::Target, &mut config.target)?;
+    super::sasl_plugin::populate_sasl_plugin(&mut config.target.security)?;
 
     // Override from CLI args
     if let Some(ts) = pitr {

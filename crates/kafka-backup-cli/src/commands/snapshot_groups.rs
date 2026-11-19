@@ -44,6 +44,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     let config_content = tokio::fs::read_to_string(config_path).await?;
     let config_content = super::config::expand_env_vars(&config_content);
     let mut config: Config = super::config::parse_config(&config_content)?;
+    super::oauth::apply(&mut config)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.source)?;
 
     if config.mode != Mode::Backup {

@@ -1,0 +1,81 @@
+name: OAuth E2E
+
+# OAUTHBEARER against a real identity provider and a Kafka broker that
+# validates its tokens (issue #261): backup and restore with checksums, a
+# refused issuer and audience, the re-authentication soak, an identity
+# provider outage and a principal change.
+#
+# Runs on pull requests that touch OAuth; run it by hand with
+# soak_seconds=1800 for the 30-minute acceptance soak.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/oauth-e2e.yml'
+      - 'crates/kafka-backup-core/src/oauth/**'
+      - 'crates/kafka-backup-core/src/kafka/sasl/**'
+      - 'crates/kafka-backup-core/src/kafka/client.rs'
+      - 'crates/kafka-backup-cli/src/commands/oauth.rs'
+      - 'crates/kafka-backup-cli/src/commands/cluster_args.rs'
+      - 'crates/kafka-backup-cli/src/commands/sasl_plugin.rs'
+      - 'crates/kafka-backup-cli/tests/oauth_real_broker.rs'
+      - 'tests/sasl-oauth-test-infra/**'
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: Length of the re-authentication soak in seconds (1800 for the acceptance run)
+        type: string
+        default: '1800'
+
+concurrency:
+  group: oauth-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-broker:
+    name: OAuth E2E (identity provider + JWKS-validating broker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      KB_OAUTH_SOAK_SECS: ${{ inputs.soak_seconds || '330' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oauth-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-oauth-e2e-
+
+      - name: Build the CLI and the test binary
+        run: cargo test -p kafka-backup-cli --test oauth_real_broker --no-run
+
+      - name: Start the identity provider and the broker
+        run: docker compose -f tests/sasl-oauth-test-infra/docker-compose-oauth-idp.yml up -d --wait
+
+      - name: Run the OAuth real-broker suite
+        run: cargo test -p kafka-backup-cli --test oauth_real_broker -- --ignored --nocapture --test-threads=1
+
+      - name: Broker and identity provider logs
+        if: failure()
+        run: docker compose -f tests/sasl-oauth-test-infra/docker-compose-oauth-idp.yml logs --tail 300
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f tests/sasl-oauth-test-infra/docker-compose-oauth-idp.yml down -v

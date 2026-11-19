@@ -1,0 +1,54 @@
+{
+  "interactiveLogin": false,
+  "httpServer": "NettyWrapper",
+  "tokenCallbacks": [
+    {
+      "issuerId": "kafka",
+      "tokenExpiry": 120,
+      "requestMappings": [
+        {
+          "requestParam": "grant_type",
+          "match": "client_credentials",
+          "claims": {
+            "iss": "http://idp:8080/kafka",
+            "sub": "${clientId}",
+            "aud": ["api://kafka-backup-local"],
+            "scope": "kafka"
+          }
+        }
+      ]
+    },
+    {
+      "issuerId": "other",
+      "tokenExpiry": 120,
+      "requestMappings": [
+        {
+          "requestParam": "grant_type",
+          "match": "client_credentials",
+          "claims": {
+            "iss": "http://idp:8080/other",
+            "sub": "${clientId}",
+            "aud": ["api://kafka-backup-local"],
+            "scope": "kafka"
+          }
+        }
+      ]
+    },
+    {
+      "issuerId": "wrongaud",
+      "tokenExpiry": 120,
+      "requestMappings": [
+        {
+          "requestParam": "grant_type",
+          "match": "client_credentials",
+          "claims": {
+            "iss": "http://idp:8080/kafka",
+            "sub": "${clientId}",
+            "aud": ["api://some-other-api"],
+            "scope": "kafka"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -301,6 +301,7 @@ async fn sasl_gssapi_backup_restore_roundtrip() {
     let storage_path = temp_dir.path().to_path_buf();
 
     let backup_config = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.clone(),
         source: Some(KafkaConfig {
@@ -354,6 +355,7 @@ async fn sasl_gssapi_backup_restore_roundtrip() {
         .insert(source_topic.clone(), restored_topic.clone());
 
     let restore_config = Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.clone(),
         source: None,

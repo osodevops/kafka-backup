@@ -1,0 +1,87 @@
+# Docker Compose for OAUTHBEARER with a real identity provider (issue #261).
+#
+# - `idp`: mock-oauth2-server, an OAuth 2.0 / OIDC server that signs real JWTs.
+#   Three issuers (idp/mock-oauth2-config.json), all with 120 s tokens:
+#     kafka     iss http://idp:8080/kafka, aud api://kafka-backup-local  (trusted)
+#     other     a different issuer, validly signed by its own key       (refused)
+#     wrongaud  the trusted issuer claim with another audience          (refused)
+#   `sub` is the client ID, so a different client is a different principal.
+# - `kafka`: one KRaft broker (Kafka 4.x) whose OAUTH listener validates
+#   tokens against the `kafka` issuer's JWKS, expected issuer and audience,
+#   and forces KIP-368 re-authentication every 60 s.
+#
+# Host ports (override with the environment variables):
+#   KB_OAUTH_IDP_PORT        18080  identity provider
+#   KB_OAUTH_PLAIN_PORT      19092  broker, PLAINTEXT
+#   KB_OAUTH_PORT            19093  broker, SASL_PLAINTEXT + OAUTHBEARER
+#
+#   docker compose -f docker-compose-oauth-idp.yml up -d --wait
+#   cargo test -p kafka-backup-cli --test oauth_real_broker -- --ignored --nocapture --test-threads=1
+#   docker compose -f docker-compose-oauth-idp.yml down -v
+#
+# SASL_PLAINTEXT is for this local fixture only: outside it, bearer tokens
+# need SASL_SSL.
+
+name: kb-oauth
+
+services:
+  idp:
+    image: ghcr.io/navikt/mock-oauth2-server:6.0.3
+    hostname: idp
+    environment:
+      SERVER_PORT: "8080"
+      JSON_CONFIG_PATH: /config/mock-oauth2-config.json
+    volumes: ["./idp/mock-oauth2-config.json:/config/mock-oauth2-config.json:ro"]
+    ports: ["${KB_OAUTH_IDP_PORT:-18080}:8080"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/isalive"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  kafka:
+    image: confluentinc/cp-kafka:8.3.1
+    hostname: kafka
+    depends_on:
+      idp: { condition: service_healthy }
+    ports:
+      - "${KB_OAUTH_PLAIN_PORT:-19092}:19092"
+      - "${KB_OAUTH_PORT:-19093}:19093"
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: S0JPQXV0aENsdXN0ZXIwMQ
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:19092,OAUTH://0.0.0.0:19093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,PLAINTEXT_HOST://localhost:${KB_OAUTH_PLAIN_PORT:-19092},OAUTH://localhost:${KB_OAUTH_PORT:-19093}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,OAUTH:SASL_PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx1g
+      # Listener-scoped SASL settings: nothing here is JVM-wide, so no
+      # java.security.auth.login.config is needed.
+      KAFKA_LISTENER_NAME_OAUTH_SASL_ENABLED_MECHANISMS: OAUTHBEARER
+      KAFKA_LISTENER_NAME_OAUTH_OAUTHBEARER_SASL_JAAS_CONFIG: org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;
+      # Kafka 4.x: the `.secured` package is gone; this is the only class name.
+      KAFKA_LISTENER_NAME_OAUTH_OAUTHBEARER_SASL_SERVER_CALLBACK_HANDLER_CLASS: org.apache.kafka.common.security.oauthbearer.OAuthBearerValidatorCallbackHandler
+      KAFKA_LISTENER_NAME_OAUTH_SASL_OAUTHBEARER_JWKS_ENDPOINT_URL: http://idp:8080/kafka/jwks
+      KAFKA_LISTENER_NAME_OAUTH_SASL_OAUTHBEARER_EXPECTED_AUDIENCE: api://kafka-backup-local
+      # The mock IdP issues a fixed `iss` claim, so the issuer is the same
+      # whether a client fetched its token from localhost or from `idp`.
+      KAFKA_LISTENER_NAME_OAUTH_SASL_OAUTHBEARER_EXPECTED_ISSUER: http://idp:8080/kafka
+      # KIP-368: force re-authentication at least every 60 s on this listener.
+      KAFKA_LISTENER_NAME_OAUTH_OAUTHBEARER_CONNECTIONS_MAX_REAUTH_MS: 60000
+      # Kafka 4.x refuses any OAuth URL not on this exact-match list.
+      KAFKA_OPTS: -Dorg.apache.kafka.sasl.oauthbearer.allowed.urls=http://idp:8080/kafka/jwks
+      # DEBUG on the authenticator makes KIP-368 re-authentication visible.
+      KAFKA_LOG4J_LOGGERS: org.apache.kafka.common.security.authenticator=DEBUG,org.apache.kafka.common.security.oauthbearer=DEBUG
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 30s
+      retries: 30

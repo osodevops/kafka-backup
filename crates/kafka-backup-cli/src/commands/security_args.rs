@@ -38,7 +38,8 @@ pub struct SecurityCliArgs {
     /// SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI,
     /// OAUTHBEARER; case-insensitive, SCRAM-SHA256 / SCRAM-SHA512 also
     /// accepted). Required when security_protocol is SASL_*.
-    /// OAUTHBEARER needs Kafka Backup Enterprise (licence feature `oauth`).
+    /// OAUTHBEARER needs a token provider from a configuration file: use
+    /// --config <yaml> --cluster source|target.
     #[arg(long, env = "KAFKA_SASL_MECHANISM")]
     pub sasl_mechanism: Option<String>,
 
@@ -94,6 +95,7 @@ impl SecurityCliArgs {
         };
 
         let mut security = SecurityConfig {
+            oauth: None,
             security_protocol,
             sasl_mechanism,
             sasl_username,
@@ -239,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn oauthbearer_parses_then_fails_clearly_without_enterprise() {
+    fn oauthbearer_flag_parses_then_points_at_a_config_file() {
         assert_eq!(
             parse_sasl_mechanism(Some("oauthbearer"), SecurityProtocol::SaslSsl).unwrap(),
             Some(SaslMechanism::OAuthBearer)
@@ -249,7 +251,7 @@ mod tests {
         args.sasl_mechanism = Some("OAUTHBEARER".to_string());
         let err = format!("{}", args.into_security_config().unwrap_err());
         assert!(
-            err.contains("SASL OAUTHBEARER requires Kafka Backup Enterprise"),
+            err.contains("oauth.providers") && err.contains("--config"),
             "{err}"
         );
         assert!(!err.contains("unsupported sasl_mechanism"), "{err}");
