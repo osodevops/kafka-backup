@@ -28,6 +28,7 @@ const RECORDS: usize = 300;
 
 fn backup_config(bs: &str, storage: PathBuf) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(KafkaConfig {
@@ -57,6 +58,7 @@ fn backup_config(bs: &str, storage: PathBuf) -> Config {
 
 fn restore_config(bs: &str, storage: PathBuf) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

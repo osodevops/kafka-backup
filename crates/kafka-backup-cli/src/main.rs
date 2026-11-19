@@ -6,6 +6,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod commands;
 
+use commands::cluster_args::{resolve_cluster, ClusterConfigArgs};
 use commands::security_args::SecurityCliArgs;
 
 /// `--path` help for every subcommand that resolves it with
@@ -288,6 +289,9 @@ enum Commands {
         #[command(flatten)]
         security: SecurityCliArgs,
 
+        #[command(flatten)]
+        cluster: ClusterConfigArgs,
+
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
         format: String,
@@ -344,6 +348,9 @@ enum OffsetRollbackAction {
         #[command(flatten)]
         security: SecurityCliArgs,
 
+        #[command(flatten)]
+        cluster: ClusterConfigArgs,
+
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
         format: String,
@@ -389,6 +396,9 @@ enum OffsetRollbackAction {
         #[command(flatten)]
         security: SecurityCliArgs,
 
+        #[command(flatten)]
+        cluster: ClusterConfigArgs,
+
         /// Verify offsets after rollback (`--verify false` to skip)
         #[arg(
             long,
@@ -419,6 +429,9 @@ enum OffsetRollbackAction {
 
         #[command(flatten)]
         security: SecurityCliArgs,
+
+        #[command(flatten)]
+        cluster: ClusterConfigArgs,
 
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
@@ -490,6 +503,9 @@ enum OffsetResetAction {
 
         #[command(flatten)]
         security: SecurityCliArgs,
+
+        #[command(flatten)]
+        cluster: ClusterConfigArgs,
     },
 
     /// Generate a shell script for manual offset reset
@@ -736,8 +752,10 @@ async fn main() -> Result<()> {
                 groups,
                 bootstrap_servers,
                 security,
+                cluster,
             } => {
-                let security = security.into_security_config()?;
+                let (bootstrap_servers, security) =
+                    resolve_cluster(&cluster, &bootstrap_servers, security).await?;
                 commands::offset_reset::execute_plan(
                     &path,
                     &backup_id,
@@ -775,9 +793,11 @@ async fn main() -> Result<()> {
             max_concurrent,
             max_retries,
             security,
+            cluster,
             format,
         } => {
-            let security = security.into_security_config()?;
+            let (bootstrap_servers, security) =
+                resolve_cluster(&cluster, &bootstrap_servers, security).await?;
             commands::offset_reset_bulk::execute_bulk(
                 &path,
                 &backup_id,
@@ -797,9 +817,11 @@ async fn main() -> Result<()> {
                 bootstrap_servers,
                 description,
                 security,
+                cluster,
                 format,
             } => {
-                let security = security.into_security_config()?;
+                let (bootstrap_servers, security) =
+                    resolve_cluster(&cluster, &bootstrap_servers, security).await?;
                 commands::offset_rollback::create_snapshot(
                     &path,
                     &groups,
@@ -834,10 +856,12 @@ async fn main() -> Result<()> {
                 snapshot_id,
                 bootstrap_servers,
                 security,
+                cluster,
                 verify,
                 format,
             } => {
-                let security = security.into_security_config()?;
+                let (bootstrap_servers, security) =
+                    resolve_cluster(&cluster, &bootstrap_servers, security).await?;
                 commands::offset_rollback::execute_rollback(
                     &path,
                     &snapshot_id,
@@ -853,9 +877,11 @@ async fn main() -> Result<()> {
                 snapshot_id,
                 bootstrap_servers,
                 security,
+                cluster,
                 format,
             } => {
-                let security = security.into_security_config()?;
+                let (bootstrap_servers, security) =
+                    resolve_cluster(&cluster, &bootstrap_servers, security).await?;
                 commands::offset_rollback::verify_snapshot(
                     &path,
                     &snapshot_id,

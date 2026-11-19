@@ -84,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_rejects_oauth_under_security_with_enterprise_hint() {
+    fn parse_config_accepts_the_oauth_binding_and_rejects_unknown_keys_in_it() {
         let yaml = r#"
 mode: backup
 backup_id: b
@@ -94,17 +94,27 @@ source:
     security_protocol: SASL_SSL
     sasl_mechanism: OAUTHBEARER
     oauth:
-      token_endpoint_url: https://idp/token
+      provider: idp
 storage:
   backend: filesystem
   path: /tmp/b
+oauth:
+  providers:
+    idp: { type: file, path: /var/run/token }
 "#;
-        let err = parse_config(yaml).unwrap_err().to_string();
-        assert!(err.contains("source.security.oauth"), "{err}");
-        assert!(
-            err.contains("OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)"),
-            "{err}"
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(
+            config.source.unwrap().security.oauth.unwrap().provider,
+            "idp"
         );
+
+        // A provider setting in the binding is an error, not an ignored line.
+        let misplaced = yaml.replace(
+            "      provider: idp\n",
+            "      provider: idp\n      token_endpoint_url: https://idp/token\n",
+        );
+        let err = parse_config(&misplaced).unwrap_err().to_string();
+        assert!(err.contains("token_endpoint_url"), "{err}");
     }
 
     #[test]

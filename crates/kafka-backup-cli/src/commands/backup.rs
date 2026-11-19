@@ -10,6 +10,9 @@ pub async fn run(config_path: &str) -> Result<()> {
     let config_content = tokio::fs::read_to_string(config_path).await?;
     let config_content = super::config::expand_env_vars(&config_content);
     let mut config: Config = super::config::parse_config(&config_content)?;
+    // OAuth before any client exists: the token caches are shared by every
+    // connection the engine opens.
+    let oauth = super::oauth::apply(&mut config)?;
     super::sasl_plugin::populate_sasl_plugin_opt(&mut config.source)?;
 
     info!("Starting backup: {}", config.backup_id);
@@ -22,6 +25,7 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     // Initialize before exposing HTTP, so even the first scrape has error samples.
     prometheus_metrics.initialize_backup_errors(&config.backup_id);
+    prometheus_metrics.track_oauth(&oauth.caches);
 
     let metrics_server = super::metrics_runtime::RunningMetricsServer::start(
         &metrics_config,

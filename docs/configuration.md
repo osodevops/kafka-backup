@@ -10,12 +10,13 @@ Complete reference for all configuration options in Kafka Backup.
 2. [Global Options](#global-options)
 3. [Source Configuration](#source-configuration)
 4. [Target Configuration](#target-configuration)
-5. [Storage Configuration](#storage-configuration)
-6. [Backup Configuration](#backup-configuration)
-7. [Offset Storage Configuration](#offset-storage-configuration)
-8. [Restore Configuration](#restore-configuration)
-9. [Environment Variables](#environment-variables)
-10. [CLI Arguments](#cli-arguments)
+5. [OAuth Configuration](#oauth-configuration)
+6. [Storage Configuration](#storage-configuration)
+7. [Backup Configuration](#backup-configuration)
+8. [Offset Storage Configuration](#offset-storage-configuration)
+9. [Restore Configuration](#restore-configuration)
+10. [Environment Variables](#environment-variables)
+11. [CLI Arguments](#cli-arguments)
 
 ---
 
@@ -75,18 +76,20 @@ Configuration for the Kafka cluster to read from (backup mode).
 | `security.ssl_ca_location` | string | No | - | Path to CA certificate |
 | `security.ssl_certificate_location` | string | No | - | Path to client certificate |
 | `security.ssl_key_location` | string | No | - | Path to client key |
+| `security.oauth.provider` | string | With OAUTHBEARER | - | The token provider this cluster authenticates with: a key of the top-level [`oauth.providers`](#oauth-configuration) |
+| `security.oauth.extensions` | map | No | - | SASL extensions sent with the token. Confluent Cloud: `logicalCluster` (`lkc-...`) and `identityPoolId` (`pool-...`, or a comma-separated list) |
 
-`sasl_mechanism: OAUTHBEARER` (for example Confluent Cloud OAuth) parses, but
-this build ships no OAuth token provider. Without Kafka Backup Enterprise
-(licence feature `oauth`) or a custom `SaslMechanismPlugin` installed by code,
-the command fails with "SASL OAUTHBEARER requires Kafka Backup Enterprise
-(licence feature `oauth`) or a custom SaslMechanismPlugin".
+`sasl_mechanism: OAUTHBEARER` (Confluent Cloud identity pools, or any cluster
+that validates OAuth tokens) takes its token from a provider defined in the
+top-level `oauth` section; see [OAuth Configuration](#oauth-configuration) and
+the [OAuth guide](oauth.md). OAUTHBEARER without a `security.oauth` binding, or
+a binding on a cluster that uses another mechanism, is an error before
+anything connects.
 
 Unknown keys under `source.security` and `target.security` are an error, not a
 warning, because a misspelt or misplaced security setting connects with
-different credentials than intended. OAuth settings such as `security.oauth`
-are rejected with the hint "OAuth settings belong under enterprise.oauth (Kafka
-Backup Enterprise)".
+different credentials than intended. That includes the keys inside
+`security.oauth`.
 
 ### Topic Patterns
 
@@ -237,6 +240,31 @@ source:
     ssl_ca_location: /etc/kafka/certs/ca.pem
 ```
 
+#### OAuth (SASL/OAUTHBEARER)
+
+```yaml
+source:
+  bootstrap_servers: ["pkc-xxxxx.westeurope.azure.confluent.cloud:9092"]
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+    oauth:
+      provider: entra-backup
+      extensions:
+        logicalCluster: lkc-abc123
+
+oauth:
+  providers:
+    entra-backup:
+      type: oidc_client_credentials
+      token_endpoint_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+      client_id: <app id>
+      client_secret: ${ENTRA_BACKUP_CLIENT_SECRET}
+      scope: api://<api app id>/.default
+```
+
+See [OAuth Configuration](#oauth-configuration).
+
 #### Certificate Format
 
 All certificate and key files must be in PEM format:
@@ -290,6 +318,54 @@ target:
     sasl_mechanism: PLAIN
     sasl_username: restore-user
     sasl_password: ${KAFKA_PASSWORD}
+```
+
+---
+
+## OAuth Configuration
+
+Token providers for clusters that use `sasl_mechanism: OAUTHBEARER` (v0.29.0+).
+A cluster names one with `security.oauth.provider`; `source` and `target` bind
+independently. The [OAuth guide](oauth.md) has every option, the token cache
+semantics, a Confluent Cloud and Microsoft Entra ID walkthrough and a
+troubleshooting table.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `oauth.providers.<name>.type` | string | `oidc_client_credentials` (Entra ID, Okta, Auth0, Keycloak, any RFC 6749 provider), `azure_managed_identity` (Azure VMs and scale sets, through IMDS), `azure_workload_identity` (AKS) or `file` (a token kept fresh by another process) |
+| `oauth.cache.refresh_fraction` | float | Refresh a token after this share of its lifetime (default `0.8`)... |
+| `oauth.cache.refresh_before_expiry` | duration | ...or this long before it expires, whichever is earlier (default `5m`) |
+| `oauth.cache.clock_skew` | duration | A token is valid while `exp - clock_skew > now` (default `30s`) |
+| `oauth.cache.min_refresh_interval` | duration | Never refresh sooner than this after a fetch (default `30s`) |
+
+`oidc_client_credentials` takes `token_endpoint_url` or `issuer` (exactly
+one), `client_id`, `client_secret`, and optionally `client_auth` (`basic`,
+the default, or `post`), `scope`, `audience`, `extra_params`, `ca_cert` and
+`allow_insecure_http`. `azure_managed_identity` takes `scope` or `resource`
+and optionally `client_id` (a user-assigned identity). `azure_workload_identity`
+takes `scope`; the rest defaults to the `AZURE_*` variables the AKS webhook
+injects. `file` takes `path` and optionally `expires_at_file`.
+
+Unknown keys anywhere under `oauth` are errors. Client secrets and tokens are
+never logged or serialised.
+
+```yaml
+oauth:
+  providers:
+    entra-backup:
+      type: oidc_client_credentials
+      token_endpoint_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+      client_id: <app id>
+      client_secret: ${ENTRA_BACKUP_CLIENT_SECRET}
+      scope: api://<api app id>/.default
+    aks:
+      type: azure_workload_identity
+      scope: api://<api app id>/.default
+  cache:
+    refresh_fraction: 0.8
+    refresh_before_expiry: 5m
+    clock_skew: 30s
+    min_refresh_interval: 30s
 ```
 
 ---
@@ -912,6 +988,7 @@ metrics:
 | `kafka_backup_storage_write_latency_seconds` | Histogram | Storage write latency |
 | `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
 | `kafka_backup_errors_total` | Counter | Errors by type |
+| `kafka_backup_oauth_token_requests_total` | Counter | Token requests to the identity provider, by `provider`, `kind` and `outcome` (`success` / `failure`). Present when a cluster uses [OAuth](oauth.md); also on restores |
 
 Restore metrics (`restore` and `three-phase-restore`). The `restore_id` label
 is the backup id.
@@ -1536,6 +1613,9 @@ Common arguments for all subcommands:
 | `--groups` | Consumer groups (comma-separated) |
 | `--bootstrap-servers` | Kafka brokers (comma-separated) |
 
+`execute` also takes `--config` and `--cluster`; see
+[Connecting the offset commands from a configuration file](#connecting-the-offset-commands-from-a-configuration-file).
+
 ### Offset-Reset-Bulk Command
 
 ```bash
@@ -1551,7 +1631,28 @@ kafka-backup offset-reset-bulk --path /path --backup-id ID --groups g1,g2 --boot
 | `--max-concurrent` | Maximum parallel operations (default: 50) |
 | `--max-retries` | Retry attempts (default: 3) |
 | `--security-protocol` | Security protocol |
+| `--config`, `--cluster` | Take the cluster from a configuration file (see below) |
 | `--format` | Output format (text, json) |
+
+#### Connecting the offset commands from a configuration file
+
+`offset-reset execute`, `offset-reset-bulk` and `offset-rollback snapshot |
+rollback | verify` take `--config <yaml>` and `--cluster source|target`
+(v0.29.0+):
+
+```bash
+kafka-backup offset-reset-bulk --path s3://bucket --backup-id ID --groups g1,g2 \
+  --config restore.yaml --cluster target
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--config` | A backup or restore configuration file. The cluster's bootstrap servers and its whole `security:` block (TLS files, SASL credentials, GSSAPI, OAuth) come from it. An explicit `--bootstrap-servers` overrides the file's list; `--security-protocol` / `--sasl-*` are ignored with a warning |
+| `--cluster` | `source` or `target` (default `target`). Requires `--config` |
+
+This is the only way to use these commands with `sasl_mechanism: OAUTHBEARER`:
+the flags cannot describe a token provider, and `--sasl-mechanism OAUTHBEARER`
+without `--config` fails with a message that says so.
 
 ### Offset-Rollback Command
 

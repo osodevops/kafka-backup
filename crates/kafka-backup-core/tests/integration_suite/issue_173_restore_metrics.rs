@@ -47,6 +47,7 @@ fn metric(encoded: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
 
 fn restore_config(bootstrap: &str, storage: &std::path::Path, backup_id: &str) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

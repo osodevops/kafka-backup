@@ -84,6 +84,7 @@ fn kafka(bs: &str) -> KafkaConfig {
 
 fn backup_config(bs: &str, storage: PathBuf) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(kafka(bs)),
@@ -111,6 +112,7 @@ fn restore_config(bs: &str, storage: PathBuf) -> Config {
     let mut target = kafka(bs);
     target.topics = TopicSelection::default();
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,

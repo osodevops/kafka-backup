@@ -40,6 +40,10 @@ pub struct PrometheusMetrics {
     /// Internal prometheus-client registry.
     registry: RwLock<Registry>,
 
+    /// OAuth token caches whose request counts are exported as
+    /// `kafka_backup_oauth_token_requests_total` (see [`Self::track_oauth`]).
+    oauth_caches: RwLock<Vec<crate::oauth::TokenCache>>,
+
     // ========================================
     // Consumer Lag Metrics
     // ========================================
@@ -520,6 +524,7 @@ impl PrometheusMetrics {
 
         Self {
             registry: RwLock::new(registry),
+            oauth_caches: RwLock::new(Vec::new()),
             lag_records,
             lag_bytes,
             lag_seconds,
@@ -994,6 +999,19 @@ impl PrometheusMetrics {
         self.start_time.elapsed()
     }
 
+    /// Export the identity-provider request counts of `caches` as
+    /// `kafka_backup_oauth_token_requests_total{provider,kind,outcome}`
+    /// (`outcome` is `success` or `failure`). The counts are read from the
+    /// caches at scrape time; a cache already tracked is not added twice.
+    pub fn track_oauth(&self, caches: &[crate::oauth::TokenCache]) {
+        let mut tracked = self.oauth_caches.write();
+        for cache in caches {
+            if !tracked.iter().any(|c| c.ptr_eq(cache)) {
+                tracked.push(cache.clone());
+            }
+        }
+    }
+
     /// Encode all metrics to Prometheus text format.
     pub fn encode(&self) -> String {
         let registry = self.registry.read();
@@ -1001,7 +1019,43 @@ impl PrometheusMetrics {
         if encode(&mut buffer, &registry).is_err() {
             return String::new();
         }
+        let oauth = self.encode_oauth();
+        if !oauth.is_empty() {
+            // The registry's output ends with the OpenMetrics `# EOF` line.
+            match buffer.rfind("# EOF") {
+                Some(eof) => buffer.insert_str(eof, &oauth),
+                None => buffer.push_str(&oauth),
+            }
+        }
         buffer
+    }
+
+    fn encode_oauth(&self) -> String {
+        let caches = self.oauth_caches.read();
+        if caches.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "# HELP kafka_backup_oauth_token_requests Token requests made to the identity \
+             provider, per OAuth provider.\n\
+             # TYPE kafka_backup_oauth_token_requests counter\n",
+        );
+        for cache in caches.iter() {
+            let failures = cache.failure_count();
+            let successes = cache.fetch_count().saturating_sub(failures);
+            let provider = cache
+                .name()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            for (outcome, value) in [("success", successes), ("failure", failures)] {
+                out.push_str(&format!(
+                    "kafka_backup_oauth_token_requests_total{{provider=\"{provider}\",kind=\"{}\",outcome=\"{outcome}\"}} {value}\n",
+                    cache.provider_kind()
+                ));
+            }
+        }
+        out
     }
 
     /// Admit existing label sets, or one new label set while under the limit.
@@ -1086,6 +1140,44 @@ impl Drop for TimerGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_token_requests_are_exported_once_per_cache() {
+        use crate::oauth::providers::static_token::StaticTokenProvider;
+        use crate::oauth::{CacheSettings, TokenCache};
+
+        let metrics = PrometheusMetrics::new();
+        assert!(!metrics.encode().contains("kafka_backup_oauth"));
+
+        let cache = TokenCache::new(
+            "entra",
+            std::sync::Arc::new(StaticTokenProvider::new("t").unwrap()),
+            CacheSettings::default(),
+        );
+        cache.get().await.unwrap();
+        metrics.track_oauth(&[cache.clone(), cache]);
+        let text = metrics.encode();
+        assert!(
+            text.contains(
+                "kafka_backup_oauth_token_requests_total{provider=\"entra\",kind=\"static\",outcome=\"success\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "kafka_backup_oauth_token_requests_total{provider=\"entra\",kind=\"static\",outcome=\"failure\"} 0\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("kafka_backup_oauth_token_requests_total{")
+                .count(),
+            2,
+            "one cache, two outcomes: {text}"
+        );
+        assert!(text.contains("# TYPE kafka_backup_oauth_token_requests counter\n"));
+        assert!(text.trim_end().ends_with("# EOF"), "{text}");
+    }
 
     #[test]
     fn test_metrics_creation() {

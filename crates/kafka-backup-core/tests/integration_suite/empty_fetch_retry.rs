@@ -29,6 +29,7 @@ fn config(broker: &MockBroker, storage: &TempDir, retry_secs: u64, max_wait_ms: 
     };
     source.connection.fetch_max_wait_ms = max_wait_ms;
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: "empty-fetch".to_string(),
         source: Some(source),

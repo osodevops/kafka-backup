@@ -1,8 +1,10 @@
 pub mod backup;
+pub mod cluster_args;
 pub mod config;
 pub mod describe;
 pub mod list;
 pub mod metrics_runtime;
+pub mod oauth;
 pub mod offset_mapping;
 pub mod offset_reset;
 pub mod offset_reset_bulk;

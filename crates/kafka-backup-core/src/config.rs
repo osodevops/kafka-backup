@@ -39,6 +39,12 @@ pub struct Config {
     /// Metrics server configuration
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+
+    /// OAuth token providers for clusters that use
+    /// `sasl_mechanism: OAUTHBEARER`. A cluster picks one with
+    /// `security.oauth.provider`; [`crate::oauth::install`] wires them up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::oauth::OauthConfig>,
 }
 
 /// Metrics server configuration
@@ -243,6 +249,14 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub sasl_krb5_config_path: Option<PathBuf>,
 
+    /// Which OAuth token provider this cluster authenticates with, and the
+    /// SASL extensions sent with its tokens (Confluent Cloud's
+    /// `logicalCluster` / `identityPoolId`). Required when
+    /// `sasl_mechanism: OAUTHBEARER`; `provider` names a key of the
+    /// top-level `oauth.providers`.
+    #[serde(default)]
+    pub oauth: Option<crate::oauth::ClusterBinding>,
+
     /// Optional pluggable SASL mechanism factory.
     ///
     /// When set, overrides [`sasl_mechanism`] and drives the handshake
@@ -403,25 +417,28 @@ pub enum SaslMechanism {
     /// a config requests `GSSAPI`.
     Gssapi,
     /// SASL/OAUTHBEARER (RFC 7628), e.g. Confluent Cloud OAuth. YAML
-    /// spelling `OAUTHBEARER`. This crate ships no token provider: a
-    /// [`SaslMechanismPlugin`](crate::kafka::SaslMechanismPlugin) must be
-    /// installed through `SecurityConfig::sasl_mechanism_plugin_factory`
-    /// (Kafka Backup Enterprise does this when its `oauth` licence feature
-    /// is enabled). Without one, authentication fails with an error that
-    /// says so.
+    /// spelling `OAUTHBEARER`. The token comes from the provider named by
+    /// `security.oauth.provider` (see [`crate::oauth`]);
+    /// [`crate::oauth::install`] turns that binding into the plugin factory
+    /// in `SecurityConfig::sasl_mechanism_plugin_factory`. A custom
+    /// [`SaslMechanismPlugin`](crate::kafka::SaslMechanismPlugin) can be
+    /// installed there instead. Without either, authentication fails with
+    /// an error that says so.
     #[serde(rename = "OAUTHBEARER")]
     OAuthBearer,
 }
 
 /// Error raised when `sasl_mechanism: OAUTHBEARER` reaches authentication
 /// without a plugin factory.
-pub const OAUTHBEARER_REQUIRES_PLUGIN: &str = "SASL OAUTHBEARER requires Kafka Backup Enterprise \
-     (licence feature `oauth`) or a custom SaslMechanismPlugin";
+pub const OAUTHBEARER_REQUIRES_PLUGIN: &str =
+    "SASL OAUTHBEARER needs a token provider: define one \
+     under oauth.providers and bind the cluster to it with security.oauth.provider (or install a \
+     custom SaslMechanismPlugin)";
 
-/// Hint for OAuth-looking keys found under `source.security` /
-/// `target.security`.
-pub const OAUTH_SETTINGS_HINT: &str =
-    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)";
+/// Hint for OAuth-looking keys other than `oauth` found under
+/// `source.security` / `target.security`.
+pub const OAUTH_SETTINGS_HINT: &str = "OAuth settings go in `security.oauth: { provider: <name>, \
+     extensions: { ... } }`, with the provider defined under the top-level oauth.providers";
 
 /// Topic selection configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1629,8 +1646,9 @@ impl Config {
     /// Elsewhere an unknown key is only a warning, but a security block
     /// with a misplaced or misspelt setting connects with different
     /// credentials than the operator intended (or none), so it is an error.
-    /// OAuth-looking keys (for example `security.oauth`) get a hint that
-    /// those settings belong under `enterprise.oauth`. Every unknown key is
+    /// OAuth-looking keys other than `oauth` (for example
+    /// `security.oauth_token`) get a hint naming `security.oauth` and
+    /// `oauth.providers`. Every unknown key is
     /// reported at once. Values of the wrong type are left to
     /// deserialization to report.
     pub fn check_security_sections(root: &serde_yaml::Value) -> crate::Result<()> {
@@ -2514,32 +2532,79 @@ enterprise:
     }
 
     #[test]
-    fn security_lint_rejects_oauth_settings_with_enterprise_hint() {
-        let source_oauth = SECURITY_LINT_BASE.replace(
+    fn security_oauth_binding_parses_and_rejects_unknown_keys() {
+        let bound = SECURITY_LINT_BASE.replace(
             "    sasl_mechanism: OAUTHBEARER\n",
-            "    sasl_mechanism: OAUTHBEARER\n    oauth:\n      client_id: x\n",
+            "    sasl_mechanism: OAUTHBEARER\n    oauth:\n      provider: idp\n      \
+             extensions: { logicalCluster: lkc-1, identityPoolId: pool-a }\n",
         );
-        let target_oauth = format!(
-            "{SECURITY_LINT_BASE}target:\n  bootstrap_servers: [\"localhost:9092\"]\n  \
-             security:\n    sasl_oauthbearer_token_endpoint_url: https://idp/token\n"
+        let yaml = format!(
+            "{bound}oauth:\n  providers:\n    idp: {{ type: file, path: /var/run/token }}\n  \
+             cache: {{ clock_skew: 10s }}\n"
         );
-        for (yaml, key) in [
-            (source_oauth, "source.security.oauth"),
+        let (config, warnings) = Config::from_yaml_with_warnings(&yaml).expect("valid config");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let binding = config.source.unwrap().security.oauth.expect("binding");
+        assert_eq!(binding.provider, "idp");
+        assert_eq!(binding.extensions.logical_cluster.as_deref(), Some("lkc-1"));
+        assert_eq!(config.oauth.expect("oauth section").providers.len(), 1);
+
+        // Unknown keys inside the binding and inside `oauth` are errors.
+        for (bad, key) in [
             (
-                target_oauth,
-                "target.security.sasl_oauthbearer_token_endpoint_url",
+                bound.replace(
+                    "      provider: idp\n",
+                    "      provider: idp\n      client_id: x\n",
+                ),
+                "client_id",
+            ),
+            (format!("{bound}oauth:\n  provider: {{}}\n"), "provider"),
+            (
+                format!(
+                    "{bound}oauth:\n  providers:\n    idp: {{ type: file, path: /t, pth: /x }}\n"
+                ),
+                "pth",
             ),
         ] {
-            let err = Config::from_yaml_with_warnings(&yaml)
+            let err = Config::from_yaml_with_warnings(&bad)
                 .expect_err(&format!("{key} must be rejected"))
                 .to_string();
             assert!(err.contains(key), "names the key: {err}");
-            assert!(
-                err.contains(
-                    "OAuth settings belong under enterprise.oauth (Kafka Backup Enterprise)"
-                ),
-                "hint: {err}"
-            );
+        }
+    }
+
+    #[test]
+    fn security_lint_points_other_oauth_keys_at_the_binding() {
+        let yaml = format!(
+            "{SECURITY_LINT_BASE}target:\n  bootstrap_servers: [\"localhost:9092\"]\n  \
+             security:\n    sasl_oauthbearer_token_endpoint_url: https://idp/token\n"
+        );
+        let err = Config::from_yaml_with_warnings(&yaml)
+            .expect_err("must be rejected")
+            .to_string();
+        assert!(
+            err.contains("target.security.sasl_oauthbearer_token_endpoint_url"),
+            "names the key: {err}"
+        );
+        assert!(
+            err.contains("security.oauth") && err.contains("oauth.providers"),
+            "hint: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_secrets_are_not_serialized() {
+        let yaml = format!(
+            "{SECURITY_LINT_BASE}oauth:\n  providers:\n    idp: {{ type: oidc_client_credentials, \
+             token_endpoint_url: \"https://idp/token\", client_id: a, client_secret: very-secret-value }}\n"
+        );
+        let (config, _) = Config::from_yaml_with_warnings(&yaml).expect("valid config");
+        for text in [
+            format!("{config:?}"),
+            serde_yaml::to_string(&config).unwrap(),
+            serde_json::to_string(&config).unwrap(),
+        ] {
+            assert!(!text.contains("very-secret-value"), "{text}");
         }
     }
 
@@ -2554,7 +2619,7 @@ enterprise:
             .to_string();
         assert!(err.contains("source.security.sasl_pasword"), "{err}");
         assert!(err.contains("sasl_password"), "lists valid keys: {err}");
-        assert!(!err.contains("enterprise.oauth"), "no OAuth hint: {err}");
+        assert!(!err.contains("oauth.providers"), "no OAuth hint: {err}");
     }
 
     #[test]

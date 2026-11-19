@@ -497,6 +497,7 @@ async fn run_breaker_pause_scenario(breaker_enabled: bool) {
     write_two_partition_backup(tmp.path(), backup_id).await;
 
     let config = Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: backup_id.to_string(),
         source: None,

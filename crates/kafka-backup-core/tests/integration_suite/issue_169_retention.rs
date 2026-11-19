@@ -26,6 +26,7 @@ const PARTITIONS: usize = 3;
 
 fn config(bootstrap: &str, storage: &TempDir, offset_db: &Path, retention: bool) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(KafkaConfig {

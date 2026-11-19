@@ -31,6 +31,7 @@ pub mod kafka;
 pub mod manifest;
 pub mod metrics;
 pub mod notification;
+pub mod oauth;
 pub mod offset_headers;
 pub mod offset_store;
 pub(crate) mod rate_limit;

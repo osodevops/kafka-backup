@@ -30,6 +30,7 @@ fn create_snapshot_backup_config(
     topics: Vec<String>,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -81,6 +82,7 @@ fn create_continuous_backup_config(
 #[test]
 fn test_config_validation_mutual_exclusivity() {
     let config = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: "test".to_string(),
         source: Some(KafkaConfig {
@@ -117,6 +119,7 @@ fn test_config_validation_mutual_exclusivity() {
 #[test]
 fn test_config_validation_snapshot_mode_valid() {
     let config = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: "test".to_string(),
         source: Some(KafkaConfig {
@@ -147,6 +150,7 @@ fn test_config_validation_snapshot_mode_valid() {
 #[test]
 fn test_config_validation_compression_level() {
     let config = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: "test".to_string(),
         source: Some(KafkaConfig {
@@ -492,6 +496,7 @@ async fn test_incremental_oneshot_backup_resumes_from_offset() {
 
     // --- First backup run ---
     let config1 = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -574,6 +579,7 @@ async fn test_incremental_oneshot_backup_resumes_from_offset() {
 
     // --- Second backup run (same backup_id, same offset_storage) ---
     let config2 = Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {

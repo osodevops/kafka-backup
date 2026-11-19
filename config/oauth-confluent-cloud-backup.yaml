@@ -1,0 +1,58 @@
+# Backup from Confluent Cloud with OAuth (SASL/OAUTHBEARER) and Microsoft
+# Entra ID client credentials. See docs/oauth.md.
+#
+#   export ENTRA_BACKUP_CLIENT_SECRET=...
+#   kafka-backup backup --config config/oauth-confluent-cloud-backup.yaml
+
+mode: backup
+backup_id: "orders-daily"
+
+source:
+  bootstrap_servers:
+    - "pkc-xxxxx.westeurope.azure.confluent.cloud:9092"
+  topics:
+    include:
+      - "orders-*"
+  security:
+    security_protocol: SASL_SSL
+    sasl_mechanism: OAUTHBEARER
+    oauth:
+      # A key of oauth.providers below.
+      provider: entra-backup
+      extensions:
+        # The Kafka cluster ID.
+        logicalCluster: lkc-abc123
+        # Optional. Omit it to let Confluent Cloud match the token against
+        # your identity pools' filters (automatic pool mapping).
+        identityPoolId: pool-Ab1
+
+storage:
+  backend: s3
+  bucket: kafka-backups
+  region: eu-west-1
+  prefix: confluent/
+
+backup:
+  compression: zstd
+
+oauth:
+  providers:
+    entra-backup:
+      type: oidc_client_credentials
+      token_endpoint_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+      client_id: "<backup app client id>"
+      client_secret: ${ENTRA_BACKUP_CLIENT_SECRET}
+      # The API application's ID URI. The app registration must set
+      # requestedAccessTokenVersion: 2.
+      scope: api://<api app id>/.default
+
+    # On an Azure VM, with no stored secret:
+    # vm:
+    #   type: azure_managed_identity
+    #   scope: api://<api app id>/.default
+    #   client_id: "<user-assigned identity client id>"
+
+    # On AKS, with workload identity:
+    # aks:
+    #   type: azure_workload_identity
+    #   scope: api://<api app id>/.default

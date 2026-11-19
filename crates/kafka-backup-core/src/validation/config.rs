@@ -36,6 +36,12 @@ pub struct ValidationConfig {
     /// Human-readable string recording who/what triggered this run.
     #[serde(default)]
     pub triggered_by: Option<String>,
+
+    /// OAuth token providers, for a target with
+    /// `sasl_mechanism: OAUTHBEARER` (`target.security.oauth.provider`
+    /// names one of them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::oauth::OauthConfig>,
 }
 
 /// Configuration for all validation checks.

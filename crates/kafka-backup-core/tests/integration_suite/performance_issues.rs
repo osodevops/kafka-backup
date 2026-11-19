@@ -34,6 +34,7 @@ fn create_continuous_backup_config(
     topics: Vec<String>,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {
@@ -68,6 +69,7 @@ fn create_high_partition_backup_config(
     topics: Vec<String>,
 ) -> Config {
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: backup_id.to_string(),
         source: Some(KafkaConfig {

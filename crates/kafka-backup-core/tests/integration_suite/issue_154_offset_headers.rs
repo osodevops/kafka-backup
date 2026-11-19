@@ -66,6 +66,7 @@ fn backup_config(bs: &str, storage: PathBuf) -> Config {
         "the default under test is `true`"
     );
     Config {
+        oauth: None,
         mode: Mode::Backup,
         backup_id: BACKUP_ID.to_string(),
         source: Some(KafkaConfig {
@@ -90,6 +91,7 @@ fn restore_config(bs: &str, storage: PathBuf, target: &str, restore: RestoreOpti
     let mut topic_mapping = HashMap::new();
     topic_mapping.insert(SOURCE_TOPIC.to_string(), target.to_string());
     Config {
+        oauth: None,
         mode: Mode::Restore,
         backup_id: BACKUP_ID.to_string(),
         source: None,
