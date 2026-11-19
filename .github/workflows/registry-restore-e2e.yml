@@ -123,7 +123,8 @@ jobs:
       REGISTRY_APICURIO_TARGET_VERSION: ${{ matrix.ap_target }}
       REGISTRY_MATRIX_SOURCE_PROVIDER: ${{ matrix.source_provider }}
       REGISTRY_MATRIX_TARGET_PROVIDER: ${{ matrix.target_provider }}
-      REGISTRY_EVIDENCE_DIR: ${{ github.workspace }}/target/registry-compatibility
+      # Outside `target`, which is cached between runs.
+      REGISTRY_EVIDENCE_DIR: ${{ github.workspace }}/registry-compatibility
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -161,5 +162,5 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: registry-restore-${{ matrix.name }}
-          path: target/registry-compatibility
+          path: registry-compatibility
           if-no-files-found: ignore

@@ -35,6 +35,8 @@ export REGISTRY_APICURIO_API="$REGISTRY_APICURIO_SOURCE_API"
 export REGISTRY_COMPOSE_FILE="$REGISTRY_REPO_ROOT/tests/registry-restore-test-infra/docker-compose.yml"
 export REGISTRY_COMPOSE_PROJECT="${REGISTRY_COMPOSE_PROJECT:-registry-restore-test}"
 export REGISTRY_EVIDENCE_DIR="${REGISTRY_EVIDENCE_DIR:-$REGISTRY_REPO_ROOT/target/registry-compatibility}"
+# Logs of an earlier run would read as results of this one.
+rm -rf "$REGISTRY_EVIDENCE_DIR"
 mkdir -p "$REGISTRY_EVIDENCE_DIR"
 compose() { docker compose -p "$REGISTRY_COMPOSE_PROJECT" -f "$REGISTRY_COMPOSE_FILE" "$@"; }
 cleanup() {
