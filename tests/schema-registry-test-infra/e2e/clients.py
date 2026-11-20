@@ -13,6 +13,7 @@ serializers; nothing is shared with kafka-backup.
   registry  print a registry's subjects, versions, IDs and modes as JSON
 """
 import argparse
+import os
 import json
 import struct
 import sys
@@ -152,16 +153,45 @@ def data_set(Shipment):
     return records
 
 
+# --------------------------------------------------------------------------
+# connection settings
+# --------------------------------------------------------------------------
+# Plain connections by default (the Docker stack). For Confluent Cloud the
+# caller sets KBSR_KAFKA_API_KEY / KBSR_KAFKA_API_SECRET and KBSR_SR_API_KEY /
+# KBSR_SR_API_SECRET for the cluster and registry this invocation talks to,
+# and KBSR_REPLICATION_FACTOR=3.
+
+HTTP = requests.Session()
+if os.environ.get("KBSR_SR_API_KEY"):
+    HTTP.auth = (os.environ["KBSR_SR_API_KEY"], os.environ["KBSR_SR_API_SECRET"])
+
+
+def kafka_conf(bootstrap, **extra):
+    conf = {"bootstrap.servers": bootstrap, **extra}
+    if os.environ.get("KBSR_KAFKA_API_KEY"):
+        conf.update({"security.protocol": "SASL_SSL", "sasl.mechanisms": "PLAIN",
+                     "sasl.username": os.environ["KBSR_KAFKA_API_KEY"],
+                     "sasl.password": os.environ["KBSR_KAFKA_API_SECRET"]})
+    return conf
+
+
+def sr_conf(url):
+    conf = {"url": url}
+    if os.environ.get("KBSR_SR_API_KEY"):
+        conf["basic.auth.user.info"] = os.environ["KBSR_SR_API_KEY"] + ":" + os.environ["KBSR_SR_API_SECRET"]
+    return conf
+
+
 def cmd_produce(a):
-    admin = AdminClient({"bootstrap.servers": a.bootstrap})
+    admin = AdminClient(kafka_conf(a.bootstrap))
     existing = set(admin.list_topics(timeout=20).topics)
-    new = [NewTopic(t, num_partitions=c["partitions"], replication_factor=1)
+    new = [NewTopic(t, num_partitions=c["partitions"], replication_factor=int(os.environ.get("KBSR_REPLICATION_FACTOR", "1")))
            for t, c in TOPICS.items() if t not in existing]
     for future in admin.create_topics(new).values():
         future.result(30)
     time.sleep(1)
 
-    sr = SchemaRegistryClient({"url": a.registry})
+    sr = SchemaRegistryClient(sr_conf(a.registry))
     Shipment = shipment_class()
     no_auto = {"auto.register.schemas": True}
     serializers = {
@@ -174,8 +204,8 @@ def cmd_produce(a):
     # The blob topic's keys go through the registry too (Avro "string").
     key_serializer = AvroSerializer(sr, '"string"', conf=no_auto)
 
-    producers = {t: Producer({"bootstrap.servers": a.bootstrap, "compression.type": c["compression"],
-                              "enable.idempotence": True, "linger.ms": 5}) for t, c in TOPICS.items()}
+    producers = {t: Producer(kafka_conf(a.bootstrap, **{"compression.type": c["compression"],
+                              "enable.idempotence": True, "linger.ms": 5})) for t, c in TOPICS.items()}
     expected, errors = [], []
 
     def delivered(entry):
@@ -217,8 +247,8 @@ def cmd_produce(a):
 # --------------------------------------------------------------------------
 
 def consume_all(bootstrap, topics):
-    c = Consumer({"bootstrap.servers": bootstrap, "group.id": f"kbsr-verify-{time.time_ns()}",
-                  "enable.auto.commit": False, "auto.offset.reset": "earliest", "isolation.level": "read_committed"})
+    c = Consumer(kafka_conf(bootstrap, **{"group.id": f"kbsr-verify-{time.time_ns()}",
+                  "enable.auto.commit": False, "auto.offset.reset": "earliest", "isolation.level": "read_committed"}))
     meta = c.list_topics(timeout=20)
     parts = []
     for t in topics:
@@ -257,7 +287,7 @@ def cmd_verify(a):
     back = {v: k for k, v in mapping.items()}
 
     # Deserializers know the target registry only.
-    sr = SchemaRegistryClient({"url": a.registry})
+    sr = SchemaRegistryClient(sr_conf(a.registry))
     Shipment = shipment_class()
     avro, json_d = AvroDeserializer(sr), JSONDeserializer(None, schema_registry_client=sr)
     proto = ProtobufDeserializer(Shipment, {"use.deprecated.format": False})
@@ -339,7 +369,7 @@ def cmd_verify(a):
 # --------------------------------------------------------------------------
 
 def call(registry, method, path, body=None, ok=(200,)):
-    r = requests.request(method, registry + path, headers=HEADERS, data=None if body is None else json.dumps(body), timeout=30)
+    r = HTTP.request(method, registry + path, headers=HEADERS, data=None if body is None else json.dumps(body), timeout=30)
     if r.status_code not in ok:
         raise SystemExit(f"{method} {registry}{path}: {r.status_code} {r.text}")
     return r.json() if r.text else None
@@ -356,11 +386,11 @@ def cmd_wipe(a):
         if not subjects:
             break
         for s in subjects:
-            requests.put(f"{a.registry}/mode/{enc(s)}?force=true", headers=HEADERS, data=json.dumps({"mode": "READWRITE"}), timeout=30)
-            requests.delete(f"{a.registry}/subjects/{enc(s)}", timeout=30)
-            requests.delete(f"{a.registry}/subjects/{enc(s)}?permanent=true", timeout=30)
-            requests.delete(f"{a.registry}/mode/{enc(s)}", timeout=30)
-            requests.delete(f"{a.registry}/config/{enc(s)}", timeout=30)
+            HTTP.put(f"{a.registry}/mode/{enc(s)}?force=true", headers=HEADERS, data=json.dumps({"mode": "READWRITE"}), timeout=30)
+            HTTP.delete(f"{a.registry}/subjects/{enc(s)}", timeout=30)
+            HTTP.delete(f"{a.registry}/subjects/{enc(s)}?permanent=true", timeout=30)
+            HTTP.delete(f"{a.registry}/mode/{enc(s)}", timeout=30)
+            HTTP.delete(f"{a.registry}/config/{enc(s)}", timeout=30)
     call(a.registry, "PUT", "/config", {"compatibility": "BACKWARD"})
     left = call(a.registry, "GET", "/subjects?deleted=true")
     if left:
@@ -403,14 +433,29 @@ def registry_state(registry):
         for v in call(registry, "GET", f"/subjects/{enc(s)}/versions?deleted=true"):
             sv = call(registry, "GET", f"/subjects/{enc(s)}/versions/{v}?deleted=true")
             versions[str(v)] = {"id": sv["id"], "schema": sv["schema"], "type": sv.get("schemaType", "AVRO")}
-        mode = requests.get(f"{registry}/mode/{enc(s)}", timeout=30)
+        mode = HTTP.get(f"{registry}/mode/{enc(s)}", timeout=30)
         state["subjects"][s] = {
             "versions": versions,
-            "live": requests.get(f"{registry}/subjects/{enc(s)}/versions", timeout=30).json()
-            if requests.get(f"{registry}/subjects/{enc(s)}/versions", timeout=30).status_code == 200 else [],
+            "live": HTTP.get(f"{registry}/subjects/{enc(s)}/versions", timeout=30).json()
+            if HTTP.get(f"{registry}/subjects/{enc(s)}/versions", timeout=30).status_code == 200 else [],
             "mode": mode.json().get("mode") if mode.status_code == 200 else None,
         }
     return state
+
+
+def cmd_delete_topics(a):
+    """Delete this test's topics (`kbsr-*`) and wait until they are gone."""
+    admin = AdminClient(kafka_conf(a.bootstrap))
+    ours = [t for t in admin.list_topics(timeout=30).topics if t.startswith("kbsr-")]
+    if ours:
+        for future in admin.delete_topics(ours, operation_timeout=60).values():
+            future.result(90)
+    for _ in range(60):
+        if not [t for t in admin.list_topics(timeout=30).topics if t.startswith("kbsr-")]:
+            print(json.dumps({"deleted": sorted(ours)}))
+            return 0
+        time.sleep(2)
+    raise SystemExit("topics were not deleted")
 
 
 def cmd_registry(a):
@@ -442,8 +487,10 @@ def main():
     s = sub.add_parser("seed")
     s.add_argument("--registry", required=True)
     s.add_argument("--count", type=int, required=True)
+    s = sub.add_parser("delete-topics")
+    s.add_argument("--bootstrap", required=True)
     a = p.parse_args()
-    return {"produce": cmd_produce, "verify": cmd_verify, "wipe": cmd_wipe, "occupy": cmd_occupy,
+    return {"delete-topics": cmd_delete_topics, "produce": cmd_produce, "verify": cmd_verify, "wipe": cmd_wipe, "occupy": cmd_occupy,
             "seed": cmd_seed, "registry": cmd_registry}[a.cmd](a)
 
 

@@ -421,9 +421,16 @@ schema_registry:
 - An environment has a single registry. To restore next to existing schemas
   use `into_existing`, and run `validate-restore --schema-only` first.
 
-> **Not yet verified against Confluent Cloud.** Everything on this page was
-> tested against self-managed Confluent Schema Registry (see below). Reports
-> from Confluent Cloud environments are welcome on
+> **Verified against Confluent Cloud with API keys** (November 2026, Stream
+> Governance Essentials, version 0.30.1): backup of an environment's registry
+> and topics; restore of both into an empty environment, read back with the
+> official deserializers; `into_existing` into a populated environment (dry
+> run, strict refusal, `rewrite_ids`); and the `max_schema_versions` check.
+> The backup ran with `DeveloperRead` and the restore with `ResourceOwner` on
+> the registry's subjects, nothing more. The script is
+> `tests/schema-registry-test-infra/confluent-cloud.sh`. **OAuth to a
+> Confluent Cloud registry is not verified yet**; it is tested against a mock
+> registry. Reports are welcome on
 > [issue #262](https://github.com/osodevops/kafka-backup/issues/262).
 
 ## 8. Tested versions and limits
