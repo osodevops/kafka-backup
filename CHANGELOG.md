@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.1] - 2026-11-20
+
+### Fixed
+- **A restore that creates its topics could fail on Confluent Cloud** with `Broker returned error code 3: ListOffsets error for <topic>:<partition>`. The cluster lists a new topic's partitions a few seconds before every partition leader serves them, and the restore read the partitions' offsets in that gap; the affected topics were not restored and the command exited with an error. The restore now waits, for up to 30 seconds per partition, until each new partition's leader answers. Found while running the Schema Registry acceptance test of [#262](https://github.com/osodevops/kafka-backup/issues/262) against Confluent Cloud, where it failed 3 runs out of 3 before the fix and none after.
+
+### Added
+- `tests/schema-registry-test-infra/confluent-cloud.sh`: the Schema Registry acceptance test for Confluent Cloud (scenarios 8 to 11 of [#262](https://github.com/osodevops/kafka-backup/issues/262)), run by hand against three non-production environments. The test clients accept Confluent Cloud API keys.
+
 ## [0.30.0] - 2026-11-19
 
 ### Added

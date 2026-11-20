@@ -2054,9 +2054,69 @@ impl RestoreEngine {
                     topic.name
                 ))));
             }
+
+            // Metadata lists the partitions before every leader serves them.
+            // Confluent Cloud answered ListOffsets with
+            // UNKNOWN_TOPIC_OR_PARTITION for a few seconds after CreateTopics,
+            // which failed the topic's restore. Wait until each partition's
+            // leader answers; any other error is left to the restore itself.
+            for partition in 0..topic.num_partitions {
+                for attempt in 1..=max_retries {
+                    match router
+                        .get_offsets(&topic.name, partition, IsolationLevel::ReadUncommitted)
+                        .await
+                    {
+                        Err(e) if is_unknown_topic_or_partition(&e) => {
+                            if attempt == max_retries {
+                                return Err(Error::Kafka(crate::error::KafkaError::Timeout(
+                                    format!(
+                                        "Timeout waiting for partition {} of new topic '{}' to be served by its leader",
+                                        partition, topic.name
+                                    ),
+                                )));
+                            }
+                            debug!(
+                                "Partition {} of new topic '{}' is not served by its leader yet (attempt {}/{})",
+                                partition, topic.name, attempt, max_retries
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+/// UNKNOWN_TOPIC_OR_PARTITION (3): the broker does not know the partition
+/// (yet, for a topic created moments ago).
+fn is_unknown_topic_or_partition(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Kafka(crate::error::KafkaError::BrokerError { code: 3, .. })
+    )
+}
+
+#[cfg(test)]
+mod new_topic_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn only_unknown_topic_or_partition_is_waited_for() {
+        let broker = |code| {
+            Error::Kafka(crate::error::KafkaError::BrokerError {
+                code,
+                message: format!("ListOffsets error for t:0: code {code}"),
+            })
+        };
+        assert!(is_unknown_topic_or_partition(&broker(3)));
+        // Authorization and leader errors have their own handling.
+        assert!(!is_unknown_topic_or_partition(&broker(29)));
+        assert!(!is_unknown_topic_or_partition(&broker(6)));
+        assert!(!is_unknown_topic_or_partition(&Error::Config("x".into())));
     }
 }
 
