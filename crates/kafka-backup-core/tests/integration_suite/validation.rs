@@ -726,3 +726,83 @@ async fn test_evidence_upload_to_storage() {
 
     println!("Evidence upload/download roundtrip: PASSED");
 }
+
+/// operator#117: a multi-topic validation must identify the changed topic,
+/// keep the exact control, and reconcile all observed counts to its summary.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn multi_topic_message_count_exposes_each_topic_and_partition() {
+    let cluster = KafkaTestCluster::start().await.unwrap();
+    cluster
+        .wait_for_ready(Duration::from_secs(60))
+        .await
+        .unwrap();
+    let topics = ["count-control", "count-changed"];
+    for topic in topics {
+        cluster.create_topic(topic, 30).await.unwrap();
+    }
+    let dir = TempDir::new().unwrap();
+    let config = create_snapshot_backup_config(
+        &cluster.bootstrap_servers,
+        dir.path().to_path_buf(),
+        "topic-breakdown",
+        topics.iter().map(|s| s.to_string()).collect(),
+    );
+    run_backup(config).await.unwrap();
+    let client = cluster.create_client();
+    client.connect().await.unwrap();
+    for partition in 0..3 {
+        client
+            .produce(
+                topics[1],
+                partition,
+                vec![kafka_backup_core::manifest::BackupRecord {
+                    key: None,
+                    value: Some(b"new-data".to_vec()),
+                    headers: vec![],
+                    offset: 0,
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                }],
+                -1,
+                30_000,
+            )
+            .await
+            .unwrap();
+    }
+    let summary = run_validation(
+        &cluster,
+        dir.path(),
+        "topic-breakdown",
+        ChecksConfig {
+            message_count: MessageCountConfig::default(),
+            offset_range: OffsetRangeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            consumer_group_offsets: ConsumerGroupConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let result = &summary.results[0];
+    let rows = result.data["topic_counts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let control = rows.iter().find(|t| t["topic"] == topics[0]).unwrap();
+    let changed = rows.iter().find(|t| t["topic"] == topics[1]).unwrap();
+    assert_eq!(control["outcome"], "PASSED");
+    assert_eq!(control["expected"], 30);
+    assert_eq!(control["observed"], 30);
+    assert_eq!(changed["outcome"], "FAILED");
+    assert_eq!(changed["expected"], 30);
+    assert_eq!(changed["observed"], 33);
+    assert_eq!(changed["delta"], 3);
+    assert_eq!(changed["delta_percentage"], 10.0);
+    assert_eq!(changed["partitions"].as_array().unwrap().len(), 3);
+    assert_eq!(result.data["counts_complete"], true);
+    assert_eq!(result.data["total_messages_expected"], 60);
+    assert_eq!(result.data["total_messages_restored"], 63);
+}

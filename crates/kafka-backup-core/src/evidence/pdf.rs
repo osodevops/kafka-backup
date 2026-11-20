@@ -67,9 +67,23 @@ pub fn generate_pdf(report: &EvidenceReport, report_sha256: Option<&str>) -> Res
             "{}: {} ({} ms)",
             result.check_name, result.outcome, result.duration_ms
         ));
-        validation.body(truncate(&result.detail, 120));
+        validation.body(&result.detail);
+        if result.check_name == "MessageCountCheck" && result.data.get("topic_counts").is_some() {
+            validation.body("Expected: archived records selected for replay. Observed: visible read_committed records in each captured target offset range.");
+            validation.body("Delta = observed - expected; percentage = delta / expected * 100. n/a when expected is zero and delta is nonzero, or a count is unknown.");
+            validation.body("Outcome uses fail_threshold per partition; opposite partition differences do not cancel. Failed scans have unknown counts.");
+            for line in crate::validation::message_count::diagnostic_lines(result) {
+                if line.starts_with("Topic:") {
+                    validation.keep_together(45.0);
+                    validation.space(2.0);
+                    validation.subheading(line);
+                } else {
+                    validation.body(line);
+                }
+            }
+        }
     }
-    validation.footer("Page 2 - Validation Results");
+    validation.footer("Validation Results");
 
     let mut integrity = PageBuilder::new();
     integrity.heading("Integrity and Signing");
@@ -100,9 +114,22 @@ pub fn generate_pdf(report: &EvidenceReport, report_sha256: Option<&str>) -> Res
             integrity.body(format!("RTO demonstrated: {rto} seconds"));
         }
     }
-    integrity.footer("Page 3 - Integrity and Compliance Mappings");
+    integrity.footer("Integrity and Compliance Mappings");
 
-    let pages = vec![cover.finish(), validation.finish(), integrity.finish()];
+    let mut pages: Vec<_> = [cover.finish(), validation.finish(), integrity.finish()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let total = pages.len();
+    for (index, page) in pages.iter_mut().enumerate() {
+        page.ops.extend(text_ops(
+            format!("{} / {total}", index + 1),
+            BuiltinFont::Helvetica,
+            8.0,
+            PAGE_WIDTH_MM - MARGIN_MM - 15.0,
+            MARGIN_MM,
+        ));
+    }
     let mut warnings = Vec::new();
     Ok(doc
         .with_pages(pages)
@@ -152,76 +179,118 @@ pub fn integrity_display_lines(
 
 struct PageBuilder {
     ops: Vec<Op>,
+    pages: Vec<PdfPage>,
     y_mm: f32,
+    footer_label: String,
 }
 
 impl PageBuilder {
     fn new() -> Self {
         Self {
             ops: Vec::new(),
+            pages: Vec::new(),
             y_mm: PAGE_HEIGHT_MM - MARGIN_MM,
+            footer_label: String::new(),
         }
     }
-
     fn title(&mut self, text: impl Into<String>) {
         self.line(text, BuiltinFont::HelveticaBold, 24.0, 10.0);
     }
-
     fn heading(&mut self, text: impl Into<String>) {
         self.line(text, BuiltinFont::HelveticaBold, 14.0, 8.0);
     }
-
     fn subheading(&mut self, text: impl Into<String>) {
         self.line(text, BuiltinFont::HelveticaBold, 10.0, 6.0);
     }
-
     fn body(&mut self, text: impl Into<String>) {
         self.line(text, BuiltinFont::Helvetica, 9.0, 5.0);
     }
 
     fn line(&mut self, text: impl Into<String>, font: BuiltinFont, size: f32, advance: f32) {
-        if self.y_mm <= MARGIN_MM + 10.0 {
-            return;
+        // One em per character is a conservative width bound for these built-in
+        // fonts. Wrap long topic names, errors and digests without truncation.
+        let max_chars = ((PAGE_WIDTH_MM - 2.0 * MARGIN_MM) * 72.0 / 25.4 / size).floor() as usize;
+        for line in wrap(&text.into(), max_chars) {
+            if self.y_mm < MARGIN_MM + 12.0 + advance {
+                self.flush();
+            }
+            self.ops
+                .extend(text_ops(line, font, size, MARGIN_MM, self.y_mm));
+            self.y_mm -= advance;
         }
-        self.ops.extend([
-            Op::StartTextSection,
-            Op::SetTextCursor {
-                pos: Point::new(Mm(MARGIN_MM), Mm(self.y_mm)),
-            },
-            Op::SetFont {
-                font: PdfFontHandle::Builtin(font),
-                size: Pt(size),
-            },
-            Op::ShowText {
-                items: vec![TextItem::Text(text.into())],
-            },
-            Op::EndTextSection,
-        ]);
-        self.y_mm -= advance;
     }
-
+    fn keep_together(&mut self, height_mm: f32) {
+        if self.y_mm < MARGIN_MM + 12.0 + height_mm {
+            self.flush();
+        }
+    }
     fn space(&mut self, millimetres: f32) {
         self.y_mm -= millimetres;
     }
-
     fn footer(&mut self, text: impl Into<String>) {
-        let saved_y = self.y_mm;
-        self.y_mm = MARGIN_MM;
-        self.line(text, BuiltinFont::Helvetica, 8.0, 0.0);
-        self.y_mm = saved_y;
+        self.footer_label = text.into();
     }
-
-    fn finish(self) -> PdfPage {
-        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), self.ops)
+    fn flush(&mut self) {
+        self.pages.push(PdfPage::new(
+            Mm(PAGE_WIDTH_MM),
+            Mm(PAGE_HEIGHT_MM),
+            std::mem::take(&mut self.ops),
+        ));
+        self.y_mm = PAGE_HEIGHT_MM - MARGIN_MM;
+    }
+    fn finish(mut self) -> Vec<PdfPage> {
+        self.flush();
+        for page in &mut self.pages {
+            page.ops.extend(text_ops(
+                self.footer_label.clone(),
+                BuiltinFont::Helvetica,
+                8.0,
+                MARGIN_MM,
+                MARGIN_MM,
+            ));
+        }
+        self.pages
     }
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
+fn text_ops(text: String, font: BuiltinFont, size: f32, x: f32, y: f32) -> Vec<Op> {
+    vec![
+        Op::StartTextSection,
+        Op::SetTextCursor {
+            pos: Point::new(Mm(x), Mm(y)),
+        },
+        Op::SetFont {
+            font: PdfFontHandle::Builtin(font),
+            size: Pt(size),
+        },
+        Op::ShowText {
+            items: vec![TextItem::Text(text)],
+        },
+        Op::EndTextSection,
+    ]
+}
+
+fn wrap(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let chars: Vec<_> = paragraph.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let end = (start + max_chars).min(chars.len());
+            let split = if end < chars.len() {
+                (start + 1..end)
+                    .rev()
+                    .find(|&i| chars[i].is_whitespace())
+                    .unwrap_or(end)
+            } else {
+                end
+            };
+            lines.push(chars[start..split].iter().collect::<String>());
+            start = split;
+            while start < chars.len() && chars[start].is_whitespace() {
+                start += 1;
+            }
+        }
     }
+    lines
 }

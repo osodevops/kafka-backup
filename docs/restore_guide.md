@@ -1198,3 +1198,35 @@ programmatic record filters require reading the selected segments to count
 records using replay's rules. Full disjoint segments use manifest counts;
 byte and timestamp summaries still describe selected segment metadata. Neither
 path adds `offsets.db` checkpoint values to manifest record counts.
+
+### Investigating a validation count difference
+
+`MessageCountCheck.data.topic_counts` contains every selected topic, including
+passes. Each row records `manifest_count` (the raw sum of manifest segment
+counts), `expected` (records selected from the archive using replay overlap/PITR
+rules), `observed` (visible target `read_committed` records), signed `delta`
+(observed minus expected), `delta_percentage` (100 * delta / expected), and
+`outcome`. The nested `partitions` include the same comparison plus archive
+bounds, captured target start and exclusive end, the offset reached, last
+reported high watermark/LSO, and errors. The target is the configured Kafka
+cluster, including when you point validation back at the live source.
+
+Zero expected and zero observed gives 0%; zero expected and a nonzero delta is
+undefined (`null` in JSON, `n/a` in text). A failed scan or unreadable archive
+has an unknown count (`null`), never an invented zero. `counts_complete: false`
+means aggregate numeric totals contain only known counts and cannot be used as
+a complete shortfall measurement. A topic fails if any partition exceeds
+`fail_threshold` or errors, even when opposite deltas cancel in its total.
+
+A backup and a later live scan need not contain the same records. Compaction
+can remove superseded records without changing the offset bounds; retention,
+aborted transactions, older read-uncommitted archives and the last stable
+offset can also affect comparisons. An offset-range check can pass while
+record counts differ. There is no atomic snapshot across topics: each target
+partition captures its own scan bounds and later appends are excluded. Use a
+quiet completed restore for parity checks, and inspect the failed partitions
+before attributing a difference to backup loss. Per-topic/partition counts do
+not by themselves verify record contents or prove the cause of a discrepancy.
+
+The OSS CLI prints these rows and saves them in JSON/PDF evidence. Existing
+older evidence is unchanged; rerun validation to collect the new diagnostics.

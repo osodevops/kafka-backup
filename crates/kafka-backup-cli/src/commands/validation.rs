@@ -103,6 +103,9 @@ pub async fn run(config_path: &str, pitr: Option<i64>, triggered_by: Option<&str
             "  [{}] {} — {}",
             result.outcome, result.check_name, result.detail
         );
+        for line in kafka_backup_core::validation::message_count::diagnostic_lines(result) {
+            println!("    {line}");
+        }
     }
 
     // Build and emit evidence artifacts through the shared core pipeline.

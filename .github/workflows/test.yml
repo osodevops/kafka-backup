@@ -114,6 +114,11 @@ jobs:
         # the Schema Registry E2E workflow.
         run: cargo test -p kafka-backup-core --test schema_registry_tests --all-features
 
+      - name: Run evidence contract tests
+        run: cargo test -p kafka-backup-core --test evidence_contract_test --all-features
+        env:
+          RUST_LOG: debug
+
       - name: Run CLI tests
         # kafka-backup-cli is binary-only, so `cargo test --lib` skips it. This
         # runs its unit tests and tests/*.rs, which spawn the built binary
