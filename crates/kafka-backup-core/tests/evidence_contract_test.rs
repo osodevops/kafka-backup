@@ -453,3 +453,109 @@ async fn report_with_embedded_digest_is_rejected() {
         .unwrap_err();
     assert!(err.to_string().contains("must be empty"));
 }
+
+/// operator#117: every topic, including the last of a 28-topic archive and
+/// failed/unknown counts, must survive JSON emission and PDF pagination.
+#[tokio::test]
+async fn per_topic_diagnostics_survive_json_and_multipage_pdf() {
+    let mut report = test_report("issue-117", false);
+    let topics: Vec<_> = (0..28)
+        .map(|i| {
+            serde_json::json!({
+                "topic": format!("topic-{i:02}"), "manifest_count": 100, "expected": 100,
+                "observed": if i == 27 { 95 } else { 100 },
+                "delta": if i == 27 { -5 } else { 0 },
+                "delta_percentage": if i == 27 { -5.0 } else { 0.0 },
+                "outcome": if i == 27 { "FAILED" } else { "PASSED" },
+                "scan_complete": true,
+                "partitions": [{"partition": 0, "expected": 100,
+                    "observed": if i == 27 { 95 } else { 100 },
+                    "delta": if i == 27 { -5 } else { 0 },
+                    "delta_percentage": if i == 27 { -5.0 } else { 0.0 },
+                    "outcome": if i == 27 { "FAILED" } else { "PASSED" },
+                    "scan_complete": true, "target_start_offset": 0, "target_end_offset": 100,
+                    "scan_reached_offset": 100, "error": null}],
+            })
+        })
+        .collect();
+    report.validation.overall_result = CheckOutcome::Failed;
+    report.validation.checks_passed = 0;
+    report.validation.checks_failed = 1;
+    report.validation.results[0].outcome = CheckOutcome::Failed;
+    report.validation.results[0].detail =
+        "28 topics; 2800 messages expected, 2795 restored; 1 discrepancies".into();
+    report.validation.results[0].data = serde_json::json!({"topic_counts": topics});
+    let storage = MemoryBackend::new();
+    let emission = emit_evidence(
+        &storage,
+        &report,
+        &EvidenceConfig {
+            formats: vec![EvidenceFormat::Json, EvidenceFormat::Pdf],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&reload(&storage, emission.json_key.as_ref().unwrap()).await)
+            .unwrap();
+    assert_eq!(
+        json["validation"]["results"][0]["data"]["topic_counts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        28
+    );
+    let pdf = reload(&storage, emission.pdf_key.as_ref().unwrap()).await;
+    let parsed = printpdf::PdfDocument::parse(&pdf, &Default::default(), &mut Vec::new()).unwrap();
+    let text = parsed.extract_text().concat().join("\n");
+    for i in 0..28 {
+        assert!(
+            text.contains(&format!("topic-{i:02}")),
+            "topic {i} missing from PDF"
+        );
+    }
+    assert!(text.contains("Observed: 95"));
+    assert!(text.contains("Delta: -5 (-5.00%)"));
+    assert!(
+        parsed.pages.len() > 3,
+        "a large report must paginate, not drop rows"
+    );
+    if let Ok(dir) = std::env::var("ISSUE117_PDF_PREVIEW_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("validation-breakdown.pdf"),
+            pdf,
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("validation-breakdown.json"),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn pdf_preserves_unknown_counts_long_topic_names_and_scan_errors() {
+    let mut report = test_report("unknown-count", false);
+    let topic = format!("topic-{}-end", "x".repeat(230));
+    let error = format!("Authorization failed: {} END-ERROR", "details ".repeat(120));
+    report.validation.results[0].data = serde_json::json!({"topic_counts": [{
+        "topic": topic, "manifest_count": 100, "expected": 100, "observed": null,
+        "delta": null, "delta_percentage": null, "outcome": "FAILED", "scan_complete": false,
+        "partitions": [{"partition": 0, "expected": 100, "observed": null, "delta": null,
+            "delta_percentage": null, "outcome": "FAILED", "scan_complete": false,
+            "target_start_offset": 0, "target_end_offset": 100, "scan_reached_offset": 0,
+            "error": error}]
+    }]});
+    let pdf = evidence::pdf::generate_pdf(&report, None).unwrap();
+    let parsed = printpdf::PdfDocument::parse(&pdf, &Default::default(), &mut Vec::new()).unwrap();
+    let text = parsed.extract_text().concat().join("\n");
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(&topic));
+    assert!(text.contains("Observed: unknown"));
+    assert!(text.contains("Delta: unknown (n/a)"));
+    assert!(compact.contains("END-ERROR"));
+    assert!(text.contains("Integrity and Signing"));
+}

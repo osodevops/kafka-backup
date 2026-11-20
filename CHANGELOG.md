@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.2] - 2026-11-20
+
+### Fixed
+- Include expected, observed, signed delta, percentage and outcome for every selected topic and partition in validation JSON, CLI output and paginated PDF evidence (kafka-backup-operator#117). Report scan bounds, completion and errors; unknown counts remain null rather than implying zero. Preserve aggregate and legacy discrepancy fields, and per-partition threshold semantics.
+- Wrap PDF text and continue onto new pages instead of truncating check details or dropping content at the page boundary. Include page numbers and render the integrity footer.
+
 ## [0.30.1] - 2026-11-20
 
 ### Fixed
