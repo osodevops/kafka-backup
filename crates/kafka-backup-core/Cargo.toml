@@ -59,6 +59,7 @@ webpki-roots.workspace = true
 
 # Database
 sqlx.workspace = true
+libsqlite3-sys.workspace = true
 
 # Object storage
 object_store.workspace = true

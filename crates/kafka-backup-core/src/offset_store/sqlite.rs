@@ -382,6 +382,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn sqlite_runtime_includes_wal_memory_disclosure_fix() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SqliteOffsetStore::new(OffsetStoreConfig {
+            db_path: temp_dir.path().join("patched.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let pool = store.pool.read().await;
+        let (version,): (String,) = sqlx::query_as("SELECT sqlite_version()")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+        let components: Vec<u32> = version
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        assert!(
+            components >= vec![3, 54, 0],
+            "SQLite {version} is affected by RUSTSEC-2026-0459"
+        );
+    }
+
+    #[tokio::test]
     async fn test_offset_store_basic() {
         let temp_dir = TempDir::new().unwrap();
         let config = OffsetStoreConfig {
