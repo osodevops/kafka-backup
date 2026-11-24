@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.3] - 2026-11-24
+
+### Security
+- Upgrade SQLx to 0.9.1 and require `libsqlite3-sys >=0.39.1` (bundled SQLite 3.54.1), fixing RUSTSEC-2026-0459 in checkpoint databases. The direct minimum also protects consumers whose lockfile already contains an older SQLite version. Existing checkpoint schemas and backup archives are unchanged.
+- Upgrade ZIP to 9.8.2, removing the six RustSec advisories affecting ZIP 2.6.1. The registry restore continues reading central-directory entries without extraction or AES support.
+- Refresh compatible dependencies and require patched Tokio, URL, Zstandard and root-certificate releases. The committed dependency graph has no RustSec vulnerabilities or unsoundness findings.
+- Make dependency audits block CI and release publication; verify the linked SQLite runtime includes the WAL security fix.
+
 ## [0.30.2] - 2026-11-20
 
 ### Fixed

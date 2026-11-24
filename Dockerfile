@@ -22,7 +22,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build the CLI binary in release mode
-RUN cargo build --release --bin kafka-backup && \
+RUN cargo build --locked --release --bin kafka-backup && \
     ls -lh target/release/kafka-backup
 
 

@@ -2782,7 +2782,7 @@ impl RegistryRestore {
         let mut manifest = None;
         for i in 0..zip.len() {
             let mut f = zip.by_index(i)?;
-            let name = f.name().to_owned();
+            let name = f.name()?.into_owned();
             let mut data = vec![];
             f.read_to_end(&mut data)?;
             if name.ends_with(".Manifest.json") {

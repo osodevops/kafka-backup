@@ -87,10 +87,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit release dependencies
+        run: cargo audit
 
       - name: Run unit tests
-        run: cargo test --lib --all-features
+        run: cargo test --locked --lib --all-features
         env:
           RUST_LOG: debug
 
@@ -310,13 +316,13 @@ jobs:
 
       - name: Verify package is publishable
         if: steps.patch.outputs.active != 'true'
-        run: cargo publish -p kafka-backup-core --dry-run
+        run: cargo publish --locked -p kafka-backup-core --dry-run
 
       - name: Publish kafka-backup-core to crates.io
         if: steps.patch.outputs.active != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p kafka-backup-core
+        run: cargo publish --locked -p kafka-backup-core
 
   # Determines if we should publish/announce
   host:
